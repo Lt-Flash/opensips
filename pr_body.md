@@ -4,7 +4,7 @@ This PR introduces **`cachedb_perf`** — a new, from-scratch `cachedb` backend 
 
 It implements the same `cachedb_funcs` vtable as every other backend, so **any module taking a `cachedb_url` works unchanged**, and core script usage (`cache_store("perf", ...)`) only changes the backend name. v1 is deliberately a **single-node in-memory cache**: no clusterer replication, no restart persistency — deployments sharing state via `cachedb_local` + `cluster_id` are out of scope for now.
 
-Draft because a few items remain before it leaves draft — the generated README, and optional index/event refinements — but the module is functionally complete for a single node (data ops, expiry, runtime growth, statistics, huge-page arena and a full introspection MI), validated by built-in selftests, a script-level end-to-end suite, and a multi-process correctness soak.
+Draft because a couple of items remain — a cluster-sync command (designed, below) and optional index refinements — but the module is functionally complete for a single node (data ops, expiry, runtime growth, statistics, huge-page arena, a full introspection MI, observability events and `db_*` persistence), validated by built-in selftests, a script-level end-to-end suite, and a multi-process correctness soak.
 
 ## Motivation
 
@@ -26,6 +26,10 @@ Every parameter is optional — with none set you get a single `default` collect
 | `arena_hugepage_mb` | int (MB) | `0` (off) | Size of the 2 MB huge-page arena reservation (mlock-pinned, created pre-fork, shared by all workers). Chases the best tier by *trying* the hugetlb → THP → `MADV_COLLAPSE` → 4K ladder; `0` uses plain demand-faulted shm. Wants `LimitMEMLOCK=infinity`; warns and continues unpinned otherwise. |
 | `arena_selftest` | int | `0` | Run the arena selftest at startup and **fail startup** on any mismatch. Permanent, cheap diagnostic. |
 | `htable_selftest` | int | `0` | Run the hash-table + growth selftest at startup and **fail startup** on any mismatch. |
+| `db_url` | string | *(unset)* | A `db_*` (SQL) backend to persist collections to (the matching `db_*` module must be loaded). Unset = no persistence. |
+| `db_table` | string | `cachedb_perf` | Table holding the persisted rows. |
+| `db_mode` | int | `0` (off) | Automatic persistence for `persist_collections`: `1` = load at startup, `2` = load at startup + save on graceful shutdown. `0` = MI-only. |
+| `persist_collections` | string | *(none)* | CSV of collections that `db_mode` auto-loads/saves. `perf_save`/`perf_load` still work on any collection on demand. |
 
 **The motivating setup — topology_hiding state backend:**
 
@@ -74,6 +78,8 @@ The full management interface — the operator visibility `cachedb_local` never 
 | `perf_set` | `<key> <value> [ttl] [collection]` | write one key; `ttl` in seconds (`0` or omitted = never expires) |
 | `perf_ttl` | `<glob> <ttl> [collection]` | re-arm the TTL of **every key matching the glob** without rewriting the value (the versionless bump — one atomic `expires` store, readers undisturbed); `ttl` in seconds (`0` = never). Returns the count updated. A literal key matches exactly one |
 | `perf_del` | `<glob> [collection]` | delete every key matching the glob; returns the count. The MI face of the `perf_del()` script function |
+| `perf_save` | `[collection]` | snapshot a collection to the `db_url` backend (all declared collections if none named) |
+| `perf_load` | `[collection]` | restore a collection from the `db_url` backend |
 
 MI parameters are named, so any sensible subset resolves — e.g. `perf_keys <glob> limit=N` without a collection, or `perf_set <key> <value> collection=C` without a ttl.
 
@@ -104,6 +110,25 @@ event_route[E_CACHEDB_PERF_NOMEM] {
     xlog("L_ERR", "cachedb_perf full: dropped $param(key) ($param(size) B) in $param(collection)\n");
 }
 ```
+
+### DB persistence
+
+With `db_url` set, a whole collection can be persisted to any `db_*` (SQL) backend. The **DB is a shared, durable store; the cache is an in-memory view over it.** A save is a full snapshot — the collection's rows are deleted and every live entry re-inserted; a load restores them. TTLs are stored as **absolute wall-clock time** so they survive a restart (the cache's own expiry is monotonic ticks, which reset on reboot); already-expired rows are skipped on both save and load, and native counters round-trip as their decimal value. This is single-node durability, **not** cross-node replication.
+
+```
+loadmodule "db_mysql.so"
+modparam("cachedb_perf", "cache_collections", "sessions")
+modparam("cachedb_perf", "db_url", "mysql://opensips:pw@localhost/opensips")
+modparam("cachedb_perf", "db_mode", 2)              # load at startup, save on graceful shutdown
+modparam("cachedb_perf", "persist_collections", "sessions")
+```
+```
+# on demand, from opensips-cli:
+opensips-cli -x mi cachedb_perf:perf_save sessions   # -> {"collections":1,"saved":N}
+opensips-cli -x mi cachedb_perf:perf_load sessions   # -> {"collections":1,"loaded":N}
+```
+
+The table (default `cachedb_perf`) has four columns: `collection` (string), `pkey` (string), `pvalue` (BLOB, binary-safe), `expires` (int, absolute unix time, `0` = never). The startup load runs before the workers fork, so every worker starts with a warm cache.
 
 ### Enabling the kernel memory backing
 
@@ -356,6 +381,8 @@ The same walker backs the **introspection MI** (full command table under [MI com
 - [x] Huge-page arena backing — 2M-aligned mlock-pinned reservation via the detect-by-trying ladder (`arena_hugepage_mb`), lock-free bump from it, shm_malloc fallback; measured +7–13% (see above)
 - [x] Multi-process correctness soak — forked worker processes hammer one live backend (get/set/remove/add) while the maintenance timer splits buckets underneath them, checking four invariants: no torn read, no lost update, no lost key across splits, no crash/UAF. **Found and fixed a real fork-safety bug** (see below). Post-fix: 8 processes, 24M ops, 3093 concurrent splits, 0 crashes, `torn_reads=0`, counter sum == adds, all immortals intact; clean under the `Q_MALLOC_DBG` redzone allocator and under all three core allocators (`F_MALLOC` / `Q_MALLOC` / `HP_MALLOC`, driving both pkg and the arena's shm chunk backing)
 - [x] End-to-end `th_state_url` benchmark against `cachedb_local` (50k held calls) and against dialog-based topology hiding (100k held calls) — both sections above
+- [x] DB persistence — whole-collection save/load to any `db_*` backend (`perf_save`/`perf_load` MI, plus `db_mode` startup-load / shutdown-save), TTLs kept as absolute wall-clock time so they survive a restart. Verified with `db_sqlite` (save → shutdown-save → startup-load, values intact, TTL decremented correctly across the cycle). Single-node durability, not replication
+- [ ] **Cluster sync (`perf_sync`)** — MI command + script function that saves this node's collection to the DB, then broadcasts a reload signal over the `clusterer` API (soft dependency; falls back to a local reload if clusterer isn't loaded); every peer reloads from the DB and raises a new `E_CACHEDB_PERF_SYNCED` event. A pull-from-DB refresh model — deliberately *not* `/r`-style per-operation replication. Designed; implementation pending (multi-node testing needs a cluster)
 
 ### Correctness: what the multi-process soak caught
 

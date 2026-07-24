@@ -152,7 +152,20 @@ Pushing to **100 000 held calls**, comparing three topology-hiding strategies on
 
 At 100k concurrency **cachedb_perf-TH is nearly as cheap as doing no topology hiding at all** — it tracks the no-TH curve and holds 4000 CPS at 93% CPU. **dialog-TH is the loser here**: it saturates CPU by 3000 CPS, breaks at 4000, and carries ~2.5× the resident memory (a full per-dialog state machine + timers vs one compact th_store entry). This is a crossover from lower concurrency, where dialog leads — cachedb_perf's flat per-entry cost wins as the live-state count climbs.
 
-Caveats: the single load generator is unstable at 100k (some cachedb_perf mid-rungs showed generator-side failures at low LB CPU — discarded); and the huge pages here are whole-shm THP that benefits all three equally — the module's *own* huge-page arena (below) is separate work.
+Caveats: the single load generator is unstable at 100k (some cachedb_perf mid-rungs showed generator-side failures at low LB CPU — discarded); and the huge pages here are whole-shm THP that benefits all three equally — the module's *own* huge-page arena (next) is separate work.
+
+### Huge-page arena (CP-20)
+
+The arena can now back its chunks with **2 MB huge pages** instead of 4 K (modparam `arena_hugepage_mb`; the reservation is 2M-aligned, mlock-pinned, created pre-fork and shared by all workers). Measured on the real module (−O3, 8 workers, medians of repeated runs):
+
+![CP-20 huge pages](https://raw.githubusercontent.com/Lt-Flash/opensips/cachedb-perf-assets/cp20-hugepages.png)
+
+| condition | 4K pages | huge pages | gain |
+|---|---|---|---|
+| near-empty (clustered working set) | 31.7 Mops/s | 33.8 Mops/s | +7% |
+| 50 000 resident (~13 MB working set) | 21.2 Mops/s | 24.0 Mops/s | **+13%** |
+
+The gain is larger at 50k, where the working set spreads across enough memory to thrash the 4K TLB — exactly the case huge pages relieve. It's below the 1.19–1.43× the pointer-chase showed in isolation because each operation also pays for the hash, the tag scan and a copy of the value. Detection is by *trying* each tier (hugetlb → THP → collapse → 4K), never by kernel version; `mlock` wants `LimitMEMLOCK=infinity` and warns-and-continues otherwise.
 
 ## Design in brief
 
@@ -198,7 +211,7 @@ All three ride one lock-free walker (Redis SCAN-class guarantee) with binary-saf
 - [x] Statistics — per-process sharded counters (one 64-byte line per process, summed only at read time; a shared `update_stat` counter would recreate the 0.72× collapse measured above), exported as ten `cachedb_perf:` core stats and a per-collection `perf_stats` MI (load factor, overflow, seqlock retries/1k, backing tier)
 - [ ] Linear-hash growth + maintenance worker
 - [ ] Introspection MI (`perf_keys` / `perf_scan` / `perf_dump` / `perf_get` / `perf_set` / `perf_del` / `perf_stats`)
-- [ ] Huge-page arena backing (the ladder above) + `mlock` pinning
+- [x] Huge-page arena backing — 2M-aligned mlock-pinned reservation via the detect-by-trying ladder (`arena_hugepage_mb`), lock-free bump from it, shm_malloc fallback; measured +7–13% (see above)
 - [ ] Multi-process correctness suite; end-to-end `th_state_url` benchmark against `cachedb_local` and dialog-based topology hiding
 
 `modules/cachedb_perf/DESIGN.md` and `bench/` are in-tree as working documents for reviewers — full measurement history, every rejected alternative and why; they will be dropped before this leaves draft.

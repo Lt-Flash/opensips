@@ -12,6 +12,47 @@ Found while benchmarking `topology_hiding`'s cacheDB state backend (#4114): sett
 
 Rather than progressively rewriting a module every deployment depends on, this is a clean backend: operators opt in per collection by changing a URL.
 
+## Configuration
+
+Every parameter is optional — with none set you get a single `default` collection at 16384 buckets, plain shm, growth and the expiry sweep on. In practice you declare the collection(s) you use and point consumers at them.
+
+| modparam | type | default | what it does |
+|---|---|---|---|
+| `cache_collections` | string | `default` (`14` → 16384 buckets) | Declares collections as `name` or `name=size`, `;`-separated. `size` is the log2 of the *initial* bucket count, clamped to `[4, 24]`; the table grows past it at runtime, so it is a starting point, not a ceiling. The `cachedb_local` `/r` replication marker is rejected — this cache is single-node. |
+| `cachedb_url` | string | `perf://` (the `default` collection) | Connection URL(s) that scripts and other modules resolve. The collection is the URL's db part (`perf:///th`) or, equivalently, its host part (`perf://th`); `perf://` alone selects `default`. Prefix a group (`perf:grp:///th`) to address a specific URL from the script. Naming an undeclared collection is a startup error. Repeatable. |
+| `expiry_sweep_period` | int (seconds) | `1` | How often expired records are *reclaimed*. Expiry itself is instant — an expired entry reads as absent the moment it lapses; the sweep only frees the memory, hint-guided so idle collections cost next to nothing. `0` disables reclamation (expired entries hold their memory until overwritten). |
+| `growth_load_factor` | int | `2` | Target entries-per-bucket the maintenance timer grows the table toward — the knob that keeps the ~84 ns bucket shape as the cache scales. `0` disables growth (fixed-size table, i.e. `cachedb_local` behaviour). |
+| `growth_budget` | int | `4096` | Cap on bucket splits per maintenance tick, so a single growth pass can never stall the timer. |
+| `arena_hugepage_mb` | int (MB) | `0` (off) | Size of the 2 MB huge-page arena reservation (mlock-pinned, created pre-fork, shared by all workers). Chases the best tier by *trying* the hugetlb → THP → `MADV_COLLAPSE` → 4K ladder; `0` uses plain demand-faulted shm. Wants `LimitMEMLOCK=infinity`; warns and continues unpinned otherwise. |
+| `arena_selftest` | int | `0` | Run the arena selftest at startup and **fail startup** on any mismatch. Permanent, cheap diagnostic. |
+| `htable_selftest` | int | `0` | Run the hash-table + growth selftest at startup and **fail startup** on any mismatch. |
+
+**The motivating setup — topology_hiding state backend:**
+
+```
+loadmodule "cachedb_perf.so"
+modparam("cachedb_perf", "cache_collections", "th=16")   # 2^16=65536 buckets to start; grows with call volume
+modparam("cachedb_perf", "expiry_sweep_period", 1)
+modparam("cachedb_perf", "arena_hugepage_mb", 512)       # optional: 512 MB of 2M huge pages
+
+loadmodule "topology_hiding.so"
+modparam("topology_hiding", "th_state_url", "perf:///th") # requires force_dialog=0
+```
+
+**Generic script cache + glob operations:**
+
+```
+modparam("cachedb_perf", "cache_collections", "sessions;counters=18")
+modparam("cachedb_perf", "cachedb_url", "perf:///sessions")
+
+route {
+    cache_store("perf", "session-$ci", "$var(state)", 3600);
+    cache_fetch("perf", "session-$ci", $var(state));
+    perf_del("session-$ci-*");                     # glob delete -> count
+    perf_mget("session-*", $avp(k), $avp(v));      # matches -> index-paired AVPs
+}
+```
+
 ## The study
 
 Everything below was measured, not assumed — the benchmark rig ships in-tree (`modules/cachedb_perf/bench/`, `make run`, no OpenSIPS build needed) and every figure is reproducible. Hosts: Xeon E5-2699 v4, kernels 5.4 / 6.8 / 6.12; the NUMA numbers come from a vNUMA-pinned two-socket guest on the same silicon. The rig models structures and cache behaviour (single process, threads); it ranks designs rather than predicting server throughput.

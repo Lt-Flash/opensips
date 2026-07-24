@@ -138,6 +138,22 @@ Same LB, topology_hiding with `th_state_url` pointing at each backend (65536 buc
 
 cachedb_perf **sustains the 6000-CPS rung where cachedb_local breaks** — a sustained-ceiling lift from ~3941 to ~5775 CPS (**~1.5×**) at 50k live th_store states. The end-to-end gain is smaller than the isolated-cache 2.3–7.8× because SIP processing is the larger share of per-call cost, but it lands exactly where the cache matters: the high-concurrency point where cachedb_local's lock-on-every-read serializes the workers.
 
+### At 100 000 concurrent calls: cachedb_perf-TH vs dialog-TH vs no-TH
+
+Pushing to **100 000 held calls**, comparing three topology-hiding strategies on the same LB (huge pages / THP enabled): cachedb_perf-backed th_store, the in-memory dialog module (`force_dialog`), and plain record-routing with no topology hiding at all.
+
+![100k three-way](https://raw.githubusercontent.com/Lt-Flash/opensips/cachedb-perf-assets/conc100k-th-compare.png)
+
+| offered CPS (≈100k held) | no-TH (rr) | cachedb_perf-TH | dialog-TH |
+|---|---|---|---|
+| 2000 | 55% CPU, 0% fail | 67% CPU, 2.9% | 85% CPU, 0.1% |
+| 3000 | 73% CPU, 0.1% | — | **100% CPU**, 1.0% |
+| 4000 | 96% CPU, 0.1% | 93% CPU, 1.3% | 100% CPU, **8.2% (breaks)** |
+
+At 100k concurrency **cachedb_perf-TH is nearly as cheap as doing no topology hiding at all** — it tracks the no-TH curve and holds 4000 CPS at 93% CPU. **dialog-TH is the loser here**: it saturates CPU by 3000 CPS, breaks at 4000, and carries ~2.5× the resident memory (a full per-dialog state machine + timers vs one compact th_store entry). This is a crossover from lower concurrency, where dialog leads — cachedb_perf's flat per-entry cost wins as the live-state count climbs.
+
+Caveats: the single load generator is unstable at 100k (some cachedb_perf mid-rungs showed generator-side failures at low LB CPU — discarded); and the huge pages here are whole-shm THP that benefits all three equally — the module's *own* huge-page arena (below) is separate work.
+
 ## Design in brief
 
 ```c

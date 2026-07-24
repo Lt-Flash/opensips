@@ -100,6 +100,32 @@ Measured in-guest on a Proxmox VM with vNUMA bound per host socket (`numaN: ...,
 
 Where NUMA does matter for the roadmap: page walks against remote memory amplify TLB-miss cost, so the huge-page backing is expected to be worth *more* on two sockets than the 1.42× measured on one — to be quantified in the end-to-end benchmark. One refinement from the same testbed: with `pdpe1gb` exposed, 1 GB pages *are* allocatable at runtime on a fresh boot (2 granted right after boot) — the earlier "unobtainable" holds only once uptime fragments memory. The ruling against them stands on arithmetic: 2 M pages already give a ≤1 GB arena full TLB coverage on this hardware.
 
+## Measured: cachedb_perf vs cachedb_local, in-process
+
+The bench rig above ranks *designs* in a single process. This measures the **real modules** — real OpenSIPS 4.1-dev, real shared memory, N real worker **processes** — driving the `th_store` access pattern (16-byte thid keys, 200-byte values, 95% get / 5% set). Both backends did byte-for-byte identical work (same 22.8 M hit count). Release build (`-O3`), `Q_MALLOC`, pinned to one 8-core socket.
+
+![throughput](https://raw.githubusercontent.com/Lt-Flash/opensips/cachedb-perf-assets/cp17-throughput.png)
+
+**Same conditions — both collections sized to 65536 buckets (`th=16`):**
+
+| condition | cachedb_perf | cachedb_local | perf faster |
+|---|---|---|---|
+| no load (near-empty), 8 workers | **29.7 Mops/s** (271 ns/op) | 9.9 Mops/s (812 ns) | **3.0×** |
+| 50 000 resident, 8 workers | **18.0 Mops/s** (448 ns/op) | 7.9 Mops/s (1013 ns) | **2.3×** |
+| 50 000 resident, 1 worker | 1.8 Mops/s (558 ns) | 1.2 Mops/s (853 ns) | 1.5× |
+
+![scaling and cliff](https://raw.githubusercontent.com/Lt-Flash/opensips/cachedb-perf-assets/cp17-scaling-cliff.png)
+
+Two effects drive the gap. **Scaling:** cachedb_perf's lock-free reads scale **10.0×** from 1→8 workers vs cachedb_local's **6.6×** (it takes a bucket lock on every read). **The default:** most deployments never set `cache_collections`, so cachedb_local runs at its 512-bucket default — at 50k entries that is a load factor of ~98, **3529 ns/op**, and cachedb_perf is **7.8× faster** than cachedb_local as typically shipped.
+
+| at 50 000 resident, 8 workers | ns per operation |
+|---|---|
+| cachedb_perf (65536 buckets) | **448 ns** |
+| cachedb_local, tuned (65536 buckets) | 1013 ns |
+| cachedb_local, default (512 buckets) | 3529 ns |
+
+Honest notes: numbers include a real `pkg_malloc`+`free` of the 200-byte value on every get (the th_store copy-out), so this is per-operation cost, not a bare lookup. This isolates the **cache** deliberately — the current topology_hiding design keeps INVITE state self-contained in the Contact, so an end-to-end INVITE test would not exercise the cache; a SUBSCRIBE-driven end-to-end run (which does populate th_store) is the next measurement.
+
 ## Design in brief
 
 ```c

@@ -4,7 +4,7 @@ This PR introduces **`cachedb_perf`** — a new, from-scratch `cachedb` backend 
 
 It implements the same `cachedb_funcs` vtable as every other backend, so **any module taking a `cachedb_url` works unchanged**, and core script usage (`cache_store("perf", ...)`) only changes the backend name. v1 is deliberately a **single-node in-memory cache**: no clusterer replication, no restart persistency — deployments sharing state via `cachedb_local` + `cluster_id` are out of scope for now.
 
-Draft because a few roadmap items remain — chiefly the introspection MI, admin docs, and optional index/event refinements — but the module already runs as a complete cache, validated by built-in selftests, a script-level end-to-end suite, and a multi-process correctness soak.
+Draft because a few items remain before it leaves draft — the generated README, and optional index/event refinements — but the module is functionally complete for a single node (data ops, expiry, runtime growth, statistics, huge-page arena and a full introspection MI), validated by built-in selftests, a script-level end-to-end suite, and a multi-process correctness soak.
 
 ## Motivation
 
@@ -247,6 +247,20 @@ perf_mget_json("*", $var(j));                   # -> {"hits":"6","user-alice":"a
 
 All three ride one lock-free walker (Redis SCAN-class guarantee) with binary-safe JSON escaping; `iter_keys` uses the same walker. Two startup selftest modparams (`arena_selftest`, `htable_selftest`) ship as permanent diagnostics and fail startup on any mismatch.
 
+For operators, the same walker backs an **introspection MI** — the visibility `cachedb_local` never had, and lock-free so a key scan never stalls SIP traffic:
+
+```
+opensips-cli -x mi perf_keys "session-*"        # names + TTL, bounded (KEYS-like)
+opensips-cli -x mi perf_scan 0                  # cursored, Redis SCAN; repeat until cursor 0
+opensips-cli -x mi perf_dump "profile-*"        # names AND values (opt-in)
+opensips-cli -x mi perf_get session-abc123      # value + TTL + size
+opensips-cli -x mi perf_set greeting hello 300  # single-key write (ttl seconds)
+opensips-cli -x mi perf_del "session-abc*"      # glob delete -> count
+opensips-cli -x mi perf_stats [collection]      # per-collection stats
+```
+
+`perf_scan` is the answer for a large cache where `perf_keys` would truncate: its cursor is an ascending bucket index, so it stays valid across a concurrent resize and returns every entry present throughout at least once — without Redis's reverse-binary cursor masking, because the table only grows (buckets never move).
+
 ## Status
 
 - [x] Module shell, URL/collection parsing (size clamped to [4,24] — `1 << size` on an unbounded unsigned is UB), memory-tier probe with actionable sysctl guidance
@@ -258,7 +272,7 @@ All three ride one lock-free walker (Redis SCAN-class guarantee) with binary-saf
 - [x] Expiry sweep — hint-routed (per-bucket min-expires hints in sweep-friendly parallel arrays, 16 per cache line; the hot TTL-bump path never writes them), timer-driven via `expiry_sweep_period` (default 1 s), reclamation through the global pool strictly after lock release
 - [x] Statistics — per-process sharded counters (one 64-byte line per process, summed only at read time; a shared `update_stat` counter would recreate the 0.72× collapse measured above), exported as ten `cachedb_perf:` core stats and a per-collection `perf_stats` MI (load factor, overflow, seqlock retries/1k, backing tier)
 - [x] Linear-hash growth + maintenance timer — the table now resizes itself (the thing `cachedb_local` fundamentally cannot do): one-bucket-at-a-time splits driven from the single-process maintenance timer, no rehash, overflow left findable; `growth_load_factor` keeps the bucket shape as entries scale. Verified: 1000 entries → 484 splits → 500 buckets, all keys intact
-- [ ] Introspection MI — `perf_keys` / `perf_scan` / `perf_dump` / `perf_get` / `perf_set` as MI commands (the per-collection `perf_stats` MI already ships; see above)
+- [x] Introspection MI — `perf_keys` / `perf_scan` / `perf_dump` / `perf_get` / `perf_set` / `perf_del` as MI commands, all lock-free (a key scan never stalls writers, unlike `cachedb_local`'s). `perf_scan` is cursor-based (Redis SCAN): an ascending bucket cursor, stable across a concurrent resize, every entry returned at least once. Verified over a datagram MI
 - [x] Huge-page arena backing — 2M-aligned mlock-pinned reservation via the detect-by-trying ladder (`arena_hugepage_mb`), lock-free bump from it, shm_malloc fallback; measured +7–13% (see above)
 - [x] Multi-process correctness soak — forked worker processes hammer one live backend (get/set/remove/add) while the maintenance timer splits buckets underneath them, checking four invariants: no torn read, no lost update, no lost key across splits, no crash/UAF. **Found and fixed a real fork-safety bug** (see below). Post-fix: 8 processes, 24M ops, 3093 concurrent splits, 0 crashes, `torn_reads=0`, counter sum == adds, all immortals intact; clean under the `Q_MALLOC_DBG` redzone allocator and under all three core allocators (`F_MALLOC` / `Q_MALLOC` / `HP_MALLOC`, driving both pkg and the arena's shm chunk backing)
 - [x] End-to-end `th_state_url` benchmark against `cachedb_local` (50k held calls) and against dialog-based topology hiding (100k held calls) — both sections above

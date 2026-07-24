@@ -4,7 +4,7 @@ This PR introduces **`cachedb_perf`** — a new, from-scratch `cachedb` backend 
 
 It implements the same `cachedb_funcs` vtable as every other backend, so **any module taking a `cachedb_url` works unchanged**, and core script usage (`cache_store("perf", ...)`) only changes the backend name. v1 is deliberately a **single-node in-memory cache**: no clusterer replication, no restart persistency — deployments sharing state via `cachedb_local` + `cluster_id` are out of scope for now.
 
-Draft because the roadmap below is about half done — but the module already runs as a complete cache, validated by built-in selftests and a script-level end-to-end suite.
+Draft because a few roadmap items remain — chiefly the introspection MI, admin docs, and optional index/event refinements — but the module already runs as a complete cache, validated by built-in selftests, a script-level end-to-end suite, and a multi-process correctness soak.
 
 ## Motivation
 
@@ -152,7 +152,7 @@ Pushing to **100 000 held calls**, comparing three topology-hiding strategies on
 
 At 100k concurrency **cachedb_perf-TH is nearly as cheap as doing no topology hiding at all** — it tracks the no-TH curve and holds 4000 CPS at 93% CPU. **dialog-TH is the loser here**: it saturates CPU by 3000 CPS, breaks at 4000, and carries ~2.5× the resident memory (a full per-dialog state machine + timers vs one compact th_store entry). This is a crossover from lower concurrency, where dialog leads — cachedb_perf's flat per-entry cost wins as the live-state count climbs.
 
-Caveats: the single load generator is unstable at 100k (some cachedb_perf mid-rungs showed generator-side failures at low LB CPU — discarded); and the huge pages here are whole-shm THP that benefits all three equally — the module's *own* huge-page arena (next) is separate work.
+Caveats: the single load generator is unstable at 100k (some cachedb_perf mid-rungs showed generator-side failures at low LB CPU — discarded); and the huge pages here are whole-shm THP that benefits all three equally — the module's *own* huge-page arena (the next section) is separate work.
 
 ### Huge-page arena (CP-20)
 
@@ -210,10 +210,10 @@ All three ride one lock-free walker (Redis SCAN-class guarantee) with binary-saf
 - [x] Expiry sweep — hint-routed (per-bucket min-expires hints in sweep-friendly parallel arrays, 16 per cache line; the hot TTL-bump path never writes them), timer-driven via `expiry_sweep_period` (default 1 s), reclamation through the global pool strictly after lock release
 - [x] Statistics — per-process sharded counters (one 64-byte line per process, summed only at read time; a shared `update_stat` counter would recreate the 0.72× collapse measured above), exported as ten `cachedb_perf:` core stats and a per-collection `perf_stats` MI (load factor, overflow, seqlock retries/1k, backing tier)
 - [x] Linear-hash growth + maintenance timer — the table now resizes itself (the thing `cachedb_local` fundamentally cannot do): one-bucket-at-a-time splits driven from the single-process maintenance timer, no rehash, overflow left findable; `growth_load_factor` keeps the bucket shape as entries scale. Verified: 1000 entries → 484 splits → 500 buckets, all keys intact
-- [ ] Introspection MI (`perf_keys` / `perf_scan` / `perf_dump` / `perf_get` / `perf_set` / `perf_del` / `perf_stats`)
+- [ ] Introspection MI — `perf_keys` / `perf_scan` / `perf_dump` / `perf_get` / `perf_set` as MI commands (the per-collection `perf_stats` MI already ships; see above)
 - [x] Huge-page arena backing — 2M-aligned mlock-pinned reservation via the detect-by-trying ladder (`arena_hugepage_mb`), lock-free bump from it, shm_malloc fallback; measured +7–13% (see above)
 - [x] Multi-process correctness soak — forked worker processes hammer one live backend (get/set/remove/add) while the maintenance timer splits buckets underneath them, checking four invariants: no torn read, no lost update, no lost key across splits, no crash/UAF. **Found and fixed a real fork-safety bug** (see below). Post-fix: 8 processes, 24M ops, 3093 concurrent splits, 0 crashes, `torn_reads=0`, counter sum == adds, all immortals intact; clean under the `Q_MALLOC_DBG` redzone allocator and under all three core allocators (`F_MALLOC` / `Q_MALLOC` / `HP_MALLOC`, driving both pkg and the arena's shm chunk backing)
-- [ ] End-to-end `th_state_url` benchmark against `cachedb_local` and dialog-based topology hiding
+- [x] End-to-end `th_state_url` benchmark against `cachedb_local` (50k held calls) and against dialog-based topology hiding (100k held calls) — both sections above
 
 ### Correctness: what the multi-process soak caught
 

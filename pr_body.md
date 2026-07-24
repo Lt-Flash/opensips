@@ -86,6 +86,52 @@ opensips-cli -x mi perf_set greeting hello 300
 opensips-cli -x mi perf_del "session-abc*"
 ```
 
+### Enabling the kernel memory backing
+
+The huge-page arena (`arena_hugepage_mb`) climbs a **detect-by-trying** ladder at `mod_init`: it attempts each tier in turn and keeps the best one the running kernel actually grants — you do **not** pick a tier, you enable what you can and the module reports what it got. The tiers, fastest to slowest (the cost is the isolated 2 MB pointer-chase from §5 of the study):
+
+| tier | kernel feature the module uses | one-time admin action | cost (2M chase) | swap-pinning |
+|---|---|---|---|---|
+| **1 (fastest)** | overcommit hugetlb pool + `MAP_HUGETLB` | one `sysctl` | **177 → 125 ns (1.42×)** | inherent — hugetlb is unswappable, no `mlock` needed |
+| **2** | shmem THP + `MADV_HUGEPAGE` | one `sysfs` write | 177 → 158 ns | via `mlock` (see below) |
+| **3** | `MADV_COLLAPSE` after fill | none (kernel ≥ 6.1) | 177 → 156 ns | via `mlock` (see below) |
+| **4 (baseline)** | plain demand-faulted 4 KB | — | 177 ns | via `mlock` (still reserved+pinned) |
+
+**Tier 1 — overcommit hugetlb** (the one to prefer: on-demand, nothing held while the cache is small, and no memlock grant needed). Allow enough on-demand 2 MB pages for the arena (`arena_hugepage_mb / 2`, plus a small margin):
+
+```bash
+sysctl -w vm.nr_overcommit_hugepages=320          # e.g. a 512 MB arena = 256 pages + margin
+echo 'vm.nr_overcommit_hugepages = 320' > /etc/sysctl.d/60-opensips-hugepages.conf
+```
+
+**Tier 2 — shmem THP** (used if tier 1 is unavailable). Put shmem THP in `advise` so it honours the module's `MADV_HUGEPAGE`:
+
+```bash
+echo advise  > /sys/kernel/mm/transparent_hugepage/shmem_enabled
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+**Tier 3 — `MADV_COLLAPSE`** needs no sysctl (kernel ≥ 6.1); on some 6.12 builds it also wants tier 2's `shmem_enabled=advise`. **Tier 4** is the default and needs nothing.
+
+**Swap-pinning (`mlock`) — tiers 2–4 only.** When tier 1 is unavailable the arena is a regular shared mapping, which the module `mlock`-pins pre-fork so it can't be swapped out from under the lock-free readers. systemd's default `LimitMEMLOCK=65536` (64 KB) makes that `mlock` fail on any real arena — the module then warns and runs **unpinned (swappable)**; the huge pages still form, they are just not pinned. Tier 1 (`MAP_HUGETLB`) is exempt and needs none of this. To pin tiers 2–4, grant it once:
+
+```bash
+mkdir -p /etc/systemd/system/opensips.service.d
+printf '[Service]\nLimitMEMLOCK=infinity\n' > /etc/systemd/system/opensips.service.d/memlock.conf
+systemctl daemon-reload
+```
+
+Turn it on and confirm what landed:
+
+```
+modparam("cachedb_perf", "arena_hugepage_mb", 512)   # 0 (default) = plain shm, tier 4
+```
+```bash
+opensips-cli -x mi perf_stats     # -> memory_tier (1 hugetlb .. 4 plain 4K) + memory_backing
+```
+
+`mod_init` also logs the achieved tier and, when it falls short of tier 1, the exact `sysctl` to reach it and the measured cost of running without it.
+
 ## The study
 
 Everything below was measured, not assumed — the benchmark rig ships in-tree (`modules/cachedb_perf/bench/`, `make run`, no OpenSIPS build needed) and every figure is reproducible. Hosts: Xeon E5-2699 v4, kernels 5.4 / 6.8 / 6.12; the NUMA numbers come from a vNUMA-pinned two-socket guest on the same silicon. The rig models structures and cache behaviour (single process, threads); it ranks designs rather than predicting server throughput.

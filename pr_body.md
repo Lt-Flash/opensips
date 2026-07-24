@@ -72,6 +72,7 @@ The full management interface — the operator visibility `cachedb_local` never 
 | `perf_dump` | `<glob> [collection] [limit]` | like `perf_keys` but **includes values** — opt-in, never the default |
 | `perf_get` | `<key> [collection]` | one key: its value, remaining TTL (`-1` = never) and size |
 | `perf_set` | `<key> <value> [ttl] [collection]` | write one key; `ttl` in seconds (`0` or omitted = never expires) |
+| `perf_ttl` | `<glob> <ttl> [collection]` | re-arm the TTL of **every key matching the glob** without rewriting the value (the versionless bump — one atomic `expires` store, readers undisturbed); `ttl` in seconds (`0` = never). Returns the count updated. A literal key matches exactly one |
 | `perf_del` | `<glob> [collection]` | delete every key matching the glob; returns the count. The MI face of the `perf_del()` script function |
 
 MI parameters are named, so any sensible subset resolves — e.g. `perf_keys <glob> limit=N` without a collection, or `perf_set <key> <value> collection=C` without a ttl.
@@ -83,6 +84,7 @@ opensips-cli -x mi cachedb_perf:perf_scan 0            # then: …:perf_scan <re
 opensips-cli -x mi cachedb_perf:perf_dump "profile-*"
 opensips-cli -x mi cachedb_perf:perf_get session-abc123
 opensips-cli -x mi cachedb_perf:perf_set greeting hello 300
+opensips-cli -x mi cachedb_perf:perf_ttl "session-*" 1800   # re-arm matching keys to 30 min
 opensips-cli -x mi cachedb_perf:perf_del "session-abc*"
 ```
 

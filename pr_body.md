@@ -124,7 +124,19 @@ Two effects drive the gap. **Scaling:** cachedb_perf's lock-free reads scale **1
 | cachedb_local, tuned (65536 buckets) | 1013 ns |
 | cachedb_local, default (512 buckets) | 3529 ns |
 
-Honest notes: numbers include a real `pkg_malloc`+`free` of the 200-byte value on every get (the th_store copy-out), so this is per-operation cost, not a bare lookup. This isolates the **cache** deliberately — the current topology_hiding design keeps INVITE state self-contained in the Contact, so an end-to-end INVITE test would not exercise the cache; a SUBSCRIBE-driven end-to-end run (which does populate th_store) is the next measurement.
+Honest notes: numbers include a real `pkg_malloc`+`free` of the 200-byte value on every get (the th_store copy-out), so this is per-operation cost, not a bare lookup. This deliberately isolates the **cache** from the SIP layer. In a full LB the per-call cost is SIP parsing, header manipulation and transaction state plus the th_store put/get — there is no per-call encryption (th_store values are stored in the clear; the only crypto is one cheap MD5 to derive the key), so the cache is a direct share of that cost. An end-to-end run under 50 000 held calls confirms the direction below.
+
+### End-to-end: TH under 50 000 held calls
+
+Same LB, topology_hiding with `th_state_url` pointing at each backend (65536 buckets), ramped while holding ~50 000 concurrent calls. "Sustained" means <5% failures **and** peak concurrency ≤75k (actually still holding 50k, not backlogging):
+
+| offered CPS | th + cachedb_perf | th + cachedb_local |
+|---|---|---|
+| 4000 | 3875 achieved, 3.0% fail, 54k held | 3941 achieved, 1.4% fail, 57k held |
+| 6000 | **5775 achieved, 3.7% fail, 68k held** ✓ | 5490 achieved, 8.5% fail, 94k (backlogging) ✗ |
+| 8000 | 6670, 16.6% fail (overloaded) | 5874, 26.6% fail (overloaded) |
+
+cachedb_perf **sustains the 6000-CPS rung where cachedb_local breaks** — a sustained-ceiling lift from ~3941 to ~5775 CPS (**~1.5×**) at 50k live th_store states. The end-to-end gain is smaller than the isolated-cache 2.3–7.8× because SIP processing is the larger share of per-call cost, but it lands exactly where the cache matters: the high-concurrency point where cachedb_local's lock-on-every-read serializes the workers.
 
 ## Design in brief
 

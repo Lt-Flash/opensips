@@ -140,7 +140,7 @@ All three ride one lock-free walker (Redis SCAN-class guarantee) with binary-saf
 - [x] cachedb vtable: get/set/remove/add/sub/get_counter + native counters; `iter_keys`
 - [x] `perf_del` / `perf_mget` / `perf_mget_json`
 - [x] Selftests + script-level end-to-end suite
-- [ ] Expiry sweep (expired entries are already invisible; their memory is not yet reclaimed)
+- [x] Expiry sweep — hint-routed (per-bucket min-expires hints in sweep-friendly parallel arrays, 16 per cache line; the hot TTL-bump path never writes them), timer-driven via `expiry_sweep_period` (default 1 s), reclamation through the global pool strictly after lock release
 - [ ] Statistics (per-process sharded — a single shared `update_stat` counter would recreate the 0.72× collapse measured above)
 - [ ] Linear-hash growth + maintenance worker
 - [ ] Introspection MI (`perf_keys` / `perf_scan` / `perf_dump` / `perf_get` / `perf_set` / `perf_del` / `perf_stats`)

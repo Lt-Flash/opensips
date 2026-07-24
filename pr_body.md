@@ -46,14 +46,17 @@ modparam("topology_hiding", "th_state_url", "perf:///th")
 **Generic script cache + glob operations:**
 
 ```
-modparam("cachedb_perf", "cache_collections", "sessions;counters=18")
-modparam("cachedb_perf", "cachedb_url", "perf:///sessions")
+modparam("cachedb_perf", "cache_collections", "sessions")
+modparam("cachedb_perf", "cachedb_url", "perf:///sessions")   # groupless default -> "sessions"
 
 route {
-    cache_store("perf", "session-$ci", "$var(state)", 3600);
+    cache_store("perf", "session-$ci", "$var(state)", 3600);   # -> "sessions"
     cache_fetch("perf", "session-$ci", $var(state));
-    perf_del("session-$ci-*");                     # glob delete -> count
-    perf_mget("session-*", $avp(k), $avp(v));      # matches -> index-paired AVPs
+    # the collection arg is optional: omitted, the glob ops use the groupless
+    # cachedb_url's collection (here "sessions") - the same place cache_store
+    # above writes. Pass it explicitly to target another collection.
+    perf_del("session-$ci-*", "sessions");                  # glob delete -> count
+    perf_mget("session-*", $avp(k), $avp(v), "sessions");   # matches -> index-paired AVPs
 }
 ```
 

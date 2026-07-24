@@ -60,6 +60,32 @@ route {
 }
 ```
 
+### MI commands
+
+The full management interface — the operator visibility `cachedb_local` never had. Every command is lock-free (seqlock reads), so a key scan or dump never stalls SIP traffic; every name carries the `perf_` prefix to match the script functions and stay clear of the core's bare `get`/`set`. Arguments in `<>` are required, `[]` optional; an omitted `collection` means the groupless `cachedb_url`'s collection (where `cache_store("perf", …)` writes).
+
+| command | arguments | returns / effect |
+|---|---|---|
+| `perf_stats` | `[collection]` | per-collection stats: entries, buckets, load factor, overflow occupancy, hits/misses/stores/removes, seqlock retries (and per-1k-reads), plus arena bytes/chunks and the achieved memory tier. No arg = every collection |
+| `perf_keys` | `<glob> [collection] [limit]` | names **and TTL** of keys matching the shell glob, bounded (default limit 1000; the reply flags truncation). The `KEYS` equivalent |
+| `perf_scan` | `<cursor> [glob] [count]` | cursor-based incremental iteration (Redis `SCAN`) over the default collection: start at cursor `0`, repeat with the returned cursor until it comes back `0`. `count` bounds the buckets visited per call. The answer for a large cache, where `perf_keys` would truncate |
+| `perf_dump` | `<glob> [collection] [limit]` | like `perf_keys` but **includes values** — opt-in, never the default |
+| `perf_get` | `<key> [collection]` | one key: its value, remaining TTL (`-1` = never) and size |
+| `perf_set` | `<key> <value> [ttl] [collection]` | write one key; `ttl` in seconds (`0` or omitted = never expires) |
+| `perf_del` | `<glob> [collection]` | delete every key matching the glob; returns the count. The MI face of the `perf_del()` script function |
+
+MI parameters are named, so any sensible subset resolves — e.g. `perf_keys <glob> limit=N` without a collection, or `perf_set <key> <value> collection=C` without a ttl.
+
+```
+opensips-cli -x mi perf_stats
+opensips-cli -x mi perf_keys "session-*" th 50
+opensips-cli -x mi perf_scan 0                  # then: perf_scan <returned-cursor> … until 0
+opensips-cli -x mi perf_dump "profile-*"
+opensips-cli -x mi perf_get session-abc123
+opensips-cli -x mi perf_set greeting hello 300
+opensips-cli -x mi perf_del "session-abc*"
+```
+
 ## The study
 
 Everything below was measured, not assumed — the benchmark rig ships in-tree (`modules/cachedb_perf/bench/`, `make run`, no OpenSIPS build needed) and every figure is reproducible. Hosts: Xeon E5-2699 v4, kernels 5.4 / 6.8 / 6.12; the NUMA numbers come from a vNUMA-pinned two-socket guest on the same silicon. The rig models structures and cache behaviour (single process, threads); it ranks designs rather than predicting server throughput.
@@ -247,19 +273,7 @@ perf_mget_json("*", $var(j));                   # -> {"hits":"6","user-alice":"a
 
 All three ride one lock-free walker (Redis SCAN-class guarantee) with binary-safe JSON escaping; `iter_keys` uses the same walker. Two startup selftest modparams (`arena_selftest`, `htable_selftest`) ship as permanent diagnostics and fail startup on any mismatch.
 
-For operators, the same walker backs an **introspection MI** — the visibility `cachedb_local` never had, and lock-free so a key scan never stalls SIP traffic:
-
-```
-opensips-cli -x mi perf_keys "session-*"        # names + TTL, bounded (KEYS-like)
-opensips-cli -x mi perf_scan 0                  # cursored, Redis SCAN; repeat until cursor 0
-opensips-cli -x mi perf_dump "profile-*"        # names AND values (opt-in)
-opensips-cli -x mi perf_get session-abc123      # value + TTL + size
-opensips-cli -x mi perf_set greeting hello 300  # single-key write (ttl seconds)
-opensips-cli -x mi perf_del "session-abc*"      # glob delete -> count
-opensips-cli -x mi perf_stats [collection]      # per-collection stats
-```
-
-`perf_scan` is the answer for a large cache where `perf_keys` would truncate: its cursor is an ascending bucket index, so it stays valid across a concurrent resize and returns every entry present throughout at least once — without Redis's reverse-binary cursor masking, because the table only grows (buckets never move).
+The same walker backs the **introspection MI** (full command table under [MI commands](#mi-commands) above) — the operator visibility `cachedb_local` never had, and lock-free so a key scan never stalls SIP traffic. `perf_scan` is the answer for a large cache where `perf_keys` would truncate: its cursor is an ascending bucket index, so it stays valid across a concurrent resize and returns every entry present throughout at least once — without Redis's reverse-binary cursor masking, because the table only grows (buckets never move).
 
 ## Status
 

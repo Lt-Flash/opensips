@@ -4,7 +4,7 @@ This PR introduces **`cachedb_perf`** — a new, from-scratch `cachedb` backend 
 
 It implements the same `cachedb_funcs` vtable as every other backend, so **any module taking a `cachedb_url` works unchanged**, and core script usage (`cache_store("perf", ...)`) only changes the backend name. v1 is a **single-node in-memory cache** with optional `db_*` persistence — whole collections can be saved to and loaded from an SQL backend, so state survives a restart (see the **DB persistence** section below). What it deliberately does **not** do is `cachedb_local`-style per-operation replication (`cluster_id` write-through); cross-node sharing is instead a shared-DB refresh model (the `perf_sync` task below), not a streamed op log.
 
-Draft because a couple of items remain — a cluster-sync command (designed, below) and optional index refinements — but the module is functionally complete for a single node (data ops, expiry, runtime growth, statistics, huge-page arena, a full introspection MI, observability events and `db_*` persistence), validated by built-in selftests, a script-level end-to-end suite, and a multi-process correctness soak.
+Draft mainly to land multi-node validation of the cluster-sync path and optional index refinements — but the module is functionally complete (data ops, expiry, runtime growth, statistics, huge-page arena, a full introspection MI, observability events, `db_*` persistence, and a `perf_sync` cluster refresh), validated by built-in selftests, a script-level end-to-end suite, and a multi-process correctness soak.
 
 ## Motivation
 
@@ -30,6 +30,7 @@ Every parameter is optional — with none set you get a single `default` collect
 | `db_table` | string | `cachedb_perf` | Table holding the persisted rows. |
 | `db_mode` | int | `0` (off) | Automatic persistence for `persist_collections`: `1` = load at startup, `2` = load at startup + save on graceful shutdown. `0` = MI-only. |
 | `persist_collections` | string | *(none)* | CSV of collections that `db_mode` auto-loads/saves. `perf_save`/`perf_load` still work on any collection on demand. |
+| `sync_cluster_id` | int | `0` (off) | Cluster to signal on `perf_sync` (needs `clusterer` loaded + a `db_url`). Soft: with either missing, `perf_sync` degrades to a DB save. |
 
 **The motivating setup — topology_hiding state backend:**
 
@@ -80,6 +81,7 @@ The full management interface — the operator visibility `cachedb_local` never 
 | `perf_del` | `<glob> [collection]` | delete every key matching the glob; returns the count. The MI face of the `perf_del()` script function |
 | `perf_save` | `[collection]` | snapshot a collection to the `db_url` backend (all declared collections if none named) |
 | `perf_load` | `[collection]` | restore a collection from the `db_url` backend |
+| `perf_sync` | `[collection]` | save to the DB, then signal the cluster to reload it (save-then-broadcast); also a script function |
 
 MI parameters are named, so any sensible subset resolves — e.g. `perf_keys <glob> limit=N` without a collection, or `perf_set <key> <value> collection=C` without a ttl.
 
@@ -104,6 +106,7 @@ Four EVI events let a script or monitor react to the cache. Each is gated by `ev
 | `E_CACHEDB_PERF_NOMEM` | a write was **dropped because the arena is full** | `collection`, `key`, `size` |
 | `E_CACHEDB_PERF_GROWN` | the table grew itself | `collection`, `prev_buckets`, `buckets`, `splits`, `entries` |
 | `E_CACHEDB_PERF_MEM_DEGRADED` | huge pages requested but the arena landed below hugetlb (once at boot) | `requested_mb`, `tier`, `backing`, `overcommit_pages` |
+| `E_CACHEDB_PERF_SYNCED` | this node reloaded a collection because a peer issued `perf_sync` | `collection`, `source_node` |
 
 ```
 event_route[E_CACHEDB_PERF_NOMEM] {
@@ -382,7 +385,7 @@ The same walker backs the **introspection MI** (full command table in the **MI c
 - [x] Multi-process correctness soak — forked worker processes hammer one live backend (get/set/remove/add) while the maintenance timer splits buckets underneath them, checking four invariants: no torn read, no lost update, no lost key across splits, no crash/UAF. **Found and fixed a real fork-safety bug** (see below). Post-fix: 8 processes, 24M ops, 3093 concurrent splits, 0 crashes, `torn_reads=0`, counter sum == adds, all immortals intact; clean under the `Q_MALLOC_DBG` redzone allocator and under all three core allocators (`F_MALLOC` / `Q_MALLOC` / `HP_MALLOC`, driving both pkg and the arena's shm chunk backing)
 - [x] End-to-end `th_state_url` benchmark against `cachedb_local` (50k held calls) and against dialog-based topology hiding (100k held calls) — both sections above
 - [x] DB persistence — whole-collection save/load to any `db_*` backend (`perf_save`/`perf_load` MI, plus `db_mode` startup-load / shutdown-save), TTLs kept as absolute wall-clock time so they survive a restart. Verified with `db_sqlite` (save → shutdown-save → startup-load, values intact, TTL decremented correctly across the cycle). Single-node durability, not replication
-- [ ] **Cluster sync (`perf_sync`)** — MI command + script function that saves this node's collection to the DB, then broadcasts a reload signal over the `clusterer` API (soft dependency; falls back to a local reload if clusterer isn't loaded); every peer reloads from the DB and raises a new `E_CACHEDB_PERF_SYNCED` event. A pull-from-DB refresh model — deliberately *not* `/r`-style per-operation replication. Designed; implementation pending (multi-node testing needs a cluster)
+- [x] **Cluster sync (`perf_sync`)** — MI command + script function that saves this node's collection to the DB, then signals peers over the `clusterer` API to reload it (one message per *sync*, not per operation); each peer reloads from the DB and raises `E_CACHEDB_PERF_SYNCED`. Soft dependency — degrades to a DB save with no broadcast if clusterer/`sync_cluster_id` is absent. A pull-from-DB refresh model for single-writer/read-replica topologies — deliberately *not* `/r`-style per-operation replication. Single-node paths verified (loads, publishes the event, degrades gracefully, no crash); the multi-node broadcast/receive follows the `ratelimit` clusterer pattern and awaits validation on a real cluster
 
 ### Correctness: what the multi-process soak caught
 

@@ -141,7 +141,7 @@ All three ride one lock-free walker (Redis SCAN-class guarantee) with binary-saf
 - [x] `perf_del` / `perf_mget` / `perf_mget_json`
 - [x] Selftests + script-level end-to-end suite
 - [x] Expiry sweep — hint-routed (per-bucket min-expires hints in sweep-friendly parallel arrays, 16 per cache line; the hot TTL-bump path never writes them), timer-driven via `expiry_sweep_period` (default 1 s), reclamation through the global pool strictly after lock release
-- [ ] Statistics (per-process sharded — a single shared `update_stat` counter would recreate the 0.72× collapse measured above)
+- [x] Statistics — per-process sharded counters (one 64-byte line per process, summed only at read time; a shared `update_stat` counter would recreate the 0.72× collapse measured above), exported as ten `cachedb_perf:` core stats and a per-collection `perf_stats` MI (load factor, overflow, seqlock retries/1k, backing tier)
 - [ ] Linear-hash growth + maintenance worker
 - [ ] Introspection MI (`perf_keys` / `perf_scan` / `perf_dump` / `perf_get` / `perf_set` / `perf_del` / `perf_stats`)
 - [ ] Huge-page arena backing (the ladder above) + `mlock` pinning

@@ -36,7 +36,11 @@ modparam("cachedb_perf", "expiry_sweep_period", 1)
 modparam("cachedb_perf", "arena_hugepage_mb", 512)       # optional: 512 MB of 2M huge pages
 
 loadmodule "topology_hiding.so"
-modparam("topology_hiding", "th_state_url", "perf:///th") # requires force_dialog=0
+modparam("topology_hiding", "th_state_url", "perf:///th")
+# force_dialog is independent of this: with force_dialog=1 the dialog
+# module holds INVITE calls and the cache serves the non-INVITE dialogs
+# (SUBSCRIBE/NOTIFY/OPTIONS/INFO/PUBLISH); with force_dialog=0 INVITE
+# state (when session-timed) flows through the cache too.
 ```
 
 **Generic script cache + glob operations:**

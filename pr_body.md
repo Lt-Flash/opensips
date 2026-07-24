@@ -62,7 +62,7 @@ route {
 
 ### MI commands
 
-The full management interface — the operator visibility `cachedb_local` never had. Every command is lock-free (seqlock reads), so a key scan or dump never stalls SIP traffic; every name carries the `perf_` prefix to match the script functions and stay clear of the core's bare `get`/`set`. Arguments in `<>` are required, `[]` optional; an omitted `collection` means the groupless `cachedb_url`'s collection (where `cache_store("perf", …)` writes).
+The full management interface — the operator visibility `cachedb_local` never had. Every command is lock-free (seqlock reads), so a key scan or dump never stalls SIP traffic; every name carries the `perf_` prefix to match the script functions and stay clear of the core's bare `get`/`set`. Each is invoked module-namespaced as **`cachedb_perf:<command>`** (OpenSIPS 4.0+). Arguments in `<>` are required, `[]` optional; an omitted `collection` means the groupless `cachedb_url`'s collection (where `cache_store("perf", …)` writes).
 
 | command | arguments | returns / effect |
 |---|---|---|
@@ -77,13 +77,13 @@ The full management interface — the operator visibility `cachedb_local` never 
 MI parameters are named, so any sensible subset resolves — e.g. `perf_keys <glob> limit=N` without a collection, or `perf_set <key> <value> collection=C` without a ttl.
 
 ```
-opensips-cli -x mi perf_stats
-opensips-cli -x mi perf_keys "session-*" th 50
-opensips-cli -x mi perf_scan 0                  # then: perf_scan <returned-cursor> … until 0
-opensips-cli -x mi perf_dump "profile-*"
-opensips-cli -x mi perf_get session-abc123
-opensips-cli -x mi perf_set greeting hello 300
-opensips-cli -x mi perf_del "session-abc*"
+opensips-cli -x mi cachedb_perf:perf_stats
+opensips-cli -x mi cachedb_perf:perf_keys "session-*" th 50
+opensips-cli -x mi cachedb_perf:perf_scan 0            # then: …:perf_scan <returned-cursor> … until 0
+opensips-cli -x mi cachedb_perf:perf_dump "profile-*"
+opensips-cli -x mi cachedb_perf:perf_get session-abc123
+opensips-cli -x mi cachedb_perf:perf_set greeting hello 300
+opensips-cli -x mi cachedb_perf:perf_del "session-abc*"
 ```
 
 ### Enabling the kernel memory backing
@@ -127,7 +127,7 @@ Turn it on and confirm what landed:
 modparam("cachedb_perf", "arena_hugepage_mb", 512)   # 0 (default) = plain shm, tier 4
 ```
 ```bash
-opensips-cli -x mi perf_stats     # -> memory_tier (1 hugetlb .. 4 plain 4K) + memory_backing
+opensips-cli -x mi cachedb_perf:perf_stats     # -> memory_tier (1 hugetlb .. 4 plain 4K) + memory_backing
 ```
 
 `mod_init` also logs the achieved tier and, when it falls short of tier 1, the exact `sysctl` to reach it and the measured cost of running without it.

@@ -2332,9 +2332,17 @@ static int topo_no_dlg_seq_handling(struct sip_msg *msg,str *info)
 		} else {
 			sock = grep_sock_info( &host, (unsigned short)port, proto);
 			if (!sock) {
-				LM_WARN("non-local socket <%.*s>...ignoring\n", bind_buf.len, bind_buf.s);
+				/* The state was encoded by a node that owns this socket
+				 * and this one does not - normal whenever topology hiding
+				 * state reaches a different node than created it, so DBG:
+				 * at WARN it fires on every sequential request of every
+				 * such call.  Note this is only the send socket; the R-URI
+				 * has already been restored, so the request still routes. */
+				LM_DBG("non-local socket <%.*s> - leaving the send socket "
+					"to the caller\n", bind_buf.len, bind_buf.s);
+			} else {
+				msg->force_send_socket = sock;
 			}
-			msg->force_send_socket = sock;
 		}
 	}
 

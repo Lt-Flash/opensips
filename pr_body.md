@@ -116,7 +116,7 @@ event_route[E_CACHEDB_PERF_NOMEM] {
 
 ### DB persistence
 
-With `db_url` set, a whole collection can be persisted to any `db_*` (SQL) backend. The **DB is a shared, durable store; the cache is an in-memory view over it.** A save is a full snapshot — the collection's rows are deleted and every live entry re-inserted; a load restores them. TTLs are stored as **absolute wall-clock time** so they survive a restart (the cache's own expiry is monotonic ticks, which reset on reboot); already-expired rows are skipped on both save and load, and native counters round-trip as their decimal value. This is single-node durability, **not** cross-node replication.
+With `db_url` set, a whole collection can be persisted to any `db_*` (SQL) backend. The **DB is a shared, durable store; the cache is an in-memory view over it.** A save is a full snapshot — the collection's rows are deleted and every live entry re-inserted; a load restores them. TTLs are stored as **absolute wall-clock time** so they survive a restart (the cache's own expiry is monotonic ticks, which reset on reboot); already-expired rows are skipped on both save and load, and native counters round-trip as their decimal value. This is single-node durability; cross-node sharing over the same DB is `perf_sync` (below), still **not** per-operation replication.
 
 ```
 loadmodule "db_mysql.so"
@@ -132,6 +132,31 @@ opensips-cli -x mi cachedb_perf:perf_load sessions   # -> {"collections":1,"load
 ```
 
 The table (default `cachedb_perf`) has four columns: `collection` (string), `pkey` (string), `pvalue` (BLOB, binary-safe), `expires` (int, absolute unix time, `0` = never). The startup load runs before the workers fork, so every worker starts with a warm cache.
+
+> ⚠️ **A save/load is a full, blocking snapshot** — one SQL statement per entry, synchronous in the issuing process. On a large collection (this module targets millions of entries) or a slow backend (`db_text`, `db_sqlite`), it can take a long time and stall that process for its duration. It is a **maintenance / bootstrap** operation — startup warm-up, shutdown flush, an occasional snapshot or a `perf_sync` refresh — **never on a per-request path or a tight timer.** If you need durable per-key writes on every operation, this is the wrong tool.
+
+### Cluster sync
+
+`perf_sync [collection]` (MI **and** script function) builds on the same DB: it saves the collection, then signals the cluster over `clusterer` to reload it — **one message per sync, not per operation**, so the hot path is untouched. A reload **overwrites** a peer's copy from the DB, so it's for single-writer / read-replica topologies (one authority updates the DB, the others refresh); a node reloads and raises `E_CACHEDB_PERF_SYNCED`. With no clusterer / `sync_cluster_id` 0 it degrades to a DB save. Same blocking cost as `perf_save`, so: an occasional refresh, not a live primitive.
+
+```
+loadmodule "clusterer.so"          # before cachedb_perf (a soft dep also enforces init order)
+modparam("clusterer", "my_node_id", 1)          # 2, 3 on the other nodes
+loadmodule "cachedb_perf.so"
+modparam("cachedb_perf", "cache_collections", "profiles")
+modparam("cachedb_perf", "db_url", "mysql://opensips:pw@dbhost/opensips")
+modparam("cachedb_perf", "sync_cluster_id", 1)
+
+# on the authority, after it updated "profiles":
+#   opensips-cli -x mi cachedb_perf:perf_sync profiles   # save + tell peers to reload
+#   perf_sync("profiles");                                # same, from script
+
+event_route[E_CACHEDB_PERF_SYNCED] {   # fires on each replica after its reload
+    xlog("L_INFO", "reloaded $param(collection) from node $param(source_node)\n");
+}
+```
+
+The capability shows in the clusterer's `clusterer_list_cap` MI as `cachedb-perf-sync`.
 
 ### Enabling the kernel memory backing
 

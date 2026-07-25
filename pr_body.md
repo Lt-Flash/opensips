@@ -86,16 +86,26 @@ The full management interface — the operator visibility `cachedb_local` never 
 
 MI parameters are named, so any sensible subset resolves — e.g. `perf_keys <glob> limit=N` without a collection, or `perf_set <key> <value> collection=C` without a ttl.
 
+Note the argument order: the glob-taking commands (`perf_keys`, `perf_dump`, `perf_del`, `perf_ttl`) take the **glob first** and the collection second, so `perf_dump mycoll` looks for keys *named* `mycoll` rather than dumping that collection — use `perf_dump "*" mycoll`. Only `perf_get`/`perf_set` lead with a key. Quote globs, or the shell expands them before opensips-cli sees them.
+
 ```
 opensips-cli -x mi cachedb_perf:perf_stats
-opensips-cli -x mi cachedb_perf:perf_keys "session-*" th 50
-opensips-cli -x mi cachedb_perf:perf_scan 0            # then: …:perf_scan <returned-cursor> … until 0
-opensips-cli -x mi cachedb_perf:perf_dump "profile-*"
+opensips-cli -x mi cachedb_perf:perf_stats_reset            # fresh interval for the rates
+opensips-cli -x mi cachedb_perf:perf_stats_reset th         # just one collection
+
+opensips-cli -x mi cachedb_perf:perf_keys "*"               # every key in the default collection
+opensips-cli -x mi cachedb_perf:perf_keys "session-*" th 50 # glob, collection, limit
+opensips-cli -x mi cachedb_perf:perf_scan 0                 # then: …:perf_scan <returned-cursor> … until 0
+opensips-cli -x mi cachedb_perf:perf_dump "profile-*"       # names AND values
+opensips-cli -x mi cachedb_perf:perf_dump "*" th 20         # a sample of one collection
+
 opensips-cli -x mi cachedb_perf:perf_get session-abc123
 opensips-cli -x mi cachedb_perf:perf_set greeting hello 300
 opensips-cli -x mi cachedb_perf:perf_ttl "session-*" 1800   # re-arm matching keys to 30 min
 opensips-cli -x mi cachedb_perf:perf_del "session-abc*"
 ```
+
+`perf_stats` counters are cumulative since startup (or the last `perf_stats_reset`), so a hit rate read straight after a restart is dominated by sequential requests for dialogs older than the cache and recovers only as those age out. Either reset once the cache has warmed, or — better for monitoring — poll twice and difference the counters.
 
 ### Events
 
@@ -452,4 +462,5 @@ afterwards — a churn set with a 2 s TTL, a 1 s sweep and growth enabled catche
 it in under a minute — and the soak was extended to cover the same shape.
 
 The standalone rig behind every figure above lives in `modules/cachedb_perf/bench/` (`make run`, no OpenSIPS build needed) — full measurement history, every rejected alternative and why — so the numbers here are reproducible rather than asserted.
+
 

@@ -156,7 +156,18 @@ event_route[E_CACHEDB_PERF_SYNCED] {   # fires on each replica after its reload
 }
 ```
 
-The capability shows in the clusterer's `clusterer_list_cap` MI as `cachedb-perf-sync`.
+The capability registers with the clusterer, so it shows in its `clusterer_list_cap` MI — verified on a single-node cluster (with `cachedb_perf` loaded *before* `clusterer`, confirming the soft dependency reorders init):
+
+```
+$ opensips-cli -x mi clusterer_list_cap
+{
+  "Clusters": [
+    { "cluster_id": 1,
+      "Capabilities": [
+        { "name": "cachedb-perf-sync", "state": "Ok", "enabled": "yes" }
+      ] } ]
+}
+```
 
 ### Enabling the kernel memory backing
 

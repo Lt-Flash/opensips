@@ -71,7 +71,8 @@ The full management interface — the operator visibility `cachedb_local` never 
 
 | command | arguments | returns / effect |
 |---|---|---|
-| `perf_stats` | `[collection]` | per-collection stats: entries, buckets, load factor, overflow occupancy, hits/misses/stores/removes, seqlock retries (and per-1k-reads), plus arena bytes/chunks and the achieved memory tier. No arg = every collection |
+| `perf_stats` | `[collection]` | per-collection stats: entries, buckets, load factor, overflow occupancy, hits/misses/stores/removes/expired/destroyed, hit rate (with a note that reflects the measured value), seqlock retries (and per-1k-reads), plus arena bytes/chunks and the achieved memory tier. No arg = every collection |
+| `perf_stats_reset` | `[collection]` | re-baseline the cumulative counters so the next reading covers a fresh interval instead of a lifetime average — useful after a restart, when the miss burst from dialogs older than the cache drags the hit rate down long after it has recovered. The counters are never rewound (each process owns its counter cache line); only a baseline is recorded and the difference reported. Live gauges — entries, buckets, overflow, load factor, arena — are unaffected |
 | `perf_keys` | `<glob> [collection] [limit]` | names **and TTL** of keys matching the shell glob, bounded (default limit 1000; the reply flags truncation). The `KEYS` equivalent |
 | `perf_scan` | `<cursor> [glob] [count]` | cursor-based incremental iteration (Redis `SCAN`) over the default collection: start at cursor `0`, repeat with the returned cursor until it comes back `0`. `count` bounds the buckets visited per call. The answer for a large cache, where `perf_keys` would truncate |
 | `perf_dump` | `<glob> [collection] [limit]` | like `perf_keys` but **includes values** — opt-in, never the default |
@@ -413,14 +414,14 @@ The same walker backs the **introspection MI** (full command table in the **MI c
 - [x] `perf_del` / `perf_mget` / `perf_mget_json`
 - [x] Selftests + script-level end-to-end suite
 - [x] Expiry sweep — hint-routed (per-bucket min-expires hints in sweep-friendly parallel arrays, 16 per cache line; the hot TTL-bump path never writes them), timer-driven via `expiry_sweep_period` (default 1 s), reclamation through the global pool strictly after lock release
-- [x] Statistics — per-process sharded counters (one 64-byte line per process, summed only at read time; a shared `update_stat` counter would recreate the 0.72× collapse measured above), exported as ten `cachedb_perf:` core stats and a per-collection `perf_stats` MI (load factor, overflow, seqlock retries/1k, backing tier)
+- [x] Statistics — per-process sharded counters (one 64-byte line per process, summed only at read time; a shared `update_stat` counter would recreate the 0.72× collapse measured above), exported as ten `cachedb_perf:` core stats and a per-collection `perf_stats` MI (load factor, overflow, seqlock retries/1k, backing tier, `expired`/`destroyed`, and a hit rate whose accompanying note follows the measured value rather than asserting a verdict). `perf_stats_reset` re-baselines the cumulative counters for a fresh measurement interval without a restart, leaving live gauges alone
 - [x] Linear-hash growth + maintenance timer — the table now resizes itself (the thing `cachedb_local` fundamentally cannot do): one-bucket-at-a-time splits driven from the single-process maintenance timer, no rehash, overflow left findable; `growth_load_factor` keeps the bucket shape as entries scale. Verified: 1000 entries → 484 splits → 500 buckets, all keys intact
 - [x] Introspection MI — `perf_keys` / `perf_scan` / `perf_dump` / `perf_get` / `perf_set` / `perf_ttl` / `perf_del` as MI commands, all lock-free (a key scan never stalls writers, unlike `cachedb_local`'s). `perf_scan` is cursor-based (Redis SCAN): an ascending bucket cursor, stable across a concurrent resize, every entry returned at least once. Verified over a datagram MI
 - [x] Observability events (EVI) — `E_CACHEDB_PERF_EXPIRED` (per reaped key, opt-in per collection), `E_CACHEDB_PERF_NOMEM` (a write dropped because the arena is full), `E_CACHEDB_PERF_GROWN` (a table resized, with the before/after span), `E_CACHEDB_PERF_MEM_DEGRADED` (huge pages requested but the arena landed below hugetlb). Each `evi_probe_event()`-gated (free with no subscriber) and off the hot path; verified end-to-end over `event_route`s
 - [x] Huge-page arena backing — 2M-aligned mlock-pinned reservation via the detect-by-trying ladder (`arena_hugepage_mb`), lock-free bump from it, shm_malloc fallback; measured +7–13% (see above)
 - [x] Multi-process correctness soak — forked worker processes hammer one live backend (get/set/remove/add) while the maintenance timer splits buckets underneath them, checking four invariants: no torn read, no lost update, no lost key across splits, no crash/UAF. **Found and fixed a real fork-safety bug** (see below). Post-fix: 8 processes, 24M ops, 3093 concurrent splits, 0 crashes, `torn_reads=0`, counter sum == adds, all immortals intact; clean under the `Q_MALLOC_DBG` redzone allocator and under all three core allocators (`F_MALLOC` / `Q_MALLOC` / `HP_MALLOC`, driving both pkg and the arena's shm chunk backing)
 - [x] End-to-end `th_state_url` benchmark against `cachedb_local` (50k held calls) and against dialog-based topology hiding (100k held calls) — both sections above
-- [x] DB persistence — whole-collection save/load to any `db_*` backend (`perf_save`/`perf_load` MI, plus `db_mode` startup-load / shutdown-save), TTLs kept as absolute wall-clock time so they survive a restart. Verified with `db_sqlite` (save → shutdown-save → startup-load, values intact, TTL decremented correctly across the cycle). Single-node durability, not replication
+- [x] DB persistence — whole-collection save/load to any `db_*` backend (`perf_save`/`perf_load` MI, plus `db_mode` startup-load / shutdown-save), TTLs kept as absolute wall-clock time so they survive a restart. Verified with `db_sqlite` (save → shutdown-save → startup-load, values intact, TTL decremented correctly across the cycle). Rows whose wall-clock expiry has passed are dropped at load rather than merely skipped — otherwise, with `db_mode=1` or after any shutdown that was not graceful, dead rows accumulate in the table indefinitely. Single-node durability, not replication
 - [x] **Cluster sync (`perf_sync`)** — MI command + script function that saves this node's collection to the DB, then signals peers over the `clusterer` API to reload it (one message per *sync*, not per operation); each peer reloads from the DB and raises `E_CACHEDB_PERF_SYNCED`. Soft dependency — degrades to a DB save with no broadcast if clusterer/`sync_cluster_id` is absent. A pull-from-DB refresh model for single-writer/read-replica topologies — deliberately *not* `/r`-style per-operation replication. Verified on a single-node cluster: the capability registers and lists in the clusterer's `clusterer_list_cap` MI (`cachedb-perf-sync`, state Ok), a soft `DEP_SILENT` clusterer dependency reorders init so it works regardless of load order, and `perf_sync` degrades cleanly with no clusterer — no crashes. The multi-node broadcast→reload fan-out follows the `ratelimit` clusterer pattern and awaits a two-node run
 
 ### Correctness: what the multi-process soak caught
@@ -429,4 +430,26 @@ A lock-free read path plus a table that resizes itself under live traffic is exa
 
 It failed inside a second — a segfault on an *impossible* size class (88) read out of a cell's class byte. Root cause: after `fork()` every child holds a copy-on-write copy of the parent's private allocator hoard (same bump pointer, same free-list cell addresses), and `pcache_arena_child_init` had each child *donate* that hoard to the global pool. The identical physical cells were enqueued once per child, popped by several processes at once, and written through concurrently — one process's value byte landed on another's class id. The fix: a child drops its inherited copy and carves its own chunk on first use, never donating cells it doesn't own. After it, the full soak is clean — 24M ops, 3093 concurrent splits, no torn reads, counter sum equals total adds, every immortal key intact — and equally clean under the `Q_MALLOC_DBG` redzone allocator and under each of OpenSIPS' three core allocators (`F_MALLOC`, `Q_MALLOC`, `HP_MALLOC`), which back both the per-process state and the arena's shm chunk allocation.
 
+### And what production caught that the soak did not
+
+The soak runs a single collection with generous TTLs, so it never combined
+overflow chaining with expiry reclamation — and that combination was the one
+that mattered. On a live SBC the module crashed repeatedly inside the arena's
+free path, on an impossible size class, with topology-hiding keys going
+missing.
+
+`struct povf`, the overflow node, had its `next` pointer at **offset 0** — but
+byte 0 of every arena cell is the size class, read by both free paths. Linking
+a node wrote the pointer's low byte over the class id (0x40/0x80/0xC0 →
+"class" 64/128/192), indexing past the 21-entry class table and corrupting the
+pool, so the crash surfaced far from the cause. It needs overflow *and* the
+expiry sweep together to trigger, which is why a table with room to spare never
+showed it.
+
+The fix reserves byte 0 in `struct povf` and hardens both free paths to log and
+leak on an invalid class rather than corrupt. Reproduced deliberately
+afterwards — a churn set with a 2 s TTL, a 1 s sweep and growth enabled catches
+it in under a minute — and the soak was extended to cover the same shape.
+
 The standalone rig behind every figure above lives in `modules/cachedb_perf/bench/` (`make run`, no OpenSIPS build needed) — full measurement history, every rejected alternative and why — so the numbers here are reproducible rather than asserted.
+

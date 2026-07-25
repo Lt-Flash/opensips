@@ -144,7 +144,44 @@ opensips-cli -x mi cachedb_perf:perf_load sessions   # -> {"collections":1,"load
 
 The table (default `cachedb_perf`) has four columns: `collection` (string), `pkey` (string), `pvalue` (BLOB, binary-safe), `expires` (int, absolute unix time, `0` = never). The startup load runs before the workers fork, so every worker starts with a warm cache.
 
-> ⚠️ **A save/load is a full, blocking snapshot** — one SQL statement per entry, synchronous in the issuing process. On a large collection (this module targets millions of entries) or a slow backend (`db_text`, `db_sqlite`), it can take a long time and stall that process for its duration. It is a **maintenance / bootstrap** operation — startup warm-up, shutdown flush, an occasional snapshot or a `perf_sync` refresh — **never on a per-request path or a tight timer.** If you need durable per-key writes on every operation, this is the wrong tool.
+> ⚠️ **A save/load is a full, blocking snapshot** — one SQL statement per entry, synchronous in the issuing process. It is a **maintenance / bootstrap** operation — startup warm-up, shutdown flush, an occasional snapshot or a `perf_sync` refresh — **never on a per-request path or a tight timer.** If you need durable per-key writes on every operation, this is the wrong tool.
+
+> 🛑 **Do not use `db_text` or `db_sqlite` for this under load.** Not a style preference — a snapshot of a realistically sized cache does not complete. Measured below.
+
+#### Backend choice is not a detail: measured
+
+The same 30 000-entry collection, saved on shutdown (`db_mode=2`), same host, same one-statement-per-row code path:
+
+| backend | outcome | rate |
+|---|---|---|
+| `db_sqlite` | **aborted** — `SHUTDOWN_TIMEOUT` (60 s, `config.h`) fired mid-save, `CRITICAL: BUG - shutdown timeout triggered, dying...`; **7 918 of 30 000 rows written** | ~140 rows/s |
+| `db_redis` | completed in **5.21 s**, all 30 000 rows | ~5 760 rows/s |
+
+Roughly **41×**, and the difference is not incidental: SQLite autocommits every `INSERT` as its own transaction with its own `fsync`, so the snapshot is durability-bound per row. Redis (`appendonly no`) takes the write in memory and returns. `db_text` rewrites its file and is slower still.
+
+The failure mode matters more than the number. A save begins by **deleting the collection's existing rows**, so a snapshot that overruns the shutdown watchdog leaves a *partially written* table where a complete one used to be — a quarter of a cache, with nothing in the reply or the log to say the data is incomplete. It looks like it worked.
+
+So for anything beyond a few thousand entries use `db_redis`, `db_mysql` or `db_postgres`. `db_sqlite` and `db_text` are fine for a small collection, a lab, or a config-check — not for a loaded node.
+
+#### With db_redis
+
+```
+loadmodule "db_redis.so"
+modparam("cachedb_perf", "cache_collections", "th=16")
+modparam("cachedb_perf", "db_url", "redis://127.0.0.1:6379/0")
+modparam("cachedb_perf", "db_mode", 2)
+modparam("cachedb_perf", "persist_collections", "th")
+```
+
+`db_redis` needs a schema declared for the table before first use — it fails at load without one, and none ships for `cachedb_perf`:
+
+```
+redis-cli -n 0 HSET schema:cachedb_perf \
+  __cols "collection pkey pvalue expires" __pk pkey \
+  collection string pkey string pvalue string expires int
+```
+
+Two things to know with this backend. Its primary key is a **single column**, while a row here is identified by *(collection, pkey)* — so persist **one collection**: with two, identical key names in each would collide and the later save would overwrite the earlier. And the `/0` database component of the URL is required by the core URL parser even though Redis-cluster mode ignores it.
 
 ### Cluster sync
 
@@ -431,7 +468,7 @@ The same walker backs the **introspection MI** (full command table in the **MI c
 - [x] Huge-page arena backing — 2M-aligned mlock-pinned reservation via the detect-by-trying ladder (`arena_hugepage_mb`), lock-free bump from it, shm_malloc fallback; measured +7–13% (see above)
 - [x] Multi-process correctness soak — forked worker processes hammer one live backend (get/set/remove/add) while the maintenance timer splits buckets underneath them, checking four invariants: no torn read, no lost update, no lost key across splits, no crash/UAF. **Found and fixed a real fork-safety bug** (see below). Post-fix: 8 processes, 24M ops, 3093 concurrent splits, 0 crashes, `torn_reads=0`, counter sum == adds, all immortals intact; clean under the `Q_MALLOC_DBG` redzone allocator and under all three core allocators (`F_MALLOC` / `Q_MALLOC` / `HP_MALLOC`, driving both pkg and the arena's shm chunk backing)
 - [x] End-to-end `th_state_url` benchmark against `cachedb_local` (50k held calls) and against dialog-based topology hiding (100k held calls) — both sections above
-- [x] DB persistence — whole-collection save/load to any `db_*` backend (`perf_save`/`perf_load` MI, plus `db_mode` startup-load / shutdown-save), TTLs kept as absolute wall-clock time so they survive a restart. Verified with `db_sqlite` (save → shutdown-save → startup-load, values intact, TTL decremented correctly across the cycle). Rows whose wall-clock expiry has passed are dropped at load rather than merely skipped — otherwise, with `db_mode=1` or after any shutdown that was not graceful, dead rows accumulate in the table indefinitely. Single-node durability, not replication
+- [x] DB persistence — whole-collection save/load to any `db_*` backend (`perf_save`/`perf_load` MI, plus `db_mode` startup-load / shutdown-save), TTLs kept as absolute wall-clock time so they survive a restart. Verified with `db_sqlite` (save → shutdown-save → startup-load, values intact, TTL decremented correctly across the cycle) and with `db_redis` at scale (30 000 entries saved on shutdown in 5.21 s, where `db_sqlite` did not finish inside the 60 s shutdown watchdog — see the backend note above). Rows whose wall-clock expiry has passed are dropped at load rather than merely skipped — otherwise, with `db_mode=1` or after any shutdown that was not graceful, dead rows accumulate in the table indefinitely. Single-node durability, not replication
 - [x] **Cluster sync (`perf_sync`)** — MI command + script function that saves this node's collection to the DB, then signals peers over the `clusterer` API to reload it (one message per *sync*, not per operation); each peer reloads from the DB and raises `E_CACHEDB_PERF_SYNCED`. Soft dependency — degrades to a DB save with no broadcast if clusterer/`sync_cluster_id` is absent. A pull-from-DB refresh model for single-writer/read-replica topologies — deliberately *not* `/r`-style per-operation replication. Verified on a single-node cluster: the capability registers and lists in the clusterer's `clusterer_list_cap` MI (`cachedb-perf-sync`, state Ok), a soft `DEP_SILENT` clusterer dependency reorders init so it works regardless of load order, and `perf_sync` degrades cleanly with no clusterer — no crashes. The multi-node broadcast→reload fan-out follows the `ratelimit` clusterer pattern and awaits a two-node run
 
 ### Correctness: what the multi-process soak caught
@@ -462,5 +499,6 @@ afterwards — a churn set with a 2 s TTL, a 1 s sweep and growth enabled catche
 it in under a minute — and the soak was extended to cover the same shape.
 
 The standalone rig behind every figure above lives in `modules/cachedb_perf/bench/` (`make run`, no OpenSIPS build needed) — full measurement history, every rejected alternative and why — so the numbers here are reproducible rather than asserted.
+
 
 

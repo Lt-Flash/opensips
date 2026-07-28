@@ -874,6 +874,13 @@ typedef struct cl_ctr_peer_ {
     unsigned char pubkey[CL_CTR_PUBKEY_SZ];           /* long-lived X25519 pubkey (from ALIVE);
                                                      zero if unknown; used for KEY_HANDOFF */
     uint32_t      last_seq;                        /* highest seq accepted from this peer */
+    /* Consumer traffic is counted separately from the control plane.  They
+     * share a session key and a socket but not a sequence space: a consumer
+     * may send thousands of packets a second where the control plane sends a
+     * handful, and one counter for both means a reordered consumer packet can
+     * make a MASTER_ALIVE arriving behind it look like a replay - which is a
+     * missed liveness beacon, not a dropped cache reply. */
+    uint32_t      last_consumer_seq;
     /* Peer's advertised consistency-critical config (from ALIVE), used to warn
      * on accidental per-node config drift.  cfg_known=0 until first advertised;
      * cfg_warned deduplicates the mismatch warning. */
@@ -901,6 +908,7 @@ struct cl_ctr_peers_ {
      * GOODBYE without needing the worker's private state.  Reset to 0 on
      * every session key rotation so last_seq counters reset cleanly.   */
     uint32_t        my_seq;
+    uint32_t        my_consumer_seq;   /* the consumer plane's own counter */
     /* Sharing-tag override: 0 = automatic (master-driven) allocation; nonzero =
      * an operator has forced this node_id to be the active shtag holder for the
      * cluster (cl_ctr_shtag_force MI), suspending automatic allocation until
@@ -2196,8 +2204,11 @@ static int cl_ctr_derive_session_key(cl_ctr_cluster_t *cl)
     /* Reset sequence counters: old packets encrypted with the previous key
      * fail AEAD authentication, so starting from 0 is safe. */
     cl->peers->my_seq = 0;
-    for (i = 0; i < cl->peers->count; i++)
+    cl->peers->my_consumer_seq = 0;
+    for (i = 0; i < cl->peers->count; i++) {
         cl->peers->entries[i].last_seq = 0;
+        cl->peers->entries[i].last_consumer_seq = 0;
+    }
     cl->have_session_key = 1;   /* a valid group key now exists */
     /* The salt (and my_seq) just changed, so any queued retransmit is now stale. */
     cl_ctr_retx_flush(cl);
@@ -2387,17 +2398,30 @@ static int cl_ctr_decrypt_pkt(char *buf, ssize_t n, const char *sender_ip,
  * @return 0 to accept, -1 to drop.
  */
 static int cl_ctr_check_and_update_seq(const char *sender_ip, uint32_t pkt_seq,
-                                   cl_ctr_cluster_t *cl)
+                                   cl_ctr_cluster_t *cl, int is_consumer)
 {
     int i;
     for (i = 0; i < cl->peers->count; i++) {
         if (strcmp(cl->peers->entries[i].ip, sender_ip) == 0) {
-            if (pkt_seq <= cl->peers->entries[i].last_seq) {
-                LM_WARN("clusterer_controller: replay from %s seq=%u last=%u, dropping\n",
-                        sender_ip, pkt_seq, cl->peers->entries[i].last_seq);
+            uint32_t *last = is_consumer
+                             ? &cl->peers->entries[i].last_consumer_seq
+                             : &cl->peers->entries[i].last_seq;
+
+            if (pkt_seq <= *last) {
+                /* Debug for consumer traffic, warning for the control plane.
+                 * A consumer sending at rate will reorder on any network with
+                 * more than one path, and a warning per reordered packet says
+                 * "attack" about something entirely ordinary. */
+                if (is_consumer)
+                    LM_DBG("clusterer_controller: consumer packet from %s out "
+                           "of order seq=%u last=%u, dropping\n",
+                           sender_ip, pkt_seq, *last);
+                else
+                    LM_WARN("clusterer_controller: replay from %s seq=%u "
+                            "last=%u, dropping\n", sender_ip, pkt_seq, *last);
                 return -1;
             }
-            cl->peers->entries[i].last_seq = pkt_seq;
+            *last = pkt_seq;
             return 0;
         }
     }
@@ -3771,8 +3795,10 @@ static void cl_ctr_handle_join_req(int sock, const char *payload, int payload_le
      * ALIVE, not here - the JOIN_REQ now carries only an ephemeral Noise key. */
     {
 	cl_ctr_peer_t *e = cl_ctr_peer_by_ip_locked(cl, src_ip);
-	if (e)
+	if (e) {
 	    e->last_seq = 0;
+	    e->last_consumer_seq = 0;
+	}
     }
 
     lock_stop_write(cl->peers->lock);
@@ -3958,6 +3984,7 @@ static void cl_ctr_handle_member_list(const char *payload, int payload_len,
 	for (_j = 0; _j < cl->peers->count; _j++) {
 	    if (strcmp(cl->peers->entries[_j].ip, ip_buf) == 0) {
 		cl->peers->entries[_j].last_seq = 0;
+		cl->peers->entries[_j].last_consumer_seq = 0;
 		break;
 	    }
 	}
@@ -5011,9 +5038,16 @@ static void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	 * Bootstrap packets (CL_CTR_BOOTSTRAP_MAGIC) use join_nonce instead. */
 	if (!is_bootstrap) {
 	    uint32_t pkt_seq;
+	    /* The type byte, not the cleartext magic: this runs after the AEAD,
+	     * so the byte is authenticated and the magic is only the hint the
+	     * rate limiter needed before there was anything to trust. */
+	    int is_consumer_pkt = ((unsigned char)buf[CL_CTR_WIRE_HDR_SZ]
+	                           == CL_CTR_PKT_CONSUMER);
+
 	    memcpy(&pkt_seq, buf + CL_CTR_WIRE_HDR_SZ + 1, CL_CTR_SEQ_SZ);
 	    pkt_seq = ntohl(pkt_seq);
-	    if (cl_ctr_check_and_update_seq(sender_ip_buf, pkt_seq, cl) < 0)
+	    if (cl_ctr_check_and_update_seq(sender_ip_buf, pkt_seq, cl,
+	                                    is_consumer_pkt) < 0)
 		return;
 	}
 
@@ -6926,7 +6960,7 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param)
     }
 
     if (on_wire) {
-        seq   = htonl(++cl->peers->my_seq);
+        seq   = htonl(++cl->peers->my_consumer_seq);
         id_be = htons(my_node_id);
 
         /* the consumer tag, so the receiver's pre-decrypt rate limiter

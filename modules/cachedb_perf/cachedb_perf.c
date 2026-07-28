@@ -42,6 +42,7 @@
 #include <poll.h>
 #include "../clusterer/api.h"
 #include "../clusterer_controller/api.h"
+#include "pull_api.h"
 
 #include "cachedb_perf.h"
 #include "pcache_mem.h"
@@ -316,6 +317,7 @@ static int fixup_check_wvar(void **param);
 /* introspection MI (CP-18) - defined just above the mi_cmds table; these
  * forward decls let that table sit before the glob/collection helpers */
 static pcache_col_t *col_by_name(const str *name);
+int load_pcache_pull(pcache_pull_api_t *api);
 static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 		unsigned int outlen, unsigned int *vlen, unsigned int *expires);
 static int pcache_pull_enabled(pcache_col_t *col);
@@ -327,6 +329,7 @@ static inline unsigned int ttl_to_abs(int expires);
 	LOCAL_ROUTE|STARTUP_ROUTE|TIMER_ROUTE|EVENT_ROUTE)
 
 static const cmd_export_t cmds[] = {
+	{"load_pcache_pull", (cmd_function)load_pcache_pull, {{0,0,0}}, 0},
 	{"perf_del", (cmd_function)w_perf_del, {
 		{CMD_PARAM_STR,0,0},
 		{CMD_PARAM_STR|CMD_PARAM_OPT,0,0}, {0,0,0}},
@@ -3032,6 +3035,63 @@ static void mark_collections(char *csv_s, const char *what, enum col_flag f)
 				what, c->s.len, c->s.s);
 	}
 	free_csv_record(cr);
+}
+
+/* ---- consumer-facing pull API (pull_api.h) ---------------------------- */
+
+static int pcache_api_pull_start(cachedb_con *con, str *key, int *fd,
+		unsigned int *handle)
+{
+	pcache_col_t *col = con ? ((pcache_con *)con->data)->col : NULL;
+
+	if (!col || !key || !fd || !handle)
+		return -1;
+	return pcache_pull_start(col, key, fd, handle);
+}
+
+static int pcache_api_pull_finish(cachedb_con *con, str *key,
+		unsigned int handle, str *val)
+{
+	pcache_col_t *col = con ? ((pcache_con *)con->data)->col : NULL;
+	char buf[PCACHE_PULL_MAX_VAL];
+	unsigned int vlen = 0;
+	int rc;
+
+	if (val) {
+		val->s = NULL;
+		val->len = 0;
+	}
+	if (!col || !key)
+		return -1;
+
+	rc = pcache_pull_finish(col, key, handle, buf, sizeof buf, &vlen, NULL);
+	if (rc != 1 || !val)
+		return rc;
+
+	/* hand back memory the caller owns, exactly as a get would - the value
+	 * is in the local table too, so a plain get would find it as well */
+	val->s = pkg_malloc(vlen ? vlen : 1);
+	if (!val->s) {
+		LM_ERR("no more pkg memory for a %u byte pulled value\n", vlen);
+		return -1;
+	}
+	memcpy(val->s, buf, vlen);
+	val->len = vlen;
+	return 1;
+}
+
+int load_pcache_pull(pcache_pull_api_t *api)
+{
+	if (!api)
+		return -1;
+	if (!pull_ready) {
+		LM_WARN("a module asked for the cross-node pull API, but pulling "
+			"is not configured (replicate_collections)\n");
+		return -1;
+	}
+	api->start  = pcache_api_pull_start;
+	api->finish = pcache_api_pull_finish;
+	return 0;
 }
 
 static int mod_init(void)

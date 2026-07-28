@@ -32,6 +32,7 @@ cachedb_perf Module
               1.3.17. pull_transport (string)
               1.3.18. pull_timeout_ms (integer)
               1.3.19. pull_negative_ms (integer)
+              1.3.20. pull_on_miss (integer)
 
         1.4. DB persistence
         1.5. Cluster sync
@@ -444,6 +445,25 @@ modparam("cachedb_perf", "replicate_collections", "th")
    perf_keys or perf_dump and never count as entries.
 
    Default value is “300”.
+
+1.3.20. pull_on_miss (integer)
+
+   Repair a miss on the ordinary read path: when a lookup finds
+   nothing locally, ask the cluster and return whatever comes back
+   as though it had been here all along. A consumer needs no
+   changes - cross-node lookups simply start working for the
+   collections listed in replicate_collections.
+
+   Off by default, and it should stay off on a SIP path for now.
+   The lookup blocks until the cluster answers or pull_timeout_ms
+   elapses, and a blocked lookup means a process serving nothing
+   else in the meantime. A LAN pull takes a couple of milliseconds
+   and the negative cache absorbs retransmits, but that is a
+   statement about the common case, not a guarantee under load.
+   Enable it for maintenance, migration or test paths; a startup
+   warning repeats this when it is on.
+
+   Default value is “0” (disabled).
 
 1.4. DB persistence
 

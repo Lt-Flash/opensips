@@ -173,6 +173,7 @@ struct pcache_neg_slot {
 static struct pcache_neg_slot *neg_slots;
 static gen_lock_t *neg_lock;
 static int pull_negative_ms = 300;     /* modparam; 0 = no negative cache  */
+static int pull_on_miss;               /* modparam; read repair on the get path */
 #define PULL_ST_REQUESTED 0
 #define PULL_ST_SERVED    1
 #define PULL_ST_RECEIVED  2
@@ -272,6 +273,7 @@ static int fixup_check_wvar(void **param);
 static pcache_col_t *col_by_name(const str *name);
 static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 		unsigned int outlen, unsigned int *vlen, unsigned int *expires);
+static int pcache_pull_enabled(pcache_col_t *col);
 static char *glob_dup(const str *glob);
 static int perf_del_run(pcache_col_t *col, str *glob);
 static inline unsigned int ttl_to_abs(int expires);
@@ -324,6 +326,7 @@ static const param_export_t params[] = {
 	{ "pull_transport",      STR_PARAM, &pull_transport_str },
 	{ "pull_timeout_ms",     INT_PARAM, &pull_timeout_ms },
 	{ "pull_negative_ms",    INT_PARAM, &pull_negative_ms },
+	{ "pull_on_miss",        INT_PARAM, &pull_on_miss },
 	{ "replicate_collections", STR_PARAM, &replicate_collections },
 	{0,0,0}
 };
@@ -2181,11 +2184,41 @@ static inline unsigned int ttl_to_abs(int expires)
 	return expires > 0 ? get_ticks() + (unsigned int)expires : 0;
 }
 
+/* Read repair on the normal get path: a miss here asks the cluster, and a
+ * value that comes back is returned as if it had been local all along -
+ * so a consumer gets cross-node lookups without knowing they exist.
+ *
+ * Off by default, and it must stay that way until the lookup can suspend
+ * the transaction instead of the worker: this blocks for as long as the
+ * pull takes, which on a SIP path means a worker not serving anything
+ * else.  A LAN pull is a couple of milliseconds and the negative cache
+ * absorbs retransmits, but "usually fast" is not the same as "safe under
+ * load", which is why the startup warning says so out loud. */
 static int pcache_htable_fetch(cachedb_con *con, str *attr, str *val)
 {
-	pcache_htable_t *ht = con_ht(con);
+	pcache_col_t *col = con ? ((pcache_con *)con->data)->col : NULL;
+	char buf[PCACHE_PULL_MAX_VAL];
+	unsigned int vlen = 0;
+	int rc;
 
-	return ht ? pcache_ht_fetch(ht, attr, val) : -1;
+	if (!col || !col->htable)
+		return -1;
+	rc = pcache_ht_fetch(col->htable, attr, val);
+	if (rc != -2 || !pull_on_miss || !pcache_pull_enabled(col))
+		return rc;
+
+	if (pcache_pull_key(col, attr, buf, sizeof buf, &vlen, NULL) != 1)
+		return -2;                    /* absent, or nobody answered */
+
+	/* hand back a copy the caller owns, exactly as a local hit would */
+	val->s = pkg_malloc(vlen ? vlen : 1);
+	if (!val->s) {
+		LM_ERR("no more pkg memory for a %u byte pulled value\n", vlen);
+		return -1;
+	}
+	memcpy(val->s, buf, vlen);
+	val->len = vlen;
+	return 0;
 }
 
 /* CACHEDB_CAP_GET_BUF: the allocation-free read.  Note this deliberately
@@ -2933,6 +2966,13 @@ static int mod_init(void)
 			LM_INFO("cross-node pull active over bin, %d ms timeout, "
 				"%d ms negative cache, collections: %s\n", pull_timeout_ms,
 				pull_negative_ms, replicate_collections);
+			if (pull_on_miss)
+				LM_WARN("pull_on_miss is enabled: a cache miss now BLOCKS "
+					"the calling process for up to %d ms while the cluster "
+					"is asked.  That is fine for a maintenance or test "
+					"path; on a SIP path it costs a worker, so keep it off "
+					"until the lookup can be suspended instead\n",
+					pull_timeout_ms);
 		}
 	}
 

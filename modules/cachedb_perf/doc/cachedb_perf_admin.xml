@@ -501,6 +501,34 @@ modparam("cachedb_perf", "replicate_collections", "th")
 		</emphasis>
 		</para>
 	</section>
+	<section id="param_pull_on_miss" xreflabel="pull_on_miss">
+		<title><varname>pull_on_miss</varname> (integer)</title>
+		<para>
+		Repair a miss on the ordinary read path: when a lookup finds
+		nothing locally, ask the cluster and return whatever comes back
+		as though it had been here all along.  A consumer needs no
+		changes - cross-node lookups simply start working for the
+		collections listed in
+		<xref linkend="param_replicate_collections"/>.
+		</para>
+		<para>
+		<emphasis role='bold'>Off by default, and it should stay off on a
+		SIP path for now.</emphasis>  The lookup blocks until the cluster
+		answers or <varname>pull_timeout_ms</varname> elapses, and a
+		blocked lookup means a process serving nothing else in the
+		meantime.  A LAN pull takes a couple of milliseconds and the
+		negative cache absorbs retransmits, but that is a statement about
+		the common case, not a guarantee under load.  Enable it for
+		maintenance, migration or test paths; a startup warning repeats
+		this when it is on.
+		</para>
+		<para>
+		<emphasis>
+			Default value is <quote>0</quote> (disabled).
+		</emphasis>
+		</para>
+	</section>
+
 
 
 

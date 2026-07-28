@@ -406,6 +406,19 @@ modparam("topology_hiding", "th_state_url",
          "memcached://127.0.0.1:11211/")
 ...
 
+   When the state comes from another node. A stored state records
+   the socket the message arrived on, so that a sequential request
+   leaves by the same one. That address belongs to the node that
+   stored it: where every node shares a public address the lookup
+   succeeds anywhere and the socket is used as usual, but a state
+   created against a node's own internal address cannot be
+   resolved by a sibling. In that case the send socket is simply
+   left to normal routing - the request still routes, because the
+   destination comes from the state's route set and contact, which
+   are node-independent. It is logged at debug level rather than
+   as a warning: with state shared between nodes this is an
+   ordinary event, not a fault.
+
 1.3.13. th_state_ttl (int)
 
    For how long, in seconds, a topology hiding state is kept in

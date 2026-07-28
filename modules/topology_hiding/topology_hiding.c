@@ -394,6 +394,7 @@ struct th_async_ctx {
 	char         key[TH_KEY_LEN];
 	int          klen;
 	int          mm;
+	int          hinted;             /* asked one node, so a miss is not final */
 };
 
 static int th_match_resume(int fd, struct sip_msg *msg, void *param)
@@ -411,7 +412,41 @@ static int th_match_resume(int fd, struct sip_msg *msg, void *param)
 	if (blob.s)
 		pkg_free(blob.s);
 
-	async_status = ASYNC_DONE_NO_IO;   /* the fd is the cache's, not ours */
+	if (rc != 1 && ctx->hinted) {
+		/* We asked the one node the key named and came back empty.  That
+		 * says nothing about the rest of the cluster - the node may have
+		 * restarted, expired the entry, or be a different machine wearing
+		 * a reused id - so ask everybody before giving up. */
+		int fd2 = -1;
+		unsigned int handle2 = 0;
+
+		ctx->hinted = 0;
+		if (th_store_pull_start(&key, 0, &fd2, &handle2) == 1) {
+			ctx->handle = handle2;
+			/* Wait again, for the second request's answer.  The framework
+			 * wants a new descriptor as the RETURN value with the status
+			 * that goes with it - handing it back any other way leaves the
+			 * old one armed against a context already released.  The
+			 * second request often reuses the first's slot and therefore
+			 * its descriptor, and asking to replace a descriptor with
+			 * itself is an error there, so say plainly that we are simply
+			 * still waiting. */
+			if (fd2 == fd) {
+				async_status = ASYNC_CONTINUE;
+				return 1;
+			}
+			async_status = ASYNC_CHANGE_FD;
+			return fd2;
+		}
+	}
+
+	/* Done waiting.  ASYNC_DONE takes the descriptor out of the reactor
+	 * without closing it, which is exactly right here: it belongs to the
+	 * cache's pool and will be handed to another request, but this
+	 * registration must not outlive the context it points at - the next
+	 * request to use that slot would otherwise wake a resume that has
+	 * already been freed. */
+	async_status = ASYNC_DONE;
 	shm_free(ctx);
 
 	if (rc != 1) {
@@ -465,7 +500,8 @@ int async_w_topology_hiding_match(struct sip_msg *req, async_ctx *actx,
 	ctx->klen = missed->len;
 	ctx->mm = mm;
 
-	switch (th_store_pull_start(missed, &fd, &handle)) {
+	ctx->hinted = 1;
+	switch (th_store_pull_start(missed, 1, &fd, &handle)) {
 	case 1:
 		ctx->handle = handle;
 		async_status = fd;             /* suspend until the answer lands */

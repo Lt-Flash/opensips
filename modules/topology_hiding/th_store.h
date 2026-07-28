@@ -140,7 +140,14 @@ void th_store_clear_last_miss(void);
  * nobody has it, -1 when no fetch is possible. */
 void th_store_bind_pull(void);
 int  th_store_pull_available(void);
-int  th_store_pull_start(str *key, int *fd, unsigned int *handle);
+int  th_store_pull_start(str *key, int use_hint, int *fd,
+		unsigned int *handle);
+
+/* The key records which node stored the state, in two of its characters,
+ * masked so only a node holding the encoding password can read them.  A
+ * hint, never an authority: validate it and be ready to ask everyone. */
+void th_store_key_set_hint(char *key, int node_id);
+int  th_store_key_get_hint(const str *key);
 int  th_store_pull_finish(str *key, unsigned int handle, str *blob);
 
 /* Drop the blob stored under @key, once it is known to be of no use. */

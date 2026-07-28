@@ -45,6 +45,12 @@ static cachedb_con *th_cdbc;
 static pcache_pull_api_t th_pull;
 static int th_pull_ready;
 
+/* this node's id in the cluster, 0 when it has none - the value written
+ * into the keys this node creates */
+static int th_my_node_id;
+
+extern str topo_hiding_ct_encode_pw;   /* the module's encoding password */
+
 /* the stored keys are prefixed, so that the storage may be shared with
  * other users without clashing over the key names */
 #define TH_KEY_PREFIX     "th:"
@@ -297,6 +303,85 @@ void th_store_destroy(void)
  * dialog to another: without it, knowing a dialog's call-id and tags -
  * which travel in the clear - would hand out its hidden topology.
  */
+/* ---- the location hint --------------------------------------------------
+ *
+ * A key travels in the Contact and comes back to whichever node the load
+ * balancer picked, which need not be the one that stored it.  Finding it
+ * then means asking the cluster, and asking everyone costs a packet per
+ * peer.  So the node that stores a state writes its own id into the key,
+ * and whoever reads the key can ask that one node directly.
+ *
+ * It is a HINT and never an authority: the node may be gone, restarted,
+ * or have expired the entry, and ids are reused as nodes come and go, so
+ * a stale hint points at a live stranger.  Every use is validated against
+ * current membership and falls back to asking everyone.
+ *
+ * Two of the sixteen characters carry it, rather than lengthening the
+ * token: the reader accepts a stored key only at exactly TH_KEY_WIRE_LEN,
+ * so a longer one would be unrecognisable to any node still running the
+ * previous build - the format has to stay byte-compatible through a
+ * rolling upgrade.  Two characters hold 0..255, which covers node ids
+ * 1..256, the cluster stack's own limit.  The cost is 64 bits of key
+ * entropy down to 56, still around one collision in 144000 at a million
+ * concurrent keys.
+ *
+ * The two characters are masked with a value derived from the rest of the
+ * key and the encoding password, so they are not a cleartext map of which
+ * dialog lives on which node: a peer can unmask them because it has the
+ * password, an observer sees hex that looks like the rest.
+ */
+
+#define TH_HINT_CHARS 2
+
+static unsigned char th_hint_mask(const char *key_tail)
+{
+	static str parts[2];
+	char md5[MD5_LEN];
+	unsigned int v;
+
+	parts[0] = topo_hiding_ct_encode_pw;
+	parts[1].s = (char *)key_tail;
+	parts[1].len = TH_KEY_LEN - TH_HINT_CHARS;
+	MD5StringArray(md5, parts, 2);
+	/* first byte of the digest, as a number */
+	if (sscanf(md5, "%2x", &v) != 1)
+		return 0;
+	return (unsigned char)v;
+}
+
+/* Write the hint over the first characters of an already-derived key. */
+void th_store_key_set_hint(char *key, int node_id)
+{
+	static const char hex[] = "0123456789abcdef";
+	unsigned char h;
+
+	if (node_id < 1 || node_id > 256)
+		return;                       /* out of range - leave the key be */
+	h = (unsigned char)((node_id - 1) ^ th_hint_mask(key + TH_HINT_CHARS));
+	key[0] = hex[(h >> 4) & 0xF];
+	key[1] = hex[h & 0xF];
+}
+
+/* Read it back.  Returns a node id in 1..256, or 0 when the characters do
+ * not unmask to anything usable - which is what a key written before this
+ * existed looks like, and is handled by asking everyone. */
+int th_store_key_get_hint(const str *key)
+{
+	unsigned int v;
+	unsigned char h;
+	char buf[3];
+
+	if (!key || key->len != TH_KEY_LEN)
+		return 0;
+	buf[0] = key->s[0];
+	buf[1] = key->s[1];
+	buf[2] = '\0';
+	if (sscanf(buf, "%2x", &v) != 1)
+		return 0;
+	h = (unsigned char)(v ^ th_hint_mask(key->s + TH_HINT_CHARS));
+	return (int)h + 1;
+}
+
 void th_store_make_key(str seeds[], int n, char *out)
 {
 	char md5[MD5_LEN];
@@ -305,6 +390,10 @@ void th_store_make_key(str seeds[], int n, char *out)
 	/* MD5StringArray emits MD5_LEN(32) hex chars; TH_KEY_LEN of them
 	 * make for a 64-bit key, as wide as the former random one */
 	memcpy(out, md5, TH_KEY_LEN);
+	/* ...of which the first two now say where the state was put, when
+	 * this node knows its own id in a cluster */
+	if (th_my_node_id > 0)
+		th_store_key_set_hint(out, th_my_node_id);
 }
 
 
@@ -502,7 +591,11 @@ void th_store_bind_pull(void)
 		return;
 	if (load_pcache_pull_api(&th_pull) == 0) {
 		th_pull_ready = 1;
-		LM_INFO("topology hiding state can be fetched from other nodes\n");
+		if (th_pull.my_node_id)
+			th_my_node_id = th_pull.my_node_id(NULL);
+		LM_INFO("topology hiding state can be fetched from other nodes%s\n",
+			th_my_node_id ? ", and new keys will say where they were put"
+			              : "");
 	} else {
 		LM_DBG("no cross-node fetch available for the topology hiding "
 			"state - a miss stays a miss\n");
@@ -514,14 +607,29 @@ int th_store_pull_available(void)
 	return th_pull_ready;
 }
 
-int th_store_pull_start(str *key, int *fd, unsigned int *handle)
+/* @use_hint: ask the node the key names, when it names one.  Pass 0 to
+ * ask the whole cluster - which is what a caller does after a hinted
+ * attempt came back empty. */
+int th_store_pull_start(str *key, int use_hint, int *fd, unsigned int *handle)
 {
 	char buf[TH_KEY_PREFIX_LEN + TH_KEY_LEN];
 	str full_key;
+	int hint = 0;
 
 	if (!th_pull_ready || !th_cdbc || !key || key->len != TH_KEY_LEN)
 		return -1;
 	th_store_key(key, buf, &full_key);
+
+	if (use_hint && th_pull.start_at) {
+		hint = th_store_key_get_hint(key);
+		/* asking ourselves is pointless - we already looked */
+		if (hint == th_my_node_id)
+			hint = 0;
+		if (hint > 0) {
+			LM_DBG("the key names node %d - asking it directly\n", hint);
+			return th_pull.start_at(th_cdbc, &full_key, hint, fd, handle);
+		}
+	}
 	return th_pull.start(th_cdbc, &full_key, fd, handle);
 }
 

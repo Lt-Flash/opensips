@@ -1625,17 +1625,19 @@ cl_ctr_broadcast_req(1, "config changed", "cfg", 1);
 # makes no difference here, since every named node gets the same message.
 $avp(nodes) = 2;
 $avp(nodes) = 5;
-cl_ctr_send_req_list(1, $avp(nodes), "just for you", "mytag", $var(sent));
-if ($rc &gt; 0)
+if (cl_ctr_send_req_list(1, $avp(nodes), "just for you", "mytag", $var(sent)))
     xlog("sent to $var(sent) node(s)\n");
 	</programlisting>
     </example>
     <para>
-	Note where the count comes back. It is written into a variable, not
-	returned: &osips; stops running the script when a function returns
-	zero, and <quote>sent to nobody</quote> is a real answer a script must
-	be able to see rather than a reason to stop. The return value says only
-	whether the send could be attempted.
+	Note where the count comes back. It is written into a variable, and the
+	function itself is simply true or false, which is why the call sits
+	inside the <emphasis>if</emphasis> above rather than being followed by a
+	test of its return code. It has to be that way round: &osips; stops
+	running the script when a function returns zero, so a function that
+	returned a count would halt the route on the day it reached nobody -
+	which is a real answer a script must be able to see, not a reason to
+	stop.
     </para>
     <para>
 	Note also what that count is, and is not. It is how many nodes the

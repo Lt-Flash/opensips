@@ -144,6 +144,10 @@ static str  pull_channel = str_init("cdbperf-pull");
  * @found: 0 = not here, 1 = value follows, 2 = held but too big to send. */
 #define PCACHE_CLCTR_REQ  1
 #define PCACHE_CLCTR_RPL  2
+/* fixed bytes of each framing, so the size checks and the budget the serve
+ * path hands out cannot drift from what the writers actually emit */
+#define PCACHE_CLCTR_REQ_HDR  8    /* type + id + collen + klen           */
+#define PCACHE_CLCTR_RPL_HDR  14   /* type + id + found + ttl + klen+vlen */
 #define PCACHE_FOUND_NO       0
 #define PCACHE_FOUND_YES      1
 #define PCACHE_FOUND_OVERSIZE 2
@@ -1334,17 +1338,35 @@ static struct pcache_pull_slot *pull_slot_get(unsigned int id)
 	return NULL;
 }
 
-/* Send one reply, by whichever transport this node was configured with. */
+/* Send one reply, over the transport the request came in on.
+ *
+ * @via_clctr says how it arrived, and is deliberately NOT this node's own
+ * configuration: the two can differ while a cluster is being reconfigured,
+ * and answering a BIN request over the multicast plane (or the reverse)
+ * means the requester waits out its timeout for an answer that was sent,
+ * which is indistinguishable from packet loss. */
 static void pcache_pull_send_rpl(int dst_node, unsigned int id, const str *key,
-		int found, int ttl, const str *val)
+		int found, int ttl, const str *val, int via_clctr)
 {
-	if (pull_via_clctr) {
+	if (via_clctr) {
 		char buf[CLCTR_MAX_PAYLOAD];
 		str pl;
 		uint32_t id_be = htonl(id), ttl_be = htonl((uint32_t)ttl);
 		uint16_t kl = htons((uint16_t)key->len);
-		uint16_t vl = htons((uint16_t)(found == PCACHE_FOUND_YES ? val->len : 0));
+		int vlen = (found == PCACHE_FOUND_YES) ? val->len : 0;
+		uint16_t vl = htons((uint16_t)vlen);
 		int n = 0;
+
+		/* Never trust the caller to have sized this: the key is echoed
+		 * straight back from the request, so a peer sending an oversized
+		 * one would otherwise write past the buffer.  The serve path
+		 * rejects those already - this is the second lock on the door. */
+		if (PCACHE_CLCTR_RPL_HDR + key->len + vlen > (int)sizeof buf) {
+			LM_ERR("pull reply for a %d byte key with %d bytes of value "
+				"does not fit %d - dropping it\n", key->len, vlen,
+				(int)sizeof buf);
+			return;
+		}
 
 		buf[n++] = PCACHE_CLCTR_RPL;
 		memcpy(buf + n, &id_be, 4);  n += 4;
@@ -1396,12 +1418,25 @@ static void pcache_pull_send_rpl(int dst_node, unsigned int id, const str *key,
  * and the controller-plane receivers decode their own framing and land
  * here, so the two can never disagree about what is served. */
 static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
-		str *key)
+		str *key, int via_clctr)
 {
 	pcache_col_t *col;
 	str val = {NULL, 0};
 	unsigned int exp = 0;
 	int found = PCACHE_FOUND_NO, ttl_left = 0, budget;
+
+	/* The key arrives from a peer and is echoed back in the reply, so it
+	 * is sized before anything else touches it.  A requester never asks
+	 * for more than PCACHE_PULL_MAX_KEY; anything longer is a peer that
+	 * is broken, of another version, or hostile, and answering it at all
+	 * would mean copying it into a fixed reply buffer. */
+	if (key->len <= 0 || key->len > PCACHE_PULL_MAX_KEY ||
+	        coll->len <= 0 || coll->len > 63) {
+		LM_ERR("pull request from node %d has a %d byte key in a %d byte "
+			"collection - out of range, ignored\n", src_node, key->len,
+			coll->len);
+		return;
+	}
 
 	col = col_by_name(coll);
 	if (!col || !col->htable || !col->replicate)
@@ -1445,8 +1480,8 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 	 * it.  Say "I have it but cannot send it" rather than "not here":
 	 * the requester must not conclude the key is absent from a node that
 	 * demonstrably holds it. */
-	budget = pull_via_clctr
-		? CLCTR_MAX_PAYLOAD - (int)(14 + key->len)
+	budget = via_clctr
+		? CLCTR_MAX_PAYLOAD - (int)(PCACHE_CLCTR_RPL_HDR + key->len)
 		: PCACHE_PULL_MAX_VAL;
 	if (val.len > budget) {
 		LM_DBG("pull: <%.*s> is %d bytes, over this transport's %d - "
@@ -1458,7 +1493,7 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 	}
 
 reply:
-	pcache_pull_send_rpl(src_node, id, key, found, ttl_left, &val);
+	pcache_pull_send_rpl(src_node, id, key, found, ttl_left, &val, via_clctr);
 	if (val.s)
 		pkg_free(val.s);
 }
@@ -1474,7 +1509,9 @@ static void pcache_pull_serve(bin_packet_t *in)
 		LM_ERR("malformed pull request from node %d\n", in->src_id);
 		return;
 	}
-	pcache_pull_do_serve(in->src_id, id, &coll, &key);
+	/* arrived over BIN, so it is answered over BIN - even on a node whose
+	 * own pull_transport is the controller plane */
+	pcache_pull_do_serve(in->src_id, id, &coll, &key, 0);
 }
 
 /* A peer answered.  Fill the waiting slot; first positive answer wins and
@@ -1582,7 +1619,7 @@ static void pcache_clctr_recv(int cluster_id, int src_node_id, str *channel,
 		if (left < key.len)
 			goto bad;
 		key.s = (char *)p;
-		pcache_pull_do_serve(src_node_id, ntohl(id_be), &coll, &key);
+		pcache_pull_do_serve(src_node_id, ntohl(id_be), &coll, &key, 1);
 		return;
 	}
 	if (type == PCACHE_CLCTR_RPL) {
@@ -1715,6 +1752,14 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 		uint16_t kl = htons((uint16_t)key->len);
 		int n = 0;
 
+		/* the entry checks above bound both lengths, so this can only
+		 * fire if those ever change - which is exactly when it should */
+		if (PCACHE_CLCTR_REQ_HDR + col->col_name.len + key->len >
+		        (int)sizeof buf) {
+			LM_ERR("pull request for a %d byte key does not fit %d\n",
+				key->len, (int)sizeof buf);
+			goto fail;
+		}
 		buf[n++] = PCACHE_CLCTR_REQ;
 		memcpy(buf + n, &id_be, 4); n += 4;
 		buf[n++] = (char)col->col_name.len;

@@ -202,6 +202,7 @@
 #include "../../net/api_proto.h" /* protos[] array                            */
 #include "../../globals.h"      /* process_no - this process's index          */
 #include "../../ipc.h"          /* ipc_send_rpc() - cross-process job dispatch */
+#include "api.h"                 /* consumer messaging API contract */
 #include "../../pvar.h"         /* pv_export_t - read-only $cl_ctr_* variables */
 
 #include "../clusterer/clusterer_ctrl.h"  /* set_my_identity, add_node, remove_node */
@@ -243,6 +244,17 @@ static const unsigned char CL_CTR_BOOTSTRAP_MAGIC[CL_CTR_MAGIC_SZ] = { 0xCC, 0x0
 #define CL_CTR_PKT_JOIN_REJECT      0x09  /* master -> joiner: authentication rejected     */
 #define CL_CTR_PKT_ACK              0x0B  /* receiver -> sender: ack of a 1:1 handshake pkt */
 #define CL_CTR_PKT_RESYNC           0x0C  /* member -> master: my view differs, resend state */
+#define CL_CTR_PKT_CONSUMER         0x0D  /* consumer API message: [src_id][chan][data] */
+
+/* Consumer messaging (api.h): plaintext payload layout after type+seq is
+ * [src_node_id u16 BE][chan_len u8][channel bytes][consumer payload].
+ * Bounded to one comfortably-under-MTU datagram; bulk data is the
+ * consumer's problem (the API contract says fall back to BIN for bulk). */
+#define CL_CTR_MAX_CHANNELS         8
+#define CL_CTR_CONSUMER_HDR_SZ      (CL_CTR_NODE_ID_SZ + 1)
+#define CL_CTR_CONSUMER_PKT_MAX     (CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ \
+                                     + CL_CTR_CONSUMER_HDR_SZ + CLCTR_MAX_CHAN_LEN \
+                                     + CLCTR_MAX_PAYLOAD + CL_CTR_TAG_SZ)
 #define CL_CTR_PKT_MASTER_BEACON    0x0A  /* master-only announce (BOOTSTRAP key) so
                                        * masters with divergent session keys can
                                        * still discover each other and merge a
@@ -698,6 +710,46 @@ static char my_interface_buf[IF_NAMESIZE];
 
 /* Local node identity - populated at mod_init by scanning the config file */
 static uint16_t my_node_id                              = 0;
+
+/* ---- consumer messaging API (api.h) ----------------------------------- */
+
+/* Channel registry: filled PRE-FORK by consumers' mod_init, inherited
+ * read-only by every process afterwards - no lock needed. */
+struct cl_ctr_channel {
+    char            name[CLCTR_MAX_CHAN_LEN + 1];
+    int             len;
+    clctr_msg_cb_f  cb;
+};
+static struct cl_ctr_channel cl_ctr_channels[CL_CTR_MAX_CHANNELS];
+static int cl_ctr_nchannels;
+
+/* A send marshalled to the cluster worker over IPC.  Routing every send
+ * through the worker keeps the anti-replay sequence space single-writer
+ * (cl_ctr_check_and_update_seq is strictly monotonic per sender IP, so
+ * concurrent senders in different processes would trip it) and reuses
+ * the worker's socket and session key, which are worker-local state. */
+struct cl_ctr_consumer_job {
+    cl_ctr_cluster_t *cl;
+    uint16_t          dst_node_id;   /* 0 = multicast */
+    int               flags;
+    int               chan_len;
+    int               payload_len;
+    char              chan[CLCTR_MAX_CHAN_LEN];
+    unsigned char     payload[];
+};
+
+static void cl_ctr_consumer_dispatch(cl_ctr_cluster_t *cl, int src_node_id,
+        const char *chan, int chan_len, const char *payload, int payload_len);
+static void cl_ctr_handle_consumer(const char *payload, int payload_len,
+        const char *src_ip, cl_ctr_cluster_t *cl);
+static void cl_ctr_rpc_consumer_send(int sender, void *param);
+static int clctr_register_channel(str *channel, clctr_msg_cb_f cb);
+static int clctr_send_mcast(int cluster_id, str *channel, str *payload,
+        int flags);
+static int clctr_send_ucast(int cluster_id, int node_id, str *channel,
+        str *payload, int flags);
+static int clctr_get_my_node_id(int cluster_id);
+int load_clctr(clctr_api_t *api);
 
 /* clusterer integration - loaded at mod_init if clusterer use_controller=1 */
 static clusterer_ctrl_binds_t clctl;
@@ -1278,6 +1330,7 @@ static const cmd_export_t cl_ctr_cmds[] = {
 	{CMD_PARAM_INT, 0, 0}, {CMD_PARAM_INT, 0, 0}, {CMD_PARAM_VAR, 0, 0}, {0, 0, 0}}, ALL_ROUTES},
     {"cl_ctr_get_node_ip", (cmd_function)w_cl_ctr_get_node_ip, {
 	{CMD_PARAM_INT, 0, 0}, {CMD_PARAM_INT, 0, 0}, {CMD_PARAM_VAR, 0, 0}, {0, 0, 0}}, ALL_ROUTES},
+    {"load_clctr", (cmd_function)load_clctr, {{0, 0, 0}}, 0},
     {0, 0, {{0, 0, 0}}, 0}
 };
 
@@ -4842,6 +4895,14 @@ static void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	    break;
 	}
 
+	case CL_CTR_PKT_CONSUMER:
+	    /* session-key only: a consumer message under the bootstrap key
+	     * would come from a node that has not even joined - drop it */
+	    if (is_bootstrap)
+		break;
+	    cl_ctr_handle_consumer(payload, payload_len, sender_ip_buf, cl);
+	    break;
+
 	case CL_CTR_PKT_JOIN_REQ:
 	    cl_ctr_handle_join_req(sock, payload, payload_len, cl,
 	                       (const struct sockaddr *)&src_addr, src_len);
@@ -6587,4 +6648,297 @@ cleanup:
 	cl->peers = NULL;
     }
     LM_INFO("clusterer_controller: shut down\n");
+}
+
+/* =========================================================================
+ * Consumer messaging API (api.h)
+ *
+ * Other modules ride the controller's encrypted UDP plane: named
+ * channels, multicast or per-node unicast, delivered to the registered
+ * callback in the cluster worker.  See api.h for the delivery contract.
+ * ========================================================================= */
+
+static cl_ctr_cluster_t *cl_ctr_cluster_by_id(int cluster_id)
+{
+    int i;
+
+    for (i = 0; i < cl_ctr_cluster_count; i++)
+        if (cl_ctr_clusters[i].cluster_id == cluster_id)
+            return &cl_ctr_clusters[i];
+    return NULL;
+}
+
+/* Invoke the registered callback for @chan, if any.  Runs in whichever
+ * process called it - for wire packets and IPC'd sends that is the
+ * cluster worker, which is the documented delivery context. */
+static void cl_ctr_consumer_dispatch(cl_ctr_cluster_t *cl, int src_node_id,
+        const char *chan, int chan_len, const char *payload, int payload_len)
+{
+    str ch, pl;
+    int i;
+
+    for (i = 0; i < cl_ctr_nchannels; i++) {
+        if (cl_ctr_channels[i].len == chan_len &&
+                memcmp(cl_ctr_channels[i].name, chan, chan_len) == 0) {
+            ch.s = (char *)chan;      ch.len = chan_len;
+            pl.s = (char *)payload;   pl.len = payload_len;
+            cl_ctr_channels[i].cb(cl->cluster_id, src_node_id, &ch, &pl);
+            return;
+        }
+    }
+    /* unknown channel: a mixed-version cluster is normal, drop quietly */
+    LM_DBG("clusterer_controller: [cluster %d] no consumer for channel "
+           "'%.*s'\n", cl->cluster_id, chan_len, chan);
+}
+
+/* Receive path (worker, via cl_ctr_recv_one): already through the magic
+ * gate, cluster_id filter, rate limiter, decrypt and seq check. */
+static void cl_ctr_handle_consumer(const char *payload, int payload_len,
+        const char *src_ip, cl_ctr_cluster_t *cl)
+{
+    uint16_t src_id_be;
+    int      chan_len;
+
+    /* our own multicast looped back: self-delivery, when asked for, was
+     * already done locally at send time - never accept it off the wire */
+    if (strcmp(src_ip, my_ip) == 0)
+        return;
+
+    if (payload_len < CL_CTR_CONSUMER_HDR_SZ) {
+        LM_DBG("clusterer_controller: [cluster %d] short consumer packet "
+               "(%d)\n", cl->cluster_id, payload_len);
+        return;
+    }
+    memcpy(&src_id_be, payload, CL_CTR_NODE_ID_SZ);
+    chan_len = (unsigned char)payload[CL_CTR_NODE_ID_SZ];
+    if (chan_len == 0 || chan_len > CLCTR_MAX_CHAN_LEN ||
+            payload_len < CL_CTR_CONSUMER_HDR_SZ + chan_len) {
+        LM_DBG("clusterer_controller: [cluster %d] bad consumer channel "
+               "length %d (payload %d)\n", cl->cluster_id, chan_len,
+               payload_len);
+        return;
+    }
+
+    cl_ctr_consumer_dispatch(cl, ntohs(src_id_be),
+            payload + CL_CTR_CONSUMER_HDR_SZ, chan_len,
+            payload + CL_CTR_CONSUMER_HDR_SZ + chan_len,
+            payload_len - CL_CTR_CONSUMER_HDR_SZ - chan_len);
+}
+
+/* Runs in the cluster worker.  Builds, seals and sends the consumer
+ * packet - and/or dispatches locally for the self-delivery cases. */
+static void cl_ctr_rpc_consumer_send(int sender, void *param)
+{
+    struct cl_ctr_consumer_job *job = (struct cl_ctr_consumer_job *)param;
+    cl_ctr_cluster_t *cl = job->cl;
+    char      pkt[CL_CTR_CONSUMER_PKT_MAX];
+    char      dst_ip[CL_CTR_MAX_IP_LEN + 1];
+    uint32_t  seq;
+    uint16_t  id_be;
+    int       plain_len, i, to_self = 0, on_wire = 1;
+
+    /* unicast to our own id never touches the wire; multicast with
+     * CLCTR_SEND_TO_SELF touches it AND dispatches locally */
+    if (job->dst_node_id != 0 && job->dst_node_id == my_node_id) {
+        to_self = 1;
+        on_wire = 0;
+    } else if (job->flags & CLCTR_SEND_TO_SELF) {
+        to_self = 1;
+    }
+
+    if (on_wire) {
+        if (!cl->have_session_key) {
+            LM_DBG("clusterer_controller: [cluster %d] consumer send before "
+                   "session key - dropped\n", cl->cluster_id);
+            on_wire = 0;
+        }
+    }
+
+    if (on_wire) {
+        seq   = htonl(++cl->peers->my_seq);
+        id_be = htons(my_node_id);
+
+        memcpy(pkt, CL_CTR_PACKET_MAGIC, CL_CTR_MAGIC_SZ);
+        pkt[CL_CTR_WIRE_HDR_SZ] = (char)CL_CTR_PKT_CONSUMER;
+        memcpy(pkt + CL_CTR_WIRE_HDR_SZ + 1, &seq, CL_CTR_SEQ_SZ);
+        memcpy(pkt + CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ, &id_be,
+               CL_CTR_NODE_ID_SZ);
+        pkt[CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ + CL_CTR_NODE_ID_SZ] =
+               (char)job->chan_len;
+        memcpy(pkt + CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ
+               + CL_CTR_CONSUMER_HDR_SZ, job->chan, job->chan_len);
+        memcpy(pkt + CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ
+               + CL_CTR_CONSUMER_HDR_SZ + job->chan_len, job->payload,
+               job->payload_len);
+        plain_len = CL_CTR_PLAIN_HDR_SZ + CL_CTR_CONSUMER_HDR_SZ
+                    + job->chan_len + job->payload_len;
+
+        if (job->dst_node_id == 0) {
+            cl_ctr_seal_and_send(cl->sock, cl, pkt, plain_len,
+                    cl->session_key, CL_CTR_PKT_CONSUMER);
+        } else {
+            struct sockaddr_in d;
+
+            dst_ip[0] = '\0';
+            lock_start_read(cl->peers->lock);
+            for (i = 0; i < cl->peers->count; i++) {
+                if (cl->peers->entries[i].node_id == job->dst_node_id) {
+                    strcpy(dst_ip, cl->peers->entries[i].ip);
+                    break;
+                }
+            }
+            lock_stop_read(cl->peers->lock);
+
+            if (!dst_ip[0]) {
+                LM_DBG("clusterer_controller: [cluster %d] consumer send to "
+                       "unknown node %u - dropped\n", cl->cluster_id,
+                       job->dst_node_id);
+            } else {
+                memset(&d, 0, sizeof d);
+                d.sin_family = AF_INET;
+                d.sin_port   = cl->mcast_dest.sin_port;
+                if (inet_pton(AF_INET, dst_ip, &d.sin_addr) != 1) {
+                    LM_ERR("clusterer_controller: [cluster %d] bad peer ip "
+                           "'%s'\n", cl->cluster_id, dst_ip);
+                } else {
+                    cl_ctr_seal_and_send_to(cl->sock, cl, pkt, plain_len,
+                            cl->session_key, CL_CTR_PKT_CONSUMER,
+                            (const struct sockaddr *)&d, sizeof d);
+                }
+            }
+        }
+    }
+
+    if (to_self)
+        cl_ctr_consumer_dispatch(cl, my_node_id, job->chan, job->chan_len,
+                (const char *)job->payload, job->payload_len);
+
+    shm_free(job);
+}
+
+static int clctr_register_channel(str *channel, clctr_msg_cb_f cb)
+{
+    int i;
+
+    if (!channel || !channel->s || channel->len <= 0 ||
+            channel->len > CLCTR_MAX_CHAN_LEN || !cb) {
+        LM_ERR("bad consumer channel registration\n");
+        return -1;
+    }
+    for (i = 0; i < cl_ctr_nchannels; i++) {
+        if (cl_ctr_channels[i].len == channel->len &&
+                memcmp(cl_ctr_channels[i].name, channel->s, channel->len) == 0) {
+            LM_ERR("consumer channel '%.*s' already registered\n",
+                   channel->len, channel->s);
+            return -1;
+        }
+    }
+    if (cl_ctr_nchannels == CL_CTR_MAX_CHANNELS) {
+        LM_ERR("consumer channel table full (%d)\n", CL_CTR_MAX_CHANNELS);
+        return -1;
+    }
+    memcpy(cl_ctr_channels[cl_ctr_nchannels].name, channel->s, channel->len);
+    cl_ctr_channels[cl_ctr_nchannels].name[channel->len] = '\0';
+    cl_ctr_channels[cl_ctr_nchannels].len = channel->len;
+    cl_ctr_channels[cl_ctr_nchannels].cb  = cb;
+    cl_ctr_nchannels++;
+    LM_DBG("consumer channel '%.*s' registered\n", channel->len, channel->s);
+    return 0;
+}
+
+/* Common caller side: validate, marshal into shm, hand to the worker. */
+static int cl_ctr_consumer_submit(int cluster_id, int dst_node_id,
+        str *channel, str *payload, int flags)
+{
+    struct cl_ctr_consumer_job *job;
+    cl_ctr_cluster_t *cl;
+    int payload_len = payload ? payload->len : 0;
+    int proc_no;
+
+    if (!channel || !channel->s || channel->len <= 0 ||
+            channel->len > CLCTR_MAX_CHAN_LEN)
+        return -1;
+    if (payload_len < 0 || payload_len > CLCTR_MAX_PAYLOAD) {
+        LM_ERR("consumer payload of %d exceeds the %d-byte datagram bound - "
+               "use BIN for bulk data\n", payload_len, CLCTR_MAX_PAYLOAD);
+        return -1;
+    }
+    cl = cl_ctr_cluster_by_id(cluster_id);
+    if (!cl) {
+        LM_ERR("consumer send to unknown cluster %d\n", cluster_id);
+        return -1;
+    }
+    /* worker_proc_no is written once at worker fork and stable thereafter */
+    proc_no = cl->peers ? cl->peers->worker_proc_no : -1;
+    if (proc_no < 0)
+        return -2;
+
+    job = shm_malloc(sizeof *job + payload_len);
+    if (!job) {
+        LM_ERR("no shm for a consumer send\n");
+        return -1;
+    }
+    job->cl          = cl;
+    job->dst_node_id = (uint16_t)dst_node_id;
+    job->flags       = flags;
+    job->chan_len    = channel->len;
+    job->payload_len = payload_len;
+    memcpy(job->chan, channel->s, channel->len);
+    if (payload_len)
+        memcpy(job->payload, payload->s, payload_len);
+
+    if (ipc_send_rpc(proc_no, cl_ctr_rpc_consumer_send, job) < 0) {
+        LM_ERR("cannot dispatch consumer send to the cluster %d worker\n",
+               cluster_id);
+        shm_free(job);
+        return -2;
+    }
+    return 0;
+}
+
+static int clctr_send_mcast(int cluster_id, str *channel, str *payload,
+        int flags)
+{
+    return cl_ctr_consumer_submit(cluster_id, 0, channel, payload, flags);
+}
+
+static int clctr_send_ucast(int cluster_id, int node_id, str *channel,
+        str *payload, int flags)
+{
+    if (node_id <= 0 || node_id > CL_CTR_MAX_PEERS)
+        return -1;
+    return cl_ctr_consumer_submit(cluster_id, node_id, channel, payload,
+            flags);
+}
+
+/* Readable from ANY process: the worker-local my_node_id global is only
+ * authoritative inside the worker, so read our own entry from the shm
+ * peer table instead. */
+static int clctr_get_my_node_id(int cluster_id)
+{
+    cl_ctr_cluster_t *cl = cl_ctr_cluster_by_id(cluster_id);
+    int i, id = 0;
+
+    if (!cl || !cl->peers)
+        return 0;
+    lock_start_read(cl->peers->lock);
+    for (i = 0; i < cl->peers->count; i++) {
+        if (strcmp(cl->peers->entries[i].ip, my_ip) == 0) {
+            id = cl->peers->entries[i].node_id;
+            break;
+        }
+    }
+    lock_stop_read(cl->peers->lock);
+    return id;
+}
+
+int load_clctr(clctr_api_t *api)
+{
+    if (!api)
+        return -1;
+    api->register_channel = clctr_register_channel;
+    api->send_mcast       = clctr_send_mcast;
+    api->send_ucast       = clctr_send_ucast;
+    api->get_my_node_id   = clctr_get_my_node_id;
+    return 0;
 }

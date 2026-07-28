@@ -28,6 +28,7 @@
 #include "../../md5utils.h"
 #include "../../cachedb/cachedb.h"
 #include "th_store.h"
+#include "../cachedb_perf/pull_api.h"
 
 str th_state_url = {NULL, 0};
 int th_state_ttl = 3600;
@@ -37,6 +38,12 @@ static enum th_store_type th_store_be = TH_STORE_NONE;
 
 static cachedb_funcs th_cdbf;
 static cachedb_con *th_cdbc;
+
+/* Optional: a backend that can fetch a key from another node.  Bound at
+ * startup if it is there and simply absent if not, in which case a miss
+ * stays a miss exactly as before. */
+static pcache_pull_api_t th_pull;
+static int th_pull_ready;
 
 /* the stored keys are prefixed, so that the storage may be shared with
  * other users without clashing over the key names */
@@ -349,10 +356,29 @@ int th_store_put(str *blob, str *key, int ttl)
 }
 
 
+/* The key of the most recent miss in THIS process.  Read immediately after
+ * a failed match, in the same function, in the same process - never across
+ * a suspension - so it needs no more protection than that.  It exists so
+ * the asynchronous path can retry a lookup without re-implementing the
+ * Contact parsing that produced the key in the first place. */
+static char th_last_miss_buf[TH_KEY_LEN];
+static str  th_last_miss = {NULL, 0};
+
+str *th_store_last_miss(void)
+{
+	return th_last_miss.len ? &th_last_miss : NULL;
+}
+
+void th_store_clear_last_miss(void)
+{
+	th_last_miss.len = 0;
+}
+
 int th_store_get(str *key, str *blob)
 {
 	char buf[TH_KEY_PREFIX_LEN + TH_KEY_LEN];
 	str full_key;
+	int rc;
 
 	if (!th_store_enabled()) {
 		LM_BUG("no topology hiding storage configured\n");
@@ -374,22 +400,37 @@ int th_store_get(str *key, str *blob)
 	blob->s = NULL;
 	blob->len = 0;
 
-	if (th_cdbf.get(th_cdbc, &full_key, blob) < 0) {
-		LM_ERR("failed to fetch the topology hiding state of <%.*s>\n",
-			full_key.len, full_key.s);
-		return -1;
-	}
-	if (!blob->s || !blob->len) {
+	rc = th_cdbf.get(th_cdbc, &full_key, blob);
+
+	/* Absent is not a failure, and the two must not be logged alike: a
+	 * backend reports "no such key" as -2, which the old test for any
+	 * negative swept in with connection errors and reported at ERROR.
+	 * A state that expired, or that a sibling holds, is an ordinary
+	 * event - a broken backend is not. */
+	if (rc == -2 || (rc == 0 && (!blob->s || !blob->len))) {
 		LM_WARN("no topology hiding state found for <%.*s> - it may have "
 			"expired, check the th_state_ttl* parameters against the "
 			"lifetime of the hidden calls\n", full_key.len, full_key.s);
 		if (blob->s) {
 			pkg_free(blob->s);
 			blob->s = NULL;
+			blob->len = 0;
 		}
+		/* remember which key it was: behind a load balancer that does not
+		 * keep a dialog on one node, this may be state another node holds
+		 * rather than state that never existed */
+		memcpy(th_last_miss_buf, key->s, key->len);
+		th_last_miss.s = th_last_miss_buf;
+		th_last_miss.len = key->len;
+		return -1;
+	}
+	if (rc < 0) {
+		LM_ERR("failed to fetch the topology hiding state of <%.*s>\n",
+			full_key.len, full_key.s);
 		return -1;
 	}
 
+	th_last_miss.len = 0;
 	LM_DBG("fetched %d bytes of topology hiding state for <%.*s>\n",
 		blob->len, full_key.len, full_key.s);
 	return 0;
@@ -449,4 +490,52 @@ void th_store_del(str *key)
 	else
 		LM_DBG("dropped the topology hiding state of <%.*s>\n",
 			full_key.len, full_key.s);
+}
+
+/* ---- asynchronous fetch, for a state another node may hold ------------ */
+
+/* Bind the cross-node pull, if the configured backend offers one.  Called
+ * once the storage connection is up; failure is normal and silent-ish. */
+void th_store_bind_pull(void)
+{
+	if (!th_store_enabled())
+		return;
+	if (load_pcache_pull_api(&th_pull) == 0) {
+		th_pull_ready = 1;
+		LM_INFO("topology hiding state can be fetched from other nodes\n");
+	} else {
+		LM_DBG("no cross-node fetch available for the topology hiding "
+			"state - a miss stays a miss\n");
+	}
+}
+
+int th_store_pull_available(void)
+{
+	return th_pull_ready;
+}
+
+int th_store_pull_start(str *key, int *fd, unsigned int *handle)
+{
+	char buf[TH_KEY_PREFIX_LEN + TH_KEY_LEN];
+	str full_key;
+
+	if (!th_pull_ready || !th_cdbc || !key || key->len != TH_KEY_LEN)
+		return -1;
+	th_store_key(key, buf, &full_key);
+	return th_pull.start(th_cdbc, &full_key, fd, handle);
+}
+
+int th_store_pull_finish(str *key, unsigned int handle, str *blob)
+{
+	char buf[TH_KEY_PREFIX_LEN + TH_KEY_LEN];
+	str full_key;
+
+	if (blob) {
+		blob->s = NULL;
+		blob->len = 0;
+	}
+	if (!th_pull_ready || !th_cdbc || !key || key->len != TH_KEY_LEN)
+		return -1;
+	th_store_key(key, buf, &full_key);
+	return th_pull.finish(th_cdbc, &full_key, handle, blob);
 }

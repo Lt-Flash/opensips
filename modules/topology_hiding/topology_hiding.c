@@ -30,6 +30,7 @@
 
 #include "topo_hiding_logic.h"
 #include "th_store.h"
+#include "../../async.h"
 
 struct tm_binds tm_api;
 struct dlg_binds dlg_api;
@@ -55,6 +56,8 @@ static int fixup_mmode(void **param);
 static int fixup_th_params(void **param);
 int w_topology_hiding(struct sip_msg *req, str *flags_s, struct th_params *params);
 int w_topology_hiding_match(struct sip_msg *req, void *seq_match_mode_val);
+int async_w_topology_hiding_match(struct sip_msg *req, async_ctx *actx,
+		void *seq_match_mode_val);
 static int pv_topo_callee_callid(struct sip_msg *msg, pv_param_t *param, pv_value_t *res);
 
 static const cmd_export_t cmds[]={
@@ -66,6 +69,12 @@ static const cmd_export_t cmds[]={
 		{CMD_PARAM_STR|CMD_PARAM_OPT, fixup_mmode, 0}, {0,0,0}},
 		REQUEST_ROUTE},
 	{0,0,{{0,0,0}},0}
+};
+
+static const acmd_export_t acmds[]={
+	{"topology_hiding_match", (acmd_function)async_w_topology_hiding_match, {
+		{CMD_PARAM_STR|CMD_PARAM_OPT, fixup_mmode, 0}, {0,0,0}}},
+	{0,0,{{0,0,0}}}
 };
 
 /* Exported parameters */
@@ -124,7 +133,7 @@ struct module_exports exports= {
 	0,				  /* load function */
 	&deps,            /* OpenSIPS module dependencies */
 	cmds,             /* exported functions */
-	0,                /* exported async functions */
+	acmds,            /* exported async functions */
 	params,           /* param exports */
 	0,                /* exported statistics */
 	0,                /* exported MI functions */
@@ -174,6 +183,10 @@ static int mod_init(void)
 		LM_ERR("failed to initialize the topology hiding state storage\n");
 		goto error;
 	}
+	/* If the storage backend can fetch a key from another node, bind it -
+	 * that is what async(topology_hiding_match(), ...) uses.  Absent is
+	 * the normal case and costs nothing. */
+	th_store_bind_pull();
 
 	/* loading dependencies */
 	if (load_tm_api(&tm_api)!=0) {
@@ -356,6 +369,119 @@ int w_topology_hiding_match(struct sip_msg *req, void *seq_match_mode_val)
 	else
 		/* we went to the dlg module, which triggered us back, all good */
 		return 1;
+}
+
+/* ---- asynchronous match ------------------------------------------------
+ *
+ * Behind a load balancer that does not keep a dialog on one node, the
+ * sequential request carrying a hidden Contact can land on a node that
+ * never stored the state.  The ordinary match then fails and the call
+ * breaks, even though a sibling has exactly what is needed.
+ *
+ * async(topology_hiding_match(), resume) asks the cluster for it.  The
+ * transaction suspends; the process goes back to work; when the answer
+ * lands the resume route runs and the match is retried - by then the
+ * value is in this node's cache, so the retry is the ordinary path and
+ * every rule it enforces still applies.
+ *
+ * Nothing changes for the common case: a match that succeeds locally
+ * never suspends, and a deployment without cross-node fetch behaves
+ * exactly as the synchronous function does.
+ * ---------------------------------------------------------------------- */
+
+struct th_async_ctx {
+	unsigned int handle;
+	char         key[TH_KEY_LEN];
+	int          klen;
+	int          mm;
+};
+
+static int th_match_resume(int fd, struct sip_msg *msg, void *param)
+{
+	struct th_async_ctx *ctx = (struct th_async_ctx *)param;
+	str key, blob;
+	int rc;
+
+	key.s = ctx->key;
+	key.len = ctx->klen;
+
+	/* Collect it either way - this releases the request whether an answer
+	 * arrived or the wait timed out. */
+	rc = th_store_pull_finish(&key, ctx->handle, &blob);
+	if (blob.s)
+		pkg_free(blob.s);
+
+	async_status = ASYNC_DONE_NO_IO;   /* the fd is the cache's, not ours */
+	shm_free(ctx);
+
+	if (rc != 1) {
+		LM_DBG("no node had the topology hiding state - the match fails as "
+			"it would have without asking\n");
+		return -1;
+	}
+
+	/* The value is in this node's cache now, so the ordinary path finds
+	 * it: retrying means every rule the synchronous match applies is
+	 * applied here too, rather than duplicated. */
+	return topology_hiding_match(msg);
+}
+
+int async_w_topology_hiding_match(struct sip_msg *req, async_ctx *actx,
+		void *seq_match_mode_val)
+{
+	struct th_async_ctx *ctx;
+	str *missed;
+	int mm, rc, fd = -1;
+	unsigned int handle = 0;
+
+	mm = seq_match_mode_val ? (int)(long)seq_match_mode_val
+	                        : SEQ_MATCH_DEFAULT;
+
+	th_store_clear_last_miss();
+	if (!dlg_api.match_dialog || dlg_api.match_dialog(req, mm) < 0)
+		rc = topology_hiding_match(req);
+	else
+		rc = 1;                        /* the dialog module answered */
+
+	/* the ordinary outcome, whatever it was - do not suspend for it */
+	if (rc > 0 || !th_store_pull_available()) {
+		async_status = ASYNC_SYNC;
+		return rc;
+	}
+
+	missed = th_store_last_miss();
+	if (!missed) {
+		async_status = ASYNC_SYNC;     /* it failed for some other reason */
+		return rc;
+	}
+
+	ctx = shm_malloc(sizeof *ctx);
+	if (!ctx) {
+		LM_ERR("no shm for the asynchronous match\n");
+		async_status = ASYNC_SYNC;
+		return rc;
+	}
+	memcpy(ctx->key, missed->s, missed->len);
+	ctx->klen = missed->len;
+	ctx->mm = mm;
+
+	switch (th_store_pull_start(missed, &fd, &handle)) {
+	case 1:
+		ctx->handle = handle;
+		async_status = fd;             /* suspend until the answer lands */
+		ASYNC_SET_RESUME_F(actx, th_match_resume);
+		actx->resume_param = ctx;
+		return 1;
+	case 0:
+		/* the cluster has already said nobody has it - no point waiting */
+		LM_DBG("no node holds this topology hiding state\n");
+		break;
+	default:
+		break;
+	}
+	shm_free(ctx);
+	async_status = ASYNC_SYNC;
+	return rc;
 }
 
 static char *callid_buf=NULL;

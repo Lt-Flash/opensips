@@ -128,6 +128,21 @@ int th_store_put(str *blob, str *key, int ttl);
  */
 int th_store_get(str *key, str *blob);
 
+/* The key of the most recent lookup that found nothing, in this process.
+ * Valid only immediately after that lookup; NULL when the last one hit.
+ * Lets the asynchronous path retry without re-parsing the Contact. */
+str *th_store_last_miss(void);
+void th_store_clear_last_miss(void);
+
+/* Cross-node fetch of a state this node does not have.  Optional: only
+ * present when the configured backend offers it.  start() returns 1 when
+ * a fetch is under way (wait on @fd), 0 when the cluster already says
+ * nobody has it, -1 when no fetch is possible. */
+void th_store_bind_pull(void);
+int  th_store_pull_available(void);
+int  th_store_pull_start(str *key, int *fd, unsigned int *handle);
+int  th_store_pull_finish(str *key, unsigned int handle, str *blob);
+
 /* Drop the blob stored under @key, once it is known to be of no use. */
 void th_store_del(str *key);
 

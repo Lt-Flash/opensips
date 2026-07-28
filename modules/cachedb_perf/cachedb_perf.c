@@ -148,11 +148,13 @@ static unsigned int *pull_next_id;     /* shm: ids must be unique per node  */
 
 /* pull counters, deliberately separate from hits/misses so a pulled key
  * cannot flatter the local hit rate (R6) */
-static unsigned int *pull_stats;       /* [requested, served, received, timeouts] */
+static unsigned int *pull_stats;       /* PULL_ST_* counters */
 #define PULL_ST_REQUESTED 0
 #define PULL_ST_SERVED    1
 #define PULL_ST_RECEIVED  2
 #define PULL_ST_TIMEOUT   3
+#define PULL_ST_STORED    4
+#define PULL_ST_MAX       5
 static int sync_ready = 0;             /* clusterer loaded + capability set */
 
 /* Cluster membership view (CP-15.4).  The clusterer node list changes at
@@ -539,7 +541,9 @@ static mi_response_t *mi_perf_stats(str *col_s)
 		     add_mi_number(clobj, MI_SSTR("pulls_served"),
 		        pull_stats[PULL_ST_SERVED]) < 0 ||
 		     add_mi_number(clobj, MI_SSTR("pulls_timed_out"),
-		        pull_stats[PULL_ST_TIMEOUT]) < 0))
+		        pull_stats[PULL_ST_TIMEOUT]) < 0 ||
+		     add_mi_number(clobj, MI_SSTR("pulls_stored"),
+		        pull_stats[PULL_ST_STORED]) < 0))
 			goto err;
 		if (pc_view->last_change) {
 			char lbuf[32];
@@ -824,7 +828,7 @@ static mi_response_t *do_perf_pull(str *key, str *col_s)
 			MI_SSTR("collection is not in replicate_collections"));
 
 	/* a local hit needs no cluster at all - say so plainly */
-	if (pcache_ht_probe(col->htable, key, &vlen, &exp) == 0) {
+	if (pcache_ht_probe(col->htable, key, &vlen, &exp, NULL) == 0) {
 		resp = init_mi_result_object(&obj);
 		if (!resp)
 			return NULL;
@@ -874,7 +878,7 @@ static mi_response_t *do_perf_probe(str *key, str *col_s)
 	if (!col)
 		return init_mi_error(404, MI_SSTR("no such collection"));
 
-	rc = pcache_ht_probe(col->htable, key, &vlen, &exp);
+	rc = pcache_ht_probe(col->htable, key, &vlen, &exp, NULL);
 	if (rc == -2)
 		return init_mi_error(404, MI_SSTR("key not found"));
 	if (rc < 0)
@@ -1172,6 +1176,22 @@ static void pcache_pull_serve(bin_packet_t *in)
 		return;
 	}
 	col = col_by_name(&coll);
+	if (col && col->htable && col->replicate) {
+		int is_counter = 0;
+
+		/* Classify before reading: a native counter counts what happened
+		 * on THIS node, so handing it to a peer would import our tally as
+		 * if it were theirs - and the read path formats it as a decimal
+		 * string, which would silently arrive as a plain value and stop
+		 * being a counter at all.  Refuse to serve one; the requester
+		 * treats it as "not here", which is the truth from its side. */
+		if (pcache_ht_probe(col->htable, &key, NULL, NULL, &is_counter) == 0
+		        && is_counter) {
+			LM_DBG("pull: <%.*s> is a counter - not portable, not served\n",
+				key.len, key.s);
+			goto reply;
+		}
+	}
 	if (col && col->htable && col->replicate &&
 	        pcache_ht_fetch_ex(col->htable, &key, &val, &exp) == 0) {
 		/* Hand over the ORIGINAL lifetime, never a fresh TTL: a copy that
@@ -1334,11 +1354,33 @@ static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 		lock_get(pull_lock);
 		if (sl->done) {
 			if (sl->vlen <= outlen) {
+				str v;
+
 				memcpy(out, sl->val, sl->vlen);
 				*vlen = sl->vlen;
 				if (expires)
 					*expires = sl->expires;
 				rc = 1;
+
+				/* Keep it: this is what makes a pull a repair rather than
+				 * a relay - the next request for this key is answered
+				 * locally in about a microsecond, and the cluster is
+				 * never asked about it again.  Store under the expiry the
+				 * owner had, so our copy dies with theirs; a blob whose
+				 * lifetime elapsed while it was in flight is not worth
+				 * storing at all. */
+				v.s = sl->val;
+				v.len = sl->vlen;
+				if (sl->expires && sl->expires <= get_ticks()) {
+					LM_DBG("pulled <%.*s> had already expired in flight - "
+						"not stored\n", key->len, key->s);
+				} else if (pcache_ht_store(col->htable, key, &v,
+				        sl->expires) < 0) {
+					LM_ERR("could not store the pulled value for <%.*s>\n",
+						key->len, key->s);
+				} else {
+					pull_stats[PULL_ST_STORED]++;
+				}
 			}
 			lock_release(pull_lock);
 			goto out;
@@ -2737,7 +2779,7 @@ static int mod_init(void)
 		} else {
 			pull_slots = shm_malloc(PCACHE_PULL_SLOTS * sizeof *pull_slots);
 			pull_next_id = shm_malloc(sizeof *pull_next_id);
-			pull_stats = shm_malloc(4 * sizeof *pull_stats);
+			pull_stats = shm_malloc(PULL_ST_MAX * sizeof *pull_stats);
 			pull_lock = lock_alloc();
 			if (!pull_slots || !pull_next_id || !pull_stats || !pull_lock ||
 			        !lock_init(pull_lock)) {
@@ -2746,7 +2788,7 @@ static int mod_init(void)
 			}
 			memset(pull_slots, 0, PCACHE_PULL_SLOTS * sizeof *pull_slots);
 			*pull_next_id = 0;
-			memset(pull_stats, 0, 4 * sizeof *pull_stats);
+			memset(pull_stats, 0, PULL_ST_MAX * sizeof *pull_stats);
 			mark_collections(replicate_collections, "replicate_collections",
 				COL_FLAG_REPLICATE);
 			pull_ready = 1;

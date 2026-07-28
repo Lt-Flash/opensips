@@ -409,8 +409,23 @@ modparam("cachedb_perf", "sync_shtag", "vip1/1")
 		</para>
 		<para>
 		Requires <varname>sync_cluster_id</varname> and the clusterer.
-		A pulled key keeps the lifetime it had on the node that held it,
-		never a fresh one.
+		</para>
+		<para>
+		A pulled key is <emphasis>kept</emphasis>: the next request for it
+		is answered locally and the cluster is never asked again, which is
+		what makes this a repair rather than a relay.  The copy keeps the
+		expiry the owner had - never a fresh lifetime - so it dies when
+		the original does instead of outliving it.  Note the consequence
+		for sizing: as traffic spreads, every node tends toward holding
+		every key, so size the arena for the whole keyspace rather than
+		its share of it.
+		</para>
+		<para>
+		Native counters (created with <emphasis>cache_add</emphasis>) are
+		never served to a peer.  A counter records what happened on the
+		node holding it, so handing it over would import one node's tally
+		into another; the requester is told the key is not there, which
+		from its side is true.
 		</para>
 		<para>
 		<emphasis>

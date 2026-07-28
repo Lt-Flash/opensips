@@ -461,7 +461,7 @@ int pcache_ht_fetch_ex(pcache_htable_t *ht, const str *key, str *val,
  * retry, overflow leg, expiry), stopping before the copy-out, so a probe
  * can never disagree with a read about whether a key is there. */
 int pcache_ht_probe(pcache_htable_t *ht, const str *key, unsigned int *vlen,
-		unsigned int *expires)
+		unsigned int *expires, int *is_counter)
 {
 	unsigned int len = 0, exp = 0;
 	int rc;
@@ -470,6 +470,8 @@ int pcache_ht_probe(pcache_htable_t *ht, const str *key, unsigned int *vlen,
 		*vlen = 0;
 	if (expires)
 		*expires = 0;
+	if (is_counter)
+		*is_counter = 0;
 
 	rc = _pcache_ht_fetch_buf(ht, key, NULL, 0, &len, get_ticks(),
 		&exp, NULL);
@@ -479,6 +481,11 @@ int pcache_ht_probe(pcache_htable_t *ht, const str *key, unsigned int *vlen,
 		*vlen = len;
 	if (expires)
 		*expires = exp;
+	/* the shared core reports a native counter as 1; a probe has nothing
+	 * to hand back for one, but a caller may need to know it is not a
+	 * plain value (a counter's meaning is local to the node holding it) */
+	if (is_counter)
+		*is_counter = (rc == 1);
 	return 0;
 }
 

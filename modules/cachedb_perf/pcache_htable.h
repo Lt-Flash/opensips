@@ -223,10 +223,12 @@ int pcache_ht_store(pcache_htable_t *ht, const str *key, const str *val,
  * alone.  Intended for answering "do I have this key?" - a cross-node
  * lookup asking peers, or a script/MI existence test.
  *
- * @vlen and @expires are optional; @expires is absolute ticks, 0 = never.
+ * @vlen, @expires and @is_counter are optional; @expires is absolute ticks
+ * (0 = never); @is_counter reports a native counter, whose value is a
+ * per-node quantity rather than a portable one.
  * @return 0 = present and live, -2 = absent or expired, -1 = bad args. */
 int pcache_ht_probe(pcache_htable_t *ht, const str *key, unsigned int *vlen,
-		unsigned int *expires);
+		unsigned int *expires, int *is_counter);
 
 int pcache_ht_fetch_buf(pcache_htable_t *ht, const str *key, char *buf,
 		unsigned int buflen, unsigned int *vlen, unsigned int *needed);

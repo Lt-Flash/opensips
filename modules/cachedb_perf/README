@@ -37,8 +37,8 @@ cachedb_perf Module
               1.7.1. perf_stats
               1.7.2. perf_stats_reset
               1.7.3. Key introspection: perf_keys / perf_scan /
-                      perf_dump / perf_get / perf_set / perf_ttl /
-                      perf_del
+                      perf_dump / perf_get / perf_probe / perf_set
+                      / perf_ttl / perf_del
 
               1.7.4. perf_save / perf_load
               1.7.5. perf_sync
@@ -546,7 +546,7 @@ opensips-cli -x mi cachedb_perf:perf_stats_reset
 opensips-cli -x mi cachedb_perf:perf_stats_reset th
 
 1.7.3. Key introspection: perf_keys / perf_scan / perf_dump /
-perf_get / perf_set / perf_ttl / perf_del
+perf_get / perf_probe / perf_set / perf_ttl / perf_del
 
    These give an operator the visibility that cachedb_local lacks.
    All are lock-free: the walkers take no bucket locks (seqlock
@@ -570,6 +570,15 @@ perf_get / perf_set / perf_ttl / perf_del
        includes the values; values are opt-in, never the default.
      * perf_get <key> [collection] - one key: its value, remaining
        TTL (-1 = never) and size.
+     * perf_probe <key> [collection] - is the key here: its size
+       and remaining TTL, but never the value. Not merely a
+       cheaper perf_get - it shares the whole read path (same
+       optimistic loop, lock fallback and expiry rules) and stops
+       before the copy-out, so it cannot disagree with a read
+       about whether a key is present; it allocates nothing and
+       never touches the record's payload. Use it to answer “do
+       you have this key?”, where a read would pay for bytes
+       nobody wants.
      * perf_set <key> <value> [ttl] [collection] - write one key;
        ttl is seconds (0 or omitted = never expires).
      * perf_ttl <glob> <ttl> [collection] - re-arm the TTL of

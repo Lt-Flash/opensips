@@ -608,7 +608,7 @@ opensips-cli -x mi cachedb_perf:perf_stats_reset th
 	</section>
 
 	<section id="mi_introspection" xreflabel="introspection">
-		<title>Key introspection: perf_keys / perf_scan / perf_dump / perf_get / perf_set / perf_ttl / perf_del</title>
+		<title>Key introspection: perf_keys / perf_scan / perf_dump / perf_get / perf_probe / perf_set / perf_ttl / perf_del</title>
 		<para>
 		These give an operator the visibility that
 		<emphasis>cachedb_local</emphasis> lacks. All are lock-free: the
@@ -637,6 +637,15 @@ opensips-cli -x mi cachedb_perf:perf_stats_reset th
 			values are opt-in, never the default.</para></listitem>
 		<listitem><para><emphasis>perf_get &lt;key&gt; [collection]</emphasis>
 			- one key: its value, remaining TTL (-1 = never) and size.</para></listitem>
+		<listitem><para><emphasis>perf_probe &lt;key&gt; [collection]</emphasis>
+			- is the key here: its size and remaining TTL, but never the value.
+			Not merely a cheaper <emphasis>perf_get</emphasis> - it shares the
+			whole read path (same optimistic loop, lock fallback and expiry
+			rules) and stops before the copy-out, so it cannot disagree with a
+			read about whether a key is present; it allocates nothing and never
+			touches the record's payload. Use it to answer <quote>do you have
+			this key?</quote>, where a read would pay for bytes nobody
+			wants.</para></listitem>
 		<listitem><para><emphasis>perf_set &lt;key&gt; &lt;value&gt; [ttl] [collection]</emphasis>
 			- write one key; <emphasis>ttl</emphasis> is seconds (0 or omitted =
 			never expires).</para></listitem>

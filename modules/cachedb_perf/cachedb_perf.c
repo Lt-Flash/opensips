@@ -740,6 +740,41 @@ err:
 }
 
 /* perf_get <key> [collection] - value + TTL + size for one key */
+/* perf_probe <key> [collection] - is the key here, and what does it look
+ * like?  Deliberately never returns the value: this is the existence test
+ * a cross-node lookup would run on a peer, so it must cost what that costs
+ * (no allocation, no copy, the payload never touched). */
+static mi_response_t *do_perf_probe(str *key, str *col_s)
+{
+	pcache_col_t *col;
+	mi_response_t *resp;
+	mi_item_t *obj;
+	unsigned int vlen = 0, exp = 0;
+	int rc;
+
+	col = col_by_name(col_s);
+	if (!col)
+		return init_mi_error(404, MI_SSTR("no such collection"));
+
+	rc = pcache_ht_probe(col->htable, key, &vlen, &exp);
+	if (rc == -2)
+		return init_mi_error(404, MI_SSTR("key not found"));
+	if (rc < 0)
+		return init_mi_error(500, MI_SSTR("internal error"));
+
+	resp = init_mi_result_object(&obj);
+	if (!resp)
+		return NULL;
+	if (add_mi_string(obj, MI_SSTR("key"), key->s, key->len) < 0 ||
+	    add_mi_number(obj, MI_SSTR("size"), vlen) < 0 ||
+	    add_mi_number(obj, MI_SSTR("ttl"),
+	        exp ? (int)(exp - get_ticks()) : -1) < 0) {
+		free_mi_response(resp);
+		return init_mi_error(500, MI_SSTR("internal error"));
+	}
+	return resp;
+}
+
 static mi_response_t *do_perf_get(str *key, str *col_s)
 {
 	pcache_col_t *col;
@@ -1193,6 +1228,11 @@ static mi_response_t *mi_perf_scan_3(const mi_params_t *params, struct mi_handle
 static mi_response_t *mi_perf_scan_cc(const mi_params_t *params, struct mi_handler *a)
 { int cu, co; MI_I("cursor", cu); MI_I("count", co); return do_perf_scan(cu, NULL, co); }
 
+static mi_response_t *mi_perf_probe_1(const mi_params_t *params, struct mi_handler *a)
+{ str k; MI_S("key", k); return do_perf_probe(&k, NULL); }
+static mi_response_t *mi_perf_probe_2(const mi_params_t *params, struct mi_handler *a)
+{ str k, c; MI_S("key", k); MI_S("collection", c); return do_perf_probe(&k, &c); }
+
 static mi_response_t *mi_perf_get_1(const mi_params_t *params, struct mi_handler *a)
 { str k; MI_S("key", k); return do_perf_get(&k, NULL); }
 static mi_response_t *mi_perf_get_2(const mi_params_t *params, struct mi_handler *a)
@@ -1275,6 +1315,12 @@ static const mi_export_t mi_cmds[] = {
 		{mi_perf_dump_2, {"glob", "collection", 0}},
 		{mi_perf_dump_gl, {"glob", "limit", 0}},
 		{mi_perf_dump_3, {"glob", "collection", "limit", 0}},
+		{EMPTY_MI_RECIPE}},
+		{0}
+	},
+	{ "perf_probe", "one key: is it here, its TTL and size - no value", 0, 0, {
+		{mi_perf_probe_1, {"key", 0}},
+		{mi_perf_probe_2, {"key", "collection", 0}},
 		{EMPTY_MI_RECIPE}},
 		{0}
 	},

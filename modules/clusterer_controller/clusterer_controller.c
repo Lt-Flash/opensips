@@ -231,6 +231,14 @@
 #define CL_CTR_MAGIC_SZ          2
 static const unsigned char CL_CTR_PACKET_MAGIC[CL_CTR_MAGIC_SZ]    = { 0xCC, 0x00 };
 static const unsigned char CL_CTR_BOOTSTRAP_MAGIC[CL_CTR_MAGIC_SZ] = { 0xCC, 0x01 };
+/* Consumer traffic carries its own magic.  It is encrypted with the same
+ * session key as everything else - the distinction exists purely so the
+ * rate limiter, which runs BEFORE decryption and therefore cannot see a
+ * packet's type, can charge consumer data against its own budget instead
+ * of the control plane's.  Without this, a consumer sending faster than
+ * the control-plane limit is silently throttled, and control packets and
+ * data compete for one allowance. */
+static const unsigned char CL_CTR_CONSUMER_MAGIC[CL_CTR_MAGIC_SZ]  = { 0xCC, 0x02 };
 
 /* Packet type bytes */
 #define CL_CTR_PKT_ALIVE            0x01
@@ -383,11 +391,20 @@ static const unsigned char CL_CTR_BOOTSTRAP_MAGIC[CL_CTR_MAGIC_SZ] = { 0xCC, 0x0
  * Tracks up to CL_CTR_RATE_TBL_SZ source IPs with a 1-second sliding window. */
 #define CL_CTR_RATE_TBL_SZ  256    /* one slot per peer; matches max cluster size */
 #define CL_CTR_RATE_LIMIT    20    /* max packets per second per source IP        */
+/* Consumer data is bulk by nature - one pull is a packet each way - so it
+ * gets a far larger allowance than the handful of control packets a peer
+ * sends per second.  Separate counters, so neither can starve the other:
+ * a flood of consumer traffic can never crowd out JOIN/ALIVE, and a busy
+ * consumer is not throttled at the control plane's rate. */
+#define CL_CTR_CONSUMER_RATE_DEFAULT 1000
 
 typedef struct {
     uint32_t ip;           /* network byte order; 0 = empty slot */
     time_t   window_start;
     int      count;
+    /* consumer traffic is counted apart from control traffic, against its
+     * own budget, so neither class can exhaust the other's allowance */
+    int      consumer_count;
 } cl_ctr_rate_entry_t;
 
 /* Max packet sizes: wire(20) = magic(8) + nonce(12); plain(5) = type(1) + seq(4)
@@ -764,6 +781,7 @@ static int                    manage_shtags = 1;
  *   0           = not sticky - pure highest-IP election, so a higher-IP node
  *                 takes over as master as soon as it appears (more handovers). */
 static int                    master_stickiness = 1;
+static int      consumer_rate_limit = CL_CTR_CONSUMER_RATE_DEFAULT;
 static char     my_bin_sockets[CL_CTR_MAX_BIN_SOCKETS][CL_CTR_MAX_BIN_SOCK_LEN];
 static int      my_bin_count                            = 0;
 
@@ -798,6 +816,7 @@ static const param_export_t params[] = {
     {"interface",  STR_PARAM, &my_interface},
     {"query_time", INT_PARAM, &query_time},
     {"password",      STR_PARAM, &password},
+    {"consumer_rate_limit", INT_PARAM, &consumer_rate_limit},
     {"manage_shtags", INT_PARAM, &manage_shtags},
     {"master_stickiness", INT_PARAM, &master_stickiness},
     {"on_config_mismatch", STR_PARAM, &on_config_mismatch_s},
@@ -4525,26 +4544,43 @@ static void cl_ctr_handle_key_handoff(const char *payload, int payload_len,
  * Finds or creates a 1-second sliding-window counter for src_ip.
  * @return 0 if within CL_CTR_RATE_LIMIT packets/s, -1 to drop.
  */
-static int cl_ctr_rate_check(cl_ctr_cluster_t *cl, uint32_t src_ip)
+static int cl_ctr_rate_check(cl_ctr_cluster_t *cl, uint32_t src_ip,
+                             int is_consumer)
 {
     time_t            now     = time(NULL);
     cl_ctr_rate_entry_t  *oldest  = NULL;
+    int               limit   = is_consumer ? consumer_rate_limit
+                                            : CL_CTR_RATE_LIMIT;
     int               i;
 
     for (i = 0; i < CL_CTR_RATE_TBL_SZ; i++) {
         cl_ctr_rate_entry_t *e = &cl->rate_tbl[i];
+        int *cnt;
+
         if (e->ip == 0) {
             if (!oldest) oldest = e;             /* prefer empty slot  */
             continue;
         }
         if (e->ip == src_ip) {
+            cnt = is_consumer ? &e->consumer_count : &e->count;
             if (now > e->window_start) {         /* new second         */
-                e->window_start = now;
-                e->count        = 1;
+                e->window_start   = now;
+                e->count          = 0;
+                e->consumer_count = 0;
+                *cnt              = 1;
                 return 0;
             }
-            if (++e->count > CL_CTR_RATE_LIMIT)
+            if (++(*cnt) > limit) {
+                /* Say so, once per window per source: a silent drop here
+                 * looks exactly like packet loss to whatever was sending,
+                 * which is a miserable thing to debug. */
+                if (*cnt == limit + 1)
+                    LM_WARN("clusterer_controller: [cluster %d] %s rate "
+                        "limit of %d/s exceeded by a peer - dropping\n",
+                        cl->cluster_id,
+                        is_consumer ? "consumer" : "control", limit);
                 return -1;
+            }
             return 0;
         }
         /* track oldest entry for eviction when table is full */
@@ -4553,9 +4589,14 @@ static int cl_ctr_rate_check(cl_ctr_cluster_t *cl, uint32_t src_ip)
     }
 
     /* new source IP - claim oldest/empty slot */
-    oldest->ip           = src_ip;
-    oldest->window_start = now;
-    oldest->count        = 1;
+    oldest->ip             = src_ip;
+    oldest->window_start   = now;
+    oldest->count          = 0;
+    oldest->consumer_count = 0;
+    if (is_consumer)
+        oldest->consumer_count = 1;
+    else
+        oldest->count = 1;
     return 0;
 }
 
@@ -4743,7 +4784,8 @@ static void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
     }
 
     if (memcmp(buf, CL_CTR_PACKET_MAGIC,   CL_CTR_MAGIC_SZ) != 0 &&
-        memcmp(buf, CL_CTR_BOOTSTRAP_MAGIC, CL_CTR_MAGIC_SZ) != 0) {
+        memcmp(buf, CL_CTR_BOOTSTRAP_MAGIC, CL_CTR_MAGIC_SZ) != 0 &&
+        memcmp(buf, CL_CTR_CONSUMER_MAGIC,  CL_CTR_MAGIC_SZ) != 0) {
 	LM_DBG("clusterer_controller: bad magic, dropping\n");
 	return;
     }
@@ -4772,7 +4814,8 @@ static void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
     }
 
     /* Rate-limit before any crypto work to shed floods cheaply. */
-    if (cl_ctr_rate_check(cl, src_addr.sin_addr.s_addr) < 0)
+    if (cl_ctr_rate_check(cl, src_addr.sin_addr.s_addr,
+            memcmp(buf, CL_CTR_CONSUMER_MAGIC, CL_CTR_MAGIC_SZ) == 0) < 0)
 	return;
 
     /* Resolve sender IP once - used for HMAC warning and MEMBER_LIST dispatch */
@@ -5014,7 +5057,8 @@ static void cl_ctr_maybe_forward(const char *buf, int n,
 
     /* Shed floods before allocating: charge the source against our own limiter
      * (the target re-checks after it receives the forward). */
-    if (cl_ctr_rate_check(from, src->sin_addr.s_addr) < 0)
+    if (cl_ctr_rate_check(from, src->sin_addr.s_addr,
+            memcmp(buf, CL_CTR_CONSUMER_MAGIC, CL_CTR_MAGIC_SZ) == 0) < 0)
 	return;
 
     /* worker_proc_no is written once at worker fork and stable thereafter. */
@@ -6758,7 +6802,11 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param)
         seq   = htonl(++cl->peers->my_seq);
         id_be = htons(my_node_id);
 
-        memcpy(pkt, CL_CTR_PACKET_MAGIC, CL_CTR_MAGIC_SZ);
+        /* the consumer tag, so the receiver's pre-decrypt rate limiter
+         * charges this against the consumer budget rather than the much
+         * smaller control-plane one.  Same session key either way - the
+         * tag is a routing hint, not a key selector here. */
+        memcpy(pkt, CL_CTR_CONSUMER_MAGIC, CL_CTR_MAGIC_SZ);
         pkt[CL_CTR_WIRE_HDR_SZ] = (char)CL_CTR_PKT_CONSUMER;
         memcpy(pkt + CL_CTR_WIRE_HDR_SZ + 1, &seq, CL_CTR_SEQ_SZ);
         memcpy(pkt + CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ, &id_be,

@@ -2316,6 +2316,73 @@ struct module_exports exports = {
  * no meaning for a local cache.  No collection in the URL means the
  * default one.  Matching is exact and an unknown name is a hard error.
  */
+/* Connections this module created, so a con arriving through the exported
+ * pull API can be recognised before anything is read out of it.
+ *
+ * The API is bound by name through find_export, which offers no type safety
+ * whatever: any module that loads cachedb_perf can call these entry points
+ * and pass a cachedb_con belonging to some other backend.  Reading ->data as
+ * a pcache_con at that point is a type confusion - the field where this
+ * module keeps its collection pointer is, in a redis or local connection,
+ * whatever that module put there.  So the pointer is checked against this
+ * list instead, which never dereferences the stranger.
+ *
+ * Per-process (pkg), like the connections themselves, and short - one entry
+ * per URL this process opened. */
+struct pcache_con_reg {
+	pcache_con            *con;
+	struct pcache_con_reg *next;
+};
+static struct pcache_con_reg *pcache_con_reg_head;
+
+static void pcache_con_register(pcache_con *c)
+{
+	struct pcache_con_reg *r = pkg_malloc(sizeof(*r));
+
+	if (!r) {
+		LM_ERR("out of pkg memory registering a connection\n");
+		return;
+	}
+	r->con = c;
+	r->next = pcache_con_reg_head;
+	pcache_con_reg_head = r;
+}
+
+static void pcache_con_unregister(pcache_con *c)
+{
+	struct pcache_con_reg **p = &pcache_con_reg_head;
+
+	while (*p) {
+		if ((*p)->con == c) {
+			struct pcache_con_reg *dead = *p;
+
+			*p = dead->next;
+			pkg_free(dead);
+			return;
+		}
+		p = &(*p)->next;
+	}
+}
+
+/* The collection behind a connection, or NULL when the connection is not
+ * ours.  Every exported entry point goes through this. */
+static pcache_col_t *pcache_col_of(cachedb_con *con)
+{
+	struct pcache_con_reg *r;
+
+	if (!con || !con->data)
+		return NULL;
+	for (r = pcache_con_reg_head; r; r = r->next)
+		if (r->con == (pcache_con *)con->data)
+			return r->con->col;
+
+	LM_ERR("a connection that this module did not open was passed to its "
+		"pull API - refusing it.  The caller is holding a handle to a "
+		"different cachedb backend; only a perf:// connection can be "
+		"pulled through\n");
+	return NULL;
+}
+
 static pcache_con *pcache_new_connection(struct cachedb_id *id)
 {
 	pcache_con *con;
@@ -2366,6 +2433,7 @@ static pcache_con *pcache_new_connection(struct cachedb_id *id)
 	LM_DBG("URL <%s> bound to collection <%.*s>\n",
 		id->initial_url, col->col_name.len, col->col_name.s);
 
+	pcache_con_register(con);
 	return con;
 }
 
@@ -2376,6 +2444,8 @@ static cachedb_con *pcache_init(str *url)
 
 static void pcache_free_connection(cachedb_pool_con *con)
 {
+	pcache_con_unregister((pcache_con *)con);
+
 	pkg_free(con);
 }
 
@@ -3080,7 +3150,7 @@ static void mark_collections(char *csv_s, const char *what, enum col_flag f)
 static int pcache_api_pull_start(cachedb_con *con, str *key, int *fd,
 		unsigned int *handle)
 {
-	pcache_col_t *col = con ? ((pcache_con *)con->data)->col : NULL;
+	pcache_col_t *col = pcache_col_of(con);
 
 	if (!col || !key || !fd || !handle)
 		return -1;
@@ -3090,7 +3160,7 @@ static int pcache_api_pull_start(cachedb_con *con, str *key, int *fd,
 static int pcache_api_pull_start_at(cachedb_con *con, str *key, int node_id,
 		int *fd, unsigned int *handle)
 {
-	pcache_col_t *col = con ? ((pcache_con *)con->data)->col : NULL;
+	pcache_col_t *col = pcache_col_of(con);
 
 	if (!col || !key || !fd || !handle)
 		return -1;
@@ -3107,7 +3177,7 @@ static int pcache_api_my_node_id(cachedb_con *con)
 static int pcache_api_pull_finish(cachedb_con *con, str *key,
 		unsigned int handle, str *val)
 {
-	pcache_col_t *col = con ? ((pcache_con *)con->data)->col : NULL;
+	pcache_col_t *col = pcache_col_of(con);
 	char buf[PCACHE_PULL_MAX_VAL];
 	unsigned int vlen = 0;
 	int rc;

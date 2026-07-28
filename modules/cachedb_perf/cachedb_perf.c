@@ -106,6 +106,68 @@ static struct clusterer_binds clusterer_api;
 static str pcache_sync_cap = str_init("cachedb-perf-sync");
 static int sync_cluster_id = 0;        /* modparam; 0 = off */
 static int sync_ready = 0;             /* clusterer loaded + capability set */
+
+/* Cluster membership view (CP-15.4).  The clusterer node list changes at
+ * runtime (under clusterer_controller, on every join/leave/eviction), so
+ * anything that fans work out to peers must snapshot the member set and
+ * notice when it changed mid-flight.  The event callback below maintains
+ * this shm view; `generation` is the load-bearing field - a future
+ * cross-node pull snapshots it together with its responder set and
+ * re-checks it on completion, because an absence conclusion drawn across
+ * a membership change is unsafe.  Counters are monitoring-grade: plain
+ * stores + atomic bumps, no lock (events are rare and single-field). */
+struct pcache_cluster_view {
+	unsigned int generation;     /* bumped on every UP/DOWN            */
+	unsigned int node_ups;       /* lifetime UP events                 */
+	unsigned int node_downs;     /* lifetime DOWN events               */
+	unsigned int last_change;    /* ticks of the latest event, 0=never */
+	int          last_node;      /* node id of the latest event        */
+	int          last_was_up;    /* 1 = UP, 0 = DOWN                   */
+};
+static struct pcache_cluster_view *pc_view;
+
+static void pcache_cluster_event(enum clusterer_event ev, int node_id)
+{
+	if (ev != CLUSTER_NODE_UP && ev != CLUSTER_NODE_DOWN)
+		return;   /* sync-protocol events: we register startup_sync=0 */
+	if (!pc_view)
+		return;
+
+	pc_view->last_node   = node_id;
+	pc_view->last_was_up = (ev == CLUSTER_NODE_UP);
+	pc_view->last_change = get_ticks();
+	if (ev == CLUSTER_NODE_UP)
+		__sync_fetch_and_add(&pc_view->node_ups, 1);
+	else
+		__sync_fetch_and_add(&pc_view->node_downs, 1);
+	__sync_fetch_and_add(&pc_view->generation, 1);
+
+	LM_INFO("cluster %d membership: node %d went %s (generation %u)\n",
+		sync_cluster_id, node_id, ev == CLUSTER_NODE_UP ? "UP" : "DOWN",
+		pc_view->generation);
+}
+
+/* Snapshot the live peer set (the clusterer list holds peers only, not
+ * this node) plus the membership generation it was taken under.  A caller
+ * that fans work out to these peers re-reads the generation afterwards:
+ * a change means the set went stale mid-flight.  Returns the number of
+ * ids written, or -1 when cluster sync is not active. */
+static int pcache_cluster_members(int *ids, int max, unsigned int *gen)
+{
+	clusterer_node_t *list, *n;
+	int cnt = 0;
+
+	if (!sync_ready || !pc_view)
+		return -1;
+	if (gen)
+		*gen = pc_view->generation;
+	list = clusterer_api.get_nodes(sync_cluster_id);
+	for (n = list; n && cnt < max; n = n->next)
+		ids[cnt++] = n->node_id;
+	if (list)
+		clusterer_api.free_nodes(list);
+	return cnt;
+}
 #define PCACHE_SYNC_RELOAD  1
 #define PCACHE_SYNC_VERSION 1
 /* raised on a node that reloaded because a peer issued perf_sync */
@@ -393,6 +455,36 @@ static mi_response_t *mi_perf_stats(str *col_s)
 	    add_mi_string(obj, MI_SSTR("memory_backing"),
 	        (char *)tier, strlen(tier)) < 0)
 		goto err;
+
+	/* Cluster membership, when sync is active.  peers_up counts the OTHER
+	 * nodes the clusterer can currently reach; the generation ticks on
+	 * every membership change, so two equal reads bracket a quiet period. */
+	if (sync_ready && pc_view) {
+		mi_item_t *clobj = add_mi_object(obj, MI_SSTR("cluster"));
+		int ids[64], nup;
+		unsigned int gen = 0;
+
+		if (!clobj)
+			goto err;
+		nup = pcache_cluster_members(ids, 64, &gen);
+		if (add_mi_number(clobj, MI_SSTR("cluster_id"), sync_cluster_id) < 0 ||
+		    add_mi_number(clobj, MI_SSTR("peers_up"), nup < 0 ? 0 : nup) < 0 ||
+		    add_mi_number(clobj, MI_SSTR("membership_generation"), gen) < 0 ||
+		    add_mi_number(clobj, MI_SSTR("node_ups"), pc_view->node_ups) < 0 ||
+		    add_mi_number(clobj, MI_SSTR("node_downs"),
+		        pc_view->node_downs) < 0 ||
+		    add_mi_number(clobj, MI_SSTR("last_change_ago"),
+		        pc_view->last_change ?
+		            (int)(get_ticks() - pc_view->last_change) : -1) < 0)
+			goto err;
+		if (pc_view->last_change) {
+			char lbuf[32];
+			int ln = snprintf(lbuf, sizeof lbuf, "%s:%d",
+				pc_view->last_was_up ? "up" : "down", pc_view->last_node);
+			if (add_mi_string(clobj, MI_SSTR("last_event"), lbuf, ln) < 0)
+				goto err;
+		}
+	}
 
 	return resp;
 err:
@@ -2081,8 +2173,13 @@ static int mod_init(void)
 			LM_WARN("clusterer module not available - cluster sync disabled "
 				"(perf_sync will save to the DB but not signal peers); load "
 				"clusterer before cachedb_perf to enable it\n");
-		} else if (clusterer_api.register_capability(&pcache_sync_cap,
-		        pcache_sync_recv, NULL, sync_cluster_id, 0, NODE_CMP_ANY) < 0) {
+		} else if ((pc_view = shm_malloc(sizeof *pc_view)) == NULL) {
+			LM_WARN("no shm for the cluster membership view - cluster "
+				"sync disabled\n");
+		} else if (memset(pc_view, 0, sizeof *pc_view),
+		        clusterer_api.register_capability(&pcache_sync_cap,
+		        pcache_sync_recv, pcache_cluster_event, sync_cluster_id,
+		        0, NODE_CMP_ANY) < 0) {
 			LM_WARN("could not register the cluster-sync capability - "
 				"cluster sync disabled\n");
 		} else {

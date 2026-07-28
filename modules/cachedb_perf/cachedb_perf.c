@@ -108,6 +108,51 @@ static int sync_cluster_id = 0;        /* modparam; 0 = off */
 static char *sync_shtag_str;           /* modparam "name/cluster_id"; failover sync */
 static str  pc_shtag;                  /* parsed tag name                    */
 static int  pc_shtag_cid;              /* parsed tag cluster                 */
+
+/* ---- CP-15.5: cross-node pull ---------------------------------------- */
+/* CP-15.5 cross-node pull, on the same capability as the sync packets */
+#define PCACHE_PULL_REQ     2
+#define PCACHE_PULL_RPL     3
+
+#define PCACHE_PULL_SLOTS      64     /* concurrent in-flight pulls        */
+#define PCACHE_PULL_MAX_VAL    8192   /* value size a pull will carry      */
+#define PCACHE_PULL_MAX_KEY    256
+static char *pull_transport_str;       /* "bin" (default) | "clctr"          */
+static int   pull_timeout_ms = 50;     /* how long a miss waits for peers    */
+static char *replicate_collections;    /* CSV opt-in; nothing pulls by default */
+static int   pull_ready;               /* transport up AND a collection opted in */
+
+/* One in-flight pull.  The request is issued by whichever process took the
+ * miss, but the replies land in whichever process the transport delivers
+ * them to - so the rendezvous has to live in shm, keyed by request id.
+ * (Today the requester polls this slot; the async work of CP-15.9 replaces
+ * the poll with an eventfd it registers here, and nothing else changes.) */
+struct pcache_pull_slot {
+	unsigned int id;                 /* 0 = free                          */
+	unsigned int deadline;           /* ticks                             */
+	unsigned int gen;                /* membership generation at dispatch */
+	int          expect;             /* peers we asked                    */
+	int          negative;           /* peers that answered "not here"    */
+	int          done;               /* 1 = a value landed                */
+	unsigned int expires;            /* ABSOLUTE, as the owner holds it   */
+	unsigned int vlen;
+	char         key[PCACHE_PULL_MAX_KEY];
+	int          klen;
+	char         col[64];
+	int          collen;
+	char         val[PCACHE_PULL_MAX_VAL];
+};
+static struct pcache_pull_slot *pull_slots;
+static gen_lock_t *pull_lock;
+static unsigned int *pull_next_id;     /* shm: ids must be unique per node  */
+
+/* pull counters, deliberately separate from hits/misses so a pulled key
+ * cannot flatter the local hit rate (R6) */
+static unsigned int *pull_stats;       /* [requested, served, received, timeouts] */
+#define PULL_ST_REQUESTED 0
+#define PULL_ST_SERVED    1
+#define PULL_ST_RECEIVED  2
+#define PULL_ST_TIMEOUT   3
 static int sync_ready = 0;             /* clusterer loaded + capability set */
 
 /* Cluster membership view (CP-15.4).  The clusterer node list changes at
@@ -198,6 +243,8 @@ static int fixup_check_wvar(void **param);
 /* introspection MI (CP-18) - defined just above the mi_cmds table; these
  * forward decls let that table sit before the glob/collection helpers */
 static pcache_col_t *col_by_name(const str *name);
+static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
+		unsigned int outlen, unsigned int *vlen, unsigned int *expires);
 static char *glob_dup(const str *glob);
 static int perf_del_run(pcache_col_t *col, str *glob);
 static inline unsigned int ttl_to_abs(int expires);
@@ -247,6 +294,9 @@ static const param_export_t params[] = {
 	{ "persist_collections", STR_PARAM, &persist_collections },
 	{ "sync_cluster_id",     INT_PARAM, &sync_cluster_id },
 	{ "sync_shtag",          STR_PARAM, &sync_shtag_str },
+	{ "pull_transport",      STR_PARAM, &pull_transport_str },
+	{ "pull_timeout_ms",     INT_PARAM, &pull_timeout_ms },
+	{ "replicate_collections", STR_PARAM, &replicate_collections },
 	{0,0,0}
 };
 
@@ -480,6 +530,16 @@ static mi_response_t *mi_perf_stats(str *col_s)
 		    add_mi_number(clobj, MI_SSTR("last_change_ago"),
 		        pc_view->last_change ?
 		            (int)(get_ticks() - pc_view->last_change) : -1) < 0)
+			goto err;
+		if (pull_ready && pull_stats &&
+		    (add_mi_number(clobj, MI_SSTR("pulls_requested"),
+		        pull_stats[PULL_ST_REQUESTED]) < 0 ||
+		     add_mi_number(clobj, MI_SSTR("pulls_received"),
+		        pull_stats[PULL_ST_RECEIVED]) < 0 ||
+		     add_mi_number(clobj, MI_SSTR("pulls_served"),
+		        pull_stats[PULL_ST_SERVED]) < 0 ||
+		     add_mi_number(clobj, MI_SSTR("pulls_timed_out"),
+		        pull_stats[PULL_ST_TIMEOUT]) < 0))
 			goto err;
 		if (pc_view->last_change) {
 			char lbuf[32];
@@ -740,6 +800,64 @@ err:
 }
 
 /* perf_get <key> [collection] - value + TTL + size for one key */
+/* perf_pull <key> [collection] - ask the cluster for a key this node does
+ * not have.  The MI face exists to exercise and observe the protocol on
+ * its own, before a SIP path uses it: it reports where the answer came
+ * from, which is what makes a failing pull diagnosable. */
+static mi_response_t *do_perf_pull(str *key, str *col_s)
+{
+	pcache_col_t *col;
+	mi_response_t *resp;
+	mi_item_t *obj;
+	char buf[PCACHE_PULL_MAX_VAL];
+	unsigned int vlen = 0, exp = 0;
+	int rc;
+
+	col = col_by_name(col_s);
+	if (!col)
+		return init_mi_error(404, MI_SSTR("no such collection"));
+	if (!pull_ready)
+		return init_mi_error(500,
+			MI_SSTR("cross-node pull not active (replicate_collections)"));
+	if (!col->replicate)
+		return init_mi_error(500,
+			MI_SSTR("collection is not in replicate_collections"));
+
+	/* a local hit needs no cluster at all - say so plainly */
+	if (pcache_ht_probe(col->htable, key, &vlen, &exp) == 0) {
+		resp = init_mi_result_object(&obj);
+		if (!resp)
+			return NULL;
+		if (add_mi_string(obj, MI_SSTR("source"), MI_SSTR("local")) < 0 ||
+		    add_mi_number(obj, MI_SSTR("size"), vlen) < 0 ||
+		    add_mi_number(obj, MI_SSTR("ttl"),
+		        exp ? (int)(exp - get_ticks()) : -1) < 0)
+			goto err;
+		return resp;
+	}
+
+	rc = pcache_pull_key(col, key, buf, sizeof buf, &vlen, &exp);
+
+	resp = init_mi_result_object(&obj);
+	if (!resp)
+		return NULL;
+	if (add_mi_string(obj, MI_SSTR("source"),
+	        rc == 1 ? "cluster" : (rc == 0 ? "absent" : "no-answer"),
+	        rc == 1 ? 7 : (rc == 0 ? 6 : 9)) < 0)
+		goto err;
+	if (rc == 1) {
+		if (add_mi_string(obj, MI_SSTR("value"), buf, vlen) < 0 ||
+		    add_mi_number(obj, MI_SSTR("size"), vlen) < 0 ||
+		    add_mi_number(obj, MI_SSTR("ttl"),
+		        exp ? (int)(exp - get_ticks()) : -1) < 0)
+			goto err;
+	}
+	return resp;
+err:
+	free_mi_response(resp);
+	return init_mi_error(500, MI_SSTR("internal error"));
+}
+
 /* perf_probe <key> [collection] - is the key here, and what does it look
  * like?  Deliberately never returns the value: this is the existence test
  * a cross-node lookup would run on a peer, so it must cost what that costs
@@ -1005,11 +1123,269 @@ err:
  */
 
 /* a peer signalled "reload collection X": pull it from the DB and announce */
+/* =====================================================================
+ * CP-15.5: pull a key from the cluster on a local miss (read repair)
+ *
+ * A node that misses asks the cluster for that one key and uses the
+ * answer.  Pull rather than eager push because the request is issued at
+ * the moment of need, so it cannot race the traffic the way a broadcast
+ * on write does - and because misses are the only thing that pays.
+ *
+ * Every peer answers, positively or negatively (R5): with a handful of
+ * nodes the extra packets are trivial and definitive absence is worth
+ * far more than saving them, because "nobody has it" is then a fact
+ * rather than a timeout.  The probe of CP-15.2 is what makes answering
+ * cheap - a negative costs the bucket's tag word and nothing else.
+ * ===================================================================== */
+
+/* Is this collection opted in?  Nothing pulls unless an operator said so:
+ * a pull only makes sense where keys are globally meaningful, which the
+ * module cannot know and must not assume (R2). */
+static int pcache_pull_enabled(pcache_col_t *col)
+{
+	return pull_ready && col && col->replicate;
+}
+
+static struct pcache_pull_slot *pull_slot_get(unsigned int id)
+{
+	int i;
+
+	for (i = 0; i < PCACHE_PULL_SLOTS; i++)
+		if (pull_slots[i].id == id)
+			return &pull_slots[i];
+	return NULL;
+}
+
+/* Reply to a peer's request for one key.  Runs wherever the transport
+ * delivered the request; the cache is in shm, so any process can serve. */
+static void pcache_pull_serve(bin_packet_t *in)
+{
+	bin_packet_t out;
+	pcache_col_t *col;
+	str coll, key, val;
+	unsigned int id, exp = 0;
+	int found = 0, ttl_left = 0;
+
+	if (bin_pop_int(in, &id) < 0 || bin_pop_str(in, &coll) < 0 ||
+	        bin_pop_str(in, &key) < 0) {
+		LM_ERR("malformed pull request from node %d\n", in->src_id);
+		return;
+	}
+	col = col_by_name(&coll);
+	if (col && col->htable && col->replicate &&
+	        pcache_ht_fetch_ex(col->htable, &key, &val, &exp) == 0) {
+		/* Hand over the ORIGINAL lifetime, never a fresh TTL: a copy that
+		 * outlives the owner's entry would serve state the owner already
+		 * dropped (R6).  0 = never expires. */
+		if (exp) {
+			unsigned int now = get_ticks();
+
+			if (exp <= now) {          /* raced the sweep - treat as absent */
+				pkg_free(val.s);
+				goto reply;
+			}
+			ttl_left = (int)(exp - now);
+		} else {
+			ttl_left = 0;
+		}
+		if (val.len <= PCACHE_PULL_MAX_VAL)
+			found = 1;
+		else
+			LM_DBG("pull: <%.*s> is %d bytes, over the %d transfer bound\n",
+				key.len, key.s, val.len, PCACHE_PULL_MAX_VAL);
+	}
+
+reply:
+	if (bin_init(&out, &pcache_sync_cap, PCACHE_PULL_RPL,
+	        PCACHE_SYNC_VERSION, 0) < 0) {
+		if (found)
+			pkg_free(val.s);
+		return;
+	}
+	/* echo id AND key: the requester verifies what it got rather than
+	 * trusting the correlation id alone (R2) */
+	if (bin_push_int(&out, (int)id) < 0 ||
+	    bin_push_str(&out, &key) < 0 ||
+	    bin_push_int(&out, found) < 0 ||
+	    bin_push_int(&out, ttl_left) < 0 ||
+	    bin_push_str(&out, found ? &val : &coll) < 0) {
+		bin_free_packet(&out);
+		if (found)
+			pkg_free(val.s);
+		return;
+	}
+	if (clusterer_api.send_to(&out, sync_cluster_id, in->src_id) !=
+	        CLUSTERER_SEND_SUCCESS)
+		LM_DBG("pull reply to node %d did not get through\n", in->src_id);
+	else if (found)
+		pull_stats[PULL_ST_SERVED]++;
+	bin_free_packet(&out);
+	if (found)
+		pkg_free(val.s);
+}
+
+/* A peer answered.  Fill the waiting slot; first positive answer wins and
+ * later ones are dropped (several nodes may hold the key once pulls have
+ * converged). */
+static void pcache_pull_reply(bin_packet_t *in)
+{
+	struct pcache_pull_slot *sl;
+	str key, val;
+	unsigned int id;
+	int found = 0, ttl_left = 0;
+
+	if (bin_pop_int(in, (int *)&id) < 0 || bin_pop_str(in, &key) < 0 ||
+	        bin_pop_int(in, &found) < 0 || bin_pop_int(in, &ttl_left) < 0 ||
+	        bin_pop_str(in, &val) < 0) {
+		LM_ERR("malformed pull reply from node %d\n", in->src_id);
+		return;
+	}
+
+	lock_get(pull_lock);
+	sl = pull_slot_get(id);
+	/* the echoed key must match the slot's, or this is an answer to a
+	 * request that has already been recycled */
+	if (!sl || sl->klen != key.len || memcmp(sl->key, key.s, key.len)) {
+		lock_release(pull_lock);
+		LM_DBG("late or unmatched pull reply (id %u) from node %d\n",
+			id, in->src_id);
+		return;
+	}
+	if (!found) {
+		sl->negative++;
+	} else if (!sl->done && val.len <= PCACHE_PULL_MAX_VAL) {
+		memcpy(sl->val, val.s, val.len);
+		sl->vlen = val.len;
+		/* back to an absolute deadline on our own clock */
+		sl->expires = ttl_left ? get_ticks() + (unsigned int)ttl_left : 0;
+		sl->done = 1;
+		pull_stats[PULL_ST_RECEIVED]++;
+	}
+	lock_release(pull_lock);
+}
+
+/* Ask the cluster for one key.  Blocking, deliberately: this is the
+ * protocol under test, and the SIP-side answer to blocking is the async
+ * suspend of CP-15.9, not a different wire format.
+ *
+ * @return 1 = value found (in @out, @expires absolute, caller owns
+ *             nothing - the bytes are copied into the caller's buffer),
+ *         0 = definitively absent (every peer answered "not here"),
+ *        -1 = no answer in time / not usable. */
+static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
+		unsigned int outlen, unsigned int *vlen, unsigned int *expires)
+{
+	struct pcache_pull_slot *sl = NULL;
+	bin_packet_t packet;
+	int ids[64], nmembers, i, rc = -1;
+	unsigned int gen = 0, id;
+
+	if (!pcache_pull_enabled(col) || key->len > PCACHE_PULL_MAX_KEY ||
+	        col->col_name.len > 63)
+		return -1;
+
+	nmembers = pcache_cluster_members(ids, 64, &gen);
+	if (nmembers <= 0)
+		return -1;                       /* nobody to ask */
+
+	lock_get(pull_lock);
+	for (i = 0; i < PCACHE_PULL_SLOTS; i++)
+		if (!pull_slots[i].id) {
+			sl = &pull_slots[i];
+			break;
+		}
+	if (!sl) {
+		lock_release(pull_lock);
+		LM_WARN("all %d pull slots busy - dropping the request\n",
+			PCACHE_PULL_SLOTS);
+		return -1;
+	}
+	id = ++(*pull_next_id);
+	if (!id)                                  /* never hand out 0 */
+		id = ++(*pull_next_id);
+	memset(sl, 0, sizeof *sl);
+	sl->id       = id;
+	sl->gen      = gen;
+	sl->expect   = nmembers;
+	sl->deadline = get_ticks() + (pull_timeout_ms + 999) / 1000 + 1;
+	memcpy(sl->key, key->s, key->len);
+	sl->klen = key->len;
+	memcpy(sl->col, col->col_name.s, col->col_name.len);
+	sl->collen = col->col_name.len;
+	lock_release(pull_lock);
+
+	if (bin_init(&packet, &pcache_sync_cap, PCACHE_PULL_REQ,
+	        PCACHE_SYNC_VERSION, 0) < 0)
+		goto out;
+	if (bin_push_int(&packet, (int)id) < 0 ||
+	    bin_push_str(&packet, &col->col_name) < 0 ||
+	    bin_push_str(&packet, (str *)key) < 0) {
+		bin_free_packet(&packet);
+		goto out;
+	}
+	pull_stats[PULL_ST_REQUESTED]++;
+	if (clusterer_api.send_all(&packet, sync_cluster_id) !=
+	        CLUSTERER_SEND_SUCCESS)
+		LM_DBG("pull request reached no or only some nodes\n");
+	bin_free_packet(&packet);
+
+	/* wait for the first value, or for everyone to deny holding it */
+	for (i = 0; i < pull_timeout_ms; i++) {
+		lock_get(pull_lock);
+		if (sl->done) {
+			if (sl->vlen <= outlen) {
+				memcpy(out, sl->val, sl->vlen);
+				*vlen = sl->vlen;
+				if (expires)
+					*expires = sl->expires;
+				rc = 1;
+			}
+			lock_release(pull_lock);
+			goto out;
+		}
+		if (sl->negative >= sl->expect) {
+			/* everyone we asked answered, and none of them has it -
+			 * absence is a fact here, not an inference from silence */
+			lock_release(pull_lock);
+			rc = 0;
+			goto out;
+		}
+		lock_release(pull_lock);
+		usleep(1000);
+	}
+	pull_stats[PULL_ST_TIMEOUT]++;
+	LM_DBG("pull for <%.*s> timed out after %d ms (%d/%d answered)\n",
+		key->len, key->s, pull_timeout_ms, sl->negative, sl->expect);
+
+out:
+	/* A membership change while we were waiting means the responder set
+	 * we counted against is no longer the cluster: a "definitively
+	 * absent" verdict cannot be trusted across it (S4c), so downgrade it
+	 * to "no answer" and let the caller treat it as a plain miss. */
+	lock_get(pull_lock);
+	if (rc == 0 && pc_view && pc_view->generation != sl->gen) {
+		LM_DBG("membership changed during the pull - not concluding "
+			"absence\n");
+		rc = -1;
+	}
+	sl->id = 0;
+	lock_release(pull_lock);
+	return rc;
+}
+
 static void pcache_sync_recv(bin_packet_t *packet)
 {
 	pcache_col_t *col;
 	str coll;
 
+	if (packet->type == PCACHE_PULL_REQ) {
+		pcache_pull_serve(packet);
+		return;
+	}
+	if (packet->type == PCACHE_PULL_RPL) {
+		pcache_pull_reply(packet);
+		return;
+	}
 	if (packet->type != PCACHE_SYNC_RELOAD) {
 		LM_WARN("unknown sync packet type %d from node %d\n",
 			packet->type, packet->src_id);
@@ -1228,6 +1604,11 @@ static mi_response_t *mi_perf_scan_3(const mi_params_t *params, struct mi_handle
 static mi_response_t *mi_perf_scan_cc(const mi_params_t *params, struct mi_handler *a)
 { int cu, co; MI_I("cursor", cu); MI_I("count", co); return do_perf_scan(cu, NULL, co); }
 
+static mi_response_t *mi_perf_pull_1(const mi_params_t *params, struct mi_handler *a)
+{ str k; MI_S("key", k); return do_perf_pull(&k, NULL); }
+static mi_response_t *mi_perf_pull_2(const mi_params_t *params, struct mi_handler *a)
+{ str k, c; MI_S("key", k); MI_S("collection", c); return do_perf_pull(&k, &c); }
+
 static mi_response_t *mi_perf_probe_1(const mi_params_t *params, struct mi_handler *a)
 { str k; MI_S("key", k); return do_perf_probe(&k, NULL); }
 static mi_response_t *mi_perf_probe_2(const mi_params_t *params, struct mi_handler *a)
@@ -1315,6 +1696,12 @@ static const mi_export_t mi_cmds[] = {
 		{mi_perf_dump_2, {"glob", "collection", 0}},
 		{mi_perf_dump_gl, {"glob", "limit", 0}},
 		{mi_perf_dump_3, {"glob", "collection", "limit", 0}},
+		{EMPTY_MI_RECIPE}},
+		{0}
+	},
+	{ "perf_pull", "fetch one key from the cluster on a local miss", 0, 0, {
+		{mi_perf_pull_1, {"key", 0}},
+		{mi_perf_pull_2, {"key", "collection", 0}},
 		{EMPTY_MI_RECIPE}},
 		{0}
 	},
@@ -2123,7 +2510,7 @@ static void pcache_expire_timer(unsigned int ticks, void *param)
 
 /* set a per-collection flag for every declared collection named in a CSV
  * modparam (event_expired_collections, persist_collections) */
-enum col_flag { COL_FLAG_EXPIRED, COL_FLAG_PERSIST };
+enum col_flag { COL_FLAG_EXPIRED, COL_FLAG_PERSIST, COL_FLAG_REPLICATE };
 static void mark_collections(char *csv_s, const char *what, enum col_flag f)
 {
 	csv_record *cr, *c;
@@ -2142,6 +2529,8 @@ static void mark_collections(char *csv_s, const char *what, enum col_flag f)
 			        !memcmp(col->col_name.s, c->s.s, c->s.len)) {
 				if (f == COL_FLAG_EXPIRED)
 					col->raise_expired = 1;
+				else if (f == COL_FLAG_REPLICATE)
+					col->replicate = 1;
 				else
 					col->persist = 1;
 				found = 1;
@@ -2314,6 +2703,55 @@ static int mod_init(void)
 		} else {
 			LM_INFO("failover sync armed on sharing tag <%.*s/%d>\n",
 				pc_shtag.len, pc_shtag.s, pc_shtag_cid);
+		}
+	}
+
+	/* CP-15.5: cross-node pull.  Opt-in per collection, and inert without
+	 * it: a key is only worth asking the cluster about if it means the
+	 * same thing on every node, which only the operator knows. */
+	if (replicate_collections && *replicate_collections) {
+		int use_clctr = pull_transport_str &&
+			!strcasecmp(pull_transport_str, "clctr");
+
+		if (pull_transport_str && strcasecmp(pull_transport_str, "bin") &&
+		        !use_clctr) {
+			LM_ERR("bad pull_transport '%s' - expected 'bin' or 'clctr'\n",
+				pull_transport_str);
+			return -1;
+		}
+		if (use_clctr) {
+			/* the clusterer_controller messaging API is not wired here
+			 * yet (CP-15.8) - fail loudly rather than silently using BIN,
+			 * since the operator asked for a specific transport */
+			LM_ERR("pull_transport 'clctr' is not implemented yet - use "
+				"'bin'\n");
+			return -1;
+		}
+		if (!sync_ready) {
+			LM_WARN("replicate_collections is set but cluster sync is not "
+				"active (needs sync_cluster_id + clusterer) - cross-node "
+				"pull disabled\n");
+		} else if (pull_timeout_ms <= 0 || pull_timeout_ms > 5000) {
+			LM_ERR("pull_timeout_ms must be within 1..5000\n");
+			return -1;
+		} else {
+			pull_slots = shm_malloc(PCACHE_PULL_SLOTS * sizeof *pull_slots);
+			pull_next_id = shm_malloc(sizeof *pull_next_id);
+			pull_stats = shm_malloc(4 * sizeof *pull_stats);
+			pull_lock = lock_alloc();
+			if (!pull_slots || !pull_next_id || !pull_stats || !pull_lock ||
+			        !lock_init(pull_lock)) {
+				LM_ERR("no shm for the cross-node pull state\n");
+				return -1;
+			}
+			memset(pull_slots, 0, PCACHE_PULL_SLOTS * sizeof *pull_slots);
+			*pull_next_id = 0;
+			memset(pull_stats, 0, 4 * sizeof *pull_stats);
+			mark_collections(replicate_collections, "replicate_collections",
+				COL_FLAG_REPLICATE);
+			pull_ready = 1;
+			LM_INFO("cross-node pull active over bin, %d ms timeout, "
+				"collections: %s\n", pull_timeout_ms, replicate_collections);
 		}
 	}
 

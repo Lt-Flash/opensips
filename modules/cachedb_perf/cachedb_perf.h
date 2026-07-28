@@ -44,6 +44,7 @@ typedef struct pcache_col {
 	struct pcache_htable *htable;
 	int raise_expired;              /* CP-11: emit E_CACHEDB_PERF_EXPIRED */
 	int persist;                    /* CP-19: load-on-start / save-on-stop */
+	int replicate;                  /* CP-15: may be pulled across nodes    */
 	/* cluster-sync observability (shm: written by whichever process runs
 	 * the sync, read by perf_stats).  These record when this node last
 	 * pushed or pulled - NOT that the caches currently match. */

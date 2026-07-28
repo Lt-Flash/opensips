@@ -597,10 +597,48 @@ void th_store_del(str *key)
 
 /* Bind the cross-node pull, if the configured backend offers one.  Called
  * once the storage connection is up; failure is normal and silent-ish. */
+/* True when the state store is a perf:// one.  Only that backend can be
+ * asked for a key it does not have; the others reach the cluster - when
+ * they reach it at all - by their own means:
+ *
+ *   redis, memcached, ...  one store shared by every node, so a state is
+ *                          visible everywhere the moment it is written and
+ *                          there is no cross-node miss to repair.  Every
+ *                          lookup is a network round trip.
+ *   local with a /r        collection replicated to the cluster over BIN on
+ *                          every write, with a full sync when a node joins.
+ *                          No misses either, paid for on the write side.
+ *   local without /r       node-local and alone: a request that lands on the
+ *                          wrong node finds nothing, and nothing can help it.
+ *
+ * Asking cachedb_perf to pull through a connection belonging to one of those
+ * would hand it a foreign handle, so the pull is simply not offered. */
+static int th_store_is_perf(void)
+{
+	str scheme;
+	char *p;
+
+	if (!th_state_url.s)
+		return 0;
+	p = memchr(th_state_url.s, ':', th_state_url.len);
+	if (!p)
+		return 0;
+	scheme.s = th_state_url.s;
+	scheme.len = p - th_state_url.s;
+
+	return str_casematch_nt(&scheme, "perf");
+}
+
 void th_store_bind_pull(void)
 {
 	if (!th_store_enabled())
 		return;
+	if (!th_store_is_perf()) {
+		LM_DBG("the topology hiding state is kept in a backend that "
+			"reaches the cluster on its own, if at all - no cross-node "
+			"fetch will be attempted\n");
+		return;
+	}
 	if (load_pcache_pull_api(&th_pull) == 0) {
 		th_pull_ready = 1;
 		LM_INFO("topology hiding state can be fetched from other nodes; "

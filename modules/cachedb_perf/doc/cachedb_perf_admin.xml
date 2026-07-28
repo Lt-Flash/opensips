@@ -359,6 +359,38 @@ modparam("cachedb_perf", "sync_cluster_id", 1)
 </programlisting>
 		</example>
 	</section>
+	<section id="param_sync_shtag" xreflabel="sync_shtag">
+		<title><varname>sync_shtag</varname> (string)</title>
+		<para>
+		A clusterer sharing tag, as <quote>name/cluster_id</quote>, that
+		arms the failover sync.  A node whose tag turns
+		<emphasis>active</emphasis> warms every declared collection from
+		the DB snapshot before the redirected traffic arrives; a node
+		gracefully demoted to <emphasis>backup</emphasis> saves its
+		state and signals the peers to reload it - so a failover moves
+		the cache as one snapshot instead of a storm of misses.
+		</para>
+		<para>
+		Requires <varname>db_url</varname>.  The tag only schedules
+		these bulk operations - lookups are never gated on its state.
+		On a crash failover the last saved snapshot is the only source,
+		so pair this with periodic <emphasis>perf_save</emphasis> (or
+		<varname>db_mode</varname> 2) on the active node.
+		</para>
+		<para>
+		<emphasis>
+			Default value is unset (failover sync off).
+		</emphasis>
+		</para>
+		<example>
+		<title>Setting <varname>sync_shtag</varname></title>
+		<programlisting format="linespecific">
+modparam("clusterer", "sharing_tag", "vip1/1=backup")
+modparam("cachedb_perf", "sync_shtag", "vip1/1")
+</programlisting>
+		</example>
+	</section>
+
 
 	</section>
 

@@ -105,6 +105,9 @@ static char *persist_collections = NULL;
 static struct clusterer_binds clusterer_api;
 static str pcache_sync_cap = str_init("cachedb-perf-sync");
 static int sync_cluster_id = 0;        /* modparam; 0 = off */
+static char *sync_shtag_str;           /* modparam "name/cluster_id"; failover sync */
+static str  pc_shtag;                  /* parsed tag name                    */
+static int  pc_shtag_cid;              /* parsed tag cluster                 */
 static int sync_ready = 0;             /* clusterer loaded + capability set */
 
 /* Cluster membership view (CP-15.4).  The clusterer node list changes at
@@ -243,6 +246,7 @@ static const param_export_t params[] = {
 	{ "db_mode",             INT_PARAM, &db_mode },
 	{ "persist_collections", STR_PARAM, &persist_collections },
 	{ "sync_cluster_id",     INT_PARAM, &sync_cluster_id },
+	{ "sync_shtag",          STR_PARAM, &sync_shtag_str },
 	{0,0,0}
 };
 
@@ -1030,6 +1034,54 @@ static int perf_sync_one(pcache_col_t *col, int *bcast)
 	if (sync_ready)
 		(*bcast)++;
 	return rc;
+}
+
+/* Sharing-tag failover hook (CP-15.12).  A BACKUP->ACTIVE flip hands this
+ * node traffic for state its cache never saw - a mass-miss event.  The two
+ * directions of the hook keep that a snapshot-sized problem:
+ *   ACTIVE - warm the persist collections from the DB snapshot BEFORE the
+ *            storm.  On a crash failover the snapshot is the only source
+ *            there is; wall-clock TTLs skip whatever already expired.
+ *   BACKUP - graceful demotion: save our (freshest) state and broadcast,
+ *            so the new active reloads it via the normal sync path.  This
+ *            also repairs the flip-ordering race: the new active's warm
+ *            load may run before our save lands, but the broadcast makes
+ *            it reload again afterwards.
+ * The tag schedules bulk syncs and NOTHING ELSE - lookups are never gated
+ * on shtag state (a backup node can still legitimately receive traffic).
+ * Runs in whichever process the clusterer delivers the state change to;
+ * the DB ops use their own short-lived, fork-safe connections. */
+static void pcache_shtag_cb(str *tag_name, int state, int c_id, void *param)
+{
+	pcache_col_t *col;
+	int n = 0, entries = 0, bcast = 0, rc;
+
+	if (state == SHTAG_STATE_ACTIVE) {
+		/* same scope as a no-argument perf_load/perf_sync: every declared
+		 * collection - the persist flag only governs startup/shutdown */
+		for (col = pcache_collection; col; col = col->next) {
+			if (!col->htable)
+				continue;
+			rc = pcache_db_load(col);
+			if (rc >= 0) {
+				n++;
+				entries += rc;
+			}
+		}
+		LM_INFO("sharing tag <%.*s/%d> ACTIVE: warmed %d collection(s), "
+			"%d entries, from the DB snapshot\n",
+			tag_name->len, tag_name->s, c_id, n, entries);
+	} else if (state == SHTAG_STATE_BACKUP) {
+		for (col = pcache_collection; col; col = col->next) {
+			if (!col->htable)
+				continue;
+			if (perf_sync_one(col, &bcast) >= 0)
+				n++;
+		}
+		LM_INFO("sharing tag <%.*s/%d> BACKUP: saved %d collection(s)%s\n",
+			tag_name->len, tag_name->s, c_id, n,
+			bcast ? ", peers signalled to reload" : "");
+	}
 }
 
 /* perf_sync [collection] - save-then-broadcast; all declared if none named */
@@ -2186,6 +2238,36 @@ static int mod_init(void)
 			sync_ready = 1;
 			LM_INFO("cluster sync active on cluster_id %d (cap <%.*s>)\n",
 				sync_cluster_id, pcache_sync_cap.len, pcache_sync_cap.s);
+		}
+	}
+
+	/* CP-15.12: arm the failover sync on a sharing tag.  Independent of
+	 * sync_cluster_id (a deployment may want only the failover hook), so
+	 * bind the clusterer API here if the sync block did not. */
+	if (sync_shtag_str && *sync_shtag_str) {
+		char *slash = strchr(sync_shtag_str, '/');
+
+		pc_shtag.s = sync_shtag_str;
+		pc_shtag.len = slash ? (int)(slash - sync_shtag_str)
+		                     : (int)strlen(sync_shtag_str);
+		pc_shtag_cid = slash ? atoi(slash + 1) : sync_cluster_id;
+
+		if (!pc_shtag.len || pc_shtag_cid <= 0) {
+			LM_WARN("bad sync_shtag '%s' (expected \"name/cluster_id\") - "
+				"failover sync disabled\n", sync_shtag_str);
+		} else if (!(db_url && *db_url)) {
+			LM_WARN("sync_shtag is set but db_url is not - the failover "
+				"sync needs the DB snapshot; disabled\n");
+		} else if (!sync_ready && load_clusterer_api(&clusterer_api) != 0) {
+			LM_WARN("clusterer module not available - failover sync "
+				"disabled\n");
+		} else if (clusterer_api.shtag_register_callback(&pc_shtag,
+		        pc_shtag_cid, NULL, pcache_shtag_cb) < 0) {
+			LM_WARN("cannot register on sharing tag <%.*s/%d> - failover "
+				"sync disabled\n", pc_shtag.len, pc_shtag.s, pc_shtag_cid);
+		} else {
+			LM_INFO("failover sync armed on sharing tag <%.*s/%d>\n",
+				pc_shtag.len, pc_shtag.s, pc_shtag_cid);
 		}
 	}
 

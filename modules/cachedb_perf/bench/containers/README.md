@@ -56,6 +56,25 @@ segments for `bin`, which must ask each peer separately and pay ACKs.
 The medians never moved: the transports differ only on the miss path.
 No request in any run (10M+ total) timed out or failed.
 
+## Restarting a node
+
+Stop it, wait for the container to actually exit, then start it.  Do not use
+`nerdctl restart`: OpenSIPS takes about ten seconds to shut down, and restart
+brings the new instance up while the old one still holds its sockets in the
+same network namespace.  Both then sit on the multicast port, the master's
+unicast KEY_GRANT can be delivered to the dying socket, and the new instance -
+never seeing a grant it can decrypt - concludes the password is wrong and
+stops itself.  That conclusion is correct; only its trigger is an artifact of
+how the container was restarted.
+
+    nerdctl stop n1
+    until [ -z "$(nerdctl ps --format '{{.Names}}' | grep '^n1$')" ]; do sleep 1; done
+    nerdctl start n1
+
+Remember too that `nerdctl logs` concatenates every instance the container has
+ever run, so a successful join near the end of the output may belong to an
+earlier one.
+
 ## Data layout
 
 Each `results/<run>/` holds `stats.jsonl` (perf_stats from all three nodes

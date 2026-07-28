@@ -1574,21 +1574,23 @@ if (cl_ctr_node_present(1, 3) &amp;&amp; cl_ctr_node_is_master(1, 3)) {
     <itemizedlist>
 	<listitem><para>
 	    <emphasis role="bold">cl_ctr_broadcast_req(cluster_id, message
-	    [, out_var [, node_id [, reliable]]])</emphasis> — send a request to
-	    every member of the cluster, as one multicast packet. The sender
-	    does not receive its own broadcast. Pass 1 for
+	    [, tag [, reliable]])</emphasis> — send a request to every member of
+	    the cluster, as one multicast packet. The sender does not receive
+	    its own broadcast. The <emphasis>tag</emphasis> is carried through
+	    to the receiving event route. Pass 1 for
 	    <emphasis>reliable</emphasis> to ask for acknowledgement.
 	</para></listitem>
 	<listitem><para>
 	    <emphasis role="bold">cl_ctr_send_req(cluster_id, node_id, message
-	    [, tag])</emphasis> — send a request to one node.
+	    [, tag [, reliable]])</emphasis> — send a request to one node.
 	</para></listitem>
 	<listitem><para>
 	    <emphasis role="bold">cl_ctr_send_req_list(cluster_id, nodes_avp,
 	    message [, tag [, out_var]])</emphasis> — send to the nodes named in
-	    an AVP. <emphasis>out_var</emphasis> receives how many of them it
-	    reached; entries naming a node that is no longer a member are
-	    skipped rather than failing the send for the rest.
+	    an AVP, one unicast each. <emphasis>out_var</emphasis> receives how
+	    many nodes it was <emphasis>sent to</emphasis>; entries naming a node
+	    that is no longer a member are skipped rather than failing the send
+	    for the rest.
 	</para></listitem>
 	<listitem><para>
 	    <emphasis role="bold">cl_ctr_send_rpl(cluster_id, node_id, message
@@ -1614,25 +1616,35 @@ event_route[E_CL_CTR_REQ_RECEIVED] {
 # to everyone, cheaply
 cl_ctr_broadcast_req(1, "cache flushed");
 
-# to everyone, and tell me it arrived.  The optional arguments before
-# the last one are written out: an empty slot is not a skipped argument.
-$var(unused) = 0;
-cl_ctr_broadcast_req(1, "config changed", $var(unused), 0, 1);
+# to everyone, with a tag, and ask to be told it arrived
+cl_ctr_broadcast_req(1, "config changed", "cfg", 1);
 
-# to a few named nodes
+# to a few named nodes.  Assigning to the same AVP again adds a value
+# rather than replacing one, so this names two nodes - but note that the
+# values are stored newest first, so they are read back 5 then 2.  It
+# makes no difference here, since every named node gets the same message.
 $avp(nodes) = 2;
 $avp(nodes) = 5;
 cl_ctr_send_req_list(1, $avp(nodes), "just for you", "mytag", $var(sent));
 if ($rc &gt; 0)
-    xlog("delivered to $var(sent) node(s)\n");
+    xlog("sent to $var(sent) node(s)\n");
 	</programlisting>
     </example>
     <para>
 	Note where the count comes back. It is written into a variable, not
 	returned: &osips; stops running the script when a function returns
-	zero, and <quote>reached nobody</quote> is a real answer a script must
+	zero, and <quote>sent to nobody</quote> is a real answer a script must
 	be able to see rather than a reason to stop. The return value says only
 	whether the send could be attempted.
+    </para>
+    <para>
+	Note also what that count is, and is not. It is how many nodes the
+	message was <emphasis>sent to</emphasis>, which is known immediately.
+	How many <emphasis>acknowledged</emphasis> it is not knowable at that
+	point - the answers arrive afterwards - so for a reliable send that
+	result is reported to the log as it completes
+	(<xref linkend="param_consumer_retries"/>) rather than handed back to
+	the script. Surfacing it to the script as an event is planned.
     </para>
     </section>
 

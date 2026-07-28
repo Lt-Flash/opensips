@@ -416,7 +416,10 @@ modparam("topology_hiding", "th_callid_loop_protection", 1)
 			cachedb backends do, except for
 			<emphasis>cachedb_mongodb</emphasis>, which silently ignores it -
 			using it here would pile up the states forever, so it is rejected
-			at startup.
+			at startup. <emphasis>cachedb_sql</emphasis> stores an expiry but
+			enforces it with a periodic sweep rather than on the read, so a
+			state can outlive its lifetime there by up to one sweep interval;
+			set that module's cleanup period accordingly.
 		</para>
 		<para>
 			<emphasis>
@@ -448,6 +451,55 @@ modparam("topology_hiding", "th_state_url",
 ...
 </programlisting>
 		</example>
+	<para>
+	<emphasis role='bold'>Choosing a backend.</emphasis>
+	Any cachedb backend that expires its values can hold the state, so the
+	choice is really about what should happen when a sequential request
+	reaches a node that did not create the call - after a failover, behind a
+	load balancer that does not keep a call on one node, or on an anycast
+	address. There are three answers, and they differ in what they cost
+	rather than in whether they work.
+	</para>
+	<para>
+	A <emphasis>shared</emphasis> backend - Redis, Memcached, Cassandra,
+	Couchbase, DynamoDB, or an SQL cache - is one store that every node
+	reads and writes, so a state is visible everywhere the moment it is
+	written and no node can ever miss one. The price is that every lookup,
+	hit or miss, is a network round trip.
+	</para>
+	<para>
+	A <emphasis>replicated local</emphasis> collection - cachedb_local with
+	the <emphasis>/r</emphasis> suffix on the collection name, and a
+	cluster_id set on that module - keeps the state in each node's own
+	memory and copies every write to the rest of the cluster over the
+	clusterer BIN protocol, with a full sync when a node joins. Reads are
+	local and therefore fast, and nothing is missing anywhere; the price is
+	paid on the write side, as one send per peer for every state stored.
+	</para>
+	<para>
+	A plain <emphasis>local</emphasis> collection, with no suffix, is
+	node-local and alone: fast, but a request arriving at the wrong node
+	finds nothing. That is the right choice only for a single instance, or
+	where the load balancer is trusted to keep a call on the node that
+	started it.
+	</para>
+	<example>
+	<title>Sharing the state between nodes</title>
+	<programlisting format="linespecific">
+...
+# one store, shared by every node - always consistent, a round trip per lookup
+loadmodule "cachedb_redis.so"
+modparam("topology_hiding", "th_state_url", "redis://10.0.0.20:6379/0")
+
+# local memory on each node, replicated to the cluster on every write:
+# note the /r suffix on the collection and the cluster_id
+loadmodule "cachedb_local.so"
+modparam("cachedb_local", "cache_collections", "topohiding/r")
+modparam("cachedb_local", "cluster_id", 1)
+modparam("topology_hiding", "th_state_url", "local://topohiding")
+...
+</programlisting>
+	</example>
 	<para>
 	<emphasis role='bold'>When the state comes from another node.</emphasis>
 	A stored state records the socket the message arrived on, so that a

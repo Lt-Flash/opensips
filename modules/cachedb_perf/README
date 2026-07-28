@@ -31,6 +31,7 @@ cachedb_perf Module
               1.3.16. replicate_collections (string)
               1.3.17. pull_transport (string)
               1.3.18. pull_timeout_ms (integer)
+              1.3.19. pull_negative_ms (integer)
 
         1.4. DB persistence
         1.5. Cluster sync
@@ -422,6 +423,27 @@ modparam("cachedb_perf", "replicate_collections", "th")
    timeout only decides how long an unanswered request lingers.
 
    Default value is “50”.
+
+1.3.19. pull_negative_ms (integer)
+
+   How long to remember that the whole cluster answered “not here”
+   for a key, in milliseconds (0..2000; 0 disables it). A SIP
+   retransmit asks the same question a few hundred milliseconds
+   later, and without this every retransmit repeats the round of
+   questions.
+
+   Keep it short. A key may legitimately be created on another
+   node a moment from now, and a negative that outlives that turns
+   a transient miss into a hard failure - which is why the
+   parameter is capped rather than left open. Only a verdict the
+   whole cluster gave is remembered: a timeout is not absence, and
+   neither is an answer from a set of nodes that has since
+   changed. A local write to the key clears it at once.
+
+   Negatives are held outside the cache, so they never appear in
+   perf_keys or perf_dump and never count as entries.
+
+   Default value is “300”.
 
 1.4. DB persistence
 

@@ -117,6 +117,7 @@ static int  pc_shtag_cid;              /* parsed tag cluster                 */
 #define PCACHE_PULL_SLOTS      64     /* concurrent in-flight pulls        */
 #define PCACHE_PULL_MAX_VAL    8192   /* value size a pull will carry      */
 #define PCACHE_PULL_MAX_KEY    256
+#define PCACHE_NEG_SLOTS       256    /* direct-mapped negative cache      */
 static char *pull_transport_str;       /* "bin" (default) | "clctr"          */
 static int   pull_timeout_ms = 50;     /* how long a miss waits for peers    */
 static char *replicate_collections;    /* CSV opt-in; nothing pulls by default */
@@ -149,12 +150,36 @@ static unsigned int *pull_next_id;     /* shm: ids must be unique per node  */
 /* pull counters, deliberately separate from hits/misses so a pulled key
  * cannot flatter the local hit rate (R6) */
 static unsigned int *pull_stats;       /* PULL_ST_* counters */
+
+/* Negative cache (R4).  A key that is genuinely nowhere costs a full
+ * round of questions, and SIP retransmits ask again a few hundred
+ * milliseconds later - so remember "nobody had it" just long enough to
+ * absorb the retransmit, and no longer: the key may legitimately be
+ * created on another node a second from now, and a negative that outlives
+ * that turns a transient miss into a hard failure.
+ *
+ * Kept out of the cache proper, deliberately: a negative is not a value.
+ * Putting it in the table would make perf_keys and perf_dump show keys
+ * that do not exist and would count in the entry total.  Direct-mapped,
+ * so a fresh negative may evict an older one - losing one only costs a
+ * repeated question. */
+struct pcache_neg_slot {
+	unsigned int hash;               /* 0 = free                        */
+	utime_t      deadline;           /* absolute us                     */
+	int          klen, collen;
+	char         key[PCACHE_PULL_MAX_KEY];
+	char         col[64];
+};
+static struct pcache_neg_slot *neg_slots;
+static gen_lock_t *neg_lock;
+static int pull_negative_ms = 300;     /* modparam; 0 = no negative cache  */
 #define PULL_ST_REQUESTED 0
 #define PULL_ST_SERVED    1
 #define PULL_ST_RECEIVED  2
 #define PULL_ST_TIMEOUT   3
 #define PULL_ST_STORED    4
-#define PULL_ST_MAX       5
+#define PULL_ST_SUPPRESSED 5   /* asks a cached negative absorbed */
+#define PULL_ST_MAX       6
 static int sync_ready = 0;             /* clusterer loaded + capability set */
 
 /* Cluster membership view (CP-15.4).  The clusterer node list changes at
@@ -298,6 +323,7 @@ static const param_export_t params[] = {
 	{ "sync_shtag",          STR_PARAM, &sync_shtag_str },
 	{ "pull_transport",      STR_PARAM, &pull_transport_str },
 	{ "pull_timeout_ms",     INT_PARAM, &pull_timeout_ms },
+	{ "pull_negative_ms",    INT_PARAM, &pull_negative_ms },
 	{ "replicate_collections", STR_PARAM, &replicate_collections },
 	{0,0,0}
 };
@@ -543,7 +569,9 @@ static mi_response_t *mi_perf_stats(str *col_s)
 		     add_mi_number(clobj, MI_SSTR("pulls_timed_out"),
 		        pull_stats[PULL_ST_TIMEOUT]) < 0 ||
 		     add_mi_number(clobj, MI_SSTR("pulls_stored"),
-		        pull_stats[PULL_ST_STORED]) < 0))
+		        pull_stats[PULL_ST_STORED]) < 0 ||
+		     add_mi_number(clobj, MI_SSTR("pulls_suppressed"),
+		        pull_stats[PULL_ST_SUPPRESSED]) < 0))
 			goto err;
 		if (pc_view->last_change) {
 			char lbuf[32];
@@ -1142,6 +1170,81 @@ err:
  * cheap - a negative costs the bucket's tag word and nothing else.
  * ===================================================================== */
 
+static unsigned int neg_hash(pcache_col_t *col, const str *key)
+{
+	unsigned int h = core_hash((str *)key, &col->col_name, 0);
+
+	return h ? h : 1;                    /* 0 marks a free slot */
+}
+
+/* Did we recently establish that nobody has this key? */
+static int pcache_neg_check(pcache_col_t *col, const str *key)
+{
+	struct pcache_neg_slot *sl;
+	unsigned int h;
+	int hit = 0;
+
+	if (!neg_slots || pull_negative_ms <= 0)
+		return 0;
+	h = neg_hash(col, key);
+	sl = &neg_slots[h % PCACHE_NEG_SLOTS];
+
+	lock_get(neg_lock);
+	if (sl->hash == h && sl->klen == key->len &&
+	        !memcmp(sl->key, key->s, key->len) &&
+	        sl->collen == col->col_name.len &&
+	        !memcmp(sl->col, col->col_name.s, sl->collen)) {
+		if (sl->deadline > get_uticks())
+			hit = 1;
+		else
+			sl->hash = 0;                /* lapsed - ask again */
+	}
+	lock_release(neg_lock);
+	return hit;
+}
+
+static void pcache_neg_add(pcache_col_t *col, const str *key)
+{
+	struct pcache_neg_slot *sl;
+	unsigned int h;
+
+	if (!neg_slots || pull_negative_ms <= 0 ||
+	        key->len > PCACHE_PULL_MAX_KEY || col->col_name.len > 63)
+		return;
+	h = neg_hash(col, key);
+	sl = &neg_slots[h % PCACHE_NEG_SLOTS];
+
+	lock_get(neg_lock);
+	sl->hash = h;
+	sl->deadline = get_uticks() + (utime_t)pull_negative_ms * 1000;
+	sl->klen = key->len;
+	memcpy(sl->key, key->s, key->len);
+	sl->collen = col->col_name.len;
+	memcpy(sl->col, col->col_name.s, sl->collen);
+	lock_release(neg_lock);
+}
+
+/* A local write makes the key exist here, so whatever we concluded about
+ * the cluster no longer describes it. */
+static void pcache_neg_clear(pcache_col_t *col, const str *key)
+{
+	struct pcache_neg_slot *sl;
+	unsigned int h;
+
+	if (!neg_slots || pull_negative_ms <= 0)
+		return;
+	h = neg_hash(col, key);
+	sl = &neg_slots[h % PCACHE_NEG_SLOTS];
+	if (sl->hash != h)
+		return;                          /* cheap check before the lock */
+
+	lock_get(neg_lock);
+	if (sl->hash == h && sl->klen == key->len &&
+	        !memcmp(sl->key, key->s, key->len))
+		sl->hash = 0;
+	lock_release(neg_lock);
+}
+
 /* Is this collection opted in?  Nothing pulls unless an operator said so:
  * a pull only makes sense where keys are globally meaningful, which the
  * module cannot know and must not assume (R2). */
@@ -1304,6 +1407,13 @@ static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 	        col->col_name.len > 63)
 		return -1;
 
+	/* we asked moments ago and the whole cluster said no - a retransmit
+	 * should not repeat the round of questions (R4) */
+	if (pcache_neg_check(col, key)) {
+		pull_stats[PULL_ST_SUPPRESSED]++;
+		return 0;
+	}
+
 	nmembers = pcache_cluster_members(ids, 64, &gen);
 	if (nmembers <= 0)
 		return -1;                       /* nobody to ask */
@@ -1380,6 +1490,7 @@ static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 						key->len, key->s);
 				} else {
 					pull_stats[PULL_ST_STORED]++;
+					pcache_neg_clear(col, key);
 				}
 			}
 			lock_release(pull_lock);
@@ -1392,6 +1503,7 @@ static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 			rc = 0;
 			goto out;
 		}
+
 		lock_release(pull_lock);
 		usleep(1000);
 	}
@@ -1412,6 +1524,13 @@ out:
 	}
 	sl->id = 0;
 	lock_release(pull_lock);
+
+	/* Only a verdict the whole cluster gave is worth remembering.  A
+	 * timeout is not absence, and neither is an answer from a membership
+	 * that has since changed - caching either would turn "we do not know"
+	 * into "it is not there". */
+	if (rc == 0)
+		pcache_neg_add(col, key);
 	return rc;
 }
 
@@ -2120,6 +2239,10 @@ static int pcache_htable_insert(cachedb_con *con, str *attr, str *val,
 		pcache_raise_nomem(&col->col_name, attr, val ? val->len : 0);
 		return -1;
 	}
+	/* the key exists here now, so any conclusion we drew about the
+	 * cluster not having it no longer describes it */
+	if (rc >= 0)
+		pcache_neg_clear(col, attr);
 	return rc;
 }
 
@@ -2789,11 +2912,27 @@ static int mod_init(void)
 			memset(pull_slots, 0, PCACHE_PULL_SLOTS * sizeof *pull_slots);
 			*pull_next_id = 0;
 			memset(pull_stats, 0, PULL_ST_MAX * sizeof *pull_stats);
+			if (pull_negative_ms < 0 || pull_negative_ms > 2000) {
+				LM_ERR("pull_negative_ms must be within 0..2000 (0 = off) "
+					"- a negative that outlives a retransmit turns a "
+					"transient miss into a hard failure\n");
+				return -1;
+			}
+			if (pull_negative_ms > 0) {
+				neg_slots = shm_malloc(PCACHE_NEG_SLOTS * sizeof *neg_slots);
+				neg_lock = lock_alloc();
+				if (!neg_slots || !neg_lock || !lock_init(neg_lock)) {
+					LM_ERR("no shm for the negative cache\n");
+					return -1;
+				}
+				memset(neg_slots, 0, PCACHE_NEG_SLOTS * sizeof *neg_slots);
+			}
 			mark_collections(replicate_collections, "replicate_collections",
 				COL_FLAG_REPLICATE);
 			pull_ready = 1;
 			LM_INFO("cross-node pull active over bin, %d ms timeout, "
-				"collections: %s\n", pull_timeout_ms, replicate_collections);
+				"%d ms negative cache, collections: %s\n", pull_timeout_ms,
+				pull_negative_ms, replicate_collections);
 		}
 	}
 

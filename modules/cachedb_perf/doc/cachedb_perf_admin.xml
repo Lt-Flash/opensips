@@ -472,6 +472,36 @@ modparam("cachedb_perf", "replicate_collections", "th")
 		</emphasis>
 		</para>
 	</section>
+	<section id="param_pull_negative_ms" xreflabel="pull_negative_ms">
+		<title><varname>pull_negative_ms</varname> (integer)</title>
+		<para>
+		How long to remember that the whole cluster answered <quote>not
+		here</quote> for a key, in milliseconds (0..2000; 0 disables it).
+		A SIP retransmit asks the same question a few hundred
+		milliseconds later, and without this every retransmit repeats the
+		round of questions.
+		</para>
+		<para>
+		Keep it short.  A key may legitimately be created on another node
+		a moment from now, and a negative that outlives that turns a
+		transient miss into a hard failure - which is why the parameter
+		is capped rather than left open.  Only a verdict the whole
+		cluster gave is remembered: a timeout is not absence, and neither
+		is an answer from a set of nodes that has since changed.  A local
+		write to the key clears it at once.
+		</para>
+		<para>
+		Negatives are held outside the cache, so they never appear in
+		<emphasis>perf_keys</emphasis> or <emphasis>perf_dump</emphasis>
+		and never count as entries.
+		</para>
+		<para>
+		<emphasis>
+			Default value is <quote>300</quote>.
+		</emphasis>
+		</para>
+	</section>
+
 
 
 

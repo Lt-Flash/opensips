@@ -761,6 +761,13 @@ static void cl_ctr_handle_consumer(const char *payload, int payload_len,
         const char *src_ip, cl_ctr_cluster_t *cl);
 static void cl_ctr_rpc_consumer_send(int sender, void *param);
 static int clctr_register_channel(str *channel, clctr_msg_cb_f cb);
+static int cl_ctr_script_init(void);
+static int cmd_cl_ctr_broadcast_req(struct sip_msg *msg, int *cluster_id,
+		str *gen_msg, pv_spec_t *param, int *node_id);
+static int cmd_cl_ctr_send_req(struct sip_msg *msg, int *cluster_id,
+		int *node_id, str *gen_msg, pv_spec_t *param);
+static int cmd_cl_ctr_send_rpl(struct sip_msg *msg, int *cluster_id,
+		int *node_id, str *gen_msg, pv_spec_t *param);
 static int clctr_send_mcast(int cluster_id, str *channel, str *payload,
         int flags);
 static int clctr_send_ucast(int cluster_id, int node_id, str *channel,
@@ -782,6 +789,33 @@ static int                    manage_shtags = 1;
  *                 takes over as master as soon as it appears (more handovers). */
 static int                    master_stickiness = 1;
 static int      consumer_rate_limit = CL_CTR_CONSUMER_RATE_DEFAULT;
+
+/* ---- the script's own channel (S2c-API, second tier) -------------------
+ *
+ * The messaging API's other half: a channel the module registers for
+ * itself, so a script can exchange messages with its peers without a
+ * module in between.  It mirrors clusterer's generic messaging exactly -
+ * same three functions, same two events, same parameters - so a script
+ * moves between them by renaming, and the reason to move is what the
+ * transport underneath does: one multicast packet rather than a send per
+ * peer, over an encrypted channel rather than a plaintext one.
+ *
+ * Wire: [u8 kind][u8 tag_len][tag][message].
+ */
+#define CL_CTR_SCRIPT_REQ  1
+#define CL_CTR_SCRIPT_RPL  2
+
+static str  cl_ctr_script_chan = str_init("_script");
+static str  ei_req_name = str_init("E_CL_CTR_REQ_RECEIVED");
+static str  ei_rpl_name = str_init("E_CL_CTR_RPL_RECEIVED");
+static event_id_t ei_req_id = EVI_ERROR;
+static event_id_t ei_rpl_id = EVI_ERROR;
+static evi_params_p ei_params;
+static evi_param_p  ei_clid_p, ei_srcid_p, ei_msg_p, ei_tag_p;
+static str ei_clid_pname  = str_init("cluster_id");
+static str ei_srcid_pname = str_init("src_id");
+static str ei_msg_pname   = str_init("msg");
+static str ei_tag_pname   = str_init("tag");
 static char     my_bin_sockets[CL_CTR_MAX_BIN_SOCKETS][CL_CTR_MAX_BIN_SOCK_LEN];
 static int      my_bin_count                            = 0;
 
@@ -968,8 +1002,12 @@ static mi_response_t *mi_cl_ctr_shtag_auto(const mi_params_t *params,
  * ========================================================================= */
 
 static proc_export_t procs[] = {
+    /* NEEDS_SCRIPT because a message arriving for the script's channel
+     * raises an event here, and an event route is script: without it the
+     * route structures are not set up in this process and running one
+     * crashes. */
     {"clusterer_controller worker", 0, 0, cl_ctr_worker, 1,
-        PROC_FLAG_INITCHILD | PROC_FLAG_HAS_IPC},
+        PROC_FLAG_INITCHILD | PROC_FLAG_HAS_IPC | PROC_FLAG_NEEDS_SCRIPT},
     {0, 0, 0, 0, 0, 0}
 };
 
@@ -1349,6 +1387,24 @@ static const cmd_export_t cl_ctr_cmds[] = {
 	{CMD_PARAM_INT, 0, 0}, {CMD_PARAM_INT, 0, 0}, {CMD_PARAM_VAR, 0, 0}, {0, 0, 0}}, ALL_ROUTES},
     {"cl_ctr_get_node_ip", (cmd_function)w_cl_ctr_get_node_ip, {
 	{CMD_PARAM_INT, 0, 0}, {CMD_PARAM_INT, 0, 0}, {CMD_PARAM_VAR, 0, 0}, {0, 0, 0}}, ALL_ROUTES},
+    {"cl_ctr_broadcast_req", (cmd_function)cmd_cl_ctr_broadcast_req, {
+	{CMD_PARAM_INT,0,0},
+	{CMD_PARAM_STR,0,0},
+	{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
+	{CMD_PARAM_INT|CMD_PARAM_OPT,0,0}, {0,0,0}},
+	ALL_ROUTES},
+    {"cl_ctr_send_req", (cmd_function)cmd_cl_ctr_send_req, {
+	{CMD_PARAM_INT,0,0},
+	{CMD_PARAM_INT,0,0},
+	{CMD_PARAM_STR,0,0},
+	{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0}, {0,0,0}},
+	ALL_ROUTES},
+    {"cl_ctr_send_rpl", (cmd_function)cmd_cl_ctr_send_rpl, {
+	{CMD_PARAM_INT,0,0},
+	{CMD_PARAM_INT,0,0},
+	{CMD_PARAM_STR,0,0},
+	{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0}, {0,0,0}},
+	ALL_ROUTES},
     {"load_clctr", (cmd_function)load_clctr, {{0, 0, 0}}, 0},
     {0, 0, {{0, 0, 0}}, 0}
 };
@@ -6305,6 +6361,13 @@ static int mod_init(void)
 {
     struct in_addr addr;
     int            i, j;
+    /* the script's messaging channel and its two events; done here so the
+     * reserved name is claimed before any consumer module registers */
+    if (cl_ctr_script_init() < 0) {
+        LM_ERR("clusterer_controller: cannot set up script messaging\n");
+        return -1;
+    }
+
 
     LM_INFO("clusterer_controller: initialising\n");
 
@@ -6978,6 +7041,128 @@ static int clctr_get_my_node_id(int cluster_id)
     }
     lock_stop_read(cl->peers->lock);
     return id;
+}
+
+/* ---- script tier: receive ---------------------------------------------- */
+
+static void cl_ctr_script_recv(int cluster_id, int src_node_id, str *channel,
+		str *payload)
+{
+	str msg, tag;
+	unsigned char kind;
+	int taglen;
+
+	if (payload->len < 2)
+		goto bad;
+	kind = (unsigned char)payload->s[0];
+	taglen = (unsigned char)payload->s[1];
+	if (payload->len < 2 + taglen)
+		goto bad;
+	tag.s = payload->s + 2;
+	tag.len = taglen;
+	msg.s = payload->s + 2 + taglen;
+	msg.len = payload->len - 2 - taglen;
+
+	/* free when nobody is listening - the same gate the module's other
+	 * events use */
+	if (!evi_probe_event(kind == CL_CTR_SCRIPT_RPL ? ei_rpl_id : ei_req_id))
+		return;
+
+	if (evi_param_set_int(ei_clid_p, &cluster_id) < 0 ||
+	    evi_param_set_int(ei_srcid_p, &src_node_id) < 0 ||
+	    evi_param_set_str(ei_msg_p, &msg) < 0 ||
+	    evi_param_set_str(ei_tag_p, &tag) < 0) {
+		LM_ERR("clusterer_controller: cannot fill the message event\n");
+		return;
+	}
+	if (evi_raise_event(kind == CL_CTR_SCRIPT_RPL ? ei_rpl_id : ei_req_id,
+	        ei_params) < 0)
+		LM_ERR("clusterer_controller: cannot raise the message event\n");
+	return;
+bad:
+	LM_ERR("clusterer_controller: malformed script message from node %d\n",
+		src_node_id);
+}
+
+/* ---- script tier: send -------------------------------------------------- */
+
+static int cl_ctr_script_send(int cluster_id, int node_id, str *gen_msg,
+		str *tag, unsigned char kind)
+{
+	char buf[CLCTR_MAX_PAYLOAD];
+	str pl;
+	int taglen = tag ? tag->len : 0;
+
+	if (!gen_msg || gen_msg->len <= 0)
+		return -1;
+	if (taglen > 255)
+		taglen = 255;
+	if (2 + taglen + gen_msg->len > CLCTR_MAX_PAYLOAD) {
+		LM_ERR("clusterer_controller: message of %d bytes is more than the "
+			"%d a datagram carries\n", gen_msg->len, CLCTR_MAX_PAYLOAD);
+		return -1;
+	}
+	buf[0] = (char)kind;
+	buf[1] = (char)taglen;
+	if (taglen)
+		memcpy(buf + 2, tag->s, taglen);
+	memcpy(buf + 2 + taglen, gen_msg->s, gen_msg->len);
+	pl.s = buf;
+	pl.len = 2 + taglen + gen_msg->len;
+
+	if (node_id > 0)
+		return clctr_send_ucast(cluster_id, node_id, &cl_ctr_script_chan,
+			&pl, 0) < 0 ? -1 : 1;
+	return clctr_send_mcast(cluster_id, &cl_ctr_script_chan, &pl, 0) < 0
+		? -1 : 1;
+}
+
+static int cmd_cl_ctr_broadcast_req(struct sip_msg *msg, int *cluster_id,
+		str *gen_msg, pv_spec_t *param, int *node_id)
+{
+	return cl_ctr_script_send(*cluster_id, 0, gen_msg, NULL,
+		CL_CTR_SCRIPT_REQ);
+}
+
+static int cmd_cl_ctr_send_req(struct sip_msg *msg, int *cluster_id,
+		int *node_id, str *gen_msg, pv_spec_t *param)
+{
+	return cl_ctr_script_send(*cluster_id, *node_id, gen_msg, NULL,
+		CL_CTR_SCRIPT_REQ);
+}
+
+static int cmd_cl_ctr_send_rpl(struct sip_msg *msg, int *cluster_id,
+		int *node_id, str *gen_msg, pv_spec_t *param)
+{
+	return cl_ctr_script_send(*cluster_id, *node_id, gen_msg, NULL,
+		CL_CTR_SCRIPT_RPL);
+}
+
+/* Publish the two events and claim the script's channel.  Called from
+ * mod_init, before any consumer registers, so the reserved name cannot be
+ * taken by a module. */
+static int cl_ctr_script_init(void)
+{
+	ei_req_id = evi_publish_event(ei_req_name);
+	ei_rpl_id = evi_publish_event(ei_rpl_name);
+	if (ei_req_id == EVI_ERROR || ei_rpl_id == EVI_ERROR) {
+		LM_ERR("clusterer_controller: cannot publish the message events\n");
+		return -1;
+	}
+	ei_params = pkg_malloc(sizeof *ei_params);
+	if (!ei_params) {
+		LM_ERR("clusterer_controller: no pkg for the event parameters\n");
+		return -1;
+	}
+	memset(ei_params, 0, sizeof *ei_params);
+	if (!(ei_clid_p  = evi_param_create(ei_params, &ei_clid_pname))  ||
+	    !(ei_srcid_p = evi_param_create(ei_params, &ei_srcid_pname)) ||
+	    !(ei_msg_p   = evi_param_create(ei_params, &ei_msg_pname))   ||
+	    !(ei_tag_p   = evi_param_create(ei_params, &ei_tag_pname))) {
+		LM_ERR("clusterer_controller: cannot create the event parameters\n");
+		return -1;
+	}
+	return clctr_register_channel(&cl_ctr_script_chan, cl_ctr_script_recv);
 }
 
 int load_clctr(clctr_api_t *api)

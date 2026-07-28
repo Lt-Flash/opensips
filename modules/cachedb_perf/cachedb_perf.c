@@ -166,6 +166,7 @@ struct pcache_pull_slot {
 	unsigned char answered[(CL_MAX_NODE_ID + 7) / 8];
 	int          done;               /* 1 = a value landed                */
 	int          oversize;           /* a peer HAS it but could not send  */
+	int          hinted;             /* asked one node, not the cluster   */
 	unsigned int expires;            /* ABSOLUTE, as the owner holds it   */
 	unsigned int vlen;
 	char         key[PCACHE_PULL_MAX_KEY];
@@ -318,6 +319,8 @@ static int fixup_check_wvar(void **param);
  * forward decls let that table sit before the glob/collection helpers */
 static pcache_col_t *col_by_name(const str *name);
 int load_pcache_pull(pcache_pull_api_t *api);
+static int pcache_pull_start(pcache_col_t *col, const str *key,
+		int hint_node, int *fd, unsigned int *id_out);
 static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 		unsigned int outlen, unsigned int *vlen, unsigned int *expires);
 static int pcache_pull_enabled(pcache_col_t *col);
@@ -1623,8 +1626,14 @@ bad:
  * @return  1 = started, wait on @fd,
  *          0 = answered without asking anyone (a cached negative),
  *         -1 = cannot pull (not enabled, no peers, no free slot). */
-static int pcache_pull_start(pcache_col_t *col, const str *key, int *fd,
-		unsigned int *id_out)
+/* @hint_node: ask this one node instead of everybody, when membership
+ * confirms it exists and is not us.  A hint is never authoritative - the
+ * node may have restarted, expired the entry, or had its id reissued to
+ * somebody else - so an unhelpful answer must leave the caller able to
+ * ask the rest, which is why a hinted request that comes back empty is
+ * reported as "no answer" rather than as absence. */
+static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
+		int *fd, unsigned int *id_out)
 {
 	struct pcache_pull_slot *sl = NULL;
 	bin_packet_t packet;
@@ -1641,6 +1650,24 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int *fd,
 	nmembers = pcache_cluster_members(ids, 64, &gen);
 	if (nmembers <= 0)
 		return -1;
+
+	/* Validate the hint before trusting it: a node id that is not a
+	 * current peer is stale, reissued, or simply wrong, and asking it
+	 * would waste the request. */
+	if (hint_node > 0) {
+		int k, live = 0;
+
+		for (k = 0; k < nmembers; k++)
+			if (ids[k] == hint_node) {
+				live = 1;
+				break;
+			}
+		if (!live) {
+			LM_DBG("hint points at node %d, which is not a current peer - "
+				"asking everybody instead\n", hint_node);
+			hint_node = 0;
+		}
+	}
 
 	lock_get(pull_lock);
 	for (i = 0; i < PCACHE_PULL_SLOTS; i++)
@@ -1670,7 +1697,9 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int *fd,
 	}
 	sl->id       = id;
 	sl->gen      = gen;
-	sl->expect   = nmembers;
+	sl->hinted   = hint_node;
+	/* one node was asked, so one answer settles it */
+	sl->expect   = hint_node > 0 ? 1 : nmembers;
 	sl->deadline = get_ticks() + (pull_timeout_ms + 999) / 1000 + 1;
 	memcpy(sl->key, key->s, key->len);
 	sl->klen = key->len;
@@ -1697,7 +1726,11 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int *fd,
 		pl.len = n;
 		/* one packet, whatever the cluster size - and encrypted, which
 		 * the BIN links are not */
-		if (clctr_api.send_mcast(sync_cluster_id, &pull_channel, &pl, 0) < 0)
+		if (hint_node > 0
+		        ? clctr_api.send_ucast(sync_cluster_id, hint_node,
+		              &pull_channel, &pl, 0) < 0
+		        : clctr_api.send_mcast(sync_cluster_id, &pull_channel,
+		              &pl, 0) < 0)
 			LM_DBG("pull request could not be sent\n");
 	} else {
 		if (bin_init(&packet, &pcache_sync_cap, PCACHE_PULL_REQ,
@@ -1709,7 +1742,9 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int *fd,
 			bin_free_packet(&packet);
 			goto fail;
 		}
-		if (clusterer_api.send_all(&packet, sync_cluster_id) !=
+		if ((hint_node > 0
+		        ? clusterer_api.send_to(&packet, sync_cluster_id, hint_node)
+		        : clusterer_api.send_all(&packet, sync_cluster_id)) !=
 		        CLUSTERER_SEND_SUCCESS)
 			LM_DBG("pull request reached no or only some nodes\n");
 		bin_free_packet(&packet);
@@ -1759,7 +1794,10 @@ static int pcache_pull_finish(pcache_col_t *col, const str *key,
 		 * about it is worth remembering as a negative. */
 		rc = -1;
 	} else if (sl->negative >= sl->expect) {
-		rc = 0;
+		/* One node was asked and it does not have it.  That is not the
+		 * cluster's answer, so it must not become one: report no answer
+		 * and let the caller ask properly. */
+		rc = sl->hinted ? -1 : 0;
 	} else {
 		__sync_fetch_and_add(&pull_stats[PULL_ST_TIMEOUT], 1);
 	}
@@ -1813,7 +1851,7 @@ static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 	unsigned int id = 0;
 	int fd = -1, rc, left = pull_timeout_ms;
 
-	rc = pcache_pull_start(col, key, &fd, &id);
+	rc = pcache_pull_start(col, key, 0, &fd, &id);
 	if (rc <= 0)
 		return rc == 0 ? 0 : -1;        /* cached negative, or cannot ask */
 
@@ -3046,7 +3084,24 @@ static int pcache_api_pull_start(cachedb_con *con, str *key, int *fd,
 
 	if (!col || !key || !fd || !handle)
 		return -1;
-	return pcache_pull_start(col, key, fd, handle);
+	return pcache_pull_start(col, key, 0, fd, handle);
+}
+
+static int pcache_api_pull_start_at(cachedb_con *con, str *key, int node_id,
+		int *fd, unsigned int *handle)
+{
+	pcache_col_t *col = con ? ((pcache_con *)con->data)->col : NULL;
+
+	if (!col || !key || !fd || !handle)
+		return -1;
+	return pcache_pull_start(col, key, node_id, fd, handle);
+}
+
+static int pcache_api_my_node_id(cachedb_con *con)
+{
+	if (!cluster_ready || !clusterer_api.get_my_id)
+		return 0;
+	return clusterer_api.get_my_id();
 }
 
 static int pcache_api_pull_finish(cachedb_con *con, str *key,
@@ -3089,8 +3144,10 @@ int load_pcache_pull(pcache_pull_api_t *api)
 			"is not configured (replicate_collections)\n");
 		return -1;
 	}
-	api->start  = pcache_api_pull_start;
-	api->finish = pcache_api_pull_finish;
+	api->start      = pcache_api_pull_start;
+	api->finish     = pcache_api_pull_finish;
+	api->start_at   = pcache_api_pull_start_at;
+	api->my_node_id = pcache_api_my_node_id;
 	return 0;
 }
 

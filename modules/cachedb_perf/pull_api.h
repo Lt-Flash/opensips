@@ -48,6 +48,19 @@
 typedef int (*pcache_pull_start_f)(cachedb_con *con, str *key, int *fd,
 		unsigned int *handle);
 
+/* As start(), but ask one node first instead of the whole cluster.  The
+ * caller supplies @node_id from whatever knowledge it has of where the
+ * key was put; it is treated as a hint and validated against current
+ * membership, so a stale or nonsensical one costs nothing but the usual
+ * broadcast.  @node_id <= 0 behaves exactly like start(). */
+typedef int (*pcache_pull_start_at_f)(cachedb_con *con, str *key,
+		int node_id, int *fd, unsigned int *handle);
+
+/* This node's id in the cluster the cache is part of, 0 if it has none.
+ * A consumer that wants to record where it stored something needs this,
+ * and getting it from here saves it from binding the clusterer itself. */
+typedef int (*pcache_my_node_id_f)(cachedb_con *con);
+
 /* Collect a started pull.  Safe to call after a timeout as well as after
  * the descriptor fires - it releases the request either way, so a caller
  * that gives up leaks nothing.  On a hit @val is pkg memory the caller
@@ -58,8 +71,10 @@ typedef int (*pcache_pull_finish_f)(cachedb_con *con, str *key,
 		unsigned int handle, str *val);
 
 typedef struct pcache_pull_api {
-	pcache_pull_start_f  start;
-	pcache_pull_finish_f finish;
+	pcache_pull_start_f    start;
+	pcache_pull_finish_f   finish;
+	pcache_pull_start_at_f start_at;
+	pcache_my_node_id_f    my_node_id;
 } pcache_pull_api_t;
 
 typedef int (*load_pcache_pull_f)(pcache_pull_api_t *api);

@@ -38,6 +38,8 @@
 #include "../../lib/csv.h"
 #include "../../evi/evi_modules.h"
 #include "../../bin_interface.h"
+#include <sys/eventfd.h>
+#include <poll.h>
 #include "../clusterer/api.h"
 
 #include "cachedb_perf.h"
@@ -130,6 +132,7 @@ static int   pull_ready;               /* transport up AND a collection opted in
  * the poll with an eventfd it registers here, and nothing else changes.) */
 struct pcache_pull_slot {
 	unsigned int id;                 /* 0 = free                          */
+	int          efd;                /* readable once an answer landed    */
 	unsigned int deadline;           /* ticks                             */
 	unsigned int gen;                /* membership generation at dispatch */
 	int          expect;             /* peers we asked                    */
@@ -1387,39 +1390,54 @@ static void pcache_pull_reply(bin_packet_t *in)
 		sl->done = 1;
 		pull_stats[PULL_ST_RECEIVED]++;
 	}
+	/* Wake whoever is waiting on this slot.  The reply almost never lands
+	 * in the process that asked, so this is the only way back to it: the
+	 * fd was created before the fork, which is what lets a sibling write
+	 * to it at all. */
+	if (sl->efd >= 0 && (sl->done || sl->negative >= sl->expect)) {
+		uint64_t one = 1;
+
+		if (write(sl->efd, &one, sizeof one) != sizeof one)
+			LM_DBG("could not signal the pull waiter\n");
+	}
 	lock_release(pull_lock);
 }
 
-/* Ask the cluster for one key.  Blocking, deliberately: this is the
- * protocol under test, and the SIP-side answer to blocking is the async
- * suspend of CP-15.9, not a different wire format.
+/* ---- asynchronous face -------------------------------------------------
  *
- * @return 1 = value found (in @out, @expires absolute, caller owns
- *             nothing - the bytes are copied into the caller's buffer),
- *         0 = definitively absent (every peer answered "not here"),
- *        -1 = no answer in time / not usable. */
-static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
-		unsigned int outlen, unsigned int *vlen, unsigned int *expires)
+ * Same protocol, without owning a process while the cluster thinks.  The
+ * caller starts a pull, gets back a file descriptor, hands it to whatever
+ * reactor it lives under, and collects the answer when that fd fires.
+ *
+ * The fd is the slot's, created before the fork; the reply handler writes
+ * to it from whichever process received the answer.  Nothing else about
+ * the protocol changes - the blocking entry point below is this same
+ * machinery with a poll loop where the reactor would be.
+ * ---------------------------------------------------------------------- */
+
+/* Begin a pull.  @fd receives the descriptor to wait on, @id the handle to
+ * finish with.
+ * @return  1 = started, wait on @fd,
+ *          0 = answered without asking anyone (a cached negative),
+ *         -1 = cannot pull (not enabled, no peers, no free slot). */
+static int pcache_pull_start(pcache_col_t *col, const str *key, int *fd,
+		unsigned int *id_out)
 {
 	struct pcache_pull_slot *sl = NULL;
 	bin_packet_t packet;
-	int ids[64], nmembers, i, rc = -1;
+	int ids[64], nmembers, i;
 	unsigned int gen = 0, id;
 
 	if (!pcache_pull_enabled(col) || key->len > PCACHE_PULL_MAX_KEY ||
 	        col->col_name.len > 63)
 		return -1;
-
-	/* we asked moments ago and the whole cluster said no - a retransmit
-	 * should not repeat the round of questions (R4) */
 	if (pcache_neg_check(col, key)) {
 		pull_stats[PULL_ST_SUPPRESSED]++;
 		return 0;
 	}
-
 	nmembers = pcache_cluster_members(ids, 64, &gen);
 	if (nmembers <= 0)
-		return -1;                       /* nobody to ask */
+		return -1;
 
 	lock_get(pull_lock);
 	for (i = 0; i < PCACHE_PULL_SLOTS; i++)
@@ -1434,9 +1452,19 @@ static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 		return -1;
 	}
 	id = ++(*pull_next_id);
-	if (!id)                                  /* never hand out 0 */
+	if (!id)
 		id = ++(*pull_next_id);
-	memset(sl, 0, sizeof *sl);
+	{
+		int efd = sl->efd;             /* survives the memset below */
+		uint64_t drain;
+
+		memset(sl, 0, sizeof *sl);
+		sl->efd = efd;
+		/* a previous user may have left the counter armed if it timed
+		 * out just as an answer arrived - start from a known state */
+		while (read(efd, &drain, sizeof drain) == (ssize_t)sizeof drain)
+			;
+	}
 	sl->id       = id;
 	sl->gen      = gen;
 	sl->expect   = nmembers;
@@ -1449,12 +1477,12 @@ static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 
 	if (bin_init(&packet, &pcache_sync_cap, PCACHE_PULL_REQ,
 	        PCACHE_SYNC_VERSION, 0) < 0)
-		goto out;
+		goto fail;
 	if (bin_push_int(&packet, (int)id) < 0 ||
 	    bin_push_str(&packet, &col->col_name) < 0 ||
 	    bin_push_str(&packet, (str *)key) < 0) {
 		bin_free_packet(&packet);
-		goto out;
+		goto fail;
 	}
 	pull_stats[PULL_ST_REQUESTED]++;
 	if (clusterer_api.send_all(&packet, sync_cluster_id) !=
@@ -1462,64 +1490,61 @@ static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 		LM_DBG("pull request reached no or only some nodes\n");
 	bin_free_packet(&packet);
 
-	/* wait for the first value, or for everyone to deny holding it */
-	for (i = 0; i < pull_timeout_ms; i++) {
-		lock_get(pull_lock);
-		if (sl->done) {
-			if (sl->vlen <= outlen) {
-				str v;
+	*fd = sl->efd;
+	*id_out = id;
+	return 1;
 
-				memcpy(out, sl->val, sl->vlen);
-				*vlen = sl->vlen;
-				if (expires)
-					*expires = sl->expires;
-				rc = 1;
-
-				/* Keep it: this is what makes a pull a repair rather than
-				 * a relay - the next request for this key is answered
-				 * locally in about a microsecond, and the cluster is
-				 * never asked about it again.  Store under the expiry the
-				 * owner had, so our copy dies with theirs; a blob whose
-				 * lifetime elapsed while it was in flight is not worth
-				 * storing at all. */
-				v.s = sl->val;
-				v.len = sl->vlen;
-				if (sl->expires && sl->expires <= get_ticks()) {
-					LM_DBG("pulled <%.*s> had already expired in flight - "
-						"not stored\n", key->len, key->s);
-				} else if (pcache_ht_store(col->htable, key, &v,
-				        sl->expires) < 0) {
-					LM_ERR("could not store the pulled value for <%.*s>\n",
-						key->len, key->s);
-				} else {
-					pull_stats[PULL_ST_STORED]++;
-					pcache_neg_clear(col, key);
-				}
-			}
-			lock_release(pull_lock);
-			goto out;
-		}
-		if (sl->negative >= sl->expect) {
-			/* everyone we asked answered, and none of them has it -
-			 * absence is a fact here, not an inference from silence */
-			lock_release(pull_lock);
-			rc = 0;
-			goto out;
-		}
-
-		lock_release(pull_lock);
-		usleep(1000);
-	}
-	pull_stats[PULL_ST_TIMEOUT]++;
-	LM_DBG("pull for <%.*s> timed out after %d ms (%d/%d answered)\n",
-		key->len, key->s, pull_timeout_ms, sl->negative, sl->expect);
-
-out:
-	/* A membership change while we were waiting means the responder set
-	 * we counted against is no longer the cluster: a "definitively
-	 * absent" verdict cannot be trusted across it (S4c), so downgrade it
-	 * to "no answer" and let the caller treat it as a plain miss. */
+fail:
 	lock_get(pull_lock);
+	sl->id = 0;
+	lock_release(pull_lock);
+	return -1;
+}
+
+/* Collect a started pull.  Safe to call on a timeout as well - it releases
+ * the slot either way, so a caller that gives up leaks nothing.
+ * @return 1 = value in @out, 0 = definitively absent, -1 = no answer. */
+static int pcache_pull_finish(pcache_col_t *col, const str *key,
+		unsigned int id, char *out, unsigned int outlen, unsigned int *vlen,
+		unsigned int *expires)
+{
+	struct pcache_pull_slot *sl;
+	uint64_t drain;
+	int rc = -1;
+
+	lock_get(pull_lock);
+	sl = pull_slot_get(id);
+	if (!sl) {
+		lock_release(pull_lock);
+		return -1;                      /* already reaped */
+	}
+	while (read(sl->efd, &drain, sizeof drain) == (ssize_t)sizeof drain)
+		;
+	if (sl->done && sl->vlen <= outlen) {
+		str v;
+
+		memcpy(out, sl->val, sl->vlen);
+		*vlen = sl->vlen;
+		if (expires)
+			*expires = sl->expires;
+		rc = 1;
+		v.s = sl->val;
+		v.len = sl->vlen;
+		if (sl->expires && sl->expires <= get_ticks()) {
+			LM_DBG("pulled <%.*s> had already expired in flight - not "
+				"stored\n", key->len, key->s);
+		} else if (pcache_ht_store(col->htable, key, &v, sl->expires) < 0) {
+			LM_ERR("could not store the pulled value for <%.*s>\n",
+				key->len, key->s);
+		} else {
+			pull_stats[PULL_ST_STORED]++;
+			pcache_neg_clear(col, key);
+		}
+	} else if (sl->negative >= sl->expect) {
+		rc = 0;
+	} else {
+		pull_stats[PULL_ST_TIMEOUT]++;
+	}
 	if (rc == 0 && pc_view && pc_view->generation != sl->gen) {
 		LM_DBG("membership changed during the pull - not concluding "
 			"absence\n");
@@ -1528,13 +1553,46 @@ out:
 	sl->id = 0;
 	lock_release(pull_lock);
 
-	/* Only a verdict the whole cluster gave is worth remembering.  A
-	 * timeout is not absence, and neither is an answer from a membership
-	 * that has since changed - caching either would turn "we do not know"
-	 * into "it is not there". */
 	if (rc == 0)
 		pcache_neg_add(col, key);
 	return rc;
+}
+
+/* Ask the cluster for one key and wait for the answer.
+ *
+ * A thin wrapper over the asynchronous pair above, with a poll where a
+ * reactor would be - so the two paths cannot drift apart, and everything
+ * that exercises this also exercises the machinery a suspended lookup
+ * will use.  Blocking is why pull_on_miss is off by default.
+ *
+ * @return 1 = value found (copied into @out), 0 = definitively absent,
+ *        -1 = no answer in time, or not usable. */
+static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
+		unsigned int outlen, unsigned int *vlen, unsigned int *expires)
+{
+	struct pollfd pfd;
+	unsigned int id = 0;
+	int fd = -1, rc, left = pull_timeout_ms;
+
+	rc = pcache_pull_start(col, key, &fd, &id);
+	if (rc <= 0)
+		return rc == 0 ? 0 : -1;        /* cached negative, or cannot ask */
+
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+	while (left > 0) {
+		int n = poll(&pfd, 1, left);
+
+		if (n > 0)
+			break;                      /* an answer landed */
+		if (n < 0 && errno == EINTR) {
+			left -= 1;                  /* a signal, not an answer */
+			continue;
+		}
+		break;                          /* timeout, or poll failed */
+	}
+
+	return pcache_pull_finish(col, key, id, out, outlen, vlen, expires);
 }
 
 static void pcache_sync_recv(bin_packet_t *packet)
@@ -2748,6 +2806,7 @@ static int mod_init(void)
 	str def_name = str_init(PCACHE_DEFAULT_COLLECTION);
 	pcache_url_t *it, *next;
 	pcache_col_t *col;
+	int i;
 
 	/* which of the four memory backings (DESIGN 2.6.1) does this host
 	 * support?  Probed by trying, pre-fork; the arena consumes the
@@ -2943,6 +3002,20 @@ static int mod_init(void)
 				return -1;
 			}
 			memset(pull_slots, 0, PCACHE_PULL_SLOTS * sizeof *pull_slots);
+			/* One eventfd per slot, created HERE - before the fork - so
+			 * that every worker inherits every fd.  This is the whole
+			 * reason the pool is fixed and preallocated: a reply arrives
+			 * in whichever process the transport chose, and it has to be
+			 * able to wake the process that asked.  An fd created after
+			 * the fork exists only in its own process and could not. */
+			for (i = 0; i < PCACHE_PULL_SLOTS; i++) {
+				pull_slots[i].efd = eventfd(0, EFD_NONBLOCK);
+				if (pull_slots[i].efd < 0) {
+					LM_ERR("cannot create the pull wakeup fds: %s\n",
+						strerror(errno));
+					return -1;
+				}
+			}
 			*pull_next_id = 0;
 			memset(pull_stats, 0, PULL_ST_MAX * sizeof *pull_stats);
 			if (pull_negative_ms < 0 || pull_negative_ms > 2000) {

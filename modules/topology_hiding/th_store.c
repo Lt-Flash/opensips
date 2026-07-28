@@ -370,9 +370,18 @@ void th_store_key_set_hint(char *key, int node_id)
 	key[1] = hex[h & 0xF];
 }
 
-/* Read it back.  Returns a node id in 1..256, or 0 when the characters do
- * not unmask to anything usable - which is what a key written before this
- * existed looks like, and is handled by asking everyone. */
+/* Read it back.  Returns a node id in 1..256, or 0 only when there is
+ * nothing to read from at all (no key, or not a stored-mode one).
+ *
+ * Every other input yields SOME id: the two characters are masked, so a
+ * key written before hints existed - or by a node that had no id - is
+ * indistinguishable from a hinted one and unmasks to an arbitrary value
+ * in range.  That is deliberate, and the reason there is no reserved
+ * "no hint" value to check for: legacy keys are uniform random hex, so
+ * any sentinel would collide with real keys 1 time in 256.  The filter
+ * is membership, applied by the caller - an id that is not a current
+ * peer is discarded and the whole cluster asked instead.  The only cost
+ * of a meaningless hint is one wasted question before that fallback. */
 int th_store_key_get_hint(const str *key)
 {
 	unsigned int v;

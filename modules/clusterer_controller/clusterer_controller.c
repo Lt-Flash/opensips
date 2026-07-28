@@ -397,6 +397,12 @@ static const unsigned char CL_CTR_CONSUMER_MAGIC[CL_CTR_MAGIC_SZ]  = { 0xCC, 0x0
  * a flood of consumer traffic can never crowd out JOIN/ALIVE, and a busy
  * consumer is not throttled at the control plane's rate. */
 #define CL_CTR_CONSUMER_RATE_DEFAULT 1000
+/* Reliable consumer delivery: how many times an unacknowledged message is
+ * sent again, and how long to wait between attempts.  Deliberately modest -
+ * a consumer that needs more than this wants a different design, not a
+ * longer queue.  Both are per-cluster overridable. */
+#define CL_CTR_CONSUMER_RETRIES_DEFAULT   2
+#define CL_CTR_CONSUMER_RETRY_MS_DEFAULT 40
 
 typedef struct {
     uint32_t ip;           /* network byte order; 0 = empty slot */
@@ -569,6 +575,13 @@ typedef struct cl_ctr_cluster_ {
     unsigned char  key[32];         /* bootstrap key = SHA256(password); JOIN only */
     unsigned char  session_key[32]; /* group key = HKDF(password, master_salt)     */
     int            manage_shtags; /* per-cluster override; defaults to global manage_shtags */
+    /* Consumer-plane policy, per cluster: a fleet may run one cluster over a
+     * quiet management VLAN and another across a link where retries matter,
+     * and one global number cannot be right for both.  -1 means "not set
+     * here", resolved to the global default in mod_init. */
+    int            consumer_retries;    /* extra sends of an unacked message */
+    int            consumer_retry_ms;   /* gap between those sends           */
+    int            consumer_rate;       /* per-source packets/s for consumers */
     int            master_stickiness; /* per-cluster override; -1 = inherit global */
     cl_ctr_peers_t    *peers;        /* per-cluster peer table in shm     */
     /* BIN socket resolved at mod_init - advertised in JOIN_REQ/NODE_ASSIGN */
@@ -779,6 +792,8 @@ int load_clctr(clctr_api_t *api);
 static clusterer_ctrl_binds_t clctl;
 static int                    clctl_loaded  = 0;
 static int                    manage_shtags = 1;
+static int                    consumer_retries = CL_CTR_CONSUMER_RETRIES_DEFAULT;
+static int                    consumer_retry_ms = CL_CTR_CONSUMER_RETRY_MS_DEFAULT;
 /* master_stickiness (global default; per-cluster override via "cluster" string):
  *   1 (default) = the master is "sticky": a live master keeps the role and is
  *                 NOT displaced when a higher-IP node joins.  The highest-IP
@@ -851,6 +866,8 @@ static const param_export_t params[] = {
     {"query_time", INT_PARAM, &query_time},
     {"password",      STR_PARAM, &password},
     {"consumer_rate_limit", INT_PARAM, &consumer_rate_limit},
+    {"consumer_retries",    INT_PARAM, &consumer_retries},
+    {"consumer_retry_ms",   INT_PARAM, &consumer_retry_ms},
     {"manage_shtags", INT_PARAM, &manage_shtags},
     {"master_stickiness", INT_PARAM, &master_stickiness},
     {"on_config_mismatch", STR_PARAM, &on_config_mismatch_s},
@@ -4673,7 +4690,7 @@ static int cl_ctr_rate_check(cl_ctr_cluster_t *cl, uint32_t src_ip,
 {
     time_t            now     = time(NULL);
     cl_ctr_rate_entry_t  *oldest  = NULL;
-    int               limit   = is_consumer ? consumer_rate_limit
+    int               limit   = is_consumer ? cl->consumer_rate
                                             : CL_CTR_RATE_LIMIT;
     int               i;
 
@@ -6182,6 +6199,9 @@ static int cl_ctr_parse_cluster_str(const char *str, cl_ctr_cluster_t *cl)
     strncpy(cl->password, password, sizeof(cl->password) - 1);
     cl->password[sizeof(cl->password) - 1] = '\0';
     cl->manage_shtags = -1; /* sentinel: inherit global default in mod_init */
+    cl->consumer_retries = -1;
+    cl->consumer_retry_ms = -1;
+    cl->consumer_rate = -1;
     cl->master_stickiness = -1; /* sentinel: inherit global default in mod_init */
 
     for (tok = strtok_r(buf, ",", &p); tok; tok = strtok_r(NULL, ",", &p)) {
@@ -6234,6 +6254,30 @@ static int cl_ctr_parse_cluster_str(const char *str, cl_ctr_cluster_t *cl)
 	    }
 	    strncpy(cl->bin_socket, val, CL_CTR_MAX_BIN_SOCK_LEN - 1);
 	    cl->bin_socket[CL_CTR_MAX_BIN_SOCK_LEN - 1] = '\0';
+
+	} else if (strcmp(key, "consumer_retries") == 0) {
+	    cl->consumer_retries = atoi(val);
+	    if (cl->consumer_retries < 0 || cl->consumer_retries > 10) {
+		LM_ERR("clusterer_controller: consumer_retries must be 0..10 "
+		       "in '%s'\n", str);
+		return -1;
+	    }
+
+	} else if (strcmp(key, "consumer_retry_ms") == 0) {
+	    cl->consumer_retry_ms = atoi(val);
+	    if (cl->consumer_retry_ms < 5 || cl->consumer_retry_ms > 5000) {
+		LM_ERR("clusterer_controller: consumer_retry_ms must be "
+		       "5..5000 in '%s'\n", str);
+		return -1;
+	    }
+
+	} else if (strcmp(key, "consumer_rate_limit") == 0) {
+	    cl->consumer_rate = atoi(val);
+	    if (cl->consumer_rate < 1) {
+		LM_ERR("clusterer_controller: consumer_rate_limit must be "
+		       "positive in '%s'\n", str);
+		return -1;
+	    }
 
 	} else if (strcmp(key, "manage_shtags") == 0) {
 	    cl->manage_shtags = atoi(val) ? 1 : 0;
@@ -6607,6 +6651,12 @@ static int mod_init(void)
 	    cl->master_stickiness = master_stickiness ? 1 : 0;
 	if (cl->manage_shtags == -1)
 	    cl->manage_shtags = manage_shtags ? 1 : 0;
+	if (cl->consumer_retries == -1)
+	    cl->consumer_retries = consumer_retries;
+	if (cl->consumer_retry_ms == -1)
+	    cl->consumer_retry_ms = consumer_retry_ms;
+	if (cl->consumer_rate == -1)
+	    cl->consumer_rate = consumer_rate_limit;
 
 	/* Resolve which BIN socket to use for this cluster.
 	 * Priority: explicit bin_socket= in cluster string >

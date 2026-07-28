@@ -81,12 +81,26 @@ typedef int (*clctr_send_ucast_f)(int cluster_id, int node_id,
 		str *channel, str *payload, int flags);
 
 /* this node's controller-assigned id in the cluster; 0 = none yet */
+/* Send to a named set of nodes.  Deliberately N unicasts rather than one
+ * multicast with the receivers filtering: a multicast is decrypted by every
+ * member, so "addressed to three of you" would still hand the payload to all
+ * of them.  The cost is linear in the size of the list, which is the honest
+ * price of addressing a subset.
+ *
+ * Returns the number of nodes the message was sent to, or -1 on error.  Nodes
+ * in the list that are not current members are skipped and counted in
+ * @unknown when it is not NULL. */
+typedef int (*clctr_send_list_f)(int cluster_id, const int *node_ids, int n,
+                                 str *channel, str *payload, int flags,
+                                 int *unknown);
+
 typedef int (*clctr_get_my_node_id_f)(int cluster_id);
 
 typedef struct clctr_api {
 	clctr_register_channel_f  register_channel;
 	clctr_send_mcast_f        send_mcast;
 	clctr_send_ucast_f        send_ucast;
+	clctr_send_list_f         send_list;
 	clctr_get_my_node_id_f    get_my_node_id;
 } clctr_api_t;
 

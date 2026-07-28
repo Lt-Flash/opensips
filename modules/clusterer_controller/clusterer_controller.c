@@ -781,10 +781,15 @@ static int cmd_cl_ctr_send_req(struct sip_msg *msg, int *cluster_id,
 		int *node_id, str *gen_msg, pv_spec_t *param);
 static int cmd_cl_ctr_send_rpl(struct sip_msg *msg, int *cluster_id,
 		int *node_id, str *gen_msg, pv_spec_t *param);
+static int cmd_cl_ctr_send_req_list(struct sip_msg *msg, int *cluster_id,
+		pv_spec_t *nodes, str *gen_msg, str *tag);
 static int clctr_send_mcast(int cluster_id, str *channel, str *payload,
         int flags);
 static int clctr_send_ucast(int cluster_id, int node_id, str *channel,
         str *payload, int flags);
+static int clctr_send_list(int cluster_id, const int *node_ids, int n,
+                           str *channel, str *payload, int flags,
+                           int *unknown);
 static int clctr_get_my_node_id(int cluster_id);
 int load_clctr(clctr_api_t *api);
 
@@ -1424,6 +1429,11 @@ static const cmd_export_t cl_ctr_cmds[] = {
 	{CMD_PARAM_STR,0,0},
 	{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0}, {0,0,0}},
 	ALL_ROUTES},
+    {"cl_ctr_send_req_list", (cmd_function)cmd_cl_ctr_send_req_list, {
+	{CMD_PARAM_INT, 0, 0},
+	{CMD_PARAM_VAR, 0, 0},
+	{CMD_PARAM_STR, 0, 0},
+	{CMD_PARAM_STR|CMD_PARAM_OPT, 0, 0}, {0, 0, 0}}, ALL_ROUTES},
     {"cl_ctr_send_rpl", (cmd_function)cmd_cl_ctr_send_rpl, {
 	{CMD_PARAM_INT,0,0},
 	{CMD_PARAM_INT,0,0},
@@ -7161,6 +7171,37 @@ static int clctr_send_mcast(int cluster_id, str *channel, str *payload,
     return cl_ctr_consumer_submit(cluster_id, 0, channel, payload, flags);
 }
 
+static int clctr_send_list(int cluster_id, const int *node_ids, int n,
+                           str *channel, str *payload, int flags, int *unknown)
+{
+    int i, sent = 0, missing = 0;
+
+    if (!node_ids || n <= 0)
+        return -1;
+
+    /* One unicast per target rather than a multicast the receivers filter:
+     * a multicast is decrypted by every member, so "addressed to three of
+     * you" would still put the payload in front of all of them.  The cost is
+     * linear in the list, which is the honest price of addressing a subset. */
+    for (i = 0; i < n; i++) {
+        if (node_ids[i] <= 0) {
+            missing++;
+            continue;
+        }
+        if (clctr_send_ucast(cluster_id, node_ids[i], channel, payload,
+                             flags) < 0)
+            missing++;
+        else
+            sent++;
+    }
+    if (unknown)
+        *unknown = missing;
+    if (missing)
+        LM_DBG("clusterer_controller: [cluster %d] list send reached %d of "
+               "%d node(s)\n", cluster_id, sent, n);
+    return sent;
+}
+
 static int clctr_send_ucast(int cluster_id, int node_id, str *channel,
         str *payload, int flags)
 {
@@ -7279,6 +7320,87 @@ static int cmd_cl_ctr_send_req(struct sip_msg *msg, int *cluster_id,
 		CL_CTR_SCRIPT_REQ);
 }
 
+/**
+ * cl_ctr_send_req_list() - send one request to the nodes named in an AVP.
+ *
+ * The AVP is read as a list of node ids, in the order the script built it.
+ * Every target gets its own unicast: a multicast is decrypted by every
+ * member, so addressing a subset over one would still hand the payload to
+ * the nodes that were not addressed.
+ *
+ * Returns the number of nodes the message went to, so a script can compare
+ * it against the size of its own list; entries that name a node which is
+ * not a current member are skipped rather than failing the whole send.
+ */
+static int cmd_cl_ctr_send_req_list(struct sip_msg *msg, int *cluster_id,
+		pv_spec_t *nodes, str *gen_msg, str *tag)
+{
+	int  ids[CL_CTR_MAX_PEERS];
+	int  n = 0, sent, unknown = 0;
+	struct usr_avp *avp = NULL;
+	int_str val;
+
+	if (!cluster_id || !nodes || !gen_msg)
+		return -1;
+	if (nodes->type != PVT_AVP) {
+		LM_ERR("clusterer_controller: the node list must be an AVP\n");
+		return -1;
+	}
+
+	/* search_first_avp/search_next walk newest-first; the script's own
+	 * order is not preserved and does not need to be - every named node
+	 * gets the same message. */
+	avp = search_first_avp(nodes->pvp.pvn.u.isname.type,
+	                       nodes->pvp.pvn.u.isname.name.n, &val, NULL);
+	while (avp && n < CL_CTR_MAX_PEERS) {
+		if (!(avp->flags & AVP_VAL_STR))
+			ids[n++] = (int)val.n;
+		else
+			LM_DBG("clusterer_controller: skipping a non-numeric "
+			       "entry in the node list\n");
+		avp = search_next_avp(avp, &val);
+	}
+	if (n == 0) {
+		LM_WARN("clusterer_controller: the node list is empty - "
+			"nothing sent\n");
+		return -1;
+	}
+	if (avp)
+		LM_WARN("clusterer_controller: node list longer than the %d a "
+			"cluster can hold - the rest is ignored\n",
+			CL_CTR_MAX_PEERS);
+
+	{
+		char  buf[CLCTR_MAX_PAYLOAD];
+		str   pl;
+		int   tlen = tag ? tag->len : 0;
+
+		if (tlen > 255)
+			tlen = 255;
+		if (2 + tlen + gen_msg->len > (int)sizeof(buf)) {
+			LM_ERR("clusterer_controller: message too large for the "
+			       "cluster plane (%d bytes)\n", gen_msg->len);
+			return -1;
+		}
+		buf[0] = (char)CL_CTR_SCRIPT_REQ;
+		buf[1] = (char)tlen;
+		if (tlen)
+			memcpy(buf + 2, tag->s, tlen);
+		memcpy(buf + 2 + tlen, gen_msg->s, gen_msg->len);
+		pl.s   = buf;
+		pl.len = 2 + tlen + gen_msg->len;
+
+		sent = clctr_send_list(*cluster_id, ids, n, &cl_ctr_script_chan,
+		                       &pl, 0, &unknown);
+	}
+	if (sent <= 0)
+		return -1;
+	if (unknown)
+		LM_DBG("clusterer_controller: [cluster %d] %d of %d target(s) "
+		       "were not reachable members\n", *cluster_id, unknown, n);
+	return sent;
+}
+
 static int cmd_cl_ctr_send_rpl(struct sip_msg *msg, int *cluster_id,
 		int *node_id, str *gen_msg, pv_spec_t *param)
 {
@@ -7320,6 +7442,7 @@ int load_clctr(clctr_api_t *api)
     api->register_channel = clctr_register_channel;
     api->send_mcast       = clctr_send_mcast;
     api->send_ucast       = clctr_send_ucast;
+    api->send_list        = clctr_send_list;
     api->get_my_node_id   = clctr_get_my_node_id;
     return 0;
 }

@@ -120,6 +120,7 @@ static int  pc_shtag_cid;              /* parsed tag cluster                 */
 #define PCACHE_PULL_MAX_VAL    8192   /* value size a pull will carry      */
 #define PCACHE_PULL_MAX_KEY    256
 #define PCACHE_NEG_SLOTS       256    /* direct-mapped negative cache      */
+#define CL_MAX_NODE_ID         256    /* the cluster stack's design cap    */
 static char *pull_transport_str;       /* "bin" (default) | "clctr"          */
 static int   pull_timeout_ms = 50;     /* how long a miss waits for peers    */
 static char *replicate_collections;    /* CSV opt-in; nothing pulls by default */
@@ -137,6 +138,10 @@ struct pcache_pull_slot {
 	unsigned int gen;                /* membership generation at dispatch */
 	int          expect;             /* peers we asked                    */
 	int          negative;           /* peers that answered "not here"    */
+	/* which nodes have answered, so a repeated reply cannot be counted
+	 * twice - two negatives from one node would otherwise reach @expect
+	 * and manufacture a "nobody has it" that nobody said */
+	unsigned char answered[(CL_MAX_NODE_ID + 7) / 8];
 	int          done;               /* 1 = a value landed                */
 	unsigned int expires;            /* ABSOLUTE, as the owner holds it   */
 	unsigned int vlen;
@@ -152,6 +157,12 @@ static unsigned int *pull_next_id;     /* shm: ids must be unique per node  */
 
 /* pull counters, deliberately separate from hits/misses so a pulled key
  * cannot flatter the local hit rate (R6) */
+/* Pull counters.  In shm and bumped from several processes - the request
+ * side runs in whichever worker took the miss, the reply and serve sides in
+ * whichever one the transport picked - so the increments are atomic.  A
+ * plain ++ would drop counts under exactly the load worth measuring.  This
+ * is one shared line, which the module forbids on the hot path (CP-06); a
+ * cross-node miss is not the hot path. */
 static unsigned int *pull_stats;       /* PULL_ST_* counters */
 
 /* Negative cache (R4).  A key that is genuinely nowhere costs a full
@@ -1347,7 +1358,7 @@ reply:
 	        CLUSTERER_SEND_SUCCESS)
 		LM_DBG("pull reply to node %d did not get through\n", in->src_id);
 	else if (found)
-		pull_stats[PULL_ST_SERVED]++;
+		__sync_fetch_and_add(&pull_stats[PULL_ST_SERVED], 1);
 	bin_free_packet(&out);
 	if (found)
 		pkg_free(val.s);
@@ -1380,6 +1391,19 @@ static void pcache_pull_reply(bin_packet_t *in)
 			id, in->src_id);
 		return;
 	}
+	/* count each node once, whatever the transport does */
+	if (in->src_id > 0 && in->src_id <= CL_MAX_NODE_ID) {
+		int byte = (in->src_id - 1) / 8, bit = 1 << ((in->src_id - 1) % 8);
+
+		if (sl->answered[byte] & bit) {
+			lock_release(pull_lock);
+			LM_DBG("duplicate pull reply from node %d - ignored\n",
+				in->src_id);
+			return;
+		}
+		sl->answered[byte] |= bit;
+	}
+
 	if (!found) {
 		sl->negative++;
 	} else if (!sl->done && val.len <= PCACHE_PULL_MAX_VAL) {
@@ -1388,7 +1412,7 @@ static void pcache_pull_reply(bin_packet_t *in)
 		/* back to an absolute deadline on our own clock */
 		sl->expires = ttl_left ? get_ticks() + (unsigned int)ttl_left : 0;
 		sl->done = 1;
-		pull_stats[PULL_ST_RECEIVED]++;
+		__sync_fetch_and_add(&pull_stats[PULL_ST_RECEIVED], 1);
 	}
 	/* Wake whoever is waiting on this slot.  The reply almost never lands
 	 * in the process that asked, so this is the only way back to it: the
@@ -1432,7 +1456,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int *fd,
 	        col->col_name.len > 63)
 		return -1;
 	if (pcache_neg_check(col, key)) {
-		pull_stats[PULL_ST_SUPPRESSED]++;
+		__sync_fetch_and_add(&pull_stats[PULL_ST_SUPPRESSED], 1);
 		return 0;
 	}
 	nmembers = pcache_cluster_members(ids, 64, &gen);
@@ -1484,7 +1508,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int *fd,
 		bin_free_packet(&packet);
 		goto fail;
 	}
-	pull_stats[PULL_ST_REQUESTED]++;
+	__sync_fetch_and_add(&pull_stats[PULL_ST_REQUESTED], 1);
 	if (clusterer_api.send_all(&packet, sync_cluster_id) !=
 	        CLUSTERER_SEND_SUCCESS)
 		LM_DBG("pull request reached no or only some nodes\n");
@@ -1509,6 +1533,7 @@ static int pcache_pull_finish(pcache_col_t *col, const str *key,
 		unsigned int *expires)
 {
 	struct pcache_pull_slot *sl;
+	unsigned int exp = 0;
 	uint64_t drain;
 	int rc = -1;
 
@@ -1521,40 +1546,48 @@ static int pcache_pull_finish(pcache_col_t *col, const str *key,
 	while (read(sl->efd, &drain, sizeof drain) == (ssize_t)sizeof drain)
 		;
 	if (sl->done && sl->vlen <= outlen) {
-		str v;
-
 		memcpy(out, sl->val, sl->vlen);
 		*vlen = sl->vlen;
+		exp = sl->expires;
 		if (expires)
-			*expires = sl->expires;
+			*expires = exp;
 		rc = 1;
-		v.s = sl->val;
-		v.len = sl->vlen;
-		if (sl->expires && sl->expires <= get_ticks()) {
-			LM_DBG("pulled <%.*s> had already expired in flight - not "
-				"stored\n", key->len, key->s);
-		} else if (pcache_ht_store(col->htable, key, &v, sl->expires) < 0) {
-			LM_ERR("could not store the pulled value for <%.*s>\n",
-				key->len, key->s);
-		} else {
-			pull_stats[PULL_ST_STORED]++;
-			pcache_neg_clear(col, key);
-		}
 	} else if (sl->negative >= sl->expect) {
 		rc = 0;
 	} else {
-		pull_stats[PULL_ST_TIMEOUT]++;
+		__sync_fetch_and_add(&pull_stats[PULL_ST_TIMEOUT], 1);
 	}
 	if (rc == 0 && pc_view && pc_view->generation != sl->gen) {
 		LM_DBG("membership changed during the pull - not concluding "
 			"absence\n");
 		rc = -1;
 	}
-	sl->id = 0;
+	sl->id = 0;                          /* the slot is reusable from here */
 	lock_release(pull_lock);
 
-	if (rc == 0)
+	/* Everything below runs OUTSIDE the pull lock, on the copy taken above.
+	 * Storing under it would serialise every node-wide pull behind one
+	 * table write - and worse, it would nest the pull lock outside the
+	 * bucket locks, so any future caller that pulls while holding a bucket
+	 * would deadlock.  Nothing here needs the slot. */
+	if (rc == 1) {
+		str v;
+
+		v.s = out;
+		v.len = *vlen;
+		if (exp && exp <= get_ticks()) {
+			LM_DBG("pulled <%.*s> had already expired in flight - not "
+				"stored\n", key->len, key->s);
+		} else if (pcache_ht_store(col->htable, key, &v, exp) < 0) {
+			LM_ERR("could not store the pulled value for <%.*s>\n",
+				key->len, key->s);
+		} else {
+			__sync_fetch_and_add(&pull_stats[PULL_ST_STORED], 1);
+			pcache_neg_clear(col, key);
+		}
+	} else if (rc == 0) {
 		pcache_neg_add(col, key);
+	}
 	return rc;
 }
 
@@ -3192,6 +3225,38 @@ static void mod_destroy(void)
 	if (mem_degraded_gate) {
 		shm_free(mem_degraded_gate);
 		mem_degraded_gate = NULL;
+	}
+
+	if (pull_slots) {
+		int i;
+
+		for (i = 0; i < PCACHE_PULL_SLOTS; i++)
+			if (pull_slots[i].efd >= 0)
+				close(pull_slots[i].efd);
+		shm_free(pull_slots);
+		pull_slots = NULL;
+	}
+	if (pull_lock) {
+		lock_destroy(pull_lock);
+		lock_dealloc(pull_lock);
+		pull_lock = NULL;
+	}
+	if (neg_slots) {
+		shm_free(neg_slots);
+		neg_slots = NULL;
+	}
+	if (neg_lock) {
+		lock_destroy(neg_lock);
+		lock_dealloc(neg_lock);
+		neg_lock = NULL;
+	}
+	if (pull_next_id) {
+		shm_free(pull_next_id);
+		pull_next_id = NULL;
+	}
+	if (pull_stats) {
+		shm_free(pull_stats);
+		pull_stats = NULL;
 	}
 
 	pcache_arena_destroy();

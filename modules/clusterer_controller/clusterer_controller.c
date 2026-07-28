@@ -800,11 +800,11 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param);
 static int clctr_register_channel(str *channel, clctr_msg_cb_f cb);
 static int cl_ctr_script_init(void);
 static int cmd_cl_ctr_broadcast_req(struct sip_msg *msg, int *cluster_id,
-		str *gen_msg, pv_spec_t *param, int *node_id, int *reliable);
+		str *gen_msg, str *tag, int *reliable);
 static int cmd_cl_ctr_send_req(struct sip_msg *msg, int *cluster_id,
-		int *node_id, str *gen_msg, pv_spec_t *param);
+		int *node_id, str *gen_msg, str *tag, int *reliable);
 static int cmd_cl_ctr_send_rpl(struct sip_msg *msg, int *cluster_id,
-		int *node_id, str *gen_msg, pv_spec_t *param);
+		int *node_id, str *gen_msg, str *tag);
 static int cmd_cl_ctr_send_req_list(struct sip_msg *msg, int *cluster_id,
 		pv_spec_t *nodes, str *gen_msg, str *tag, pv_spec_t *out);
 static int clctr_send_mcast(int cluster_id, str *channel, str *payload,
@@ -1454,15 +1454,15 @@ static const cmd_export_t cl_ctr_cmds[] = {
     {"cl_ctr_broadcast_req", (cmd_function)cmd_cl_ctr_broadcast_req, {
 	{CMD_PARAM_INT,0,0},
 	{CMD_PARAM_STR,0,0},
-	{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
-	{CMD_PARAM_INT|CMD_PARAM_OPT,0,0},
+	{CMD_PARAM_STR|CMD_PARAM_OPT,0,0},
 	{CMD_PARAM_INT|CMD_PARAM_OPT,0,0}, {0,0,0}},
 	ALL_ROUTES},
     {"cl_ctr_send_req", (cmd_function)cmd_cl_ctr_send_req, {
 	{CMD_PARAM_INT,0,0},
 	{CMD_PARAM_INT,0,0},
 	{CMD_PARAM_STR,0,0},
-	{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0}, {0,0,0}},
+	{CMD_PARAM_STR|CMD_PARAM_OPT,0,0},
+	{CMD_PARAM_INT|CMD_PARAM_OPT,0,0}, {0,0,0}},
 	ALL_ROUTES},
     {"cl_ctr_send_req_list", (cmd_function)cmd_cl_ctr_send_req_list, {
 	{CMD_PARAM_INT, 0, 0},
@@ -1474,7 +1474,7 @@ static const cmd_export_t cl_ctr_cmds[] = {
 	{CMD_PARAM_INT,0,0},
 	{CMD_PARAM_INT,0,0},
 	{CMD_PARAM_STR,0,0},
-	{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0}, {0,0,0}},
+	{CMD_PARAM_STR|CMD_PARAM_OPT,0,0}, {0,0,0}},
 	ALL_ROUTES},
     {"load_clctr", (cmd_function)load_clctr, {{0, 0, 0}}, 0},
     {0, 0, {{0, 0, 0}}, 0}
@@ -7548,20 +7548,21 @@ static int cl_ctr_script_send(int cluster_id, int node_id, str *gen_msg,
 }
 
 static int cmd_cl_ctr_broadcast_req(struct sip_msg *msg, int *cluster_id,
-		str *gen_msg, pv_spec_t *param, int *node_id, int *reliable)
+		str *gen_msg, str *tag, int *reliable)
 {
 	/* Reliability is asked for per send rather than per channel: most
 	 * messages are better off cheap, and the ones that are not know it. */
-	return cl_ctr_script_send(*cluster_id, 0, gen_msg, NULL,
+	return cl_ctr_script_send(*cluster_id, 0, gen_msg, tag,
 		CL_CTR_SCRIPT_REQ,
 		(reliable && *reliable) ? CLCTR_SEND_RELIABLE : 0);
 }
 
 static int cmd_cl_ctr_send_req(struct sip_msg *msg, int *cluster_id,
-		int *node_id, str *gen_msg, pv_spec_t *param)
+		int *node_id, str *gen_msg, str *tag, int *reliable)
 {
-	return cl_ctr_script_send(*cluster_id, *node_id, gen_msg, NULL,
-		CL_CTR_SCRIPT_REQ, 0);
+	return cl_ctr_script_send(*cluster_id, *node_id, gen_msg, tag,
+		CL_CTR_SCRIPT_REQ,
+		(reliable && *reliable) ? CLCTR_SEND_RELIABLE : 0);
 }
 
 /**
@@ -7661,9 +7662,9 @@ static int cmd_cl_ctr_send_req_list(struct sip_msg *msg, int *cluster_id,
 }
 
 static int cmd_cl_ctr_send_rpl(struct sip_msg *msg, int *cluster_id,
-		int *node_id, str *gen_msg, pv_spec_t *param)
+		int *node_id, str *gen_msg, str *tag)
 {
-	return cl_ctr_script_send(*cluster_id, *node_id, gen_msg, NULL,
+	return cl_ctr_script_send(*cluster_id, *node_id, gen_msg, tag,
 		CL_CTR_SCRIPT_RPL, 0);
 }
 

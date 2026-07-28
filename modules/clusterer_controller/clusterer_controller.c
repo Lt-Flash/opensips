@@ -564,6 +564,22 @@ typedef struct {
     struct sockaddr_storage dest;         /* unicast destination                  */
     socklen_t               destlen;
     int                     pkt_len;      /* sealed length                        */
+    /* A broadcast that asked to be acknowledged is one entry, not one per
+     * member: the message goes out once as a multicast - which is the whole
+     * point of having a multicast - and only the nodes that fail to answer
+     * are repaired individually.  Sending N unicasts up front would be about
+     * twice the packets for the same delivery, and at two hundred and fifty
+     * nodes that is the difference between a message and an event.
+     *
+     * Who still owes an ACK is a bitmap by node id.  The addresses to repair
+     * to are not stored: they are looked up from current membership when the
+     * repair runs, so a node that left in the meantime is simply not chased,
+     * and one that joined is not expected to answer for something sent
+     * before it arrived. */
+    int                     is_bcast;
+    uint16_t                expect_n;     /* members at send time            */
+    uint16_t                acked_n;
+    unsigned char           acked_map[(CL_CTR_MAX_PEERS + 7) / 8];
     unsigned char           pkt[CL_CTR_NODE_ASSIGN_MAX_SZ]; /* cached sealed bytes */
 } cl_ctr_retx_entry_t;
 
@@ -781,7 +797,7 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param);
 static int clctr_register_channel(str *channel, clctr_msg_cb_f cb);
 static int cl_ctr_script_init(void);
 static int cmd_cl_ctr_broadcast_req(struct sip_msg *msg, int *cluster_id,
-		str *gen_msg, pv_spec_t *param, int *node_id);
+		str *gen_msg, pv_spec_t *param, int *node_id, int *reliable);
 static int cmd_cl_ctr_send_req(struct sip_msg *msg, int *cluster_id,
 		int *node_id, str *gen_msg, pv_spec_t *param);
 static int cmd_cl_ctr_send_rpl(struct sip_msg *msg, int *cluster_id,
@@ -993,6 +1009,8 @@ static void cl_ctr_retx_enqueue(cl_ctr_cluster_t *cl, uint32_t seq,
                             unsigned char type, const unsigned char *pkt,
                             int pkt_len, const struct sockaddr *dest,
                             socklen_t destlen);
+static void cl_ctr_retx_enqueue_bcast(cl_ctr_cluster_t *cl, uint32_t seq,
+                            const unsigned char *pkt, int pkt_len);
 static void cl_ctr_retx_enqueue_consumer(cl_ctr_cluster_t *cl, uint32_t seq,
                             unsigned char type, const unsigned char *pkt,
                             int pkt_len, const struct sockaddr *dest,
@@ -1434,6 +1452,7 @@ static const cmd_export_t cl_ctr_cmds[] = {
 	{CMD_PARAM_INT,0,0},
 	{CMD_PARAM_STR,0,0},
 	{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
+	{CMD_PARAM_INT|CMD_PARAM_OPT,0,0},
 	{CMD_PARAM_INT|CMD_PARAM_OPT,0,0}, {0,0,0}},
 	ALL_ROUTES},
     {"cl_ctr_send_req", (cmd_function)cmd_cl_ctr_send_req, {
@@ -2691,6 +2710,59 @@ static void cl_ctr_retx_flush(cl_ctr_cluster_t *cl)
  * retransmit until ACKed.  Best-effort: if the queue is full the packet still
  * went out once and the joiner's JOIN_REQ retry remains the backstop.
  */
+/* Track a reliable broadcast: one entry, the members we expect to hear from,
+ * and the sealed bytes to repair with.  The expected count is a snapshot - a
+ * node that joins a moment later never saw the message and is not owed one. */
+static void cl_ctr_retx_enqueue_bcast(cl_ctr_cluster_t *cl, uint32_t seq,
+                            const unsigned char *pkt, int pkt_len)
+{
+    cl_ctr_retx_entry_t *e = NULL;
+    int i, n = 0;
+
+    if (pkt_len <= 0 || pkt_len > (int)sizeof(cl->retx_q[0].pkt))
+        return;
+
+    lock_start_read(cl->peers->lock);
+    for (i = 0; i < cl->peers->count; i++)
+        if (cl->peers->entries[i].node_id > 0 &&
+            cl->peers->entries[i].node_id <= CL_CTR_MAX_PEERS)
+            n++;
+    lock_stop_read(cl->peers->lock);
+
+    if (n == 0) {
+        LM_DBG("clusterer_controller: [cluster %d] reliable broadcast with no "
+               "peers to acknowledge it - nothing to wait for\n",
+               cl->cluster_id);
+        return;
+    }
+
+    for (i = 0; i < CL_CTR_RETX_QUEUE_SZ; i++)
+        if (!cl->retx_q[i].used) { e = &cl->retx_q[i]; break; }
+    if (!e) {
+        LM_DBG("clusterer_controller: [cluster %d] retransmit queue full - the "
+               "broadcast went out once, unacknowledged\n", cl->cluster_id);
+        return;
+    }
+
+    memset(e, 0, sizeof(*e));
+    e->used         = 1;
+    e->seq          = seq;
+    e->type         = CL_CTR_PKT_CONSUMER_REL;
+    e->is_bcast     = 1;
+    e->expect_n     = (uint16_t)n;
+    e->retries_left = cl->consumer_retries;
+    e->next_due_us  = get_uticks() + (utime_t)cl->consumer_retry_ms * 1000;
+    e->pkt_len      = pkt_len;
+    memcpy(e->pkt, pkt, pkt_len);
+    cl->retx_count++;
+    /* First argument is the delay, and zero there means disarm - the value
+     * this once passed, which switched the retransmit timer off instead of
+     * on and left every reliable broadcast waiting for a repair that could
+     * never run. */
+    cl_ctr_arm_tfd_us(cl->retx_tfd,
+                      (utime_t)cl->consumer_retry_ms * 1000, 0);
+}
+
 /* The consumer plane retransmits on its own schedule: the join handshake's
  * budget is pinned to the JOIN_REQ retry interval, which has nothing to say
  * about how long a consumer should wait.  Both are per-cluster, because one
@@ -2753,7 +2825,8 @@ static void cl_ctr_retx_enqueue(cl_ctr_cluster_t *cl, uint32_t seq, unsigned cha
 }
 
 /* An ACK arrived: drop the queued packet whose seq it echoes. */
-static void cl_ctr_handle_ack(const char *payload, int payload_len, cl_ctr_cluster_t *cl)
+static void cl_ctr_handle_ack(const char *payload, int payload_len,
+                              cl_ctr_cluster_t *cl, const char *sender_ip)
 {
     uint32_t acked_be, acked;
     int i;
@@ -2767,10 +2840,43 @@ static void cl_ctr_handle_ack(const char *payload, int payload_len, cl_ctr_clust
         cl_ctr_retx_entry_t *e = &cl->retx_q[i];
         if (!e->used || e->seq != acked)
             continue;
-        /* seq is unique within a key epoch (a rekey flushes the queue), so this
-         * is the acknowledged packet; drop it. */
-        LM_DBG("clusterer_controller: [cluster %d] ACK for 0x%02x seq %u\n",
-               cl->cluster_id, e->type, acked);
+
+        if (e->is_bcast) {
+            /* Every member acknowledges the same sequence number, so this
+             * entry lives until they all have (or the budget runs out). */
+            uint16_t nid = 0;
+
+            lock_start_read(cl->peers->lock);
+            {
+                cl_ctr_peer_t *p = cl_ctr_peer_by_ip_locked(cl, sender_ip);
+                if (p)
+                    nid = p->node_id;
+            }
+            lock_stop_read(cl->peers->lock);
+
+            if (nid > 0 && nid <= CL_CTR_MAX_PEERS) {
+                int byte = (nid - 1) / 8, bit = 1 << ((nid - 1) % 8);
+
+                if (!(e->acked_map[byte] & bit)) {
+                    e->acked_map[byte] |= bit;
+                    e->acked_n++;
+                }
+            }
+            if (e->acked_n < e->expect_n) {
+                LM_DBG("clusterer_controller: [cluster %d] broadcast seq %u "
+                       "acknowledged by %u of %u\n", cl->cluster_id, acked,
+                       e->acked_n, e->expect_n);
+                break;                       /* still waiting on others */
+            }
+            LM_DBG("clusterer_controller: [cluster %d] broadcast seq %u "
+                   "acknowledged by all %u member(s)\n", cl->cluster_id,
+                   acked, e->expect_n);
+        } else {
+            /* seq is unique within a key epoch (a rekey flushes the queue), so
+             * this is the acknowledged packet; drop it. */
+            LM_DBG("clusterer_controller: [cluster %d] ACK for 0x%02x seq %u\n",
+                   cl->cluster_id, e->type, acked);
+        }
         e->used = 0;
         cl->retx_count--;
         break;
@@ -2798,14 +2904,57 @@ static int cl_ctr_on_retx_tfd(int fd, void *param, int was_timeout)
         if (!e->used || now < e->next_due_us)
             continue;
 
-        if (sendto(cl->sock, e->pkt, e->pkt_len, 0,
+        if (e->is_bcast) {
+            /* Repair, not rebroadcast.  Sending the multicast again would
+             * reach the members that already have it, and - because a
+             * duplicate that asked to be acknowledged is acknowledged again -
+             * every one of them would answer a second time.  On a large
+             * cluster the repair for two missing nodes would cost a packet to
+             * everyone and an ACK back from everyone.  So the repair is
+             * unicast, to exactly the nodes that still owe an answer. */
+            int j, repaired = 0;
+
+            lock_start_read(cl->peers->lock);
+            for (j = 0; j < cl->peers->count; j++) {
+                cl_ctr_peer_t     *p = &cl->peers->entries[j];
+                struct sockaddr_in d;
+                int byte, bit;
+
+                if (p->node_id == 0 || p->node_id > CL_CTR_MAX_PEERS)
+                    continue;
+                byte = (p->node_id - 1) / 8;
+                bit  = 1 << ((p->node_id - 1) % 8);
+                if (e->acked_map[byte] & bit)
+                    continue;                    /* this one answered */
+
+                memset(&d, 0, sizeof d);
+                d.sin_family = AF_INET;
+                d.sin_port   = cl->mcast_dest.sin_port;
+                if (inet_pton(AF_INET, p->ip, &d.sin_addr) != 1)
+                    continue;
+                if (sendto(cl->sock, e->pkt, e->pkt_len, 0,
+                           (struct sockaddr *)&d, sizeof d) >= 0)
+                    repaired++;
+            }
+            lock_stop_read(cl->peers->lock);
+            LM_DBG("clusterer_controller: [cluster %d] broadcast seq %u: "
+                   "repairing %d node(s) that have not acknowledged\n",
+                   cl->cluster_id, e->seq, repaired);
+
+        } else if (sendto(cl->sock, e->pkt, e->pkt_len, 0,
                    (struct sockaddr *)&e->dest, e->destlen) < 0 &&
-            errno != EAGAIN && errno != EWOULDBLOCK)
+            errno != EAGAIN && errno != EWOULDBLOCK) {
             LM_DBG("clusterer_controller: [cluster %d] retransmit 0x%02x: %s\n",
                    cl->cluster_id, e->type, strerror(errno));
+        }
 
         if (--e->retries_left <= 0) {
-            LM_DBG("clusterer_controller: [cluster %d] 0x%02x (seq %u) unacked "
+            if (e->is_bcast)
+                LM_INFO("clusterer_controller: [cluster %d] broadcast seq %u "
+                        "reached %u of %u member(s) after all retries\n",
+                        cl->cluster_id, e->seq, e->acked_n, e->expect_n);
+            else
+                LM_DBG("clusterer_controller: [cluster %d] 0x%02x (seq %u) unacked "
                    "after %d retransmits, giving up - joiner will re-JOIN_REQ\n",
                    cl->cluster_id, e->type, e->seq, CL_CTR_RETX_MAX_RETRIES);
             e->used = 0;
@@ -5222,7 +5371,7 @@ static void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	}
 
 	case CL_CTR_PKT_ACK:
-	    cl_ctr_handle_ack(payload, payload_len, cl);
+	    cl_ctr_handle_ack(payload, payload_len, cl, sender_ip_buf);
 	    break;
 
 	case CL_CTR_PKT_KEY_HANDOFF:
@@ -7079,10 +7228,7 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param)
      * from every member is the implosion the join handshake already refuses -
      * so a reliable send to everyone is N unicasts, which is what send_list
      * and the broadcast helper do before they get here. */
-    reliable = (job->flags & CLCTR_SEND_RELIABLE) && job->dst_node_id != 0;
-    if ((job->flags & CLCTR_SEND_RELIABLE) && job->dst_node_id == 0)
-        LM_DBG("clusterer_controller: [cluster %d] a multicast cannot be "
-               "acknowledged - sending it unreliably\n", cl->cluster_id);
+    reliable = (job->flags & CLCTR_SEND_RELIABLE) != 0;
 
     if (on_wire) {
         if (!cl->have_session_key) {
@@ -7118,7 +7264,10 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param)
 
         if (job->dst_node_id == 0) {
             cl_ctr_seal_and_send(cl->sock, cl, pkt, plain_len,
-                    cl->session_key, CL_CTR_PKT_CONSUMER);
+                    cl->session_key,
+                    reliable ? CL_CTR_PKT_CONSUMER_REL : CL_CTR_PKT_CONSUMER);
+            if (reliable)
+                cl_ctr_retx_enqueue_bcast(cl, ntohl(seq), pkt, plain_len);
         } else {
             struct sockaddr_in d;
 
@@ -7356,7 +7505,7 @@ bad:
 /* ---- script tier: send -------------------------------------------------- */
 
 static int cl_ctr_script_send(int cluster_id, int node_id, str *gen_msg,
-		str *tag, unsigned char kind)
+		str *tag, unsigned char kind, int flags)
 {
 	char buf[CLCTR_MAX_PAYLOAD];
 	str pl;
@@ -7381,23 +7530,26 @@ static int cl_ctr_script_send(int cluster_id, int node_id, str *gen_msg,
 
 	if (node_id > 0)
 		return clctr_send_ucast(cluster_id, node_id, &cl_ctr_script_chan,
-			&pl, 0) < 0 ? -1 : 1;
-	return clctr_send_mcast(cluster_id, &cl_ctr_script_chan, &pl, 0) < 0
+			&pl, flags) < 0 ? -1 : 1;
+	return clctr_send_mcast(cluster_id, &cl_ctr_script_chan, &pl, flags) < 0
 		? -1 : 1;
 }
 
 static int cmd_cl_ctr_broadcast_req(struct sip_msg *msg, int *cluster_id,
-		str *gen_msg, pv_spec_t *param, int *node_id)
+		str *gen_msg, pv_spec_t *param, int *node_id, int *reliable)
 {
+	/* Reliability is asked for per send rather than per channel: most
+	 * messages are better off cheap, and the ones that are not know it. */
 	return cl_ctr_script_send(*cluster_id, 0, gen_msg, NULL,
-		CL_CTR_SCRIPT_REQ);
+		CL_CTR_SCRIPT_REQ,
+		(reliable && *reliable) ? CLCTR_SEND_RELIABLE : 0);
 }
 
 static int cmd_cl_ctr_send_req(struct sip_msg *msg, int *cluster_id,
 		int *node_id, str *gen_msg, pv_spec_t *param)
 {
 	return cl_ctr_script_send(*cluster_id, *node_id, gen_msg, NULL,
-		CL_CTR_SCRIPT_REQ);
+		CL_CTR_SCRIPT_REQ, 0);
 }
 
 /**
@@ -7500,7 +7652,7 @@ static int cmd_cl_ctr_send_rpl(struct sip_msg *msg, int *cluster_id,
 		int *node_id, str *gen_msg, pv_spec_t *param)
 {
 	return cl_ctr_script_send(*cluster_id, *node_id, gen_msg, NULL,
-		CL_CTR_SCRIPT_RPL);
+		CL_CTR_SCRIPT_RPL, 0);
 }
 
 /* Publish the two events and claim the script's channel.  Called from

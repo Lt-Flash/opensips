@@ -577,6 +577,9 @@ typedef struct {
      * and one that joined is not expected to answer for something sent
      * before it arrived. */
     int                     is_bcast;
+    uint8_t                 retries_cfg;  /* the budget this started with,
+                                           * so a report can say how much of
+                                           * it was actually spent          */
     uint16_t                expect_n;     /* members at send time            */
     uint16_t                acked_n;
     unsigned char           acked_map[(CL_CTR_MAX_PEERS + 7) / 8];
@@ -2751,6 +2754,7 @@ static void cl_ctr_retx_enqueue_bcast(cl_ctr_cluster_t *cl, uint32_t seq,
     e->is_bcast     = 1;
     e->expect_n     = (uint16_t)n;
     e->retries_left = cl->consumer_retries;
+    e->retries_cfg  = (uint8_t)cl->consumer_retries;
     e->next_due_us  = get_uticks() + (utime_t)cl->consumer_retry_ms * 1000;
     e->pkt_len      = pkt_len;
     memcpy(e->pkt, pkt, pkt_len);
@@ -2782,6 +2786,7 @@ static void cl_ctr_retx_enqueue_consumer(cl_ctr_cluster_t *cl, uint32_t seq,
         if (cl->retx_q[i].used && cl->retx_q[i].seq == seq &&
             cl->retx_q[i].type == type) {
             cl->retx_q[i].retries_left = cl->consumer_retries;
+            cl->retx_q[i].retries_cfg  = (uint8_t)cl->consumer_retries;
             cl->retx_q[i].next_due_us  = get_uticks()
                                        + (utime_t)cl->consumer_retry_ms * 1000;
             break;
@@ -2869,8 +2874,11 @@ static void cl_ctr_handle_ack(const char *payload, int payload_len,
                 break;                       /* still waiting on others */
             }
             LM_DBG("clusterer_controller: [cluster %d] broadcast seq %u "
-                   "acknowledged by all %u member(s)\n", cl->cluster_id,
-                   acked, e->expect_n);
+                   "acknowledged by all %u member(s) after %u of the %u "
+                   "retries configured for this cluster\n", cl->cluster_id,
+                   acked, e->expect_n,
+                   (unsigned)(e->retries_cfg - e->retries_left),
+                   (unsigned)e->retries_cfg);
         } else {
             /* seq is unique within a key epoch (a rekey flushes the queue), so
              * this is the acknowledged packet; drop it. */
@@ -2951,12 +2959,16 @@ static int cl_ctr_on_retx_tfd(int fd, void *param, int was_timeout)
         if (--e->retries_left <= 0) {
             if (e->is_bcast)
                 LM_INFO("clusterer_controller: [cluster %d] broadcast seq %u "
-                        "reached %u of %u member(s) after all retries\n",
-                        cl->cluster_id, e->seq, e->acked_n, e->expect_n);
+                        "reached %u of %u member(s), giving up after %u of the "
+                        "%u retries configured for this cluster\n",
+                        cl->cluster_id, e->seq, e->acked_n, e->expect_n,
+                        (unsigned)e->retries_cfg, (unsigned)e->retries_cfg);
             else
                 LM_DBG("clusterer_controller: [cluster %d] 0x%02x (seq %u) unacked "
-                   "after %d retransmits, giving up - joiner will re-JOIN_REQ\n",
-                   cl->cluster_id, e->type, e->seq, CL_CTR_RETX_MAX_RETRIES);
+                   "after %u retransmits, giving up - joiner will re-JOIN_REQ\n",
+                   cl->cluster_id, e->type, e->seq,
+                   (unsigned)(e->retries_cfg ? e->retries_cfg
+                                             : CL_CTR_RETX_MAX_RETRIES));
             e->used = 0;
             cl->retx_count--;
         } else {

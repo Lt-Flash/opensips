@@ -590,6 +590,23 @@ static mi_response_t *mi_perf_stats(str *col_s)
 		     add_mi_number(clobj, MI_SSTR("pulls_suppressed"),
 		        pull_stats[PULL_ST_SUPPRESSED]) < 0))
 			goto err;
+		/* in-flight requests: a gauge, not a counter.  It should sit at 0
+		 * when nothing is being asked; anything else parked there means
+		 * slots are being taken and not released, which ends as "all pull
+		 * slots busy" and silent loss of read repair. */
+		if (pull_ready && pull_slots) {
+			int busy = 0, k;
+
+			lock_get(pull_lock);
+			for (k = 0; k < PCACHE_PULL_SLOTS; k++)
+				if (pull_slots[k].id)
+					busy++;
+			lock_release(pull_lock);
+			if (add_mi_number(clobj, MI_SSTR("pulls_in_flight"), busy) < 0 ||
+			    add_mi_number(clobj, MI_SSTR("pull_slots"),
+			        PCACHE_PULL_SLOTS) < 0)
+				goto err;
+		}
 		if (pc_view->last_change) {
 			char lbuf[32];
 			int ln = snprintf(lbuf, sizeof lbuf, "%s:%d",

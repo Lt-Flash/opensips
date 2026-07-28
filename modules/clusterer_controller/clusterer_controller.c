@@ -4600,6 +4600,47 @@ static void cl_ctr_handle_key_handoff(const char *payload, int payload_len,
  * Finds or creates a 1-second sliding-window counter for src_ip.
  * @return 0 if within CL_CTR_RATE_LIMIT packets/s, -1 to drop.
  */
+/**
+ * cl_ctr_consumer_src_known() - is this address one of our cluster members?
+ *
+ * Consumer traffic only ever passes between nodes that have already joined:
+ * a module registers a channel and talks to its peers, and nothing legitimate
+ * sends consumer packets before it is a member.  Control traffic is different
+ * - a JOIN_REQ necessarily comes from a stranger - so this filter is applied
+ * to consumer packets only.
+ *
+ * It runs before the rate limiter and therefore before any crypto, which is
+ * the point: a flood from an address we have never heard of costs one scan of
+ * a table bounded by the cluster size, and does not reach the AEAD, does not
+ * consume a rate-table slot, and cannot evict a real peer's counter from it.
+ * Our own address passes, because multicast comes back to its sender.
+ *
+ * A spoofed source that copies a member's address still gets through - this
+ * filter cannot fix address spoofing, and does not claim to.  What it removes
+ * is the much easier attack of pointing a flood at the port from anywhere.
+ */
+static int cl_ctr_consumer_src_known(cl_ctr_cluster_t *cl, uint32_t src_ip)
+{
+    static uint32_t mine;        /* my_ip in host order, resolved once */
+    uint32_t        src_num = ntohl(src_ip);   /* peers keep host order */
+    int             i, known = 0;
+
+    if (!mine && my_ip)
+	mine = ip_to_num(my_ip);
+    if (src_num == mine)
+	return 1;
+
+    lock_start_read(cl->peers->lock);
+    for (i = 0; i < cl->peers->count; i++)
+	if (cl->peers->entries[i].ip_num == src_num) {
+	    known = 1;
+	    break;
+	}
+    lock_stop_read(cl->peers->lock);
+
+    return known;
+}
+
 static int cl_ctr_rate_check(cl_ctr_cluster_t *cl, uint32_t src_ip,
                              int is_consumer)
 {
@@ -4869,10 +4910,24 @@ static void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	}
     }
 
-    /* Rate-limit before any crypto work to shed floods cheaply. */
-    if (cl_ctr_rate_check(cl, src_addr.sin_addr.s_addr,
-            memcmp(buf, CL_CTR_CONSUMER_MAGIC, CL_CTR_MAGIC_SZ) == 0) < 0)
-	return;
+    /* Rate-limit before any crypto work to shed floods cheaply.  Consumer
+     * traffic from an address that is not a member is dropped one step
+     * earlier still - it cannot be legitimate, and dropping it here keeps it
+     * out of the rate table as well as out of the cipher. */
+    {
+	int is_consumer = (memcmp(buf, CL_CTR_CONSUMER_MAGIC,
+	                          CL_CTR_MAGIC_SZ) == 0);
+
+	if (is_consumer && !cl_ctr_consumer_src_known(cl,
+	                       src_addr.sin_addr.s_addr)) {
+	    if (cl->peers->count > 0)      /* quiet while still forming */
+		LM_DBG("clusterer_controller: [cluster %d] consumer packet "
+		       "from a non-member, dropping\n", cl->cluster_id);
+	    return;
+	}
+	if (cl_ctr_rate_check(cl, src_addr.sin_addr.s_addr, is_consumer) < 0)
+	    return;
+    }
 
     /* Resolve sender IP once - used for HMAC warning and MEMBER_LIST dispatch */
     {
@@ -5113,9 +5168,18 @@ static void cl_ctr_maybe_forward(const char *buf, int n,
 
     /* Shed floods before allocating: charge the source against our own limiter
      * (the target re-checks after it receives the forward). */
-    if (cl_ctr_rate_check(from, src->sin_addr.s_addr,
-            memcmp(buf, CL_CTR_CONSUMER_MAGIC, CL_CTR_MAGIC_SZ) == 0) < 0)
-	return;
+    {
+	int is_consumer = (memcmp(buf, CL_CTR_CONSUMER_MAGIC,
+	                          CL_CTR_MAGIC_SZ) == 0);
+
+	/* Judged against the target cluster's membership, not ours - the
+	 * packet is about to be handed to that cluster's worker. */
+	if (is_consumer && !cl_ctr_consumer_src_known(target,
+	                       src->sin_addr.s_addr))
+	    return;
+	if (cl_ctr_rate_check(from, src->sin_addr.s_addr, is_consumer) < 0)
+	    return;
+    }
 
     /* worker_proc_no is written once at worker fork and stable thereafter. */
     proc_no = target->peers ? target->peers->worker_proc_no : -1;

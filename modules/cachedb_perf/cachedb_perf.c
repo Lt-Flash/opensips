@@ -171,6 +171,7 @@ struct pcache_pull_slot {
 	int          done;               /* 1 = a value landed                */
 	int          oversize;           /* a peer HAS it but could not send  */
 	int          hinted;             /* asked one node, not the cluster   */
+	int          partial;            /* more peers than the snapshot held */
 	unsigned int expires;            /* ABSOLUTE, as the owner holds it   */
 	unsigned int vlen;
 	char         key[PCACHE_PULL_MAX_KEY];
@@ -278,19 +279,34 @@ static void pcache_cluster_event(enum clusterer_event ev, int node_id)
  * this node) plus the membership generation it was taken under.  A caller
  * that fans work out to these peers re-reads the generation afterwards:
  * a change means the set went stale mid-flight.  Returns the number of
- * ids written, or -1 when cluster sync is not active. */
-static int pcache_cluster_members(int *ids, int max, unsigned int *gen)
+ * ids written, or -1 when cluster sync is not active.
+ *
+ * @truncated, when given, says the cluster held more peers than fitted.
+ * A caller that concludes something from the whole set answering - the
+ * pull deciding a key is absent - must not draw that conclusion from a
+ * partial set, because the peers it never counted are exactly the ones
+ * that might have had it. */
+static int pcache_cluster_members(int *ids, int max, unsigned int *gen,
+		int *truncated)
 {
 	clusterer_node_t *list, *n;
 	int cnt = 0;
 
+	if (truncated)
+		*truncated = 0;
 	if (!cluster_ready || !pc_view)
 		return -1;
 	if (gen)
 		*gen = pc_view->generation;
 	list = clusterer_api.get_nodes(sync_cluster_id);
-	for (n = list; n && cnt < max; n = n->next)
+	for (n = list; n; n = n->next) {
+		if (cnt >= max) {
+			if (truncated)
+				*truncated = 1;
+			break;
+		}
 		ids[cnt++] = n->node_id;
+	}
 	if (list)
 		clusterer_api.free_nodes(list);
 	return cnt;
@@ -601,12 +617,12 @@ static mi_response_t *mi_perf_stats(str *col_s)
 	 * every membership change, so two equal reads bracket a quiet period. */
 	if (cluster_ready && pc_view) {
 		mi_item_t *clobj = add_mi_object(obj, MI_SSTR("cluster"));
-		int ids[64], nup;
+		int ids[CL_MAX_NODE_ID], nup;
 		unsigned int gen = 0;
 
 		if (!clobj)
 			goto err;
-		nup = pcache_cluster_members(ids, 64, &gen);
+		nup = pcache_cluster_members(ids, CL_MAX_NODE_ID, &gen, NULL);
 		if (add_mi_number(clobj, MI_SSTR("cluster_id"), sync_cluster_id) < 0 ||
 		    add_mi_number(clobj, MI_SSTR("peers_up"), nup < 0 ? 0 : nup) < 0 ||
 		    add_mi_number(clobj, MI_SSTR("membership_generation"), gen) < 0 ||
@@ -1533,16 +1549,19 @@ static void pcache_pull_do_reply(int src_node, unsigned int id, str *key,
 		return;
 	}
 
-	/* count each node once, whatever the transport does */
-	if (src_node > 0 && src_node <= CL_MAX_NODE_ID) {
-		int byte = (src_node - 1) / 8, bit = 1 << ((src_node - 1) % 8);
-
-		if (sl->answered[byte] & bit) {
-			lock_release(pull_lock);
-			LM_DBG("duplicate pull reply from node %d - ignored\n", src_node);
-			return;
-		}
-		sl->answered[byte] |= bit;
+	/* Count each node once, whatever the transport does.  An id outside
+	 * the range the bitmap covers cannot be tracked, and counting it
+	 * undeduped is exactly the defect the bitmap exists to prevent - two
+	 * answers from one node reaching @expect and manufacturing an absence
+	 * nobody stated.  The controller assigns 1..CL_MAX_NODE_ID, but a
+	 * stock clusterer takes whatever the database says, so this is
+	 * reachable without the controller.  Drop such a reply rather than
+	 * let it vote. */
+	if (src_node <= 0 || src_node > CL_MAX_NODE_ID) {
+		lock_release(pull_lock);
+		LM_ERR("pull reply from node id %d, outside 1..%d - cannot be "
+			"tracked, ignored\n", src_node, CL_MAX_NODE_ID);
+		return;
 	}
 
 	if (found == PCACHE_FOUND_NO) {
@@ -1674,7 +1693,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 {
 	struct pcache_pull_slot *sl = NULL;
 	bin_packet_t packet;
-	int ids[64], nmembers, i;
+	int ids[CL_MAX_NODE_ID], nmembers, i, truncated = 0;
 	unsigned int gen = 0, id;
 
 	if (!pcache_pull_enabled(col) || key->len > PCACHE_PULL_MAX_KEY ||
@@ -1684,7 +1703,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 		__sync_fetch_and_add(&pull_stats[PULL_ST_SUPPRESSED], 1);
 		return 0;
 	}
-	nmembers = pcache_cluster_members(ids, 64, &gen);
+	nmembers = pcache_cluster_members(ids, CL_MAX_NODE_ID, &gen, &truncated);
 	if (nmembers <= 0)
 		return -1;
 
@@ -1735,6 +1754,10 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 	sl->id       = id;
 	sl->gen      = gen;
 	sl->hinted   = hint_node;
+	/* A broadcast goes to every peer, but only the ones that fitted the
+	 * snapshot were counted - so on a truncated set the negatives can
+	 * reach @expect while peers nobody tallied still hold the key. */
+	sl->partial  = hint_node > 0 ? 0 : truncated;
 	/* one node was asked, so one answer settles it */
 	sl->expect   = hint_node > 0 ? 1 : nmembers;
 	sl->deadline = get_ticks() + (pull_timeout_ms + 999) / 1000 + 1;
@@ -1841,8 +1864,10 @@ static int pcache_pull_finish(pcache_col_t *col, const str *key,
 	} else if (sl->negative >= sl->expect) {
 		/* One node was asked and it does not have it.  That is not the
 		 * cluster's answer, so it must not become one: report no answer
-		 * and let the caller ask properly. */
-		rc = sl->hinted ? -1 : 0;
+		 * and let the caller ask properly.  Same for a set we could only
+		 * partly account for - silence from peers we never counted is
+		 * not evidence of absence. */
+		rc = (sl->hinted || sl->partial) ? -1 : 0;
 	} else {
 		__sync_fetch_and_add(&pull_stats[PULL_ST_TIMEOUT], 1);
 	}

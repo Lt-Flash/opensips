@@ -253,6 +253,11 @@ static const unsigned char CL_CTR_CONSUMER_MAGIC[CL_CTR_MAGIC_SZ]  = { 0xCC, 0x0
 #define CL_CTR_PKT_ACK              0x0B  /* receiver -> sender: ack of a 1:1 handshake pkt */
 #define CL_CTR_PKT_RESYNC           0x0C  /* member -> master: my view differs, resend state */
 #define CL_CTR_PKT_CONSUMER         0x0D  /* consumer API message: [src_id][chan][data] */
+/* Same payload, but the receiver acknowledges it and the sender retransmits
+ * until it does.  A separate type rather than a flag in the payload so the
+ * receive path can tell them apart before it parses anything, and so an old
+ * build simply does not recognise it instead of half-understanding it. */
+#define CL_CTR_PKT_CONSUMER_REL     0x0E
 
 /* Consumer messaging (api.h): plaintext payload layout after type+seq is
  * [src_node_id u16 BE][chan_len u8][channel bytes][consumer payload].
@@ -782,7 +787,7 @@ static int cmd_cl_ctr_send_req(struct sip_msg *msg, int *cluster_id,
 static int cmd_cl_ctr_send_rpl(struct sip_msg *msg, int *cluster_id,
 		int *node_id, str *gen_msg, pv_spec_t *param);
 static int cmd_cl_ctr_send_req_list(struct sip_msg *msg, int *cluster_id,
-		pv_spec_t *nodes, str *gen_msg, str *tag);
+		pv_spec_t *nodes, str *gen_msg, str *tag, pv_spec_t *out);
 static int clctr_send_mcast(int cluster_id, str *channel, str *payload,
         int flags);
 static int clctr_send_ucast(int cluster_id, int node_id, str *channel,
@@ -984,6 +989,14 @@ static void mod_destroy(void);
 static void cl_ctr_worker(int rank);
 static int  cl_ctr_on_sock(int fd, void *param, int was_timeout);
 static void cl_ctr_retx_flush(cl_ctr_cluster_t *cl);
+static void cl_ctr_retx_enqueue(cl_ctr_cluster_t *cl, uint32_t seq,
+                            unsigned char type, const unsigned char *pkt,
+                            int pkt_len, const struct sockaddr *dest,
+                            socklen_t destlen);
+static void cl_ctr_retx_enqueue_consumer(cl_ctr_cluster_t *cl, uint32_t seq,
+                            unsigned char type, const unsigned char *pkt,
+                            int pkt_len, const struct sockaddr *dest,
+                            socklen_t destlen);
 static int  cl_ctr_on_retx_tfd(int fd, void *param, int was_timeout);
 static void cl_ctr_membership_digest(cl_ctr_cluster_t *cl, uint16_t *count, uint64_t *hash);
 static void cl_ctr_send_resync(int sock, cl_ctr_cluster_t *cl,
@@ -1433,7 +1446,8 @@ static const cmd_export_t cl_ctr_cmds[] = {
 	{CMD_PARAM_INT, 0, 0},
 	{CMD_PARAM_VAR, 0, 0},
 	{CMD_PARAM_STR, 0, 0},
-	{CMD_PARAM_STR|CMD_PARAM_OPT, 0, 0}, {0, 0, 0}}, ALL_ROUTES},
+	{CMD_PARAM_STR|CMD_PARAM_OPT, 0, 0},
+	{CMD_PARAM_VAR|CMD_PARAM_OPT, 0, 0}, {0, 0, 0}}, ALL_ROUTES},
     {"cl_ctr_send_rpl", (cmd_function)cmd_cl_ctr_send_rpl, {
 	{CMD_PARAM_INT,0,0},
 	{CMD_PARAM_INT,0,0},
@@ -2677,6 +2691,31 @@ static void cl_ctr_retx_flush(cl_ctr_cluster_t *cl)
  * retransmit until ACKed.  Best-effort: if the queue is full the packet still
  * went out once and the joiner's JOIN_REQ retry remains the backstop.
  */
+/* The consumer plane retransmits on its own schedule: the join handshake's
+ * budget is pinned to the JOIN_REQ retry interval, which has nothing to say
+ * about how long a consumer should wait.  Both are per-cluster, because one
+ * cluster may cross a link where another does not. */
+static void cl_ctr_retx_enqueue_consumer(cl_ctr_cluster_t *cl, uint32_t seq,
+                            unsigned char type, const unsigned char *pkt,
+                            int pkt_len, const struct sockaddr *dest,
+                            socklen_t destlen)
+{
+    int i;
+
+    cl_ctr_retx_enqueue(cl, seq, type, pkt, pkt_len, dest, destlen);
+    /* Re-arm the entry we just made with this cluster's consumer budget.
+     * Enqueue does not take them as arguments because every other caller
+     * wants the handshake numbers. */
+    for (i = 0; i < CL_CTR_RETX_QUEUE_SZ; i++)
+        if (cl->retx_q[i].used && cl->retx_q[i].seq == seq &&
+            cl->retx_q[i].type == type) {
+            cl->retx_q[i].retries_left = cl->consumer_retries;
+            cl->retx_q[i].next_due_us  = get_uticks()
+                                       + (utime_t)cl->consumer_retry_ms * 1000;
+            break;
+        }
+}
+
 static void cl_ctr_retx_enqueue(cl_ctr_cluster_t *cl, uint32_t seq, unsigned char type,
                             const unsigned char *pkt, int pkt_len,
                             const struct sockaddr *dest, socklen_t destlen)
@@ -4995,6 +5034,7 @@ static void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	 *   CL_CTR_PACKET_MAGIC    -> session key   (all normal traffic)
 	 * If session key decryption fails, schedule a re-JOIN to refresh it. */
 	int is_bootstrap = (memcmp(buf, CL_CTR_BOOTSTRAP_MAGIC, CL_CTR_MAGIC_SZ) == 0);
+	uint32_t pkt_seq = 0;   /* needed again below, to acknowledge by seq */
 	dec_key = is_bootstrap ? cl->key : cl->session_key;
 
 	if (cl_ctr_decrypt_pkt(buf, n, sender_ip_buf, dec_key, is_bootstrap) < 0) {
@@ -5064,18 +5104,31 @@ static void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	 * without any special-casing.
 	 * Bootstrap packets (CL_CTR_BOOTSTRAP_MAGIC) use join_nonce instead. */
 	if (!is_bootstrap) {
-	    uint32_t pkt_seq;
 	    /* The type byte, not the cleartext magic: this runs after the AEAD,
 	     * so the byte is authenticated and the magic is only the hint the
 	     * rate limiter needed before there was anything to trust. */
-	    int is_consumer_pkt = ((unsigned char)buf[CL_CTR_WIRE_HDR_SZ]
-	                           == CL_CTR_PKT_CONSUMER);
+	    /* Both flavours belong to the consumer plane - the reliable one is
+	     * still consumer traffic, and counting it against the control plane
+	     * would put back exactly the mixing the split removed. */
+	    unsigned char _t = (unsigned char)buf[CL_CTR_WIRE_HDR_SZ];
+	    int is_consumer_pkt = (_t == CL_CTR_PKT_CONSUMER ||
+	                           _t == CL_CTR_PKT_CONSUMER_REL);
 
 	    memcpy(&pkt_seq, buf + CL_CTR_WIRE_HDR_SZ + 1, CL_CTR_SEQ_SZ);
 	    pkt_seq = ntohl(pkt_seq);
 	    if (cl_ctr_check_and_update_seq(sender_ip_buf, pkt_seq, cl,
-	                                    is_consumer_pkt) < 0)
+	                                    is_consumer_pkt) < 0) {
+		/* A duplicate of a message that asked to be acknowledged means
+		 * our acknowledgement did not arrive: say it again.  Without
+		 * this the sender spends its whole retransmit budget against a
+		 * receiver that has had the message all along and is dropping
+		 * every copy in silence. */
+		if ((unsigned char)buf[CL_CTR_WIRE_HDR_SZ]
+		        == CL_CTR_PKT_CONSUMER_REL)
+		    cl_ctr_send_ack(cl->sock, cl, pkt_seq, 0,
+		                    (const struct sockaddr *)&src_addr, src_len);
 		return;
+	    }
 	}
 
 	pkt_type    = (unsigned char)buf[CL_CTR_WIRE_HDR_SZ];
@@ -5109,6 +5162,16 @@ static void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	    cl_ctr_handle_alive(ip_buf, pubkey, cfg_present, p_manage, p_stick, p_qt, cl);
 	    break;
 	}
+
+	case CL_CTR_PKT_CONSUMER_REL:
+	    /* Acknowledge first, deliver second: the sender is holding a
+	     * retransmit slot on this, and delivery cannot fail in a way the
+	     * acknowledgement should report - the consumer's own callback owns
+	     * what happens next. */
+	    cl_ctr_send_ack(cl->sock, cl, pkt_seq, 0/*session key*/,
+	                    (const struct sockaddr *)&src_addr, src_len);
+	    cl_ctr_handle_consumer(payload, payload_len, sender_ip_buf, cl);
+	    break;
 
 	case CL_CTR_PKT_CONSUMER:
 	    /* session-key only: a consumer message under the bootstrap key
@@ -7000,7 +7063,7 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param)
     char      dst_ip[CL_CTR_MAX_IP_LEN + 1];
     uint32_t  seq;
     uint16_t  id_be;
-    int       plain_len, i, to_self = 0, on_wire = 1;
+    int       plain_len, i, to_self = 0, on_wire = 1, reliable = 0;
 
     /* unicast to our own id never touches the wire; multicast with
      * CLCTR_SEND_TO_SELF touches it AND dispatches locally */
@@ -7010,6 +7073,16 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param)
     } else if (job->flags & CLCTR_SEND_TO_SELF) {
         to_self = 1;
     }
+
+    /* Reliability is per-recipient: it needs an address to retransmit to and
+     * an acknowledgement to stop on.  A multicast has neither, and ACKing one
+     * from every member is the implosion the join handshake already refuses -
+     * so a reliable send to everyone is N unicasts, which is what send_list
+     * and the broadcast helper do before they get here. */
+    reliable = (job->flags & CLCTR_SEND_RELIABLE) && job->dst_node_id != 0;
+    if ((job->flags & CLCTR_SEND_RELIABLE) && job->dst_node_id == 0)
+        LM_DBG("clusterer_controller: [cluster %d] a multicast cannot be "
+               "acknowledged - sending it unreliably\n", cl->cluster_id);
 
     if (on_wire) {
         if (!cl->have_session_key) {
@@ -7028,7 +7101,8 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param)
          * smaller control-plane one.  Same session key either way - the
          * tag is a routing hint, not a key selector here. */
         memcpy(pkt, CL_CTR_CONSUMER_MAGIC, CL_CTR_MAGIC_SZ);
-        pkt[CL_CTR_WIRE_HDR_SZ] = (char)CL_CTR_PKT_CONSUMER;
+        pkt[CL_CTR_WIRE_HDR_SZ] = (char)(reliable ? CL_CTR_PKT_CONSUMER_REL
+                                                  : CL_CTR_PKT_CONSUMER);
         memcpy(pkt + CL_CTR_WIRE_HDR_SZ + 1, &seq, CL_CTR_SEQ_SZ);
         memcpy(pkt + CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ, &id_be,
                CL_CTR_NODE_ID_SZ);
@@ -7071,8 +7145,14 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param)
                            "'%s'\n", cl->cluster_id, dst_ip);
                 } else {
                     cl_ctr_seal_and_send_to(cl->sock, cl, pkt, plain_len,
-                            cl->session_key, CL_CTR_PKT_CONSUMER,
+                            cl->session_key,
+                            reliable ? CL_CTR_PKT_CONSUMER_REL
+                                     : CL_CTR_PKT_CONSUMER,
                             (const struct sockaddr *)&d, sizeof d);
+                    if (reliable)
+                        cl_ctr_retx_enqueue_consumer(cl, ntohl(seq),
+                                CL_CTR_PKT_CONSUMER_REL, pkt, plain_len,
+                                (const struct sockaddr *)&d, sizeof d);
                 }
             }
         }
@@ -7333,7 +7413,7 @@ static int cmd_cl_ctr_send_req(struct sip_msg *msg, int *cluster_id,
  * not a current member are skipped rather than failing the whole send.
  */
 static int cmd_cl_ctr_send_req_list(struct sip_msg *msg, int *cluster_id,
-		pv_spec_t *nodes, str *gen_msg, str *tag)
+		pv_spec_t *nodes, str *gen_msg, str *tag, pv_spec_t *out)
 {
 	int  ids[CL_CTR_MAX_PEERS];
 	int  n = 0, sent, unknown = 0;
@@ -7393,12 +7473,27 @@ static int cmd_cl_ctr_send_req_list(struct sip_msg *msg, int *cluster_id,
 		sent = clctr_send_list(*cluster_id, ids, n, &cl_ctr_script_chan,
 		                       &pl, 0, &unknown);
 	}
+	/* How many nodes it reached goes out through a variable, never through
+	 * the return value: the core stops the script when an action returns
+	 * zero, and "reached nobody" is a real answer a script must be able to
+	 * see rather than a reason to stop.  The return value is therefore only
+	 * whether the send could be attempted. */
+	if (out) {
+		pv_value_t v;
+
+		memset(&v, 0, sizeof v);
+		v.flags = PV_TYPE_INT | PV_VAL_INT;
+		v.ri    = sent < 0 ? 0 : sent;
+		if (pv_set_value(msg, out, 0, &v) < 0)
+			LM_ERR("clusterer_controller: cannot write the delivery "
+			       "count to the output variable\n");
+	}
 	if (sent <= 0)
 		return -1;
 	if (unknown)
 		LM_DBG("clusterer_controller: [cluster %d] %d of %d target(s) "
 		       "were not reachable members\n", *cluster_id, unknown, n);
-	return sent;
+	return 1;
 }
 
 static int cmd_cl_ctr_send_rpl(struct sip_msg *msg, int *cluster_id,

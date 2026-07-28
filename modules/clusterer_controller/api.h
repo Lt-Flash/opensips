@@ -58,6 +58,14 @@
 
 /* deliver to this node too, via local callback dispatch (never off the wire) */
 #define CLCTR_SEND_TO_SELF   (1 << 0)
+/* Ask for the message to be acknowledged, and resent while it is not.
+ *
+ * Costs one ACK per recipient, so a reliable send to the whole cluster is
+ * N-1 packets back where a plain one was nothing - deliberately opt-in, and
+ * deliberately per send rather than per channel: most consumer traffic is
+ * better served by being idempotent and retried by its own logic, which is
+ * how the cross-node cache fetch works and why it asks for nothing here. */
+#define CLCTR_SEND_RELIABLE  (1 << 1)
 
 /* limits a consumer can rely on */
 #define CLCTR_MAX_CHAN_LEN   31

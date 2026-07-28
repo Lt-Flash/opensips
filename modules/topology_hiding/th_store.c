@@ -45,9 +45,17 @@ static cachedb_con *th_cdbc;
 static pcache_pull_api_t th_pull;
 static int th_pull_ready;
 
-/* this node's id in the cluster, 0 when it has none - the value written
- * into the keys this node creates */
-static int th_my_node_id;
+/* This node's id in the cluster, or 0 when it has none yet.  Asked for
+ * each time rather than remembered: at startup there is no cluster, and
+ * an id is assigned only once this node has joined - a value read then
+ * would be whatever the configuration guessed, which the cluster is free
+ * to overrule.  The accessor is a read of an integer. */
+static int th_node_id(void)
+{
+	if (!th_pull_ready || !th_pull.my_node_id)
+		return 0;
+	return th_pull.my_node_id(NULL);
+}
 
 extern str topo_hiding_ct_encode_pw;   /* the module's encoding password */
 
@@ -392,8 +400,12 @@ void th_store_make_key(str seeds[], int n, char *out)
 	memcpy(out, md5, TH_KEY_LEN);
 	/* ...of which the first two now say where the state was put, when
 	 * this node knows its own id in a cluster */
-	if (th_my_node_id > 0)
-		th_store_key_set_hint(out, th_my_node_id);
+	{
+		int id = th_node_id();
+
+		if (id > 0)
+			th_store_key_set_hint(out, id);
+	}
 }
 
 
@@ -591,11 +603,8 @@ void th_store_bind_pull(void)
 		return;
 	if (load_pcache_pull_api(&th_pull) == 0) {
 		th_pull_ready = 1;
-		if (th_pull.my_node_id)
-			th_my_node_id = th_pull.my_node_id(NULL);
-		LM_INFO("topology hiding state can be fetched from other nodes%s\n",
-			th_my_node_id ? ", and new keys will say where they were put"
-			              : "");
+		LM_INFO("topology hiding state can be fetched from other nodes; "
+			"new keys will say which node they were put on\n");
 	} else {
 		LM_DBG("no cross-node fetch available for the topology hiding "
 			"state - a miss stays a miss\n");
@@ -623,7 +632,7 @@ int th_store_pull_start(str *key, int use_hint, int *fd, unsigned int *handle)
 	if (use_hint && th_pull.start_at) {
 		hint = th_store_key_get_hint(key);
 		/* asking ourselves is pointless - we already looked */
-		if (hint == th_my_node_id)
+		if (hint == th_node_id())
 			hint = 0;
 		if (hint > 0) {
 			LM_DBG("the key names node %d - asking it directly\n", hint);

@@ -1563,6 +1563,16 @@ static void pcache_pull_do_reply(int src_node, unsigned int id, str *key,
 			"tracked, ignored\n", src_node, CL_MAX_NODE_ID);
 		return;
 	}
+	{
+		int byte = (src_node - 1) / 8, bit = 1 << ((src_node - 1) % 8);
+
+		if (sl->answered[byte] & bit) {
+			lock_release(pull_lock);
+			LM_DBG("duplicate pull reply from node %d - ignored\n", src_node);
+			return;
+		}
+		sl->answered[byte] |= bit;
+	}
 
 	if (found == PCACHE_FOUND_NO) {
 		sl->negative++;
@@ -2672,7 +2682,6 @@ static inline unsigned int ttl_to_abs(int expires)
 static int pcache_htable_fetch(cachedb_con *con, str *attr, str *val)
 {
 	pcache_col_t *col = con ? ((pcache_con *)con->data)->col : NULL;
-	char buf[PCACHE_PULL_MAX_VAL];
 	unsigned int vlen = 0;
 	int rc;
 
@@ -2682,16 +2691,23 @@ static int pcache_htable_fetch(cachedb_con *con, str *attr, str *val)
 	if (rc != -2 || !pull_on_miss || !pcache_pull_enabled(col))
 		return rc;
 
-	if (pcache_pull_key(col, attr, buf, sizeof buf, &vlen, NULL) != 1)
-		return -2;                    /* absent, or nobody answered */
+	/* the pull buffer lives in this branch, not in the frame of every
+	 * local hit: this is the vtable read, and a cross-node miss is the
+	 * rare path */
+	{
+		char buf[PCACHE_PULL_MAX_VAL];
 
-	/* hand back a copy the caller owns, exactly as a local hit would */
-	val->s = pkg_malloc(vlen ? vlen : 1);
-	if (!val->s) {
-		LM_ERR("no more pkg memory for a %u byte pulled value\n", vlen);
-		return -1;
+		if (pcache_pull_key(col, attr, buf, sizeof buf, &vlen, NULL) != 1)
+			return -2;                /* absent, or nobody answered */
+
+		/* hand back a copy the caller owns, exactly as a local hit would */
+		val->s = pkg_malloc(vlen ? vlen : 1);
+		if (!val->s) {
+			LM_ERR("no more pkg memory for a %u byte pulled value\n", vlen);
+			return -1;
+		}
+		memcpy(val->s, buf, vlen);
 	}
-	memcpy(val->s, buf, vlen);
 	val->len = vlen;
 	return 0;
 }

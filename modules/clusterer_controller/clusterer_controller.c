@@ -188,6 +188,7 @@
 #include <fcntl.h>          /* O_NONBLOCK, fcntl()                            */
 #include <ifaddrs.h>        /* getifaddrs(), freeifaddrs()                    */
 #include <net/if.h>         /* IF_NAMESIZE, struct ifreq, SO_BINDTODEVICE     */
+#include <sys/ioctl.h>      /* ioctl, SIOCGIFMTU                              */
 
 #include "../../sr_module.h"    /* module_exports, MODULE_VERSION, proc_export_t,
                                    PROC_FLAG_*, dep_export_t, DEP_ABORT,
@@ -763,6 +764,12 @@ static char my_ip_buf[INET_ADDRSTRLEN];
  * clctr_api.get_my_ip() so a consumer can show it without guessing */
 static const char *my_ip_src = "unresolved";
 static char my_interface_buf[IF_NAMESIZE];
+
+/* Maximum consumer payload in bytes, derived from the interface MTU at
+ * mod_init time.  Replaces the compile-time CLCTR_MAX_PAYLOAD constant so
+ * jumbo-frame interfaces (MTU 9000) are not artificially limited to 1300 B.
+ * Read-only after mod_init; safe to access from any process. */
+int cc_max_payload = CLCTR_MAX_PAYLOAD;
 
 
 /* Local node identity - populated at mod_init by scanning the config file */
@@ -6885,6 +6892,36 @@ static int mod_init(void)
     if (cl_ctr_resolve_local_identity() < 0)
 	return -1;
 
+    /* Derive max consumer payload from the interface MTU so jumbo-frame
+     * links (e.g. MTU 9000) are not capped at the 1500-byte default.
+     * Overhead per consumer datagram:
+     *   IP(20) + UDP(8) + wire_hdr(28) + plain_hdr(5) +
+     *   consumer_hdr(3) + max_chan(31) + poly1305_tag(16) = 111 bytes. */
+    if (my_interface_buf[0] != '\0') {
+	struct ifreq _mtu_ifr;
+	int _mtu_sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (_mtu_sock >= 0) {
+	    memset(&_mtu_ifr, 0, sizeof(_mtu_ifr));
+	    memcpy(_mtu_ifr.ifr_name, my_interface_buf, strnlen(my_interface_buf, IF_NAMESIZE - 1));
+	    if (ioctl(_mtu_sock, SIOCGIFMTU, &_mtu_ifr) == 0) {
+		int _mtu = _mtu_ifr.ifr_mtu;
+		int _overhead = 20 + 8 + CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ
+		                + CL_CTR_CONSUMER_HDR_SZ + CLCTR_MAX_CHAN_LEN + CL_CTR_TAG_SZ;
+		cc_max_payload = _mtu - _overhead;
+		if (cc_max_payload < CLCTR_MAX_PAYLOAD)
+		    cc_max_payload = CLCTR_MAX_PAYLOAD;
+		LM_INFO("clusterer_controller: interface %s MTU=%d, "
+		        "max consumer payload=%d bytes\n",
+		        my_interface_buf, _mtu, cc_max_payload);
+	    } else {
+		LM_WARN("clusterer_controller: SIOCGIFMTU on %s failed: %s - "
+		        "using default max payload %d\n",
+		        my_interface_buf, strerror(errno), cc_max_payload);
+	    }
+	    close(_mtu_sock);
+	}
+    }
+
     if (cl_ctr_discover_bin_sockets() < 0)
 	return -1;
 
@@ -7418,9 +7455,9 @@ static int cl_ctr_consumer_submit(int cluster_id, int dst_node_id,
     if (!channel || !channel->s || channel->len <= 0 ||
             channel->len > CLCTR_MAX_CHAN_LEN)
         return -1;
-    if (payload_len < 0 || payload_len > CLCTR_MAX_PAYLOAD) {
+    if (payload_len < 0 || payload_len > cc_max_payload) {
         LM_ERR("consumer payload of %d exceeds the %d-byte datagram bound - "
-               "use BIN for bulk data\n", payload_len, CLCTR_MAX_PAYLOAD);
+               "use BIN for bulk data\n", payload_len, cc_max_payload);
         return -1;
     }
     cl = cl_ctr_cluster_by_id(cluster_id);
@@ -7577,9 +7614,9 @@ static int cl_ctr_script_send(int cluster_id, int node_id, str *gen_msg,
 		return -1;
 	if (taglen > 255)
 		taglen = 255;
-	if (2 + taglen + gen_msg->len > CLCTR_MAX_PAYLOAD) {
+	if (2 + taglen + gen_msg->len > cc_max_payload) {
 		LM_ERR("clusterer_controller: message of %d bytes is more than the "
-			"%d a datagram carries\n", gen_msg->len, CLCTR_MAX_PAYLOAD);
+			"%d a datagram carries\n", gen_msg->len, cc_max_payload);
 		return -1;
 	}
 	buf[0] = (char)kind;

@@ -69,7 +69,13 @@
 
 /* limits a consumer can rely on */
 #define CLCTR_MAX_CHAN_LEN   31
+/* Compile-time lower bound for consumer payload; the actual runtime limit is
+ * cc_max_payload, which is derived from the interface MTU at mod_init and may
+ * be larger on jumbo-frame links.  Consumers that size local buffers at
+ * compile time should use CLCTR_MAX_PAYLOAD; consumers that want to send the
+ * largest possible message at runtime should check cc_max_payload instead. */
 #define CLCTR_MAX_PAYLOAD    1300
+extern int cc_max_payload;
 
 typedef void (*clctr_msg_cb_f)(int cluster_id, int src_node_id,
 		str *channel, str *payload);

@@ -171,6 +171,8 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 	hb->chunks = ch;
 	hb->nchunks++;
 	hb->real_used += size;
+	if (hb->real_used > hb->max_real_used)
+		hb->max_real_used = hb->real_used;
 
 	if ((unsigned long)ch < hb->lo)
 		hb->lo = (unsigned long)ch;
@@ -228,6 +230,8 @@ void *hg_region_alloc(struct hg_block *hb, unsigned long size)
 	rg->next = hb->regions;
 	hb->regions = rg;
 	hb->real_used += need;
+	if (hb->real_used > hb->max_real_used)
+		hb->max_real_used = hb->real_used;
 	if ((unsigned long)rg < hb->lo)
 		hb->lo = (unsigned long)rg;
 	if ((unsigned long)rg + need > hb->hi)
@@ -361,12 +365,12 @@ found:
 		*hline = line;
 	}
 #endif
-	hb->used += cell_sizes[c] - HG_CELL_HDR;
-#if defined(DBG_MALLOC) || defined(STATISTICS)
-	hb->fragments++;
-	if (hb->real_used > hb->max_real_used)
-		hb->max_real_used = hb->real_used;
-#endif
+	/* per-process slot: no lock, no shared cache line (see hg_pstat) */
+	{
+		struct hg_pstat *ps = hg_pstat_mine(hb);
+		ps->used += cell_sizes[c] - HG_CELL_HDR;
+		ps->fragments++;
+	}
 	return payload;
 }
 
@@ -411,10 +415,11 @@ void hg_cell_free(struct hg_block *hb, void *p)
 		return;
 	}
 
-	hb->used -= cell_sizes[c] - HG_CELL_HDR;
-#if defined(DBG_MALLOC) || defined(STATISTICS)
-	hb->fragments--;
-#endif
+	{
+		struct hg_pstat *ps = hg_pstat_mine(hb);
+		ps->used -= cell_sizes[c] - HG_CELL_HDR;
+		ps->fragments--;
+	}
 
 	cell_set_next(cell_start, pl->cls[c].free_head);
 	pl->cls[c].free_head = cell_start;

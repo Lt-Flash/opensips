@@ -151,13 +151,18 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 		lfrag_insert_free(hb, n);
 	}
 
-	hb->used += size;
+	/* charge the frag's actual payload capacity, NOT the requested @size:
+	 * hg_large_free() can only ever know the capacity, so charging the
+	 * request here would leave a permanent per-allocation drift between
+	 * the two */
+	{
+		struct hg_pstat *ps = hg_pstat_mine(hb);
+		ps->used += f->size - HG_CELL_HDR;
+		ps->fragments++;
+	}
 	hb->real_used += HG_LFRAG_HDR + f->size;
-#if defined(DBG_MALLOC) || defined(STATISTICS)
-	hb->fragments++;
 	if (hb->real_used > hb->max_real_used)
 		hb->max_real_used = hb->real_used;
-#endif
 
 	lock_release(&hb->lock);
 
@@ -183,11 +188,12 @@ void hg_large_free(struct hg_block *hb, struct hg_lfrag *frag)
 
 	lock_get(&hb->lock);
 
-	hb->used -= (frag->size - HG_CELL_HDR);
+	{
+		struct hg_pstat *ps = hg_pstat_mine(hb);
+		ps->used -= frag->size - HG_CELL_HDR;
+		ps->fragments--;
+	}
 	hb->real_used -= HG_LFRAG_HDR + frag->size;
-#if defined(DBG_MALLOC) || defined(STATISTICS)
-	hb->fragments--;
-#endif
 
 	/* forward coalesce - neigh->prev is NULL both for allocated frags AND
 	 * for a chunk's sentinel, so this naturally stops at the boundary */

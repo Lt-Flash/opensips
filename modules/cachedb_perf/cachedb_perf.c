@@ -125,6 +125,10 @@ static int  pc_shtag_cid;              /* parsed tag cluster                 */
 /* how long past its deadline a woken slot is left for its caller to come
  * back and finish() before the reaper takes it away regardless */
 #define PCACHE_PULL_ABANDON_US (5 * 1000000)
+/* a peer that answered within this many seconds is treated as answering;
+ * beyond it we only know it HAS answered at some point, not that it still
+ * would - which is why the raw counters are reported beside the verdict */
+#define PCACHE_PEER_FRESH_S    300
 #define CL_MAX_NODE_ID         256    /* the cluster stack's design cap    */
 static char *pull_transport_str;       /* "bin" (default) | "clctr"          */
 static int   pull_timeout_ms = 50;     /* how long a miss waits for peers    */
@@ -382,6 +386,10 @@ static int fixup_check_wvar(void **param);
 /* introspection MI (CP-18) - defined just above the mi_cmds table; these
  * forward decls let that table sit before the glob/collection helpers */
 static pcache_col_t *col_by_name(const str *name);
+static mi_response_t *mi_perf_cluster_probe_0(const mi_params_t *params,
+		struct mi_handler *async);
+static mi_response_t *mi_perf_cluster_probe_1(const mi_params_t *params,
+		struct mi_handler *async);
 int load_pcache_pull(pcache_pull_api_t *api);
 static int pcache_pull_start(pcache_col_t *col, const str *key,
 		int hint_node, int *fd, unsigned int *id_out);
@@ -723,39 +731,75 @@ static mi_response_t *mi_perf_stats(str *col_s)
 		 * believes, `replies`/`last_reply_ago` are what this node has
 		 * actually received from it. */
 		{
-			mi_item_t *parr = add_mi_array(clobj, MI_SSTR("peers"));
-			int ids[CL_MAX_NODE_ID], np, k;
+			mi_item_t *parr = add_mi_array(clobj, MI_SSTR("topology"));
+			clusterer_node_t *list, *n;
 			unsigned int now = get_ticks();
+			int me = clusterer_api.get_my_id ? clusterer_api.get_my_id() : 0;
+			mi_item_t *self;
 
 			if (!parr)
 				goto err;
-			np = pcache_cluster_members(ids, CL_MAX_NODE_ID, NULL, NULL);
-			for (k = 0; k < np; k++) {
+
+			/* this node first - the clusterer list holds peers only, so a
+			 * topology built from it alone silently omits the one node the
+			 * reader is talking to */
+			self = add_mi_object(parr, NULL, 0);
+			if (!self ||
+			    add_mi_number(self, MI_SSTR("node_id"), me) < 0 ||
+			    add_mi_string(self, MI_SSTR("role"), MI_SSTR("self")) < 0 ||
+			    add_mi_string(self, MI_SSTR("membership"),
+			        MI_SSTR("up")) < 0)
+				goto err;
+
+			list = cluster_ready ?
+				clusterer_api.get_nodes(sync_cluster_id) : NULL;
+			for (n = list; n; n = n->next) {
 				mi_item_t *p = add_mi_object(parr, NULL, 0);
-				struct pcache_peer_stat *ps = peer_stats && ids[k] > 0 &&
-					ids[k] <= CL_MAX_NODE_ID ? &peer_stats[ids[k]] : NULL;
+				struct pcache_peer_stat *ps = peer_stats && n->node_id > 0 &&
+					n->node_id <= CL_MAX_NODE_ID ?
+					&peer_stats[n->node_id] : NULL;
+				const char *verdict;
+				int ago;
 
 				if (!p)
 					goto err;
-				if (add_mi_number(p, MI_SSTR("node_id"), ids[k]) < 0 ||
+				if (add_mi_number(p, MI_SSTR("node_id"), n->node_id) < 0 ||
+				    add_mi_string(p, MI_SSTR("role"), MI_SSTR("peer")) < 0 ||
+				    /* what the clusterer believes about it */
 				    add_mi_string(p, MI_SSTR("membership"),
 				        MI_SSTR("up")) < 0)
 					goto err;
+				if (n->description.s && n->description.len &&
+				    add_mi_string(p, MI_SSTR("description"),
+				        n->description.s, n->description.len) < 0)
+					goto err;
+				if (n->sip_addr.s && n->sip_addr.len &&
+				    add_mi_string(p, MI_SSTR("sip_addr"),
+				        n->sip_addr.s, n->sip_addr.len) < 0)
+					goto err;
+
 				if (!ps)
 					continue;
-				if (add_mi_number(p, MI_SSTR("replies"), ps->replies) < 0 ||
+				/* ...and what it has actually done for us.  These two can
+				 * disagree in the way that matters: a membership can read
+				 * perfectly healthy while the transport carrying pulls
+				 * drops every packet, and only this half shows it. */
+				ago = ps->last_reply ? (int)(now - ps->last_reply) : -1;
+				verdict = !ps->replies ? "never-answered"
+				        : (ago <= PCACHE_PEER_FRESH_S ? "answering"
+				                                      : "quiet");
+				if (add_mi_string(p, MI_SSTR("pull_health"),
+				        verdict, strlen(verdict)) < 0 ||
+				    add_mi_number(p, MI_SSTR("replies"), ps->replies) < 0 ||
 				    add_mi_number(p, MI_SSTR("replies_with_value"),
 				        ps->values) < 0 ||
 				    add_mi_number(p, MI_SSTR("answers_we_sent_it"),
-				        ps->served) < 0)
-					goto err;
-				/* -1 = it has never answered us at all.  With a broadcast
-				 * pull every member is asked, so a peer sitting at -1
-				 * while others are not is the shape of a one-way path. */
-				if (add_mi_number(p, MI_SSTR("last_reply_ago"),
-				        ps->last_reply ? (int)(now - ps->last_reply) : -1) < 0)
+				        ps->served) < 0 ||
+				    add_mi_number(p, MI_SSTR("last_reply_ago"), ago) < 0)
 					goto err;
 			}
+			if (list)
+				clusterer_api.free_nodes(list);
 		}
 		if (pc_view->last_change) {
 			char lbuf[32];
@@ -2116,6 +2160,166 @@ static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 	return pcache_pull_finish(col, key, id, out, outlen, vlen, expires);
 }
 
+/* Ask every peer for a key that cannot exist, purely to see who answers.
+ *
+ * The passive per-peer counters cannot separate "this peer ignores us" from
+ * "we have never had reason to ask it" - both read as zero replies.  This
+ * settles it by generating the traffic itself, over the configured
+ * transport and through the same serve path a real pull uses, so a peer
+ * that answers here is genuinely reachable for pulls.
+ *
+ * CAVEAT, measured: the request inherits the transport's send semantics.
+ * Over `bin` that is a TCP write through the clusterer, and a peer that is
+ * up but not READING (wedged, stopped, swapping) can block it well past
+ * pull_timeout_ms - the timeout here bounds the wait for an ANSWER, not
+ * the send.  Observed blocking until the peer was resumed.  Over `clctr`
+ * the send is a datagram and cannot block, so this is dependable exactly
+ * where it is most wanted.  Run it on a bin cluster knowing it may stall
+ * against the kind of peer you are probing for.
+ *
+ * @seen must have room for CL_MAX_NODE_ID + 1 flags; on return each live
+ * peer's slot is 1 if it answered.  Returns the number that did, or -1 if
+ * the pull could not even be started.
+ */
+static int pcache_cluster_probe(pcache_col_t *col, unsigned char *seen,
+		int *asked)
+{
+	struct pollfd pfd;
+	struct pcache_pull_slot *sl;
+	unsigned int id = 0;
+	int fd = -1, rc, left = pull_timeout_ms, i, answered = 0;
+	/* no caller can store this: perf_set rejects an empty key, and the
+	 * marker byte cannot appear in a th key or any script key */
+	static str probe_key = str_init("\x01""cachedb-perf-probe");
+
+	if (asked)
+		*asked = 0;
+	/* a cached negative for the probe key would answer without asking
+	 * anyone, which is the one thing this must not do */
+	pcache_neg_clear(col, &probe_key);
+
+	rc = pcache_pull_start(col, &probe_key, 0, &fd, &id);
+	if (rc <= 0)
+		return -1;
+
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+	while (left > 0) {
+		int n = poll(&pfd, 1, left);
+
+		if (n > 0)
+			break;
+		if (n < 0 && errno == EINTR) {
+			left -= 1;
+			continue;
+		}
+		break;
+	}
+
+	/* read the bitmap the reply handler filled in, then release the slot
+	 * exactly as finish() would - the answers are the result here, so the
+	 * value path is not used at all */
+	lock_get(pull_lock);
+	sl = pull_slot_get(id);
+	if (sl) {
+		if (asked)
+			*asked = sl->expect;
+		for (i = 1; i <= CL_MAX_NODE_ID; i++) {
+			int byte = (i - 1) / 8, bit = 1 << ((i - 1) % 8);
+
+			if (sl->answered[byte] & bit) {
+				seen[i] = 1;
+				answered++;
+			}
+		}
+		sl->id = 0;
+	}
+	lock_release(pull_lock);
+
+	/* the probe key is absent everywhere by construction; do not let that
+	 * conclusion linger and suppress the next probe */
+	pcache_neg_clear(col, &probe_key);
+	return answered;
+}
+
+/* perf_cluster_probe [collection] - who is actually reachable for a pull */
+static mi_response_t *do_perf_cluster_probe(str *col_s)
+{
+	mi_response_t *resp;
+	mi_item_t *obj, *arr;
+	pcache_col_t *col;
+	clusterer_node_t *list, *n;
+	unsigned char seen[CL_MAX_NODE_ID + 1];
+	int answered, asked = 0;
+	/* MI_SSTR expands to two arguments, so it cannot go in a ternary */
+	const char *tname = pull_via_clctr ? "clctr" : "bin";
+
+	col = col_s ? col_by_name(col_s) : pcache_default_col;
+	if (!col)
+		return init_mi_error(404, MI_SSTR("no such collection"));
+	if (!pcache_pull_enabled(col))
+		return init_mi_error(400, MI_SSTR("cross-node pull is not active "
+			"for this collection (replicate_collections)"));
+
+	memset(seen, 0, sizeof seen);
+	answered = pcache_cluster_probe(col, seen, &asked);
+	if (answered < 0)
+		return init_mi_error(500, MI_SSTR("could not start the probe - no "
+			"peers, or no free pull slot"));
+
+	resp = init_mi_result_object(&obj);
+	if (!resp)
+		return NULL;
+	if (add_mi_number(obj, MI_SSTR("asked"), asked) < 0 ||
+	    add_mi_number(obj, MI_SSTR("answered"), answered) < 0 ||
+	    add_mi_number(obj, MI_SSTR("timeout_ms"), pull_timeout_ms) < 0 ||
+	    add_mi_string(obj, MI_SSTR("transport"), tname, strlen(tname)) < 0)
+		goto err;
+
+	arr = add_mi_array(obj, MI_SSTR("peers"));
+	if (!arr)
+		goto err;
+	list = clusterer_api.get_nodes(sync_cluster_id);
+	for (n = list; n; n = n->next) {
+		mi_item_t *p = add_mi_object(arr, NULL, 0);
+		int up = n->node_id > 0 && n->node_id <= CL_MAX_NODE_ID &&
+			seen[n->node_id];
+
+		if (!p) {
+			clusterer_api.free_nodes(list);
+			goto err;
+		}
+		if (add_mi_number(p, MI_SSTR("node_id"), n->node_id) < 0 ||
+		    add_mi_string(p, MI_SSTR("answered_probe"),
+		        up ? "yes" : "no", up ? 3 : 2) < 0) {
+			clusterer_api.free_nodes(list);
+			goto err;
+		}
+	}
+	if (list)
+		clusterer_api.free_nodes(list);
+	return resp;
+err:
+	free_mi_response(resp);
+	return init_mi_error(500, MI_SSTR("Internal error"));
+}
+
+static mi_response_t *mi_perf_cluster_probe_0(const mi_params_t *params,
+		struct mi_handler *async)
+{
+	return do_perf_cluster_probe(NULL);
+}
+
+static mi_response_t *mi_perf_cluster_probe_1(const mi_params_t *params,
+		struct mi_handler *async)
+{
+	str col;
+
+	if (get_mi_string_param(params, "collection", &col.s, &col.len) < 0)
+		return init_mi_param_error();
+	return do_perf_cluster_probe(&col);
+}
+
 static void pcache_sync_recv(bin_packet_t *packet)
 {
 	pcache_col_t *col;
@@ -2445,6 +2649,13 @@ static const mi_export_t mi_cmds[] = {
 	{ "perf_pull", "fetch one key from the cluster on a local miss", 0, 0, {
 		{mi_perf_pull_1, {"key", 0}},
 		{mi_perf_pull_2, {"key", "collection", 0}},
+		{EMPTY_MI_RECIPE}},
+		{0}
+	},
+	{ "perf_cluster_probe", "ask every peer for a key that cannot exist, to "
+		"see which ones actually answer a pull", 0, 0, {
+		{mi_perf_cluster_probe_0, {0}},
+		{mi_perf_cluster_probe_1, {"collection", 0}},
 		{EMPTY_MI_RECIPE}},
 		{0}
 	},

@@ -113,8 +113,8 @@ finally:
             pass
     time.sleep(5)
 
-check("peer topology is reported", isinstance(cl(2).get("peers"), list)
-      and cl(2).get("peers"), json.dumps(cl(2).get("peers"))[:100])
+check("cluster topology is reported", isinstance(cl(2).get("topology"), list)
+      and cl(2).get("topology"), json.dumps(cl(2).get("topology"))[:100])
 
 log = open("%s/n2.log" % D, errors="replace").read()
 check("n2 did not crash",

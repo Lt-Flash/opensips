@@ -75,7 +75,12 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 	struct hg_large_chunk *ch;
 	char *base, *tag;
 
-	need = (HG_CELL_HDR + size + ROUNDTO - 1) & ~(unsigned long)(ROUNDTO - 1);
+	/* round to HG_PAYLOAD_ALIGN, not ROUNDTO: a frag's size is what
+	 * places the NEXT frag (HG_LFRAG_NEXT), so rounding to 4 on 32-bit
+	 * ARM would walk every subsequent frag - and its payload - off the
+	 * 8-byte boundary the first one started on */
+	need = (HG_CELL_HDR + size + HG_PAYLOAD_ALIGN - 1)
+	       & ~(unsigned long)(HG_PAYLOAD_ALIGN - 1);
 
 	lock_get(&hb->lock);
 
@@ -221,6 +226,13 @@ unsigned long hg_large_frag_size_at(const void *frag)
 
 /* catches any future drift between this and HG_LFRAG_HDR_SIZE (hg_malloc.h,
  * which can't sizeof() the opaque-there struct hg_lfrag directly) */
+/* the alignment guarantee this allocator hands its callers: cells and frags
+ * both start 8-aligned only if every step between them is a multiple of 8 */
+_Static_assert(HG_CELL_HDR % HG_PAYLOAD_ALIGN == 0,
+	"HG_CELL_HDR must be a multiple of HG_PAYLOAD_ALIGN or payloads misalign");
+_Static_assert(HG_LFRAG_HDR_SIZE % HG_PAYLOAD_ALIGN == 0,
+	"sizeof(struct hg_lfrag) must be a multiple of HG_PAYLOAD_ALIGN");
+
 _Static_assert(sizeof(struct hg_lfrag) == HG_LFRAG_HDR_SIZE,
 	"HG_LFRAG_HDR_SIZE in hg_malloc.h must match sizeof(struct hg_lfrag)");
 

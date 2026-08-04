@@ -331,6 +331,31 @@ int internal_fork(const struct internal_fork_params *ifpp)
 		const struct internal_fork_handler *cfhp;
 		/* child process */
 		is_main = 0; /* a child is not main process */
+
+#ifdef HG_MALLOC
+		/*
+		 * MUST run before this child allocates anything. HG_MALLOC keeps
+		 * its fast-path allocation state (per-size-class bump pointer +
+		 * private free stack) in plain process memory, so a fresh child
+		 * inherits an identical COPY of the parent's - pointing at the
+		 * very same shm cells. Left alone, every worker would hand out
+		 * the same cells to different callers.
+		 */
+		if (mem_allocator_shm == MM_HG_MALLOC ||
+		    mem_allocator_shm == MM_HG_MALLOC_DBG) {
+			hg_malloc_child_init((struct hg_block *)shm_block);
+#ifdef DBG_MALLOC
+			if (shm_dbg_block)
+				hg_malloc_child_init((struct hg_block *)shm_dbg_block);
+#endif
+		}
+#ifdef PKG_MALLOC
+		if (mem_allocator_pkg == MM_HG_MALLOC ||
+		    mem_allocator_pkg == MM_HG_MALLOC_DBG)
+			hg_malloc_child_init((struct hg_block *)mem_block);
+#endif
+#endif /* HG_MALLOC */
+
 		/* set uid */
 		process_no = new_idx;
 		/* set attributes, pid etc */

@@ -87,7 +87,24 @@ const char *hg_mem_tier_str(enum hg_mem_tier tier);
 #define HG_CELL_HDR_STATS 0
 #endif
 
-#define HG_CELL_HDR (ROUNDTO + HG_CELL_HDR_DBG + HG_CELL_HDR_STATS)
+/*
+ * Payloads must be aligned for the widest scalar a caller may store in
+ * them; 8 covers uint64_t/double everywhere we build. This is NOT implied
+ * by ROUNDTO: on 32-bit ARM ROUNDTO is 4, so the raw header below would be
+ * 4 bytes in a plain build, and since cells always start 32-byte aligned
+ * EVERY payload would land at 4 mod 8 - misaligned for any 64-bit field,
+ * and an outright fault for the LDREXD/STREXD that gen_lock_t and the
+ * 64-bit atomics in shared structs compile down to. (f_malloc does not hit
+ * this only because its header is a struct that happens to be 8-aligned.)
+ *
+ * The padding goes at the END of the header, so every field offset below
+ * stays exactly where it was and only the header's total size grows.
+ */
+#define HG_PAYLOAD_ALIGN 8
+#define HG_CELL_HDR_RAW  (ROUNDTO + HG_CELL_HDR_DBG + HG_CELL_HDR_STATS)
+#define HG_CELL_HDR \
+	(((HG_CELL_HDR_RAW + HG_PAYLOAD_ALIGN - 1) / HG_PAYLOAD_ALIGN) \
+	 * HG_PAYLOAD_ALIGN)
 
 /* offset of the statistic_index field, valid only when SHM_EXTRA_STATS */
 #define HG_CELL_STATS_OFF (ROUNDTO + HG_CELL_HDR_DBG)

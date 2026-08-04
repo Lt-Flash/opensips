@@ -52,7 +52,61 @@
 #define MADV_COLLAPSE 25
 #endif
 
-#define HG_HPS (2UL * 1024 * 1024)   /* huge page size, x86_64 */
+/*
+ * The system's default huge page size, probed once rather than assumed.
+ *
+ * It is 2M on x86_64 and on arm64 with 4K base pages, but 32M on arm64
+ * with 16K pages and 512M with 64K pages. Getting it wrong is not
+ * cosmetic: mmap(MAP_HUGETLB) without MAP_HUGE_* bits uses the system
+ * default, and the kernel rounds the mapping up to it - so a hardcoded
+ * 2M would (a) leave hsize describing a smaller region than the VMA,
+ * making the matching munmap() fail with EINVAL and leak the arena, and
+ * (b) align the THP tiers to 2M instead of the real PMD granularity, so
+ * MADV_HUGEPAGE/MADV_COLLAPSE quietly do nothing and every arena silently
+ * degrades to 4K while still reporting a huge-page tier.
+ *
+ * Falls back to 2M only if /proc/meminfo cannot be read at all.
+ */
+#define HG_HPS_FALLBACK (2UL * 1024 * 1024)
+
+static unsigned long hg_hps_cached;
+
+static unsigned long hg_hps(void)
+{
+	FILE *f;
+	char line[256];
+	unsigned long kb = 0;
+
+	if (hg_hps_cached)
+		return hg_hps_cached;
+
+	f = fopen("/proc/meminfo", "r");
+	if (f) {
+		while (fgets(line, sizeof line, f)) {
+			if (!strncmp(line, "Hugepagesize:", 13)) {
+				kb = strtoul(line + 13, NULL, 10);
+				break;
+			}
+		}
+		fclose(f);
+	}
+
+	/* must be a power of two for the alignment masks below to work */
+	if (kb == 0 || (kb * 1024UL) & ((kb * 1024UL) - 1))
+		hg_hps_cached = HG_HPS_FALLBACK;
+	else
+		hg_hps_cached = kb * 1024UL;
+
+	return hg_hps_cached;
+}
+
+#define HG_HPS (hg_hps())
+
+/* round @s up to a whole number of huge pages. Used for the reservation
+ * length, the alignment of the THP tiers, AND the matching munmap length -
+ * they must agree exactly or the unmap fails and the arena leaks, so they
+ * all go through this one macro rather than repeating the expression. */
+#define HG_HPS_ROUND(s) (((s) + HG_HPS - 1) & ~(HG_HPS - 1))
 
 /* ROUNDTO=2^k so the following works (same trick as f_malloc.c) */
 #define ROUNDTO_MASK   (~((unsigned long)ROUNDTO-1))
@@ -84,7 +138,7 @@ static long hg_read_shmem_huge_kb(void)
 	return kb;
 }
 
-/* is the 2M range starting at @addr PMD-mapped in this process? */
+/* is the huge-page-sized range starting at @addr PMD-mapped here? */
 static int hg_range_is_huge(unsigned long addr)
 {
 	FILE *f;
@@ -141,7 +195,7 @@ static void hg_exclude_from_core(void *base, unsigned long size)
 }
 
 /*
- * Reserve a 2M-aligned, huge-page-backed (best effort) region of at least
+ * Reserve a huge-page-aligned, huge-page-backed (best effort) region of at least
  * @size bytes, mlock-pinned against swap. Never unmapped until
  * hg_malloc_destroy(). Returns NULL on total mmap failure only - a huge-page
  * miss still returns a valid plain-4K mapping (degrade, don't fail), per
@@ -165,7 +219,7 @@ static void hg_exclude_from_core(void *base, unsigned long size)
 static void *hg_mem_reserve(unsigned long size, enum hg_mem_tier *tier,
 		unsigned long *locked_mb, int shared)
 {
-	unsigned long asize = (size + HG_HPS - 1) & ~(HG_HPS - 1);
+	unsigned long asize = HG_HPS_ROUND(size);
 	int vis = shared ? MAP_SHARED : MAP_PRIVATE;
 	char *resv, *base;
 	long shmem_kb;
@@ -185,11 +239,12 @@ static void *hg_mem_reserve(unsigned long size, enum hg_mem_tier *tier,
 		return p;
 	}
 
-	/* tiers 2-4: 2M-aligned anon mapping. For the shmem (MAP_SHARED) case
-	 * the VA and shmem *file offset* must be congruent mod 2M for THP
-	 * eligibility, so reserve PROT_NONE first, then MAP_FIXED the real
-	 * mapping at a 2M boundary inside it - an atomic replace, no race with
-	 * other mappings. Harmless (and keeps the alignment) for MAP_PRIVATE. */
+	/* tiers 2-4: huge-page-aligned anon mapping. For the shmem
+	 * (MAP_SHARED) case the VA and shmem *file offset* must be congruent
+	 * modulo the huge page size for THP eligibility, so reserve PROT_NONE
+	 * first, then MAP_FIXED the real mapping at a huge-page boundary
+	 * inside it - an atomic replace, no race with other mappings.
+	 * Harmless (and keeps the alignment) for MAP_PRIVATE. */
 	resv = mmap(NULL, asize + HG_HPS, PROT_NONE,
 	            MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	if (resv == MAP_FAILED)
@@ -272,7 +327,7 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared)
 	if (size < ROUNDUP_TO(sizeof(struct hg_block))) {
 		LM_ERR("%s arena of %lu bytes too small for the block header "
 			"(%zu bytes)\n", name, size, sizeof(struct hg_block));
-		munmap(base, (size + HG_HPS - 1) & ~(HG_HPS - 1));
+		munmap(base, HG_HPS_ROUND(size));
 		return NULL;
 	}
 
@@ -282,7 +337,7 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared)
 	hb->size = size;
 	hb->lo = ~0UL;
 	hb->hbase = base;
-	hb->hsize = (size + HG_HPS - 1) & ~(HG_HPS - 1);
+	hb->hsize = HG_HPS_ROUND(size);
 	hb->tier = tier;
 	hb->locked_mb = locked_mb;
 

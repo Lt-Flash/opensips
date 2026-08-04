@@ -161,6 +161,33 @@ struct hg_palloc {
 	} cls[HG_NCLASSES];
 };
 
+/*
+ * Per-process counters for the two stats the lock-free fast path has to
+ * touch on every single allocation and free.
+ *
+ * Keeping them as plain fields in hg_block would make every worker do an
+ * unsynchronized read-modify-write on the same shared words - a data race
+ * on every architecture (x86 TSO does not make "x += y" atomic either;
+ * a weakly-ordered machine just loses more updates), whose symptom is
+ * silently under-reported memory in /info. Making them atomic instead
+ * would be correct but would put a contended shared cache line back on
+ * the fast path - exactly what the per-process free stacks exist to
+ * avoid. So each process gets its own cache-line-isolated slot and
+ * readers sum the slots.
+ *
+ * Both fields are SIGNED on purpose: a cell allocated by one process can
+ * be freed by another (that is what the shared pool is for), so an
+ * individual slot legitimately goes negative. Only the sum is meaningful.
+ */
+#define HG_STAT_SLOTS     256
+#define HG_STAT_LINE      64
+
+struct hg_pstat {
+	long used;       /* payload bytes handed out by this process */
+	long fragments;  /* live cells handed out by this process */
+	char _pad[HG_STAT_LINE - 2 * sizeof(long)];
+} __attribute__ ((aligned (HG_STAT_LINE)));
+
 struct hg_block {
 	char *name; /* purpose of this memory block */
 
@@ -180,16 +207,16 @@ struct hg_block {
 	struct hg_large_chunk *large_chunks;
 	struct hg_lfrag *large_free;
 
-	/* unlike f_malloc's fm_block, these are tracked unconditionally (not
-	 * gated behind DBG_MALLOC/STATISTICS): hg_info() needs real_used/size
-	 * for a basic /info reply on every build, and the increments are one
-	 * unsigned long add each, cheap enough not to bother conditionalizing */
-	unsigned long used;        /* bytes carved into chunks, minus overhead */
-	unsigned long real_used;   /* bytes carved into chunks, incl. overhead */
-#if defined(DBG_MALLOC) || defined(STATISTICS)
+	/* Bytes carved from the reservation into chunks/regions, i.e. the
+	 * arena's own footprint. Only ever changed while holding hb->lock
+	 * (carve_chunk, hg_region_alloc, the large tier), never on the
+	 * lock-free fast path, so a plain field is safe here. */
+	unsigned long real_used;
 	unsigned long max_real_used;
-	unsigned long fragments;   /* live (allocated) cells */
-#endif
+
+	/* the fast-path counters - see struct hg_pstat above. Summed by
+	 * hg_used()/hg_fragments(); never read directly. */
+	struct hg_pstat pstat[HG_STAT_SLOTS];
 	unsigned long size;        /* total arena size */
 
 	/* the huge-page reservation this block owns: a pre-fork (or per-process,
@@ -316,6 +343,43 @@ static inline unsigned long hg_frag_line(void *p) { return 0; }
 #endif
 #endif
 
+/*
+ * Fast-path stats helpers.
+ *
+ * hg_pstat_mine() picks this process's slot. process_no is -1 in the
+ * attendant and 0 in the main process before fork, so it is biased by one
+ * and wrapped: two processes sharing a slot would only reintroduce the
+ * lost-update race for those two, never corrupt anything, and with
+ * HG_STAT_SLOTS slots that needs a genuinely enormous process table.
+ */
+static inline struct hg_pstat *hg_pstat_mine(struct hg_block *hb)
+{
+	return &hb->pstat[((unsigned int)(process_no + 1)) % HG_STAT_SLOTS];
+}
+
+/* summed on read; clamped at 0 because individual slots go negative when
+ * one process frees another's cells and a torn sum could otherwise
+ * underflow an unsigned return */
+static inline unsigned long hg_used(struct hg_block *hb)
+{
+	long total = 0;
+	int i;
+
+	for (i = 0; i < HG_STAT_SLOTS; i++)
+		total += hb->pstat[i].used;
+	return total < 0 ? 0 : (unsigned long)total;
+}
+
+static inline unsigned long hg_fragments(struct hg_block *hb)
+{
+	long total = 0;
+	int i;
+
+	for (i = 0; i < HG_STAT_SLOTS; i++)
+		total += hb->pstat[i].fragments;
+	return total < 0 ? 0 : (unsigned long)total;
+}
+
 #ifdef STATISTICS
 static inline unsigned long hg_get_size(struct hg_block *hb)
 {
@@ -323,7 +387,7 @@ static inline unsigned long hg_get_size(struct hg_block *hb)
 }
 static inline unsigned long hg_get_used(struct hg_block *hb)
 {
-	return hb->used;
+	return hg_used(hb);
 }
 static inline unsigned long hg_get_free(struct hg_block *hb)
 {
@@ -339,7 +403,7 @@ static inline unsigned long hg_get_max_real_used(struct hg_block *hb)
 }
 static inline unsigned long hg_get_frags(struct hg_block *hb)
 {
-	return hb->fragments;
+	return hg_fragments(hb);
 }
 #endif /* STATISTICS */
 

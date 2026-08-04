@@ -425,16 +425,11 @@ void hg_info(struct hg_block *hb, struct mem_info *info)
 	info->total_size = hb->size;
 	info->min_frag = 64; /* smallest cell class, see hg_arena.c cell_sizes */
 	info->free = hb->size - hb->real_used;
-	info->used = hb->used;
+	info->used = hg_used(hb);
 	info->real_used = hb->real_used;
 
-#if defined(DBG_MALLOC) || defined(STATISTICS)
 	info->max_used = hb->max_real_used;
-	info->total_frags = hb->fragments;
-#else
-	info->max_used = 0;       /* only tracked under DBG_MALLOC/STATISTICS */
-	info->total_frags = 0;
-#endif
+	info->total_frags = hg_fragments(hb);
 }
 
 void hg_status(struct hg_block *hb)

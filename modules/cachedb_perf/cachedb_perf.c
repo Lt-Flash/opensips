@@ -122,6 +122,9 @@ static int  pc_shtag_cid;              /* parsed tag cluster                 */
 #define PCACHE_PULL_MAX_VAL    8192   /* value size a pull will carry      */
 #define PCACHE_PULL_MAX_KEY    256
 #define PCACHE_NEG_SLOTS       256    /* direct-mapped negative cache      */
+/* how long past its deadline a woken slot is left for its caller to come
+ * back and finish() before the reaper takes it away regardless */
+#define PCACHE_PULL_ABANDON_US (5 * 1000000)
 #define CL_MAX_NODE_ID         256    /* the cluster stack's design cap    */
 static char *pull_transport_str;       /* "bin" (default) | "clctr"          */
 static int   pull_timeout_ms = 50;     /* how long a miss waits for peers    */
@@ -160,7 +163,14 @@ static str  pull_channel = str_init("cdbperf-pull");
 struct pcache_pull_slot {
 	unsigned int id;                 /* 0 = free                          */
 	int          efd;                /* readable once an answer landed    */
-	unsigned int deadline;           /* ticks                             */
+	/* absolute us, like the negative cache: a pull that never gets a
+	 * conclusive answer has to be reclaimed on time, and second-grained
+	 * ticks would hold a SIP transaction up to a second past a timeout
+	 * the operator set in milliseconds */
+	utime_t      deadline;
+	/* the reaper woke this slot; do not keep re-arming the eventfd on
+	 * every tick while the consumer works its way back to finish() */
+	int          reaped;
 	unsigned int gen;                /* membership generation at dispatch */
 	int          expect;             /* peers we asked                    */
 	int          negative;           /* peers that answered "not here"    */
@@ -223,7 +233,10 @@ static int pull_on_miss;               /* modparam; read repair on the get path 
 #define PULL_ST_TIMEOUT   3
 #define PULL_ST_STORED    4
 #define PULL_ST_SUPPRESSED 5   /* asks a cached negative absorbed */
-#define PULL_ST_MAX       6
+/* slots the reaper had to release because the caller never collected them -
+ * distinct from a timeout, which the caller DID collect */
+#define PULL_ST_ABANDONED 6
+#define PULL_ST_MAX       7
 /* Two different readinesses, deliberately kept apart:
  *   cluster_ready - the clusterer is bound, the capability is registered and
  *                   membership is being tracked.  Everything cross-node needs
@@ -253,6 +266,37 @@ struct pcache_cluster_view {
 	int          last_was_up;    /* 1 = UP, 0 = DOWN                   */
 };
 static struct pcache_cluster_view *pc_view;
+
+/* What each peer has actually done for us, as opposed to what the clusterer
+ * says about it.  The two can disagree in the way that matters most: the
+ * membership can read perfectly healthy while the transport carrying pulls
+ * is dropping every packet, and a bare peer COUNT cannot show that.  Keyed
+ * by node id (1..CL_MAX_NODE_ID); monitoring-grade, so atomic bumps and no
+ * lock. */
+struct pcache_peer_stat {
+	unsigned int replies;        /* answers of any kind received from it */
+	unsigned int values;         /* of those, ones that carried a value  */
+	unsigned int served;         /* answers WE sent to it                */
+	unsigned int last_reply;     /* ticks of its last answer, 0 = never  */
+};
+static struct pcache_peer_stat *peer_stats;   /* [CL_MAX_NODE_ID + 1] */
+
+static inline void peer_note_reply(int node_id, int carried_value)
+{
+	if (!peer_stats || node_id <= 0 || node_id > CL_MAX_NODE_ID)
+		return;
+	__sync_fetch_and_add(&peer_stats[node_id].replies, 1);
+	if (carried_value)
+		__sync_fetch_and_add(&peer_stats[node_id].values, 1);
+	peer_stats[node_id].last_reply = get_ticks();
+}
+
+static inline void peer_note_served(int node_id)
+{
+	if (!peer_stats || node_id <= 0 || node_id > CL_MAX_NODE_ID)
+		return;
+	__sync_fetch_and_add(&peer_stats[node_id].served, 1);
+}
 
 static void pcache_cluster_event(enum clusterer_event ev, int node_id)
 {
@@ -624,6 +668,9 @@ static mi_response_t *mi_perf_stats(str *col_s)
 			goto err;
 		nup = pcache_cluster_members(ids, CL_MAX_NODE_ID, &gen, NULL);
 		if (add_mi_number(clobj, MI_SSTR("cluster_id"), sync_cluster_id) < 0 ||
+		    /* which of the peers below is us - the list holds peers only */
+		    add_mi_number(clobj, MI_SSTR("my_node_id"),
+		        clusterer_api.get_my_id ? clusterer_api.get_my_id() : 0) < 0 ||
 		    add_mi_number(clobj, MI_SSTR("peers_up"), nup < 0 ? 0 : nup) < 0 ||
 		    add_mi_number(clobj, MI_SSTR("membership_generation"), gen) < 0 ||
 		    add_mi_number(clobj, MI_SSTR("node_ups"), pc_view->node_ups) < 0 ||
@@ -645,7 +692,9 @@ static mi_response_t *mi_perf_stats(str *col_s)
 		     add_mi_number(clobj, MI_SSTR("pulls_stored"),
 		        pull_stats[PULL_ST_STORED]) < 0 ||
 		     add_mi_number(clobj, MI_SSTR("pulls_suppressed"),
-		        pull_stats[PULL_ST_SUPPRESSED]) < 0))
+		        pull_stats[PULL_ST_SUPPRESSED]) < 0 ||
+		     add_mi_number(clobj, MI_SSTR("pulls_abandoned"),
+		        pull_stats[PULL_ST_ABANDONED]) < 0))
 			goto err;
 		/* in-flight requests: a gauge, not a counter.  It should sit at 0
 		 * when nothing is being asked; anything else parked there means
@@ -663,6 +712,50 @@ static mi_response_t *mi_perf_stats(str *col_s)
 			    add_mi_number(clobj, MI_SSTR("pull_slots"),
 			        PCACHE_PULL_SLOTS) < 0)
 				goto err;
+		}
+
+		/* Who the peers are, and whether they are actually answering US.
+		 * A peer count alone cannot tell a healthy cluster apart from one
+		 * whose membership is fine while the transport carrying pulls is
+		 * black-holing every packet - the two look identical until you
+		 * see that no peer has ever replied.  So each peer is listed with
+		 * both views side by side: `membership` is what the clusterer
+		 * believes, `replies`/`last_reply_ago` are what this node has
+		 * actually received from it. */
+		{
+			mi_item_t *parr = add_mi_array(clobj, MI_SSTR("peers"));
+			int ids[CL_MAX_NODE_ID], np, k;
+			unsigned int now = get_ticks();
+
+			if (!parr)
+				goto err;
+			np = pcache_cluster_members(ids, CL_MAX_NODE_ID, NULL, NULL);
+			for (k = 0; k < np; k++) {
+				mi_item_t *p = add_mi_object(parr, NULL, 0);
+				struct pcache_peer_stat *ps = peer_stats && ids[k] > 0 &&
+					ids[k] <= CL_MAX_NODE_ID ? &peer_stats[ids[k]] : NULL;
+
+				if (!p)
+					goto err;
+				if (add_mi_number(p, MI_SSTR("node_id"), ids[k]) < 0 ||
+				    add_mi_string(p, MI_SSTR("membership"),
+				        MI_SSTR("up")) < 0)
+					goto err;
+				if (!ps)
+					continue;
+				if (add_mi_number(p, MI_SSTR("replies"), ps->replies) < 0 ||
+				    add_mi_number(p, MI_SSTR("replies_with_value"),
+				        ps->values) < 0 ||
+				    add_mi_number(p, MI_SSTR("answers_we_sent_it"),
+				        ps->served) < 0)
+					goto err;
+				/* -1 = it has never answered us at all.  With a broadcast
+				 * pull every member is asked, so a peer sitting at -1
+				 * while others are not is the shape of a one-way path. */
+				if (add_mi_number(p, MI_SSTR("last_reply_ago"),
+				        ps->last_reply ? (int)(now - ps->last_reply) : -1) < 0)
+					goto err;
+			}
 		}
 		if (pc_view->last_change) {
 			char lbuf[32];
@@ -1509,6 +1602,7 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 	}
 
 reply:
+	peer_note_served(src_node);
 	pcache_pull_send_rpl(src_node, id, key, found, ttl_left, &val, via_clctr);
 	if (val.s)
 		pkg_free(val.s);
@@ -1548,6 +1642,10 @@ static void pcache_pull_do_reply(int src_node, unsigned int id, str *key,
 			id, src_node);
 		return;
 	}
+
+	/* record who answered before any dedupe or early return, so the peer
+	 * view reflects what actually arrived on the wire */
+	peer_note_reply(src_node, found == PCACHE_FOUND_YES);
 
 	/* Count each node once, whatever the transport does.  An id outside
 	 * the range the bitmap covers cannot be tracked, and counting it
@@ -1600,6 +1698,72 @@ static void pcache_pull_do_reply(int src_node, unsigned int id, str *key,
 			LM_DBG("could not signal the pull waiter\n");
 	}
 	lock_release(pull_lock);
+}
+
+/* Reclaim pulls that never got a conclusive answer.
+ *
+ * pcache_pull_do_reply() only arms the eventfd once the outcome is settled
+ * - a value, an oversize holder, or every asked peer having said no.  When
+ * fewer than @expect peers answer (a reply is lost, a peer dies mid-flight,
+ * a node is asked that never responds) that never becomes true, so on the
+ * ASYNCHRONOUS path nothing wakes the caller: its resume never runs,
+ * pcache_pull_finish() is never reached, and since that is the only place a
+ * slot is released the slot is held for ever.  Enough of those and every
+ * slot is busy and the node stops pulling entirely.
+ *
+ * The blocking entry point never had this problem - it polls for at most
+ * pull_timeout_ms and then calls finish() regardless - which is exactly why
+ * the concurrent soak, which drives that path, reported no leak.
+ *
+ * Two stages, deliberately:
+ *   1. past its deadline, arm the eventfd once.  The caller then resumes
+ *      normally and finish() draws the ordinary "no answer" conclusion and
+ *      counts the timeout, so nothing about the outcome is special-cased
+ *      here.
+ *   2. still busy well past that, give up on the caller ever coming back
+ *      (its transaction may already be gone) and release the slot.  Safe
+ *      because releasing means clearing @id: a late finish() then simply
+ *      fails to find the slot and reports "already reaped", and ids are
+ *      monotonic so it cannot match a slot that has since been reused.
+ */
+static void pcache_pull_reap(utime_t ticks, void *param)
+{
+	utime_t now = get_uticks();
+	uint64_t one = 1;
+	int i, woke = 0, dropped = 0;
+
+	if (!pull_slots || !pull_lock)
+		return;
+
+	lock_get(pull_lock);
+	for (i = 0; i < PCACHE_PULL_SLOTS; i++) {
+		struct pcache_pull_slot *sl = &pull_slots[i];
+
+		if (!sl->id || now <= sl->deadline)
+			continue;
+
+		if (!sl->reaped) {
+			sl->reaped = 1;
+			if (sl->efd >= 0 &&
+			        write(sl->efd, &one, sizeof one) != sizeof one)
+				LM_DBG("could not wake the pull waiter on reap\n");
+			woke++;
+		} else if (now > sl->deadline + PCACHE_PULL_ABANDON_US) {
+			/* nobody came back for it */
+			sl->id = 0;
+			dropped++;
+		}
+	}
+	lock_release(pull_lock);
+
+	if (woke)
+		LM_DBG("reaped %d pull(s) past their deadline\n", woke);
+	if (dropped) {
+		__sync_fetch_and_add(&pull_stats[PULL_ST_ABANDONED], dropped);
+		LM_WARN("released %d pull slot(s) whose caller never collected "
+			"them - a suspended lookup was torn down before it could "
+			"resume\n", dropped);
+	}
 }
 
 /* BIN framing -> the shared reply path */
@@ -1770,7 +1934,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 	sl->partial  = hint_node > 0 ? 0 : truncated;
 	/* one node was asked, so one answer settles it */
 	sl->expect   = hint_node > 0 ? 1 : nmembers;
-	sl->deadline = get_ticks() + (pull_timeout_ms + 999) / 1000 + 1;
+	sl->deadline = get_uticks() + (utime_t)pull_timeout_ms * 1000;
 	memcpy(sl->key, key->s, key->len);
 	sl->klen = key->len;
 	memcpy(sl->col, col->col_name.s, col->col_name.len);
@@ -3517,13 +3681,16 @@ static int mod_init(void)
 			pull_slots = shm_malloc(PCACHE_PULL_SLOTS * sizeof *pull_slots);
 			pull_next_id = shm_malloc(sizeof *pull_next_id);
 			pull_stats = shm_malloc(PULL_ST_MAX * sizeof *pull_stats);
+			peer_stats = shm_malloc((CL_MAX_NODE_ID + 1) * sizeof *peer_stats);
 			pull_lock = lock_alloc();
-			if (!pull_slots || !pull_next_id || !pull_stats || !pull_lock ||
-			        !lock_init(pull_lock)) {
+			if (!pull_slots || !pull_next_id || !pull_stats || !peer_stats ||
+			        !pull_lock || !lock_init(pull_lock)) {
 				LM_ERR("no shm for the cross-node pull state\n");
 				return -1;
 			}
 			memset(pull_slots, 0, PCACHE_PULL_SLOTS * sizeof *pull_slots);
+			memset(peer_stats, 0,
+				(CL_MAX_NODE_ID + 1) * sizeof *peer_stats);
 			/* One eventfd per slot, created HERE - before the fork - so
 			 * that every worker inherits every fd.  This is the whole
 			 * reason the pool is fixed and preallocated: a reply arrives
@@ -3557,6 +3724,27 @@ static int mod_init(void)
 			}
 			mark_collections(replicate_collections, "replicate_collections",
 				COL_FLAG_REPLICATE);
+			/* Reclaim slots whose answer never became conclusive.  A
+			 * microsecond timer rather than the second-grained expiry
+			 * sweep: pull_timeout_ms is set in milliseconds and a
+			 * suspended lookup should not wait whole seconds past it.
+			 * Checked at half the timeout so a slot is reclaimed within
+			 * ~1.5x of it, and never tied to expiry_sweep_period, which
+			 * an operator is allowed to switch off entirely. */
+			{
+				unsigned int iv = (unsigned int)pull_timeout_ms * 1000 / 2;
+
+				if (iv < 10000)
+					iv = 10000;          /* no tighter than 10 ms */
+				if (register_utimer("cachedb-perf-pull-reap",
+				        pcache_pull_reap, NULL, iv,
+				        TIMER_FLAG_DELAY_ON_DELAY) < 0) {
+					LM_ERR("failed to register the pull reaper - a pull "
+						"that never gets a conclusive answer would hold "
+						"its slot for ever\n");
+					return -1;
+				}
+			}
 			pull_ready = 1;
 			LM_INFO("cross-node pull active over %s, %d ms timeout, "
 				"%d ms negative cache, collections: %s\n",
@@ -3747,6 +3935,10 @@ static void mod_destroy(void)
 	if (pull_stats) {
 		shm_free(pull_stats);
 		pull_stats = NULL;
+	}
+	if (peer_stats) {
+		shm_free(peer_stats);
+		peer_stats = NULL;
 	}
 
 	pcache_arena_destroy();

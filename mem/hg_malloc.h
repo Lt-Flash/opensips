@@ -26,6 +26,11 @@
 #include <stdio.h>
 #include "meminfo.h"
 #include "common.h"
+/* for process_no, used by hg_pstat_mine() below to pick this process's
+ * stats slot. Included explicitly rather than relied on to arrive via
+ * some other header - it does on a native build, and does not under a
+ * cross-compiler. */
+#include "../globals.h"
 
 #undef ROUNDTO
 

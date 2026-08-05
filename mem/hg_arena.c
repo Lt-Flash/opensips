@@ -40,6 +40,7 @@ static const unsigned int cell_sizes[HG_NCLASSES] = {
 };
 
 #define HG_CHUNK_SMALL    (256 * 1024)  /* cells <= 8K share 256K chunks */
+#define HG_CHUNK_MIN      (8 * 1024)    /* floor, however tiny the arena */
 #define HG_REFILL_BATCH   32             /* cells pulled from the global pool */
 #define HG_PRIVATE_MAX    256            /* private stack size that triggers */
 #define HG_DONATE         128            /*   donation of this many cells    */
@@ -138,9 +139,30 @@ void *hg_chunk_backing(struct hg_block *hb, unsigned long size)
 	return NULL;
 }
 
-static inline unsigned int chunk_size_for(int c)
+/*
+ * Chunk granularity has to scale with the arena, not be a fixed 256K.
+ *
+ * A chunk is claimed whole the first time its size class is touched, so
+ * with a fixed size the 21 classes cost 21 * 256K = 5.25M of granularity
+ * before a single useful byte is served - which an 8M pkg arena cannot
+ * afford, and it then fails to parse SIP messages at all. (F_MALLOC has no
+ * equivalent floor because it splits fragments to fit.) Cap a chunk at a
+ * small fraction of the arena so a small arena gets proportionally small
+ * chunks, while a large one keeps the full 256K and its amortisation.
+ */
+static inline unsigned int chunk_size_for(struct hg_block *hb, int c)
 {
-	return cell_sizes[c] <= 8192 ? HG_CHUNK_SMALL : cell_sizes[c] * 32;
+	unsigned int want = cell_sizes[c] <= 8192 ?
+		HG_CHUNK_SMALL : cell_sizes[c] * 32;
+	unsigned int least = sizeof(struct hg_chunk) + cell_sizes[c] * 2;
+
+	if (want > hb->chunk_max)
+		want = hb->chunk_max;
+	/* ...but always enough for the header plus a couple of cells, or the
+	 * class could never be served at all */
+	if (want < least)
+		want = least;
+	return want;
 }
 
 /* carve a new chunk for class @c - hb->lock must be held. The class byte of
@@ -149,7 +171,7 @@ static inline unsigned int chunk_size_for(int c)
 static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 {
 	struct hg_chunk *ch;
-	unsigned int size = chunk_size_for(c), i;
+	unsigned int size = chunk_size_for(hb, c), i;
 	char *cells;
 
 	ch = hg_chunk_backing(hb, size);
@@ -194,6 +216,15 @@ int hg_arena_init(struct hg_block *hb, unsigned long hdr_size)
 
 	/* leave the block header itself untouched by the bump allocator */
 	hb->hoff = (hdr_size + 63) & ~63UL;
+
+	/* see chunk_size_for(): no single chunk may swallow a big slice of a
+	 * small arena. /64 keeps all 21 classes plus the large tier inside a
+	 * third of the arena even in the worst case. */
+	hb->chunk_max = hb->size / 64;
+	if (hb->chunk_max > HG_CHUNK_SMALL)
+		hb->chunk_max = HG_CHUNK_SMALL;
+	if (hb->chunk_max < HG_CHUNK_MIN)
+		hb->chunk_max = HG_CHUNK_MIN;
 
 	/* size -> class LUT: needed = requested payload + hidden header */
 	for (idx = 0; idx <= HG_CELL_MAX / ROUNDTO; idx++) {

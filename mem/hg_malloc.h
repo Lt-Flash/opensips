@@ -195,6 +195,9 @@ struct hg_block {
 
 	struct hg_chunk *chunks;
 	unsigned int nchunks;
+	/* upper bound on one chunk, derived from the arena size at init -
+	 * see chunk_size_for() in hg_arena.c */
+	unsigned int chunk_max;
 	struct hg_region *regions;
 	void *gpool[HG_NCLASSES];       /* global free cells, per class */
 	unsigned int gpool_n[HG_NCLASSES];

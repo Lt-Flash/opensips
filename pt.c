@@ -20,8 +20,9 @@
  */
 
 /* for cpu_set_t / CPU_SET / sched_setaffinity, used by the pin_*_cpu()
- * Defined before the first include and never #undef'd - undefining it after
- * the fact is what broke the musl build in lib/url.c (see PR #4119). */
+ * helpers below. Defined before the first include and never #undef'd -
+ * undefining it after the fact is what broke the musl build in lib/url.c
+ * (see PR #4119). */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -89,6 +90,16 @@ void register_fork_handler(struct internal_fork_handler *h)
 		continue;
 	hp->_next = h;
 };
+
+/*
+ * CPU pinning is Linux-only: cpu_set_t and sched_setaffinity() are a
+ * glibc/Linux interface. OpenSIPS also builds on the BSDs, Solaris and
+ * Darwin, which each spell this differently (FreeBSD has cpuset_t and
+ * cpuset_setaffinity, for instance), so the whole feature is compiled out
+ * elsewhere rather than guessed at. Configuring it there is reported once
+ * instead of silently doing nothing.
+ */
+#ifdef __OS_linux
 
 /*
  * Per-process-type CPU groups.
@@ -256,6 +267,26 @@ static void pin_apply_cpu(int cpu)
 	LM_INFO("process %d pinned to CPU %d\n", process_no, cpu);
 }
 
+
+#else  /* !__OS_linux */
+
+static int pin_pick_cpu(enum process_type ptype)
+{
+	static int warned;
+
+	if (pin_workers && !warned) {
+		warned = 1;
+		LM_WARN("CPU pinning is only implemented on Linux - "
+			"pin_workers and pin_*_cpus have no effect here\n");
+	}
+	return -1;
+}
+
+static void pin_apply_cpu(int cpu)
+{
+}
+
+#endif /* __OS_linux */
 
 static unsigned long count_running_processes(void *x)
 {

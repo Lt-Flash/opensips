@@ -42,6 +42,45 @@ leak.
 Note that -m is rounded up to a whole number of huge pages, so on a
 machine with 2 MB huge pages the real granularity is 2 MB.
 
+
+Budget about twice the shm you give F_MALLOC
+--------------------------------------------
+
+An arena that is enough under one of the other allocators is not
+necessarily enough here, and the gap widens with call concurrency rather
+than with call rate. Two properties of the design cause it:
+
+  * every allocation is rounded up to its size class, so a request lands
+    in a cell up to one class larger than it asked for;
+  * a freed cell goes back to the class it came from and is never
+    reclassified, so memory the peak of one class took is not available
+    to another afterwards.
+
+Neither is a leak, and neither shows up at low concurrency - both are
+proportional to how many objects are alive at once.
+
+Measured on a topology-hiding proxy (three nodes, four UDP workers each,
+INVITE/200/ACK/BYE held for 500 ms, so roughly 1500 calls in flight per
+node at 3000 CPS):
+
+    F_MALLOC    -m 512    clean
+    HG_MALLOC   -m 512    carve_chunk failures on the hot class within
+                          seconds; topology_hiding could no longer store
+                          its state and the calls were lost
+    HG_MALLOC   -m 1024   clean - 0 carve_chunk, 0 failed calls, and
+                          25% less CPU than F_MALLOC at the same load
+
+So the rule of thumb is to give HG_MALLOC twice the arena that the same
+traffic needs under F_MALLOC, and to confirm it against the log rather
+than by arithmetic. The exact requirement here was somewhere between
+512 and 1024 MB; it was not bracketed more finely, and it will differ
+with the mix of allocation sizes a particular config makes.
+
+The failure is loud but it is not fatal, which is the trap: the server
+keeps running and keeps answering, while the module that could not get
+memory quietly drops what it was doing. Watch for carve_chunk in the log
+of any new deployment before trusting a capacity number from it.
+
 Unlike the other allocators, HG_MALLOC pre-faults and mlock()s its whole
 reservation at startup, so the memory is resident immediately rather than
 growing as it is used. Budget for -m plus (-M x number of processes).

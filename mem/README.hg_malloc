@@ -114,9 +114,35 @@ matters here: HG_MALLOC's fast path keeps its free lists in per-process
 memory, so once workers stop migrating those lists stay warm in one CPU's
 cache.
 
+Each kind of process can instead be given its own CPU list, which is
+usually what you want - the point of pinning is normally to keep the
+packet-receiving workers away from everything else:
+
+    pin_udp_cpus    = "0-7"
+    pin_tcp_cpus    = "8-11"
+    pin_timer_cpus  = "12"
+    pin_module_cpus = "13-15"
+
+Setting any of these turns pinning on by itself, so pin_workers=1 is only
+needed to pin everything with no grouping. A type with no list may use
+every CPU it is allowed. Lists take the usual "0-7,12" form.
+
+There is no bin or hep group. Neither forks processes of its own: they are
+transport protocols carried by the ordinary UDP and TCP workers, so a
+"bin:" listener is served by TCP workers and follows pin_tcp_cpus, and HEP
+follows the UDP or TCP list depending on the transport it runs over.
+
 CPUs are chosen from the set the process is already allowed to run on, so
 a cpuset or container restriction is respected and can only be narrowed,
-never widened.
+never widened - a group is intersected with that set, never substituted
+for it. If the intersection is empty those processes are left unpinned
+with a warning rather than failing the startup, and a malformed list is
+reported naming the option and the value.
+
+Within its group, each process gets the least-occupied CPU, counted over
+the processes running at that moment rather than derived from a process
+index. This matters with auto-scaling: workers come and go, and an index
+would say nothing about who is already running where.
 
 NUMA placement is deliberately NOT implemented. On a 2-socket test machine
 the arena was pinned to one node and the workers run first on the same node

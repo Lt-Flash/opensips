@@ -78,6 +78,30 @@ while the other allocators on the same machine and workload ranged from
 still worth using.
 
 
+Per-module memory accounting
+----------------------------
+
+Building with -DSHM_EXTRA_STATS lets a config attribute shared memory to
+named groups of modules:
+
+    mem-group = "core": "core"
+    mem-group = "tm": "tm"
+
+which then appear as ordinary statistics - shmem_core:memory_used,
+shmem_tm:fragments and so on - queryable over MI.
+
+It is not free, but close to it. Measured on the same host and workload as
+above, HG_MALLOC's allocator CPU self-time went from 2.74% without it to
+2.90% with it (two runs each). The symbols that exist only in this build -
+update_module_stats plus the two per-cell index accessors - account for
+0.13-0.15% of CPU directly. Most of that is not specific to this
+allocator: update_module_stats is called from the generic shared-memory
+wrappers, so every allocator pays it.
+
+Set against the 9.5% to 22.8% the other allocators spend on allocation
+alone, the accounting is worth having.
+
+
 Sharing the hugetlb pool with cachedb_perf
 ------------------------------------------
 

@@ -102,8 +102,16 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 		 * default floor so small large-object churn doesn't force a
 		 * fresh chunk carve every time) */
 		chunk_size = HG_LFRAG_HDR * 2 + need;
-		if (chunk_size < HG_LARGE_DEFAULT_CHUNK)
-			chunk_size = HG_LARGE_DEFAULT_CHUNK;
+		/* the 1M amortisation floor is only affordable on a big arena;
+		 * on a small one it would eat the whole thing (same reasoning
+		 * as chunk_size_for() in hg_arena.c) */
+		{
+			unsigned long floor = HG_LARGE_DEFAULT_CHUNK;
+			if (floor > hb->chunk_max)
+				floor = hb->chunk_max;
+			if (chunk_size < floor)
+				chunk_size = floor;
+		}
 		chunk_size = (chunk_size + 63) & ~63UL;
 
 		base = hg_chunk_backing(hb, chunk_size + sizeof(struct hg_large_chunk));

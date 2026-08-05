@@ -19,7 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-/* for cpu_set_t / CPU_SET / sched_setaffinity, used by pin_worker_to_cpu().
+/* for cpu_set_t / CPU_SET / sched_setaffinity, used by the pin_*_cpu()
  * Defined before the first include and never #undef'd - undefining it after
  * the fact is what broke the musl build in lib/url.c (see PR #4119). */
 #ifndef _GNU_SOURCE
@@ -91,59 +91,81 @@ void register_fork_handler(struct internal_fork_handler *h)
 };
 
 /*
- * Pin this worker to a single CPU, chosen from the set it is ALREADY
- * allowed to run on.
+ * Choose the CPU a new process should be pinned to, or -1 for "do not pin".
+ * Runs in the PARENT, before fork.
  *
- * Reading the current mask first and picking from within it is the whole
- * point: under a cgroup/cpuset (a container, a systemd slice) the process
- * may be confined to a subset of the machine's CPUs, and pinning to a
- * "CPU number" picked from /proc/cpuinfo would either fail with EINVAL or,
- * worse, quietly widen the process's affinity beyond what the operator
- * confined it to. Intersecting can only ever narrow.
+ * Two things matter here:
  *
- * Best-effort: any failure leaves the worker unpinned and running normally.
+ *  - The candidate CPUs come from the set this process is ALREADY allowed to
+ *    run on, read back with sched_getaffinity() rather than assumed from the
+ *    machine's CPU count. Under a cgroup or cpuset - a container, a systemd
+ *    slice - we may be confined to a subset, and picking a raw CPU number
+ *    would either fail or quietly widen affinity past what the operator
+ *    confined us to. Intersecting can only ever narrow.
+ *
+ *  - The CPU is the least-occupied one, counted over the processes actually
+ *    running right now. Deriving it from the process-table slot instead would
+ *    look balanced at startup and drift badly afterwards: with auto-scaling,
+ *    slots are freed and reused, so a recycled slot can land on a CPU that
+ *    already has workers while another sits idle.
  */
-static void pin_worker_to_cpu(int slot)
+static int pin_pick_cpu(void)
 {
-	cpu_set_t allowed, one;
-	int i, n, pick, chosen = -1;
+	cpu_set_t allowed;
+	int count[CPU_SETSIZE];
+	int i, n, best = -1, best_load = 0;
 
 	if (!pin_workers)
-		return;
+		return -1;
 
 	CPU_ZERO(&allowed);
 	if (sched_getaffinity(0, sizeof allowed, &allowed) != 0) {
-		LM_WARN("cannot read CPU affinity, leaving worker %d unpinned: %s\n",
-			slot, strerror(errno));
-		return;
+		LM_WARN("cannot read CPU affinity, leaving new process unpinned: %s\n",
+			strerror(errno));
+		return -1;
 	}
 
 	n = CPU_COUNT(&allowed);
 	if (n <= 1)
-		return;   /* already confined to one CPU - nothing to do */
+		return -1;   /* already confined to a single CPU - nothing to do */
 
-	/* round-robin over the allowed CPUs, in ascending order */
-	pick = slot % n;
+	memset(count, 0, sizeof count);
+	for (i = 0; i < counted_max_processes; i++) {
+		int c = pt[i].pinned_cpu;
+
+		if (c >= 0 && c < CPU_SETSIZE && is_process_running(i))
+			count[c]++;
+	}
+
 	for (i = 0; i < CPU_SETSIZE; i++) {
 		if (!CPU_ISSET(i, &allowed))
 			continue;
-		if (pick-- == 0) {
-			chosen = i;
-			break;
+		if (best < 0 || count[i] < best_load) {
+			best = i;
+			best_load = count[i];
 		}
 	}
-	if (chosen < 0)
+
+	return best;
+}
+
+/* Apply the choice made above. Runs in the CHILD. */
+static void pin_apply_cpu(int cpu)
+{
+	cpu_set_t one;
+
+	if (cpu < 0)
 		return;
 
 	CPU_ZERO(&one);
-	CPU_SET(chosen, &one);
+	CPU_SET(cpu, &one);
 	if (sched_setaffinity(0, sizeof one, &one) != 0) {
-		LM_WARN("failed to pin worker %d to CPU %d: %s\n",
-			slot, chosen, strerror(errno));
+		LM_WARN("failed to pin process %d to CPU %d: %s\n",
+			process_no, cpu, strerror(errno));
 		return;
 	}
 
-	LM_INFO("worker %d pinned to CPU %d (of %d allowed)\n", slot, chosen, n);
+	LM_INFO("process %d pinned to CPU %d\n", process_no, cpu);
 }
 
 
@@ -185,6 +207,7 @@ int init_multi_proc_support(void)
 	for( i=0 ; i<counted_max_processes ; i++ ) {
 		/* reset fds to prevent bogus ops */
 		pt[i].pid = -1;
+		pt[i].pinned_cpu = -1;
 		pt[i].ipc_pipe[0] = pt[i].ipc_pipe[1] = -1;
 		pt[i].ipc_sync_pipe[0] = pt[i].ipc_sync_pipe[1] = -1;
 	}
@@ -290,6 +313,7 @@ void reset_process_slot( int p_id )
 	/* we cannot simply do a memset here, as we need to preserve the holders
 	 * with the inter-process communication fds */
 	pt[p_id].pid = -1;
+	pt[p_id].pinned_cpu = -1;
 	pt[p_id].type = TYPE_NONE;
 	pt[p_id].pg_filter = NULL;
 	pt[p_id].desc[0] = 0;
@@ -386,6 +410,9 @@ int internal_fork(const struct internal_fork_params *ifpp)
 
 	atomic_init(&pt[new_idx].startup_result, CHLD_STARTING);
 
+	/* decided here, in the parent, while the process table is stable */
+	pt[new_idx].pinned_cpu = pin_pick_cpu();
+
 	if ( (pid=fork())<0 ){
 		LM_CRIT("cannot fork \"%s\" process (%d: %s)\n",ifpp->proc_desc,
 				errno, strerror(errno));
@@ -400,8 +427,10 @@ int internal_fork(const struct internal_fork_params *ifpp)
 
 		/* Pin BEFORE the allocator reset below: the reset makes this
 		 * worker carve fresh chunks on first use, and we want that to
-		 * happen once it is already on its final CPU. */
-		pin_worker_to_cpu(new_idx);
+		 * happen once it is already on its final CPU. The CPU itself was
+		 * chosen by the parent (pin_pick_cpu) so the decision could see a
+		 * consistent view of who is running where. */
+		pin_apply_cpu(pt[new_idx].pinned_cpu);
 
 #ifdef HG_MALLOC
 		/*

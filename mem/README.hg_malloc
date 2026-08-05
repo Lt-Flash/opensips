@@ -1,0 +1,129 @@
+HG_MALLOC - hugepage-backed slab allocator
+==========================================
+
+HG_MALLOC is one of the memory allocators OpenSIPS can use for its shared
+(shm) and process-private (pkg) memory. It is built around two ideas the
+other allocators do not use: huge pages, and a per-process allocation fast
+path that takes no lock and touches no shared cache line.
+
+It is selected at runtime like any other allocator:
+
+    opensips -a HG_MALLOC            # both shm and pkg
+    opensips -s HG_MALLOC            # shm only
+    opensips -k HG_MALLOC            # pkg only
+
+and compiled in by default (-DHG_MALLOC in Makefile.conf). "opensips -V"
+lists it in the flags line when present, and "opensips -h" lists the
+accepted values.
+
+
+Sizing
+------
+
+    -m <MB>   shared memory, one arena for the whole server
+    -M <MB>   private memory, per process
+
+Minimums for a small configuration (a handful of modules):
+
+    absolute minimum      -m 8 -M 2
+    recommended floor     -m 64 -M 16
+
+Below the minimum the allocator refuses to serve and says so, e.g.
+
+    ERROR:core:carve_chunk: shm: no more HG_MALLOC arena memory for a
+    65536 byte chunk (class 7) - increase the arena size
+
+A real configuration needs more. Loading cachedb_perf, for instance,
+raises the shm floor noticeably: at 200 CPS, -m 64 produced a stream of
+carve_chunk failures and tm could not clone messages, while -m 256 ran
+clean. If you see carve_chunk in the log, raise -m or -M; it is not a
+leak.
+
+Note that -m is rounded up to a whole number of huge pages, so on a
+machine with 2 MB huge pages the real granularity is 2 MB.
+
+Unlike the other allocators, HG_MALLOC pre-faults and mlock()s its whole
+reservation at startup, so the memory is resident immediately rather than
+growing as it is used. Budget for -m plus (-M x number of processes).
+
+
+Huge pages
+----------
+
+The arena is obtained through a four-tier ladder, best first. Each tier is
+attempted and then *verified* through /proc - never assumed from the
+kernel version or from sysfs settings:
+
+    1  mmap(MAP_HUGETLB)                 huge pages from the hugetlb pool
+    2  MADV_HUGEPAGE                     THP, huge at first fault
+    3  MADV_COLLAPSE                     THP, retrofitted after filling
+    4  plain 4K pages                    always works
+
+A miss degrades to the next tier; it never fails the startup. Which tier
+was actually achieved is logged, and that log line is the only reliable
+way to know:
+
+    NOTICE:core:hg_malloc_init: shm HG_MALLOC arena: 256 MB on
+    MAP_HUGETLB 2M pages, 256 MB pinned
+
+Tier 1 needs a hugetlb pool big enough for the arena, e.g.
+
+    sysctl -w vm.nr_overcommit_hugepages=<pages>
+
+Huge pages are worth having but are not where most of the benefit comes
+from. Measured on one host at 800 CPS, allocator CPU self-time varied only
+between 2.75% (tier 1) and 3.38% (tier 4, huge pages fully disabled) -
+while the other allocators on the same machine and workload ranged from
+9.5% to 22.8%. If the machine cannot give you huge pages, HG_MALLOC is
+still worth using.
+
+
+Sharing the hugetlb pool with cachedb_perf
+------------------------------------------
+
+cachedb_perf reserves its own huge-page arena (arena_hugepage_mb). Both it
+and HG_MALLOC can be on tier 1 at the same time, but they do not
+coordinate with each other - each simply asks the kernel and takes what is
+available. Two consequences:
+
+  * Size the pool for the SUM of every arena, not the largest one:
+
+        nr_overcommit_hugepages >= (-m + -M + arena_hugepage_mb) / 2
+
+    on a 2 MB huge page machine, plus headroom.
+
+  * HG_MALLOC always claims first. shm and pkg are initialised in main()
+    before any module is loaded, so cachedb_perf only ever sees what is
+    left. With a pool too small for both, it is the *core* arena that
+    degrades to a lower tier while cachedb_perf still gets tier 1.
+
+Nothing fails when the pool is short - each arena just lands on a lower
+tier - so check both startup log lines rather than assuming.
+
+Also note that pkg is a private mapping made before the workers fork, so
+every worker copies its huge pages as it writes to them; pool consumption
+grows with the number of processes.
+
+
+Limitations
+-----------
+
+  * Allocations are served from fixed size classes up to 64K, and from a
+    coalescing tier above that. There is no defragmentation or garbage
+    collection: memory is never returned to the OS while the server runs.
+  * On exhaustion it fails loudly rather than falling back to another
+    allocator. Raise -m / -M.
+  * CPU pinning and NUMA-aware placement are not implemented yet.
+  * The arena is excluded from core dumps (MADV_DONTDUMP). Since every
+    page is resident, including it would add the full arena size to every
+    worker's core file.
+
+
+Testing
+-------
+
+modules/hgstress is a throwaway stress module that hammers shm from every
+worker at once and detects the failure mode ordinary tests miss - the same
+block being handed to two processes. Each worker stamps its blocks with a
+value derived from its own pid and re-reads them later, so a foreign
+writer is caught and named. See that module's source for the parameters.

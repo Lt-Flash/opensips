@@ -352,6 +352,10 @@ extern int cfg_parse_only_routes;
 %token MEMLOG
 %token MEMDUMP
 %token PIN_WORKERS
+%token PIN_UDP_CPUS
+%token PIN_TCP_CPUS
+%token PIN_TIMER_CPUS
+%token PIN_MODULE_CPUS
 %token SHM_MEMLOG_SIZE
 %token EXECMSGTHRESHOLD
 %token EXECDNSTHRESHOLD
@@ -1254,6 +1258,14 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 		| MEMDUMP EQUAL error { yyerror("int value expected"); }
 		| PIN_WORKERS EQUAL snumber { IFOR(); pin_workers=$3; }
 		| PIN_WORKERS EQUAL error { yyerror("int value expected"); }
+		| PIN_UDP_CPUS EQUAL STRING { IFOR(); pin_udp_cpus=$3; pin_workers=1; }
+		| PIN_UDP_CPUS EQUAL error { yyerror("string value expected"); }
+		| PIN_TCP_CPUS EQUAL STRING { IFOR(); pin_tcp_cpus=$3; pin_workers=1; }
+		| PIN_TCP_CPUS EQUAL error { yyerror("string value expected"); }
+		| PIN_TIMER_CPUS EQUAL STRING { IFOR(); pin_timer_cpus=$3; pin_workers=1; }
+		| PIN_TIMER_CPUS EQUAL error { yyerror("string value expected"); }
+		| PIN_MODULE_CPUS EQUAL STRING { IFOR(); pin_module_cpus=$3; pin_workers=1; }
+		| PIN_MODULE_CPUS EQUAL error { yyerror("string value expected"); }
 		| EXECMSGTHRESHOLD EQUAL NUMBER {  IFOR();execmsgthreshold=$3; }
 		| EXECMSGTHRESHOLD EQUAL error { yyerror("int value expected"); }
 		| EXECDNSTHRESHOLD EQUAL NUMBER { IFOR(); execdnsthreshold=$3; }

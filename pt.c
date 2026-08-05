@@ -91,6 +91,79 @@ void register_fork_handler(struct internal_fork_handler *h)
 };
 
 /*
+ * Per-process-type CPU groups.
+ *
+ * "pin_workers=1" turns pinning on; each of these then optionally confines
+ * one kind of process to a CPU list:
+ *
+ *     pin_udp_cpus   = "0-7"
+ *     pin_tcp_cpus   = "8-11"
+ *     pin_timer_cpus = "12"
+ *
+ * A type with no list set may use every CPU the process is allowed. Note
+ * that bin and hep are not process types of their own - they are transport
+ * protocols carried by the ordinary UDP/TCP workers, so they follow
+ * whichever of those they run over.
+ */
+static cpu_set_t pin_type_set[TYPE_MODULE + 1];
+static char pin_type_has[TYPE_MODULE + 1];
+static int pin_spec_parsed;
+
+/* "0-7,12" -> set. Returns -1 on malformed input. */
+static int pin_parse_cpulist(const char *s, cpu_set_t *set)
+{
+	long a, b;
+	char *end;
+
+	CPU_ZERO(set);
+	while (*s) {
+		while (*s == ' ' || *s == ',') s++;
+		if (!*s)
+			break;
+		a = strtol(s, &end, 10);
+		if (end == s || a < 0 || a >= CPU_SETSIZE)
+			return -1;
+		s = end;
+		b = a;
+		if (*s == '-') {
+			s++;
+			b = strtol(s, &end, 10);
+			if (end == s || b < a || b >= CPU_SETSIZE)
+				return -1;
+			s = end;
+		}
+		for (; a <= b; a++)
+			CPU_SET(a, set);
+	}
+	return 0;
+}
+
+static void pin_set_group(enum process_type t, const char *list,
+                                                       const char *name)
+{
+	if (!list)
+		return;
+	if (pin_parse_cpulist(list, &pin_type_set[t]) < 0 ||
+	    CPU_COUNT(&pin_type_set[t]) == 0) {
+		LM_ERR("pin_%s_cpus: bad or empty CPU list \"%s\"\n", name, list);
+		return;
+	}
+	pin_type_has[t] = 1;
+	LM_INFO("pinning %s processes to %d CPU(s)\n", name,
+		CPU_COUNT(&pin_type_set[t]));
+}
+
+/* parsed once, lazily, in the parent before any fork */
+static void pin_parse_spec(void)
+{
+	pin_spec_parsed = 1;
+	pin_set_group(TYPE_UDP,    pin_udp_cpus,    "udp");
+	pin_set_group(TYPE_TCP,    pin_tcp_cpus,    "tcp");
+	pin_set_group(TYPE_TIMER,  pin_timer_cpus,  "timer");
+	pin_set_group(TYPE_MODULE, pin_module_cpus, "module");
+}
+
+/*
  * Choose the CPU a new process should be pinned to, or -1 for "do not pin".
  * Runs in the PARENT, before fork.
  *
@@ -109,7 +182,7 @@ void register_fork_handler(struct internal_fork_handler *h)
  *    slots are freed and reused, so a recycled slot can land on a CPU that
  *    already has workers while another sits idle.
  */
-static int pin_pick_cpu(void)
+static int pin_pick_cpu(enum process_type ptype)
 {
 	cpu_set_t allowed;
 	int count[CPU_SETSIZE];
@@ -118,6 +191,9 @@ static int pin_pick_cpu(void)
 	if (!pin_workers)
 		return -1;
 
+	if (!pin_spec_parsed)
+		pin_parse_spec();
+
 	CPU_ZERO(&allowed);
 	if (sched_getaffinity(0, sizeof allowed, &allowed) != 0) {
 		LM_WARN("cannot read CPU affinity, leaving new process unpinned: %s\n",
@@ -125,9 +201,21 @@ static int pin_pick_cpu(void)
 		return -1;
 	}
 
+	/* narrow to this process type's group, if the spec named one. The
+	 * intersection keeps the cpuset guarantee: a group can only ever
+	 * restrict further, never grant a CPU we were not already allowed. */
+	if (ptype >= 0 && ptype <= TYPE_MODULE && pin_type_has[ptype]) {
+		CPU_AND(&allowed, &allowed, &pin_type_set[ptype]);
+		if (CPU_COUNT(&allowed) == 0) {
+			LM_WARN("pin_workers: group for this process type has no CPU "
+				"in common with the allowed set - leaving unpinned\n");
+			return -1;
+		}
+	}
+
 	n = CPU_COUNT(&allowed);
-	if (n <= 1)
-		return -1;   /* already confined to a single CPU - nothing to do */
+	if (n < 1)
+		return -1;
 
 	memset(count, 0, sizeof count);
 	for (i = 0; i < counted_max_processes; i++) {
@@ -411,7 +499,7 @@ int internal_fork(const struct internal_fork_params *ifpp)
 	atomic_init(&pt[new_idx].startup_result, CHLD_STARTING);
 
 	/* decided here, in the parent, while the process table is stable */
-	pt[new_idx].pinned_cpu = pin_pick_cpu();
+	pt[new_idx].pinned_cpu = pin_pick_cpu(ifpp->type);
 
 	if ( (pid=fork())<0 ){
 		LM_CRIT("cannot fork \"%s\" process (%d: %s)\n",ifpp->proc_desc,

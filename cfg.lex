@@ -246,6 +246,10 @@ RPM_MEM_SIZE "restart_persistency_size"
 MEMLOG		"memlog"|"mem_log"
 MEMDUMP		"memdump"|"mem_dump"
 PIN_WORKERS	"pin_workers"|"cpu_pinning"
+PIN_UDP_CPUS	"pin_udp_cpus"
+PIN_TCP_CPUS	"pin_tcp_cpus"
+PIN_TIMER_CPUS	"pin_timer_cpus"
+PIN_MODULE_CPUS	"pin_module_cpus"
 SHM_MEMLOG_SIZE			"shm_memlog_size"
 EXECMSGTHRESHOLD		"execmsgthreshold"|"exec_msg_threshold"
 EXECDNSTHRESHOLD		"execdnsthreshold"|"exec_dns_threshold"
@@ -480,6 +484,10 @@ SPACE		[ ]
 <INITIAL>{MEMLOG}	{ count(); yylval.strval=yytext; return MEMLOG; }
 <INITIAL>{MEMDUMP}	{ count(); yylval.strval=yytext; return MEMDUMP; }
 <INITIAL>{PIN_WORKERS}	{ count(); yylval.strval=yytext; return PIN_WORKERS; }
+<INITIAL>{PIN_UDP_CPUS}	{ count(); yylval.strval=yytext; return PIN_UDP_CPUS; }
+<INITIAL>{PIN_TCP_CPUS}	{ count(); yylval.strval=yytext; return PIN_TCP_CPUS; }
+<INITIAL>{PIN_TIMER_CPUS}	{ count(); yylval.strval=yytext; return PIN_TIMER_CPUS; }
+<INITIAL>{PIN_MODULE_CPUS}	{ count(); yylval.strval=yytext; return PIN_MODULE_CPUS; }
 <INITIAL>{SHM_MEMLOG_SIZE}	{ count(); yylval.strval=yytext; return SHM_MEMLOG_SIZE; }
 <INITIAL>{EXECMSGTHRESHOLD}	{ count(); yylval.strval=yytext; return EXECMSGTHRESHOLD; }
 <INITIAL>{EXECDNSTHRESHOLD}	{ count(); yylval.strval=yytext; return EXECDNSTHRESHOLD; }

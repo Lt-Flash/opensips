@@ -105,6 +105,25 @@ every worker copies its huge pages as it writes to them; pool consumption
 grows with the number of processes.
 
 
+CPU pinning
+-----------
+
+The core option "pin_workers=1" pins each worker process to a single CPU,
+round-robin. It is off by default and independent of the allocator, but it
+matters here: HG_MALLOC's fast path keeps its free lists in per-process
+memory, so once workers stop migrating those lists stay warm in one CPU's
+cache.
+
+CPUs are chosen from the set the process is already allowed to run on, so
+a cpuset or container restriction is respected and can only be narrowed,
+never widened.
+
+NUMA placement is deliberately NOT implemented. On a 2-socket test machine
+the arena was pinned to one node and the workers run first on the same node
+and then on the other; the remote arrangement measured no worse (in fact
+marginally better, the node hosting the network interrupts being the busier
+one). Until a workload shows a real cost, there is nothing here to recover.
+
 Limitations
 -----------
 
@@ -113,7 +132,8 @@ Limitations
     collection: memory is never returned to the OS while the server runs.
   * On exhaustion it fails loudly rather than falling back to another
     allocator. Raise -m / -M.
-  * CPU pinning and NUMA-aware placement are not implemented yet.
+  * NUMA-aware arena placement is not implemented - see CPU pinning
+    above for why.
   * The arena is excluded from core dumps (MADV_DONTDUMP). Since every
     page is resident, including it would add the full arena size to every
     worker's core file.

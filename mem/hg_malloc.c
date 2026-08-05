@@ -42,6 +42,15 @@
 
 #include "../lib/dbg/struct_hist.h"
 
+/*
+ * The huge-page ladder is Linux-only, and the fallback values below are
+ * Linux's. They are defined ONLY under __OS_linux on purpose: the same bit
+ * means something else elsewhere (0x40000 is MAP_PREFAULT_READ on FreeBSD),
+ * so defining them unconditionally would make mmap() succeed with unrelated
+ * semantics and this code would then report a huge-page tier it never got.
+ * On every other OS the reservation is a plain anonymous mapping.
+ */
+#ifdef __OS_linux
 #ifndef MAP_HUGETLB
 #define MAP_HUGETLB 0x40000
 #endif
@@ -51,6 +60,7 @@
 #ifndef MADV_COLLAPSE
 #define MADV_COLLAPSE 25
 #endif
+#endif /* __OS_linux */
 
 /*
  * The system's default huge page size, probed once rather than assumed.
@@ -228,6 +238,21 @@ static void *hg_mem_reserve(unsigned long size, enum hg_mem_tier *tier,
 	*locked_mb = 0;
 	*tier = HG_MEM_4K;
 
+#ifndef __OS_linux
+	/* No verified huge-page route outside Linux: take a plain anonymous
+	 * mapping and report the 4K tier honestly rather than claiming one we
+	 * cannot check. Still pinned and pre-faulted. */
+	p = mmap(NULL, asize, PROT_READ|PROT_WRITE, vis|MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED)
+		return NULL;
+	hg_exclude_from_core(p, asize);
+	if (mlock(p, asize) == 0)
+		*locked_mb = asize >> 20;
+	else
+		memset(p, 0, asize);
+	return p;
+#else
+
 	/* tier 1: MAP_HUGETLB - unswappable, exempt from RLIMIT_MEMLOCK */
 	p = mmap(NULL, asize, PROT_READ|PROT_WRITE,
 	         vis|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
@@ -283,6 +308,7 @@ static void *hg_mem_reserve(unsigned long size, enum hg_mem_tier *tier,
 		*tier = HG_MEM_4K;         /* reserved+pinned but 4K */
 	}
 	return base;
+#endif /* __OS_linux */
 }
 
 const char *hg_mem_tier_str(enum hg_mem_tier tier)

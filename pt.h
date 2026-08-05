@@ -98,6 +98,12 @@ struct process_table {
 	/* the load statistic of this process */
 	struct proc_load_info load;
 
+	/* CPU this process is pinned to, or -1 if unpinned. Chosen by the
+	 * parent at fork time (see pin_pick_cpu() in pt.c) and applied by the
+	 * child; also what makes the choice occupancy-aware, since the parent
+	 * counts the CPUs of the currently-running processes here. */
+	int pinned_cpu;
+
 	/* synchronization during fork */
 	atomic_t startup_result;
 };

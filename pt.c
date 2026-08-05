@@ -19,11 +19,20 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+/* for cpu_set_t / CPU_SET / sched_setaffinity, used by pin_worker_to_cpu().
+ * Defined before the first include and never #undef'd - undefining it after
+ * the fact is what broke the musl build in lib/url.c (see PR #4119). */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sched.h>
 #include <stdio.h>
+#include <errno.h>
+#include <string.h>
 
 #include "lib/dbg/profiling.h"
 #include "mem/shm_mem.h"
@@ -80,6 +89,63 @@ void register_fork_handler(struct internal_fork_handler *h)
 		continue;
 	hp->_next = h;
 };
+
+/*
+ * Pin this worker to a single CPU, chosen from the set it is ALREADY
+ * allowed to run on.
+ *
+ * Reading the current mask first and picking from within it is the whole
+ * point: under a cgroup/cpuset (a container, a systemd slice) the process
+ * may be confined to a subset of the machine's CPUs, and pinning to a
+ * "CPU number" picked from /proc/cpuinfo would either fail with EINVAL or,
+ * worse, quietly widen the process's affinity beyond what the operator
+ * confined it to. Intersecting can only ever narrow.
+ *
+ * Best-effort: any failure leaves the worker unpinned and running normally.
+ */
+static void pin_worker_to_cpu(int slot)
+{
+	cpu_set_t allowed, one;
+	int i, n, pick, chosen = -1;
+
+	if (!pin_workers)
+		return;
+
+	CPU_ZERO(&allowed);
+	if (sched_getaffinity(0, sizeof allowed, &allowed) != 0) {
+		LM_WARN("cannot read CPU affinity, leaving worker %d unpinned: %s\n",
+			slot, strerror(errno));
+		return;
+	}
+
+	n = CPU_COUNT(&allowed);
+	if (n <= 1)
+		return;   /* already confined to one CPU - nothing to do */
+
+	/* round-robin over the allowed CPUs, in ascending order */
+	pick = slot % n;
+	for (i = 0; i < CPU_SETSIZE; i++) {
+		if (!CPU_ISSET(i, &allowed))
+			continue;
+		if (pick-- == 0) {
+			chosen = i;
+			break;
+		}
+	}
+	if (chosen < 0)
+		return;
+
+	CPU_ZERO(&one);
+	CPU_SET(chosen, &one);
+	if (sched_setaffinity(0, sizeof one, &one) != 0) {
+		LM_WARN("failed to pin worker %d to CPU %d: %s\n",
+			slot, chosen, strerror(errno));
+		return;
+	}
+
+	LM_INFO("worker %d pinned to CPU %d (of %d allowed)\n", slot, chosen, n);
+}
+
 
 static unsigned long count_running_processes(void *x)
 {
@@ -331,6 +397,11 @@ int internal_fork(const struct internal_fork_params *ifpp)
 		const struct internal_fork_handler *cfhp;
 		/* child process */
 		is_main = 0; /* a child is not main process */
+
+		/* Pin BEFORE the allocator reset below: the reset makes this
+		 * worker carve fresh chunks on first use, and we want that to
+		 * happen once it is already on its final CPU. */
+		pin_worker_to_cpu(new_idx);
 
 #ifdef HG_MALLOC
 		/*

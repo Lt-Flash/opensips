@@ -353,6 +353,7 @@ extern int cfg_parse_only_routes;
 %token RPM_MEM_SIZE
 %token MEMLOG
 %token MEMDUMP
+%token PIN_WORKERS
 %token SHM_MEMLOG_SIZE
 %token EXECMSGTHRESHOLD
 %token WORKER_REACTOR_TIMEOUT
@@ -1259,6 +1260,8 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 		| SHM_MEMLOG_SIZE EQUAL error { yyerror("int value expected"); }
 		| MEMDUMP EQUAL snumber { IFOR(); memdump=$3; }
 		| MEMDUMP EQUAL error { yyerror("int value expected"); }
+		| PIN_WORKERS EQUAL snumber { IFOR(); pin_workers=$3; }
+		| PIN_WORKERS EQUAL error { yyerror("int value expected"); }
 		| EXECMSGTHRESHOLD EQUAL NUMBER {  IFOR();execmsgthreshold=$3; }
 		| EXECMSGTHRESHOLD EQUAL error { yyerror("int value expected"); }
 		| WORKER_REACTOR_TIMEOUT EQUAL NUMBER { IFOR(); worker_reactor_timeout=$3; }

@@ -246,6 +246,7 @@ RPM_MEM_FILE "restart_persistency_cache_file"
 RPM_MEM_SIZE "restart_persistency_size"
 MEMLOG		"memlog"|"mem_log"
 MEMDUMP		"memdump"|"mem_dump"
+PIN_WORKERS	"pin_workers"|"cpu_pinning"
 SHM_MEMLOG_SIZE			"shm_memlog_size"
 EXECMSGTHRESHOLD		"execmsgthreshold"|"exec_msg_threshold"
 WORKER_REACTOR_TIMEOUT	"workerreactortimeout"|"worker_reactor_timeout"
@@ -481,6 +482,7 @@ SPACE		[ ]
 <INITIAL>{RPM_MEM_SIZE}	{ count(); yylval.strval=yytext; return RPM_MEM_SIZE; }
 <INITIAL>{MEMLOG}	{ count(); yylval.strval=yytext; return MEMLOG; }
 <INITIAL>{MEMDUMP}	{ count(); yylval.strval=yytext; return MEMDUMP; }
+<INITIAL>{PIN_WORKERS}	{ count(); yylval.strval=yytext; return PIN_WORKERS; }
 <INITIAL>{SHM_MEMLOG_SIZE}	{ count(); yylval.strval=yytext; return SHM_MEMLOG_SIZE; }
 <INITIAL>{EXECMSGTHRESHOLD}	{ count(); yylval.strval=yytext; return EXECMSGTHRESHOLD; }
 <INITIAL>{WORKER_REACTOR_TIMEOUT}	{ count(); yylval.strval=yytext; return WORKER_REACTOR_TIMEOUT; }

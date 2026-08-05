@@ -235,9 +235,9 @@ int hg_arena_init(struct hg_block *hb, unsigned long hdr_size)
 		hb->size2class[idx] = (unsigned char)c;   /* HG_NCLASSES = oversize */
 	}
 
-	LM_DBG("%s arena ready: %d classes, %u B to %u B cells (header=%lu B)\n",
+	LM_DBG("%s arena ready: %d classes, %u B to %u B cells (header=%zu B)\n",
 		hb->name, HG_NCLASSES, cell_sizes[0], cell_sizes[HG_NCLASSES-1],
-		(unsigned long)HG_CELL_HDR);
+		HG_CELL_HDR);
 	return 0;
 }
 

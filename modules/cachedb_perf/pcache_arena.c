@@ -345,9 +345,23 @@ void pcache_arena_child_init(void)
 	 * The leftover cells belong to the parent.  The child simply discards
 	 * its inherited copy and starts empty, carving its own chunk on first
 	 * use.  The parent keeps its own small hoard.
+	 *
+	 * Bug fixed here (2026-08-07): this function's OWN comment already
+	 * said "discards", but the code called pkg_free(pl) anyway - freeing
+	 * pl (the pcache_palloc struct itself) is exactly the same class of
+	 * mistake the comment warns about for its internal free-list cells:
+	 * pl is COW-shared with the parent and every sibling child inherited
+	 * the identical pointer, so pkg_free() is a WRITE into that shared
+	 * page (hg_cell_free()/cell_set_next() links it into a free list).
+	 * Under HG_MALLOC's hugepage-backed pkg arena this write-triggered
+	 * COW fault reproducibly SIGBUSed (mem/hg_arena.c:98, always via
+	 * cachedb_perf.c child_init -> here), first surfaced when a TCP-based
+	 * protocol (proto_bin, for clusterer_controller) made this fork/free
+	 * path run under HG_MALLOC for the first time. Fix: just drop the
+	 * reference, exactly as documented - no free, no donation, nothing.
+	 * pl's memory is reclaimed for free when the child process exits.
 	 */
 	my_palloc = NULL;
-	pkg_free(pl);
 }
 
 void *pcache_cell_alloc(unsigned int size)

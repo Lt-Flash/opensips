@@ -164,6 +164,18 @@ static void pin_set_group(enum process_type t, const char *list,
 		CPU_COUNT(&pin_type_set[t]));
 }
 
+/* did the config name a CPU list for any process type at all? */
+static int pin_any_group(void)
+{
+	int t;
+
+	for (t = 0; t <= TYPE_MODULE; t++)
+		if (pin_type_has[t])
+			return 1;
+
+	return 0;
+}
+
 /* parsed once, lazily, in the parent before any fork */
 static void pin_parse_spec(void)
 {
@@ -193,13 +205,14 @@ static void pin_parse_spec(void)
  *    slots are freed and reused, so a recycled slot can land on a CPU that
  *    already has workers while another sits idle.
  */
-static int pin_pick_cpu(enum process_type ptype)
+static int pin_pick_cpu(enum process_type ptype, struct socket_info *sock)
 {
 	cpu_set_t allowed;
+	cpu_set_t sock_set;
 	int count[CPU_SETSIZE];
 	int i, n, best = -1, best_load = 0;
 
-	if (!pin_workers)
+	if (!pin_workers && !(sock && sock->pin_cpus))
 		return -1;
 
 	if (!pin_spec_parsed)
@@ -215,13 +228,36 @@ static int pin_pick_cpu(enum process_type ptype)
 	/* narrow to this process type's group, if the spec named one. The
 	 * intersection keeps the cpuset guarantee: a group can only ever
 	 * restrict further, never grant a CPU we were not already allowed. */
-	if (ptype >= 0 && ptype <= TYPE_MODULE && pin_type_has[ptype]) {
+	if (sock && sock->pin_cpus) {
+		/* the listener named its own CPUs - more specific than the group */
+		if (pin_parse_cpulist(sock->pin_cpus, &sock_set) < 0 ||
+		    CPU_COUNT(&sock_set) == 0) {
+			LM_ERR("pin_cpus: bad or empty CPU list \"%s\" on listener "
+				"%.*s - leaving its workers unpinned\n", sock->pin_cpus,
+				sock->name.len, sock->name.s);
+			return -1;
+		}
+		CPU_AND(&allowed, &allowed, &sock_set);
+		if (CPU_COUNT(&allowed) == 0) {
+			LM_WARN("pin_cpus on listener %.*s has no CPU in common with "
+				"the allowed set - leaving its workers unpinned\n",
+				sock->name.len, sock->name.s);
+			return -1;
+		}
+	} else if (ptype >= 0 && ptype <= TYPE_MODULE && pin_type_has[ptype]) {
 		CPU_AND(&allowed, &allowed, &pin_type_set[ptype]);
 		if (CPU_COUNT(&allowed) == 0) {
 			LM_WARN("pin_workers: group for this process type has no CPU "
 				"in common with the allowed set - leaving unpinned\n");
 			return -1;
 		}
+	} else if (pin_any_group()) {
+		/* This process belongs to no named group while other groups do
+		 * exist. Pinning it anyway would place it by occupancy across
+		 * every CPU, including the ones a group was given precisely so
+		 * that nothing else would run there - which is the opposite of
+		 * what the operator asked for. Leave it to the scheduler. */
+		return -1;
 	}
 
 	n = CPU_COUNT(&allowed);
@@ -267,10 +303,38 @@ static void pin_apply_cpu(int cpu)
 	LM_INFO("process %d pinned to CPU %d\n", process_no, cpu);
 }
 
+/* Confine a multithreaded process to its group's whole CPU list. Runs in
+ * the CHILD, before any of its threads exist, so they all inherit it. */
+static void pin_apply_group(enum process_type t)
+{
+	cpu_set_t set;
+
+	if (!pin_spec_parsed)
+		pin_parse_spec();
+	if (t < 0 || t > TYPE_MODULE || !pin_type_has[t])
+		return;
+
+	if (sched_getaffinity(0, sizeof set, &set) != 0)
+		return;
+	CPU_AND(&set, &set, &pin_type_set[t]);
+	if (CPU_COUNT(&set) == 0) {
+		LM_WARN("pin group for process %d has no CPU in common with the "
+			"allowed set - leaving it unpinned\n", process_no);
+		return;
+	}
+	if (sched_setaffinity(0, sizeof set, &set) != 0) {
+		LM_WARN("failed to pin process %d to its CPU group: %s\n",
+			process_no, strerror(errno));
+		return;
+	}
+	LM_INFO("process %d pinned to a %d-CPU group\n", process_no,
+		CPU_COUNT(&set));
+}
+
 
 #else  /* !__OS_linux */
 
-static int pin_pick_cpu(enum process_type ptype)
+static int pin_pick_cpu(enum process_type ptype, struct socket_info *sock)
 {
 	static int warned;
 
@@ -283,6 +347,10 @@ static int pin_pick_cpu(enum process_type ptype)
 }
 
 static void pin_apply_cpu(int cpu)
+{
+}
+
+static void pin_apply_group(enum process_type t)
 {
 }
 
@@ -529,8 +597,14 @@ int internal_fork(const struct internal_fork_params *ifpp)
 
 	atomic_init(&pt[new_idx].startup_result, CHLD_STARTING);
 
-	/* decided here, in the parent, while the process table is stable */
-	pt[new_idx].pinned_cpu = pin_pick_cpu(ifpp->type);
+	/* decided here, in the parent, while the process table is stable;
+	 * a whole-group process gets no single CPU - it is confined to the
+	 * full group in the child instead, and must not count as occupying
+	 * one slot of it here */
+	pt[new_idx].pinned_cpu = ifpp->pin_whole_group ? -1 :
+	                         pin_pick_cpu(ifpp->pin_group ?
+	                                     ifpp->pin_group : ifpp->type,
+	                                     ifpp->sock);
 
 	if ( (pid=fork())<0 ){
 		LM_CRIT("cannot fork \"%s\" process (%d: %s)\n",ifpp->proc_desc,
@@ -549,7 +623,10 @@ int internal_fork(const struct internal_fork_params *ifpp)
 		 * happen once it is already on its final CPU. The CPU itself was
 		 * chosen by the parent (pin_pick_cpu) so the decision could see a
 		 * consistent view of who is running where. */
-		pin_apply_cpu(pt[new_idx].pinned_cpu);
+		if (ifpp->pin_whole_group)
+			pin_apply_group(ifpp->pin_group ? ifpp->pin_group : ifpp->type);
+		else
+			pin_apply_cpu(pt[new_idx].pinned_cpu);
 
 #ifdef HG_MALLOC
 		/*

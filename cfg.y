@@ -182,6 +182,7 @@ extern char *finame;
 struct listen_param {
 	enum si_flags flags;
 	int workers;
+	char *pin_cpus;
 	int tos;
 	struct socket_id *socket;
 	char *tag;
@@ -463,6 +464,7 @@ extern int cfg_parse_only_routes;
 %token SLASH
 %token AS
 %token USE_WORKERS
+%token PIN_CPUS
 %token SOCK_TOS
 %token USE_AUTO_SCALING_PROFILE
 %token MAX
@@ -764,6 +766,9 @@ socket_def_param: ANYCAST { IFOR();
 					}
 				| USE_WORKERS NUMBER { IFOR();
 					p_tmp.workers=$2;
+					}
+				| PIN_CPUS STRING { IFOR();
+					p_tmp.pin_cpus=$2;
 					}
 				| SOCK_TOS NUMBER { IFOR();
 					p_tmp.tos=$2;
@@ -2802,6 +2807,7 @@ static void fill_socket_id(struct listen_param *param, struct socket_id *s)
 	while (s) {
 		s->flags |= param->flags;
 		s->workers = param->workers;
+		s->pin_cpus = param->pin_cpus;
 		s->tos = param->tos;
 		s->auto_scaling_profile = param->auto_scaling_profile;
 		s->tag = param->tag;

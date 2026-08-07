@@ -511,6 +511,34 @@ int pcache_arena_tier(void)
 	return arena->hbase ? (int)arena->htier : PCACHE_MEM_4K;
 }
 
+/*
+ * Capacity of the DEDICATED arena_hugepage_mb reservation specifically -
+ * distinct from pcache_arena_stats()'s bytes/nchunks, which count total
+ * cachedb_perf usage regardless of backing (dedicated reservation OR the
+ * shm_malloc fallback, whichever actually served each allocation).
+ *
+ * @active is 0 whenever arena_hugepage_mb was never set (or the reserve
+ * failed) - callers MUST check it before trusting total/used/free, since
+ * 0/0/0 alone cannot distinguish "no dedicated reservation exists" from
+ * "a reservation exists and happens to be still empty".
+ */
+void pcache_arena_hugepage_capacity(int *active, unsigned long *total,
+		unsigned long *used, unsigned long *free)
+{
+	if (!arena->hbase) {
+		*active = 0;
+		*total = 0;
+		*used = 0;
+		*free = 0;
+		return;
+	}
+
+	*active = 1;
+	*total = arena->hsize;
+	*used = arena->hoff;
+	*free = arena->hsize - arena->hoff;
+}
+
 
 /*
  * startup selftest (modparam "arena_selftest"): exercises class mapping,

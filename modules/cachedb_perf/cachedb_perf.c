@@ -521,9 +521,57 @@ static unsigned long smf_arena_chunks(void *ctx)
 	return c;
 }
 
-static unsigned long smf_mem_tier(void *ctx)
+static unsigned long smf_mem_tier_probe(void *ctx)
 {
+	/* what this host is CAPABLE of - not necessarily what is in use,
+	 * see smf_mem_tier_active() for that */
 	return pcache_mem.tier;
+}
+
+static unsigned long smf_mem_tier_active(void *ctx)
+{
+	/* the tier ACTUALLY backing the dedicated arena_hugepage_mb
+	 * reservation right now; reads as PCACHE_MEM_4K (4) whenever
+	 * arena_hugepage_mb is unset/0 or its reservation failed - which is
+	 * also exactly when every cachedb_perf allocation is really going
+	 * through shm_malloc(), see smf_hugepage_arena_active() */
+	return pcache_arena_tier();
+}
+
+static unsigned long smf_hugepage_arena_active(void *ctx)
+{
+	int active;
+	unsigned long total, used, free;
+
+	pcache_arena_hugepage_capacity(&active, &total, &used, &free);
+	return active;
+}
+
+static unsigned long smf_hugepage_arena_total_bytes(void *ctx)
+{
+	int active;
+	unsigned long total, used, free;
+
+	pcache_arena_hugepage_capacity(&active, &total, &used, &free);
+	return total;
+}
+
+static unsigned long smf_hugepage_arena_used_bytes(void *ctx)
+{
+	int active;
+	unsigned long total, used, free;
+
+	pcache_arena_hugepage_capacity(&active, &total, &used, &free);
+	return used;
+}
+
+static unsigned long smf_hugepage_arena_free_bytes(void *ctx)
+{
+	int active;
+	unsigned long total, used, free;
+
+	pcache_arena_hugepage_capacity(&active, &total, &used, &free);
+	return free;
 }
 
 static const stat_export_t mod_stats[] = {
@@ -538,7 +586,16 @@ static const stat_export_t mod_stats[] = {
 	{"lock_fallbacks",  STAT_IS_FUNC, (stat_var **)smf_fallbacks},
 	{"arena_bytes",     STAT_IS_FUNC, (stat_var **)smf_arena_bytes},
 	{"arena_chunks",    STAT_IS_FUNC, (stat_var **)smf_arena_chunks},
-	{"memory_tier",     STAT_IS_FUNC, (stat_var **)smf_mem_tier},
+	/* memory_tier renamed to memory_tier_probe (2026-08-07) - the old
+	 * name was mistaken for "what's in use" live during a real
+	 * diagnosis session; not shipped/stable API yet (module unmerged),
+	 * so a rename is safe. See smf_mem_tier_probe()'s comment. */
+	{"memory_tier_probe",  STAT_IS_FUNC, (stat_var **)smf_mem_tier_probe},
+	{"memory_tier_active", STAT_IS_FUNC, (stat_var **)smf_mem_tier_active},
+	{"hugepage_arena_active",      STAT_IS_FUNC, (stat_var **)smf_hugepage_arena_active},
+	{"hugepage_arena_total_bytes", STAT_IS_FUNC, (stat_var **)smf_hugepage_arena_total_bytes},
+	{"hugepage_arena_used_bytes",  STAT_IS_FUNC, (stat_var **)smf_hugepage_arena_used_bytes},
+	{"hugepage_arena_free_bytes",  STAT_IS_FUNC, (stat_var **)smf_hugepage_arena_free_bytes},
 	{0,0,0}
 };
 
@@ -621,11 +678,12 @@ static int mi_stats_fill(mi_item_t *cobj, pcache_col_t *col)
 static mi_response_t *mi_perf_stats(str *col_s)
 {
 	mi_response_t *resp;
-	mi_item_t *obj, *arr, *cobj, *aobj;
+	mi_item_t *obj, *arr, *cobj, *aobj, *hobj;
 	pcache_col_t *col;
-	const char *tier;
-	unsigned long bytes;
+	const char *tier_probe, *tier_active;
+	unsigned long bytes, hp_total, hp_used, hp_free;
 	unsigned int nchunks, matched = 0;
+	int hp_active;
 
 	resp = init_mi_result_object(&obj);
 	if (!resp)
@@ -650,6 +708,10 @@ static mi_response_t *mi_perf_stats(str *col_s)
 		return init_mi_error(404, MI_SSTR("no such collection"));
 	}
 
+	/* "arena": total cachedb_perf usage regardless of which backing
+	 * actually served it (dedicated reservation OR the shm_malloc
+	 * fallback) - NOT specific to the dedicated arena_hugepage_mb
+	 * reservation, see "hugepage_reservation" below for that. */
 	aobj = add_mi_object(obj, MI_SSTR("arena"));
 	if (!aobj)
 		goto err;
@@ -658,10 +720,38 @@ static mi_response_t *mi_perf_stats(str *col_s)
 	    add_mi_number(aobj, MI_SSTR("bytes"), bytes) < 0)
 		goto err;
 
-	tier = pcache_mem_tier_str(pcache_mem.tier);
-	if (add_mi_number(obj, MI_SSTR("memory_tier"), pcache_mem.tier) < 0 ||
-	    add_mi_string(obj, MI_SSTR("memory_backing"),
-	        (char *)tier, strlen(tier)) < 0)
+	/* _probe = what this host is CAPABLE of (startup capability check,
+	 * see pcache_mem_probe()) - NOT proof anything is actually reserved.
+	 * _active = the tier ACTUALLY backing the dedicated reservation
+	 * right now; reads PCACHE_MEM_4K/"4K" whenever arena_hugepage_mb is
+	 * unset/0 or its reservation failed, which is also exactly when
+	 * every cachedb_perf allocation is really going through plain
+	 * shm_malloc() - counted in core's own shmem: stats, not here. */
+	tier_probe = pcache_mem_tier_str(pcache_mem.tier);
+	tier_active = pcache_mem_tier_str(pcache_arena_tier());
+	if (add_mi_number(obj, MI_SSTR("memory_tier_probe"), pcache_mem.tier) < 0 ||
+	    add_mi_string(obj, MI_SSTR("memory_backing_probe"),
+	        (char *)tier_probe, strlen(tier_probe)) < 0 ||
+	    add_mi_number(obj, MI_SSTR("memory_tier_active"), pcache_arena_tier()) < 0 ||
+	    add_mi_string(obj, MI_SSTR("memory_backing_active"),
+	        (char *)tier_active, strlen(tier_active)) < 0)
+		goto err;
+
+	/* "hugepage_reservation": the DEDICATED arena_hugepage_mb reservation
+	 * specifically - deliberately its OWN object, never folded into
+	 * "arena" above or into core's shmem: stats, so a human or dashboard
+	 * can never double-count or misattribute. "active" MUST be checked
+	 * before trusting the byte counts - all three read 0 whenever no
+	 * dedicated reservation exists, which is NOT the same thing as "a
+	 * reservation exists and is currently empty". */
+	hobj = add_mi_object(obj, MI_SSTR("hugepage_reservation"));
+	if (!hobj)
+		goto err;
+	pcache_arena_hugepage_capacity(&hp_active, &hp_total, &hp_used, &hp_free);
+	if (add_mi_number(hobj, MI_SSTR("active"), hp_active) < 0 ||
+	    add_mi_number(hobj, MI_SSTR("total_bytes"), hp_total) < 0 ||
+	    add_mi_number(hobj, MI_SSTR("used_bytes"), hp_used) < 0 ||
+	    add_mi_number(hobj, MI_SSTR("free_bytes"), hp_free) < 0)
 		goto err;
 
 	/* Cluster membership, when sync is active.  peers_up counts the OTHER
@@ -3693,18 +3783,35 @@ static int mod_init(void)
 	int i;
 
 	/* which of the four memory backings (DESIGN 2.6.1) does this host
-	 * support?  Probed by trying, pre-fork; the arena consumes the
-	 * result once it exists (CP-02/CP-20) */
+	 * support?  Probed by trying, pre-fork; the arena CONSUMES the
+	 * result only if arena_hugepage_mb>0 (CP-02/CP-20) - with it unset
+	 * (the default), this is a capability check only and every
+	 * cachedb_perf allocation actually goes through plain shm_malloc(),
+	 * fully counted in core's own shmem: stats, not a separate
+	 * reservation. The two NOTICEs below are deliberately worded to
+	 * never be mistaken for each other - a probe result is not a
+	 * report of what is actually in use. */
 	pcache_mem_probe();
 
 	if (pcache_mem.tier == PCACHE_MEM_HUGETLB)
-		LM_NOTICE("memory backing: tier 1/4 - %s (pool: %d static + %d "
-			"overcommit pages)\n",
+		LM_NOTICE("memory backing CAPABILITY PROBE: this host supports "
+			"tier 1/4 - %s (pool: %d static + %d overcommit pages)\n",
 			pcache_mem_tier_str(pcache_mem.tier),
 			pcache_mem.huge_static, pcache_mem.huge_overcommit);
 	else
-		LM_NOTICE("memory backing: tier %d/4 - %s\n",
+		LM_NOTICE("memory backing CAPABILITY PROBE: this host supports "
+			"tier %d/4 - %s\n",
 			pcache_mem.tier, pcache_mem_tier_str(pcache_mem.tier));
+
+	if (pcache_arena_hugepage_mb > 0)
+		LM_NOTICE("memory backing IN USE: a separate %d MB reservation, "
+			"OUTSIDE OpenSIPS shared memory (arena_hugepage_mb)\n",
+			pcache_arena_hugepage_mb);
+	else
+		LM_NOTICE("memory backing IN USE: OpenSIPS shared memory "
+			"(shm_malloc) - NOT a separate reservation; counted in core's "
+			"own shmem: stats, not a cachedb_perf-specific total. Set "
+			"arena_hugepage_mb to reserve a dedicated arena instead.\n");
 
 	switch (pcache_mem.tier) {
 	case PCACHE_MEM_HUGETLB:

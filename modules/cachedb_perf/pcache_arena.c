@@ -249,7 +249,7 @@ int pcache_arena_init(void)
 		} else {
 			arena->lo = (unsigned long)arena->hbase;
 			arena->hi = (unsigned long)arena->hbase + arena->hsize;
-			LM_NOTICE("huge-page arena: %d MB on %s, %lu MB pinned\n",
+			LM_NOTICE("huge-page arena: %d MB on %s, %lu MB pinned from swapping\n",
 				pcache_arena_hugepage_mb,
 				pcache_mem_tier_str(arena->htier), arena->hlocked_mb);
 		}

@@ -335,7 +335,8 @@ const char *hg_mem_tier_str(enum hg_mem_tier tier)
  * shm_malloc()/pkg_malloc() on itself to bootstrap its own bookkeeping
  * (it cannot: HG_MALLOC IS what those macros dispatch to when selected).
  */
-struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared)
+struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
+		const char *proc_desc)
 {
 	enum hg_mem_tier tier;
 	unsigned long locked_mb;
@@ -382,8 +383,21 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared)
 		return NULL;
 	}
 
-	LM_NOTICE("%s HG_MALLOC arena: %lu MB on %s, %lu MB pinned\n",
-		name, size >> 20, hg_mem_tier_str(tier), locked_mb);
+	/* "pinned from swapping" is the real guarantee this reports: tier-1
+	 * MAP_HUGETLB pages are non-swappable by construction (no mlock()
+	 * needed or taken), tiers 2-4 rely on an explicit mlock() instead -
+	 * either way, the reported MB are equally protected against swap,
+	 * just via a different mechanism. Plain "pinned" reads ambiguously
+	 * (looks like "an mlock() call happened") and was caught live during
+	 * a real diagnosis session mid-2026-08-07 being misread that way. */
+	if (proc_desc)
+		LM_NOTICE("%s HG_MALLOC arena (%s): %lu MB on %s, %lu MB "
+			"pinned from swapping\n",
+			name, proc_desc, size >> 20, hg_mem_tier_str(tier), locked_mb);
+	else
+		LM_NOTICE("%s HG_MALLOC arena: %lu MB on %s, %lu MB "
+			"pinned from swapping\n",
+			name, size >> 20, hg_mem_tier_str(tier), locked_mb);
 
 	return hb;
 }

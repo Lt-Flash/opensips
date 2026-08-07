@@ -336,6 +336,11 @@ static mi_response_t *mi_ps(const mi_params_t *params,
 		if (add_mi_string(proc_item, MI_SSTR("Type"),
 			pt[i].desc, strlen(pt[i].desc)) < 0)
 			goto error;
+
+		/* -1 = never pinned (no pin_workers / no matching group) */
+		if (add_mi_number(proc_item, MI_SSTR("PinnedCPU"),
+			pt[i].pinned_cpu) < 0)
+			goto error;
 	}
 
 	return resp;

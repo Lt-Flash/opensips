@@ -255,7 +255,8 @@ struct hg_block {
  * 0 for pkg (MAP_PRIVATE - each forked worker gets its own copy-on-write
  * arena, lock and free pools). See hg_mem_reserve() in hg_malloc.c for why
  * getting this wrong for pkg is a correctness AND a performance bug. */
-struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared);
+struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
+		const char *proc_desc);
 void hg_malloc_destroy(struct hg_block *hb);
 
 /* re-sync per-process state after fork(): see hg_arena.c for why the

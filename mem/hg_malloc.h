@@ -397,6 +397,10 @@ static inline unsigned long hg_fragments(struct hg_block *hb)
 	return total < 0 ? 0 : (unsigned long)total;
 }
 
+/* carved-but-idle cell capacity; defined in hg_arena.c (declared here too,
+ * since hg_arena.h includes THIS header and cannot be included back) */
+unsigned long hg_slab_recycled(struct hg_block *hb);
+
 /* total cell-slot bytes handed out across every process */
 static inline unsigned long hg_cell_live(struct hg_block *hb)
 {
@@ -417,13 +421,23 @@ static inline unsigned long hg_get_used(struct hg_block *hb)
 {
 	return hg_used(hb);
 }
+/* These feed the shmem: and pkgmem: statistics (the SHM_GET_ and PKG_GET_
+ * macros in shm_mem.h and mem.h) - a DIFFERENT path from hg_info(), so the
+ * recycled
+ * subtraction has to be applied here too or the published statistics still
+ * report the raw carve footprint. */
 static inline unsigned long hg_get_free(struct hg_block *hb)
 {
-	return hb->size - hb->real_used;
+	unsigned long recycled = hg_slab_recycled(hb);
+
+	return hb->size - (hb->real_used > recycled ?
+	                   hb->real_used - recycled : 0);
 }
 static inline unsigned long hg_get_real_used(struct hg_block *hb)
 {
-	return hb->real_used;
+	unsigned long recycled = hg_slab_recycled(hb);
+
+	return hb->real_used > recycled ? hb->real_used - recycled : 0;
 }
 static inline unsigned long hg_get_max_real_used(struct hg_block *hb)
 {

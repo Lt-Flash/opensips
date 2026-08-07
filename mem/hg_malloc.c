@@ -461,13 +461,26 @@ void hg_stats_core_init(struct hg_block *hb, int core_index)
 /* fills a malloc info structure with info about the block */
 void hg_info(struct hg_block *hb, struct mem_info *info)
 {
+	unsigned long recycled;
+
 	memset(info, 0, sizeof *info);
 	info->total_size = hb->size;
 	info->min_frag = 64; /* smallest cell class, see hg_arena.c cell_sizes */
-	info->free = hb->size - hb->real_used;
 	info->used = hg_used(hb);
-	info->real_used = hb->real_used;
 
+	/* Report carved-but-idle cell capacity as FREE rather than USED, so
+	 * real_used/free track live demand and fall again when load drops -
+	 * the same thing q_malloc/f_malloc do for a fragment sitting on a free
+	 * list. hb->real_used on its own is the arena's carve footprint, which
+	 * never decreases and would otherwise look like a leak. */
+	recycled = hg_slab_recycled(hb);
+	info->real_used = hb->real_used > recycled ? hb->real_used - recycled : 0;
+	info->free = hb->size - info->real_used;
+
+	/* peak carve: chunks are only ever carved when demand outruns the
+	 * recycled supply, so this is the high-water mark of live commitment
+	 * (and a safe upper bound on it), and stays monotonic like every other
+	 * allocator's max_used */
 	info->max_used = hb->max_real_used;
 	info->total_frags = hg_fragments(hb);
 }

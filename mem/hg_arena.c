@@ -235,9 +235,9 @@ int hg_arena_init(struct hg_block *hb, unsigned long hdr_size)
 		hb->size2class[idx] = (unsigned char)c;   /* HG_NCLASSES = oversize */
 	}
 
-	LM_DBG("%s arena ready: %d classes, %u B to %u B cells (header=%d B)\n",
+	LM_DBG("%s arena ready: %d classes, %u B to %u B cells (header=%lu B)\n",
 		hb->name, HG_NCLASSES, cell_sizes[0], cell_sizes[HG_NCLASSES-1],
-		HG_CELL_HDR);
+		(unsigned long)HG_CELL_HDR);
 	return 0;
 }
 
@@ -401,6 +401,7 @@ found:
 		struct hg_pstat *ps = hg_pstat_mine(hb);
 		ps->used += cell_sizes[c] - HG_CELL_HDR;
 		ps->fragments++;
+		ps->cell_live += cell_sizes[c];
 	}
 	return payload;
 }
@@ -450,6 +451,7 @@ void hg_cell_free(struct hg_block *hb, void *p)
 		struct hg_pstat *ps = hg_pstat_mine(hb);
 		ps->used -= cell_sizes[c] - HG_CELL_HDR;
 		ps->fragments--;
+		ps->cell_live -= cell_sizes[c];
 	}
 
 	cell_set_next(cell_start, pl->cls[c].free_head);
@@ -488,9 +490,51 @@ void hg_cell_free_global(struct hg_block *hb, void *p)
 			hb->name, p, c);
 		return;
 	}
+	/* hg_cell_free() delegates here WITHOUT having touched the counters
+	 * (it returns early when this process has no palloc), and this is that
+	 * function's only caller - so the decrement belongs here, not there.
+	 * Before this, a free taken down this path left used/fragments
+	 * permanently over-reported. */
+	{
+		struct hg_pstat *ps = hg_pstat_mine(hb);
+		ps->used -= cell_sizes[c] - HG_CELL_HDR;
+		ps->fragments--;
+		ps->cell_live -= cell_sizes[c];
+	}
+
 	lock_get(&hb->lock);
 	gpool_push(hb, c, cell_start);
 	lock_release(&hb->lock);
+}
+
+/*
+ * Cell-slot bytes that are carved into chunks but NOT currently handed out:
+ * cells on a private free stack, cells in the global pool, and cells never
+ * bumped at all. This capacity is fully reusable.
+ *
+ * It exists because HG_MALLOC never un-carves a chunk, so hb->real_used (the
+ * arena's own footprint) can only ever rise. q_malloc/f_malloc report a freed
+ * fragment sitting on a free list as FREE; without subtracting this figure,
+ * HG_MALLOC would report the identical state as permanently USED, and
+ * real_used would read as an unbounded leak on any monitoring dashboard.
+ *
+ * Walks the chunk registry WITHOUT hb->lock, deliberately: the list is
+ * append-only, ch->cells/ch->cell_size are immutable once carved, and the
+ * head pointer is published after the chunk is fully built, so a reader
+ * either sees a complete chunk or does not see it at all. Taking the lock
+ * here would nest it under whatever the stats caller already holds, for a
+ * figure that is a sample either way.
+ */
+unsigned long hg_slab_recycled(struct hg_block *hb)
+{
+	struct hg_chunk *ch;
+	unsigned long capacity = 0, live;
+
+	for (ch = hb->chunks; ch; ch = ch->next)
+		capacity += (unsigned long)ch->cells * ch->cell_size;
+
+	live = hg_cell_live(hb);
+	return capacity > live ? capacity - live : 0;
 }
 
 void hg_arena_stats(struct hg_block *hb, unsigned int *nchunks,

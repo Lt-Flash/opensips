@@ -190,7 +190,15 @@ struct hg_palloc {
 struct hg_pstat {
 	long used;       /* payload bytes handed out by this process */
 	long fragments;  /* live cells handed out by this process */
-	char _pad[HG_STAT_LINE - 2 * sizeof(long)];
+	/* Cell-slot bytes (header + payload + size-class round-up) currently
+	 * handed out by this process. "used" alone cannot tell how much ARENA
+	 * a process is holding, because a 100-byte request occupies a whole
+	 * 128-byte slot; hg_slab_recycled() needs the slot figure to work out
+	 * how much carved capacity is sitting idle. Lives on the same
+	 * already-private cache line as the two counters above, so maintaining
+	 * it costs no extra cache traffic on the fast path. */
+	long cell_live;
+	char _pad[HG_STAT_LINE - 3 * sizeof(long)];
 } __attribute__ ((aligned (HG_STAT_LINE)));
 
 struct hg_block {
@@ -386,6 +394,17 @@ static inline unsigned long hg_fragments(struct hg_block *hb)
 
 	for (i = 0; i < HG_STAT_SLOTS; i++)
 		total += hb->pstat[i].fragments;
+	return total < 0 ? 0 : (unsigned long)total;
+}
+
+/* total cell-slot bytes handed out across every process */
+static inline unsigned long hg_cell_live(struct hg_block *hb)
+{
+	long total = 0;
+	int i;
+
+	for (i = 0; i < HG_STAT_SLOTS; i++)
+		total += hb->pstat[i].cell_live;
 	return total < 0 ? 0 : (unsigned long)total;
 }
 

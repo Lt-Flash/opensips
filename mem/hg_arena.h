@@ -98,6 +98,8 @@ void hg_arena_child_init(struct hg_block *hb);
 
 void hg_arena_destroy(struct hg_block *hb);
 
+unsigned long hg_slab_recycled(struct hg_block *hb);
+
 void hg_arena_stats(struct hg_block *hb, unsigned int *nchunks,
 		unsigned long *bytes);
 

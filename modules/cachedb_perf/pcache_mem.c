@@ -235,6 +235,20 @@ void *pcache_mem_reserve(size_t size, enum pcache_mem_tier *tier,
 	if (p != MAP_FAILED) {
 		memset(p, 0, asize);           /* commit the pool pages */
 		*tier = PCACHE_MEM_HUGETLB;
+		/*
+		 * No mlock() call needed here (tier 1 is already unswappable by
+		 * construction, per the comment above) - but report the nominal
+		 * size as pinned anyway, matching HG_MALLOC's own hg_mem_reserve()
+		 * convention for the identical tier-1 case. Leaving this at the
+		 * init'd 0 was technically true (no mlock() syscall happened) but
+		 * reads, side by side with HG_MALLOC's own tier-1 NOTICE line, as
+		 * "this reservation is unprotected against swap" - which is false;
+		 * it is exactly as protected as HG_MALLOC's, just via a different
+		 * mechanism. Caught live during a real diagnosis session (2026-08-07)
+		 * by the same kind of confusion the tier_probe/tier_active split
+		 * above was written to eliminate.
+		 */
+		*locked_mb = asize >> 20;
 		return p;
 	}
 

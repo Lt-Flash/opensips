@@ -645,11 +645,6 @@ int internal_fork(const struct internal_fork_params *ifpp)
 				hg_malloc_child_init((struct hg_block *)shm_dbg_block);
 #endif
 		}
-#ifdef PKG_MALLOC
-		if (mem_allocator_pkg == MM_HG_MALLOC ||
-		    mem_allocator_pkg == MM_HG_MALLOC_DBG)
-			hg_malloc_child_init((struct hg_block *)mem_block);
-#endif
 #endif /* HG_MALLOC */
 
 		/* set uid */
@@ -685,6 +680,56 @@ int internal_fork(const struct internal_fork_params *ifpp)
 				child_startup_failed();
 			}
 		}
+#ifdef PKG_MALLOC
+		if (mem_allocator_pkg == MM_HG_MALLOC ||
+		    mem_allocator_pkg == MM_HG_MALLOC_DBG) {
+			/*
+			 * pkg memory is private (MAP_PRIVATE), not shared like shm - so
+			 * unlike the shm case above, resetting just the fast-path
+			 * bookkeeping on the COW-inherited block is not enough: the
+			 * block's own metadata (chunk list, bump offset, lock) lives
+			 * INSIDE that same COW-shared region, so every process's
+			 * writes to it silently diverge into disconnected private
+			 * copies while all still pulling physical hugepages from the
+			 * ONE shared reservation the parent made pre-fork - with
+			 * enough worker processes this exhausts the hugetlb pool well
+			 * beyond what pkg_mem_size alone would suggest, and confuses
+			 * the kernel's own hugetlb reservation accounting.
+			 *
+			 * Give this child its own independent reservation instead of
+			 * inheriting the parent's: hg_malloc_init() already knows how
+			 * to try tier 1 (MAP_HUGETLB) and gracefully fall back through
+			 * the tier ladder if the pool doesn't have enough left for this
+			 * specific process - exactly the semantics wanted here, just
+			 * never previously invoked per child.
+			 *
+			 * MUST run after the post-fork handler chain below, not before:
+			 * internal_fork_child_setup() (the default handler) calls
+			 * free_route_lists(), which pkg_frees the route AST this child
+			 * inherited from the parent pre-fork. Those pointers only make
+			 * sense against the ORIGINAL (COW-inherited) arena. Swapping
+			 * mem_block to a fresh arena before that handler runs made it
+			 * free foreign pointers through the new arena's bookkeeping -
+			 * silent cross-arena corruption at best, and a SIGBUS at worst
+			 * (the COW page-fault into the abandoned old arena has nothing
+			 * left to fall back on once the hugetlb pool is tight, which is
+			 * exactly what exposed this). Running the swap here instead
+			 * lets free_route_lists() finish its cleanup against the still-
+			 * correct original arena first; only then is it abandoned - the
+			 * parent's inherited mapping is left unmapped-but-unreferenced,
+			 * and this child never touches it again.
+			 */
+			struct hg_block *child_pkg =
+				hg_malloc_init(pkg_mem_size, "pkg", 0);
+			if (!child_pkg) {
+				LM_CRIT("failed to init this child's own pkg memory "
+					"(%lu bytes)\n", pkg_mem_size);
+				exit(-1);
+			}
+			mem_block = child_pkg;
+		}
+#endif
+
 		atomic_store(&pt[process_no].startup_result, CHLD_OK);
 		return 0;
 	}else{

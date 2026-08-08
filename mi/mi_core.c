@@ -1007,7 +1007,7 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb)
 	struct hg_chunk *ch;
 	unsigned int chunks_of[HG_NCLASSES], cell_size_of[HG_NCLASSES];
 	unsigned long cells_of[HG_NCLASSES];
-	unsigned long carved;
+	unsigned long carved, live_committed;
 	const char *tier;
 	int c;
 
@@ -1020,6 +1020,11 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb)
 
 	carved = hb->real_used;
 	tier = hg_mem_tier_str(hb->tier);
+	/* call this before reading max_live_used: the high-water mark is
+	 * refreshed on read, so sampling it here keeps live_peak in step with
+	 * shmem:max_used_size instead of reporting a stale 0 until something
+	 * else happens to query the statistics */
+	live_committed = hg_get_real_used(hb);
 
 	if (add_mi_string(o, MI_SSTR("tier"), (char *)tier, strlen(tier)) < 0)
 		return -1;
@@ -1041,20 +1046,28 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb)
 	if (add_mi_number(o, MI_SSTR("free_to_carve"), hb->size - carved) < 0)
 		return -1;
 
-	/* live: what is actually handed out right now */
-	if (add_mi_number(o, MI_SSTR("live_cell_bytes"), hg_cell_live(hb)) < 0)
+	/* live: what is actually handed out right now. live_committed and
+	 * live_peak are what shmem:real_used_size and shmem:max_used_size
+	 * report; payload and cells are shmem:used_size and shmem:fragments. */
+	if (add_mi_number(o, MI_SSTR("live_committed"), live_committed) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("live_peak"), hb->max_live_used) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("live_payload"), hg_used(hb)) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("live_cells"), hg_fragments(hb)) < 0)
 		return -1;
-	if (add_mi_number(o, MI_SSTR("live_peak"), hb->max_live_used) < 0)
+	/* SLAB ONLY - large allocations (> the top size class) are served by
+	 * the boundary-tag tier and never appear here, so this is deliberately
+	 * NOT comparable with live_payload above, which counts both. */
+	if (add_mi_number(o, MI_SSTR("slab_cell_bytes_live"),
+		hg_cell_live(hb)) < 0)
 		return -1;
 
 	/* carved but idle: on a private free stack or in the global pool.
 	 * Reusable, but ONLY for its own size class - which is why it is not
 	 * counted as free_to_carve. */
-	if (add_mi_number(o, MI_SSTR("recycled"), hg_slab_recycled(hb)) < 0)
+	if (add_mi_number(o, MI_SSTR("slab_recycled"), hg_slab_recycled(hb)) < 0)
 		return -1;
 
 	memset(chunks_of, 0, sizeof chunks_of);

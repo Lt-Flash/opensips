@@ -848,6 +848,26 @@ static mi_response_t *mi_perf_stats(str *col_s)
 			    add_mi_string(self, MI_SSTR("membership"),
 			        MI_SSTR("up")) < 0)
 				goto err;
+			/* Which address this node actually uses on the cluster plane,
+			 * and which of the three resolution paths produced it.  Node
+			 * ids are assigned by the controller and do not follow the
+			 * hosts' addresses in any readable order, so without this a
+			 * reader cannot tell which box they are looking at.  It is
+			 * also the fastest way to spot the failure that matters:
+			 * a node resolving its own IP onto the wrong interface. */
+			if (pull_via_clctr && clctr_api.get_my_ip) {
+				const char *mip = NULL, *mif = NULL, *msrc = NULL;
+
+				if (clctr_api.get_my_ip(&mip, &mif, &msrc) == 0 && mip) {
+					if (add_mi_string(self, MI_SSTR("ip"),
+					        (char *)mip, strlen(mip)) < 0 ||
+					    (mif && add_mi_string(self, MI_SSTR("interface"),
+					        (char *)mif, strlen(mif)) < 0) ||
+					    (msrc && add_mi_string(self, MI_SSTR("ip_source"),
+					        (char *)msrc, strlen(msrc)) < 0))
+						goto err;
+				}
+			}
 
 			list = cluster_ready ?
 				clusterer_api.get_nodes(sync_cluster_id) : NULL;
@@ -875,6 +895,20 @@ static mi_response_t *mi_perf_stats(str *col_s)
 				    add_mi_string(p, MI_SSTR("sip_addr"),
 				        n->sip_addr.s, n->sip_addr.len) < 0)
 					goto err;
+				/* the peer's address on the cluster plane - see the note on
+				 * the self entry above; node_id alone does not identify a
+				 * host to a human reading these stats */
+				{
+					struct ip_addr pip;
+					char *pips;
+
+					su2ip_addr(&pip, &n->addr);
+					pips = ip_addr2a(&pip);
+					if (pips && *pips &&
+					    add_mi_string(p, MI_SSTR("ip"), pips,
+					        strlen(pips)) < 0)
+						goto err;
+				}
 
 				if (!ps)
 					continue;

@@ -270,6 +270,27 @@ Setting any of these turns pinning on by itself, so pin_workers=1 is only
 needed to pin everything with no grouping. A type with no list may use
 every CPU it is allowed. Lists take the usual "0-7,12" form.
 
+A single UDP listener can also name its own list, which overrides the group
+for just that listener's workers:
+
+    pin_udp_cpus = "8-11"
+    socket = udp:203.0.113.10:5060  use_workers 2  pin_cpus "0-1"
+    socket = udp:10.0.0.10:5060     use_workers 4
+    socket = udp:10.0.0.10:5080     use_workers 2
+
+Here the two workers of the first listener are confined to CPUs 0-1, while
+the other six fall back to pin_udp_cpus and are spread across 8-11 by
+occupancy. A listener that names no list is unaffected, so the coarse
+option stays the sensible default and pin_cpus is the exception you make
+for the interfaces that need one - typically to keep a public-facing
+listener off the cores serving the internal ones.
+
+A list shorter than use_workers is legitimate, not an error: the workers
+share it by occupancy, so three workers on one CPU is a valid thing to ask
+for. Only UDP-based protocols fork per-listener workers, so pin_cpus on a
+TCP listener is reported and ignored (use_workers on TCP is already a
+no-op for the same reason).
+
 There is no bin or hep group. Neither forks processes of its own: they are
 transport protocols carried by the ordinary UDP and TCP workers, so a
 "bin:" listener is served by TCP workers and follows pin_tcp_cpus, and HEP

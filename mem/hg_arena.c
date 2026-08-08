@@ -699,3 +699,103 @@ void hg_arena_stats_core_init(struct hg_block *hb, int core_index)
 #endif
 
 #endif /* HG_MALLOC */
+
+
+/* =========================================================================
+ * Statistics (shm arena only - see hg_register_stats() in hg_malloc.h)
+ *
+ * The same figures hg_stats reports over MI, as core statistics so a dashboard
+ * can graph them.  Without this, hugepage consumption shows up only as the
+ * host pool draining (node_exporter's HugePages_Free) with nothing attributing
+ * it to the allocator.
+ *
+ * NAMING IS DELIBERATE: hg_shm_* under the "hgmem" module, kept clearly apart
+ * from cachedb_perf's hugepage_arena_* statistics.  Those describe that
+ * module's OWN optional dedicated reservation and read 0 when it has none -
+ * different memory entirely.  The two have already been confused once: a
+ * cachedb_perf arena reported as "plain 4K pages" was read as the cache
+ * sitting on small pages when its data was really in HG_MALLOC's 2M-backed
+ * shm.  Anything ambiguous here invites that mistake again, or double-counting.
+ * ========================================================================= */
+
+#include "../statistics.h"
+#include "shm_mem.h"   /* mem_allocator_shm */
+
+enum hg_stat_field {
+	HGS_TIER = 0, HGS_TOTAL, HGS_PINNED_BYTES, HGS_CARVED, HGS_CARVED_PEAK,
+	HGS_CHUNKS, HGS_FREE_TO_CARVE, HGS_LIVE, HGS_LIVE_PEAK, HGS_PAYLOAD,
+	HGS_CELLS, HGS_SLAB_LIVE, HGS_SLAB_RECYCLED,
+};
+
+static unsigned long hg_shm_stat(void *ctx)
+{
+	struct hg_block *hb = (struct hg_block *)shm_block;
+
+	if (!hb)
+		return 0;
+	switch ((enum hg_stat_field)(long)ctx) {
+	case HGS_TIER:          return hb->tier;
+	case HGS_TOTAL:         return hb->size;
+	/* bytes rather than the MB the MI reports, so it composes with the
+	 * other byte-valued statistics and with node_exporter's page counts */
+	case HGS_PINNED_BYTES:  return (unsigned long)hb->locked_mb << 20;
+	/* carved: taken from the arena and cut into size-class chunks.  Never
+	 * returned, so this only ever grows - and it is what free_to_carve
+	 * counts down from. */
+	case HGS_CARVED:        return hb->real_used;
+	case HGS_CARVED_PEAK:   return hb->max_real_used;
+	case HGS_CHUNKS:        return hb->nchunks;
+	case HGS_FREE_TO_CARVE: return hb->size - hb->real_used;
+	/* live: handed out right now.  NOT the same as carved - the gap is
+	 * memory sitting on per-process free stacks, reusable only within its
+	 * own size class, which is expected slab behaviour and not a leak. */
+	case HGS_LIVE:          return hg_get_real_used(hb);
+	case HGS_LIVE_PEAK:     return hb->max_live_used;
+	case HGS_PAYLOAD:       return hg_used(hb);
+	case HGS_CELLS:         return hg_fragments(hb);
+	/* SLAB ONLY: large allocations go to the boundary-tag tier and never
+	 * appear here, so this is deliberately NOT comparable with payload */
+	case HGS_SLAB_LIVE:     return hg_cell_live(hb);
+	case HGS_SLAB_RECYCLED: return hg_slab_recycled(hb);
+	}
+	return 0;
+}
+
+static const struct {
+	const char *name;
+	enum hg_stat_field field;
+} hg_stat_defs[] = {
+	{"hg_shm_tier",          HGS_TIER},
+	{"hg_shm_total_size",    HGS_TOTAL},
+	{"hg_shm_pinned_bytes",  HGS_PINNED_BYTES},
+	{"hg_shm_carved",        HGS_CARVED},
+	{"hg_shm_carved_peak",   HGS_CARVED_PEAK},
+	{"hg_shm_chunks",        HGS_CHUNKS},
+	{"hg_shm_free_to_carve", HGS_FREE_TO_CARVE},
+	{"hg_shm_live",          HGS_LIVE},
+	{"hg_shm_live_peak",     HGS_LIVE_PEAK},
+	{"hg_shm_live_payload",  HGS_PAYLOAD},
+	{"hg_shm_live_cells",    HGS_CELLS},
+	{"hg_shm_slab_live",     HGS_SLAB_LIVE},
+	{"hg_shm_slab_recycled", HGS_SLAB_RECYCLED},
+	{NULL, 0}
+};
+
+int hg_register_stats(void)
+{
+	int i;
+
+	if (mem_allocator_shm != MM_HG_MALLOC &&
+	        mem_allocator_shm != MM_HG_MALLOC_DBG)
+		return 0;       /* a different allocator is in use - nothing to say */
+
+	for (i = 0; hg_stat_defs[i].name; i++) {
+		if (register_stat2("hgmem", (char *)hg_stat_defs[i].name,
+		        (stat_var **)hg_shm_stat, STAT_NO_RESET|STAT_IS_FUNC,
+		        (void *)(long)hg_stat_defs[i].field, 0) != 0) {
+			LM_ERR("failed to add the %s statistic\n", hg_stat_defs[i].name);
+			return -1;
+		}
+	}
+	return 0;
+}

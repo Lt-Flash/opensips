@@ -759,6 +759,9 @@ static int   on_config_mismatch   = CL_CTR_CFGMISMATCH_REJECT; /* resolved; defa
 
 /* Resolved at mod_init time - always valid after cl_ctr_resolve_local_identity() */
 static char my_ip_buf[INET_ADDRSTRLEN];
+/* which of the three resolution paths produced my_ip - reported through
+ * clctr_api.get_my_ip() so a consumer can show it without guessing */
+static const char *my_ip_src = "unresolved";
 static char my_interface_buf[IF_NAMESIZE];
 
 
@@ -815,6 +818,7 @@ static int clctr_send_list(int cluster_id, const int *node_ids, int n,
                            str *channel, str *payload, int flags,
                            int *unknown);
 static int clctr_get_my_node_id(int cluster_id);
+int cl_ctr_get_my_ip(const char **ip, const char **iface, const char **src);
 int load_clctr(clctr_api_t *api);
 
 /* clusterer integration - loaded at mod_init if clusterer use_controller=1 */
@@ -1414,6 +1418,20 @@ CL_CTR_PV_WRAP(cl_ctr_pv_is_master,   CL_CTR_PV_IS_MASTER)
 CL_CTR_PV_WRAP(cl_ctr_pv_master_ip,   CL_CTR_PV_MASTER_IP)
 CL_CTR_PV_WRAP(cl_ctr_pv_backup_ip,   CL_CTR_PV_BACKUP_IP)
 CL_CTR_PV_WRAP(cl_ctr_pv_node_id,     CL_CTR_PV_NODE_ID)
+/* clctr_api.get_my_ip - see api.h */
+int cl_ctr_get_my_ip(const char **ip, const char **iface, const char **src)
+{
+	if (!my_ip)
+		return -1;              /* mod_init has not resolved it yet */
+	if (ip)
+		*ip = my_ip;
+	if (iface)
+		*iface = my_interface_buf[0] ? my_interface_buf : "(unknown)";
+	if (src)
+		*src = my_ip_src;
+	return 0;
+}
+
 CL_CTR_PV_WRAP(cl_ctr_pv_my_ip,       CL_CTR_PV_MY_IP)
 CL_CTR_PV_WRAP(cl_ctr_pv_members,     CL_CTR_PV_MEMBERS)
 CL_CTR_PV_WRAP(cl_ctr_pv_shtag_mode,  CL_CTR_PV_SHTAG_MODE)
@@ -6588,6 +6606,7 @@ static int cl_ctr_resolve_local_identity(void)
 	    freeifaddrs(ifap);
 	    return -1;
 	}
+	my_ip_src = "my_ip modparam (explicit)";
 	LM_INFO("clusterer_controller: using IP %s on interface %s\n",
 	        my_ip, my_interface_buf);
 
@@ -6626,6 +6645,7 @@ static int cl_ctr_resolve_local_identity(void)
 	else
 	    LM_INFO("clusterer_controller: using IP %s on interface %s\n",
 	            my_ip, my_interface_buf);
+	my_ip_src = "interface modparam (IPv4 of that interface)";
 
     } else {
 	/* ---- Mode 3: neither - auto-detect via kernel routing table ---- */
@@ -6664,6 +6684,7 @@ static int cl_ctr_resolve_local_identity(void)
 
 	inet_ntop(AF_INET, &local.sin_addr, my_ip_buf, sizeof(my_ip_buf));
 	my_ip = my_ip_buf;
+	my_ip_src = "auto-detected via default route to the multicast group";
 
 	/* Reverse-look up the interface name */
 	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
@@ -7723,5 +7744,6 @@ int load_clctr(clctr_api_t *api)
     api->send_ucast       = clctr_send_ucast;
     api->send_list        = clctr_send_list;
     api->get_my_node_id   = clctr_get_my_node_id;
+    api->get_my_ip        = cl_ctr_get_my_ip;
     return 0;
 }

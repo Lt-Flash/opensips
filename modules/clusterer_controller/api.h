@@ -104,12 +104,30 @@ typedef int (*clctr_send_list_f)(int cluster_id, const int *node_ids, int n,
 
 typedef int (*clctr_get_my_node_id_f)(int cluster_id);
 
+/*
+ * This node's own address on the cluster plane, as RESOLVED at startup - not
+ * the raw modparam.  It comes from one of three places (explicit `my_ip`, the
+ * IPv4 of an explicit `interface`, or a default-route probe towards the
+ * multicast group), and which one won is not otherwise visible to a consumer
+ * module.  @src, when non-NULL, receives a short constant describing that
+ * origin.  Both outputs point at module-static storage, valid for the process
+ * lifetime; neither must be freed.  Returns 0 on success, -1 before mod_init
+ * has resolved it.
+ *
+ * Worth exposing because a wrong answer here is not cosmetic: joining the
+ * multicast group on the wrong interface is exactly how a node ends up unable
+ * to decrypt its peers' traffic.
+ */
+typedef int (*clctr_get_my_ip_f)(const char **ip, const char **iface,
+		const char **src);
+
 typedef struct clctr_api {
 	clctr_register_channel_f  register_channel;
 	clctr_send_mcast_f        send_mcast;
 	clctr_send_ucast_f        send_ucast;
 	clctr_send_list_f         send_list;
 	clctr_get_my_node_id_f    get_my_node_id;
+	clctr_get_my_ip_f         get_my_ip;
 } clctr_api_t;
 
 typedef int (*load_clctr_f)(clctr_api_t *api);

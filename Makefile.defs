@@ -472,7 +472,7 @@ INSTALL_MAN ?= $(INSTALL) -m 644
 ifeq ($(VERSIONTYPE),)
 VERSIONTYPE = $(shell if [ -d "${TOP_SRCDIR}/.svn" ]; then \
 			  		echo "svn"; \
-				elif [ -d "${TOP_SRCDIR}/.git" ]; then \
+				elif [ -e "${TOP_SRCDIR}/.git" ]; then \
 					echo "git"; \
 				fi )
 endif

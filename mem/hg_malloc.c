@@ -475,7 +475,8 @@ void hg_info(struct hg_block *hb, struct mem_info *info)
 	 * never decreases and would otherwise look like a leak. */
 	recycled = hg_slab_recycled(hb);
 	info->real_used = hb->real_used > recycled ? hb->real_used - recycled : 0;
-	info->free = hb->size - info->real_used;
+	/* room left to CARVE, not size minus live - see hg_get_free() */
+	info->free = hb->size - hb->real_used;
 
 	/* the peak of what real_used above actually reached - NOT the peak
 	 * carve (hb->max_real_used), which only ever grows and would drift

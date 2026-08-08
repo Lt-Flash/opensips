@@ -189,12 +189,6 @@ static inline void cell_set_next(void *cell_start, void *next)
  * cell_next(NULL). Refusing the free leaks one cell; accepting it corrupts
  * the pool.
  */
-static inline int hg_owns(struct hg_block *hb, void *cell_start)
-{
-	return (char *)cell_start >= hb->hbase &&
-	       (char *)cell_start < hb->hbase + hb->hsize;
-}
-
 /* global pool ops - hb->lock must be held. Both take/return cell_start. */
 static inline void gpool_push(struct hg_block *hb, int c, void *cell_start)
 {

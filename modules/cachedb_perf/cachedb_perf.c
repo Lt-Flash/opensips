@@ -531,10 +531,13 @@ static unsigned long smf_mem_tier_probe(void *ctx)
 static unsigned long smf_mem_tier_active(void *ctx)
 {
 	/* the tier ACTUALLY backing the dedicated arena_hugepage_mb
-	 * reservation right now; reads as PCACHE_MEM_4K (4) whenever
+	 * reservation right now; reads as PCACHE_MEM_NO_ARENA (99) whenever
 	 * arena_hugepage_mb is unset/0 or its reservation failed - which is
 	 * also exactly when every cachedb_perf allocation is really going
-	 * through shm_malloc(), see smf_hugepage_arena_active() */
+	 * through shm_malloc(), so the true page backing is the CORE
+	 * allocator's and is NOT measured here.  It used to read 4 (plain 4K),
+	 * which was misread live as "the cache is on small pages" while it sat
+	 * on HG_MALLOC's 2M hugepages.  See smf_hugepage_arena_active(). */
 	return pcache_arena_tier();
 }
 
@@ -654,6 +657,11 @@ static int mi_stats_fill(mi_item_t *cobj, pcache_col_t *col)
 	 * clusterer's own "Ok" for the cachedb-perf-sync capability only means
 	 * it is registered and enabled - it says nothing about convergence. */
 	if (sync_cluster_id > 0) {
+		if (add_mi_number(cobj, MI_SSTR("pulled_from_cluster"),
+		        col->pulled_in) < 0 ||
+		    add_mi_number(cobj, MI_SSTR("served_to_cluster"),
+		        col->served_out) < 0)
+			return -1;
 		if (add_mi_number(cobj, MI_SSTR("last_sync_out"),
 		        col->last_sync_out ?
 		            (int)(get_ticks() - col->last_sync_out) : -1) < 0 ||
@@ -1733,6 +1741,11 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 		found = PCACHE_FOUND_OVERSIZE;
 	} else {
 		found = PCACHE_FOUND_YES;
+		/* counted here, not in pcache_pull_send_rpl(): that helper is
+		 * transport framing and has no collection in scope.  Only a real
+		 * value counts - a "not here"/oversize answer is not a serve. */
+		if (col)
+			__sync_fetch_and_add(&col->served_out, 1);
 	}
 
 reply:
@@ -2205,6 +2218,9 @@ static int pcache_pull_finish(pcache_col_t *col, const str *key,
 				key->len, key->s);
 		} else {
 			__sync_fetch_and_add(&pull_stats[PULL_ST_STORED], 1);
+			/* per-collection twin of PULL_ST_STORED: this is the number
+			 * that actually answers "is this collection converging?" */
+			__sync_fetch_and_add(&col->pulled_in, 1);
 			pcache_neg_clear(col, key);
 		}
 	} else if (rc == 0) {

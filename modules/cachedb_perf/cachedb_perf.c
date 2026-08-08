@@ -503,6 +503,68 @@ PSTATF(smf_entries, PSF_ENTRIES)
 PSTATF(smf_retries, PSF_RETRIES)
 PSTATF(smf_fallbacks, PSF_FALLBACKS)
 
+/*
+ * Cross-node pull statistics.
+ *
+ * These mirror what perf_stats already reports, but as module statistics so
+ * Prometheus scrapes them - without that, the only evidence a dashboard has
+ * that read repair is working is the entry count rising, which shows the
+ * RESULT and not the mechanism: a node whose every pull times out looks
+ * exactly like one that simply has no misses.
+ *
+ * pull_stats[] is shm and only exists once the pull layer came up, so every
+ * accessor tolerates it being NULL (pull disabled, or a config that never
+ * reached that far).
+ */
+static unsigned long pull_stat(int which)
+{
+	return pull_stats ? (unsigned long)pull_stats[which] : 0;
+}
+
+#define PULLSTATF(_fn, _which) \
+	static unsigned long _fn(void *ctx) { return pull_stat(_which); }
+
+PULLSTATF(smf_pulls_requested,  PULL_ST_REQUESTED)
+PULLSTATF(smf_pulls_served,     PULL_ST_SERVED)
+PULLSTATF(smf_pulls_received,   PULL_ST_RECEIVED)
+PULLSTATF(smf_pulls_timeout,    PULL_ST_TIMEOUT)
+PULLSTATF(smf_pulls_stored,     PULL_ST_STORED)
+PULLSTATF(smf_pulls_suppressed, PULL_ST_SUPPRESSED)
+PULLSTATF(smf_pulls_abandoned,  PULL_ST_ABANDONED)
+
+/* A GAUGE, unlike every other pull stat: it should read 0 whenever nothing is
+ * being asked.  Anything parked here means slots are taken and not released,
+ * which ends as "all pull slots busy" and silent loss of read repair - so it
+ * is worth alerting on, where the counters are only worth graphing. */
+static unsigned long smf_pulls_in_flight(void *ctx)
+{
+	unsigned long busy = 0;
+	int k;
+
+	if (!pull_slots || !pull_lock)
+		return 0;
+	lock_get(pull_lock);
+	for (k = 0; k < PCACHE_PULL_SLOTS; k++)
+		if (pull_slots[k].id)
+			busy++;
+	lock_release(pull_lock);
+	return busy;
+}
+
+/* Per-collection convergence, registered dynamically in mod_init (one pair per
+ * declared collection) because the module-wide names above cannot say WHICH
+ * collection is converging - and with a fetch-only collection like rtpdebug in
+ * the mix, the aggregate is actively misleading.  @ctx is the collection. */
+static unsigned long smf_col_pulled_in(void *ctx)
+{
+	return ctx ? ((pcache_col_t *)ctx)->pulled_in : 0;
+}
+
+static unsigned long smf_col_served_out(void *ctx)
+{
+	return ctx ? ((pcache_col_t *)ctx)->served_out : 0;
+}
+
 static unsigned long smf_arena_bytes(void *ctx)
 {
 	unsigned int c;
@@ -599,6 +661,16 @@ static const stat_export_t mod_stats[] = {
 	{"hugepage_arena_total_bytes", STAT_IS_FUNC, (stat_var **)smf_hugepage_arena_total_bytes},
 	{"hugepage_arena_used_bytes",  STAT_IS_FUNC, (stat_var **)smf_hugepage_arena_used_bytes},
 	{"hugepage_arena_free_bytes",  STAT_IS_FUNC, (stat_var **)smf_hugepage_arena_free_bytes},
+	/* cross-node pull (CP-15).  Module-wide; the per-collection split is
+	 * registered dynamically in mod_init - see smf_col_pulled_in(). */
+	{"pulls_requested",  STAT_IS_FUNC, (stat_var **)smf_pulls_requested},
+	{"pulls_served",     STAT_IS_FUNC, (stat_var **)smf_pulls_served},
+	{"pulls_received",   STAT_IS_FUNC, (stat_var **)smf_pulls_received},
+	{"pulls_timed_out",  STAT_IS_FUNC, (stat_var **)smf_pulls_timeout},
+	{"pulls_stored",     STAT_IS_FUNC, (stat_var **)smf_pulls_stored},
+	{"pulls_suppressed", STAT_IS_FUNC, (stat_var **)smf_pulls_suppressed},
+	{"pulls_abandoned",  STAT_IS_FUNC, (stat_var **)smf_pulls_abandoned},
+	{"pulls_in_flight",  STAT_IS_FUNC, (stat_var **)smf_pulls_in_flight},
 	{0,0,0}
 };
 
@@ -4114,6 +4186,37 @@ static int mod_init(void)
 				}
 			}
 			pull_ready = 1;
+			/* One pair of stats per collection, named <collection>-<stat>
+			 * via build_stat_name() (the same convention call_center uses
+			 * for its per-flow stats).  Registered here rather than in the
+			 * static table because the collection list is only known after
+			 * cache_collections has been parsed.  A failure is not fatal:
+			 * losing a statistic must never stop the module serving
+			 * traffic, so it warns and carries on. */
+			{
+				pcache_col_t *sc;
+
+				for (sc = pcache_collection; sc; sc = sc->next) {
+					char *nm;
+
+					if (!sc->replicate)
+						continue;   /* cannot be pulled, so always 0 */
+					nm = build_stat_name(&sc->col_name, "pulled_from_cluster");
+					if (!nm || register_stat2("cachedb_perf", nm,
+					        (stat_var **)smf_col_pulled_in,
+					        STAT_SHM_NAME|STAT_IS_FUNC, (void *)sc, 0) != 0)
+						LM_WARN("could not register the pulled_from_cluster "
+							"statistic for collection <%.*s>\n",
+							sc->col_name.len, sc->col_name.s);
+					nm = build_stat_name(&sc->col_name, "served_to_cluster");
+					if (!nm || register_stat2("cachedb_perf", nm,
+					        (stat_var **)smf_col_served_out,
+					        STAT_SHM_NAME|STAT_IS_FUNC, (void *)sc, 0) != 0)
+						LM_WARN("could not register the served_to_cluster "
+							"statistic for collection <%.*s>\n",
+							sc->col_name.len, sc->col_name.s);
+				}
+			}
 			LM_INFO("cross-node pull active over %s, %d ms timeout, "
 				"%d ms negative cache, collections: %s\n",
 				pull_via_clctr ? "clusterer_controller multicast" : "bin",

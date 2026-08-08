@@ -98,6 +98,33 @@ static inline void cell_set_next(void *cell_start, void *next)
 	*(void **)((char *)cell_start + HG_CELL_HDR) = next;
 }
 
+/*
+ * Does @cell_start belong to THIS arena?
+ *
+ * Everything hg hands out - small cells in chunks and large frags alike -
+ * is carved from the single hb->hbase reservation, whose bounds are fixed
+ * at init. Deliberately NOT hb->lo/hb->hi: those widen as chunks are
+ * carved, so a lock-free reader can see a stale, too-narrow range and
+ * reject a perfectly good cell.
+ *
+ * Why this matters: a process routinely hosts THREE live hg instances (shm,
+ * pkg, and cachedb_perf's own arena), all using an identical cell layout.
+ * A pointer from one of the others carries a class byte that looks entirely
+ * valid here (0..HG_NCLASSES-1), so without this check it would sail past
+ * every test below and land on THIS arena's private free list. Its real
+ * owner then reuses the cell and overwrites the payload - which is exactly
+ * where cell_set_next() keeps the free-list link - truncating our chain
+ * while nfree keeps counting the cells that were on it. That drift is what
+ * later drove the donation loop off the end of the chain and into
+ * cell_next(NULL). Refusing the free leaks one cell; accepting it corrupts
+ * the pool.
+ */
+static inline int hg_owns(struct hg_block *hb, void *cell_start)
+{
+	return (char *)cell_start >= hb->hbase &&
+	       (char *)cell_start < hb->hbase + hb->hsize;
+}
+
 /* global pool ops - hb->lock must be held. Both take/return cell_start. */
 static inline void gpool_push(struct hg_block *hb, int c, void *cell_start)
 {
@@ -422,6 +449,17 @@ void hg_cell_free(struct hg_block *hb, void *p)
 		return;
 
 	cell_start = HG_HDR(p);
+
+	/* before the class byte is even read: an out-of-arena pointer may
+	 * not be mapped at all, and reading it would fault here rather
+	 * than merely corrupt a pool. See hg_owns(). */
+	if (!hg_owns(hb, cell_start)) {
+		LM_CRIT("%s: %p does not belong to this arena [%p,%p) - "
+			"refusing to free it\n", hb->name, p, hb->hbase,
+			hb->hbase + hb->hsize);
+		return;
+	}
+
 	c = *(unsigned char *)cell_start;
 
 	if (c == HG_LARGE_MARKER) {
@@ -460,14 +498,38 @@ void hg_cell_free(struct hg_block *hb, void *p)
 
 	/* keep hoarding bounded: donate half once over the threshold */
 	if (pl->cls[c].nfree > HG_PRIVATE_MAX) {
+		unsigned int claimed = pl->cls[c].nfree;
+
 		lock_get(&hb->lock);
 		for (i = 0; i < HG_DONATE; i++) {
 			d = pl->cls[c].free_head;
+			/* HG_DONATE (128) < HG_PRIVATE_MAX (256), so a chain
+			 * whose length matches nfree can always satisfy this
+			 * loop. Reaching a NULL here therefore means nfree has
+			 * drifted ABOVE the number of cells actually on the
+			 * chain, and walking on would evaluate cell_next(NULL)
+			 * - the production SIGSEGV this guard replaces (a TCP
+			 * worker died with cls[5] = {free_head = NULL,
+			 * nfree = 257} and si_addr = HG_CELL_HDR). */
+			if (!d)
+				break;
 			pl->cls[c].free_head = cell_next(d);
 			pl->cls[c].nfree--;
 			gpool_push(hb, c, d);
 		}
+		/* The chain ran dry, so the truth is zero. Resyncing is not
+		 * cosmetic: leaving nfree high would re-enter this block on
+		 * the very next free of this class and trip the guard again
+		 * on every single call, burying the log. */
+		if (i < HG_DONATE)
+			pl->cls[c].nfree = 0;
 		lock_release(&hb->lock);
+
+		if (i < HG_DONATE)
+			LM_CRIT("%s: class %u free list ran dry after %u cells "
+				"but nfree claimed %u - counter resynced to 0, "
+				"pool accounting drifted\n",
+				hb->name, c, i, claimed);
 	}
 }
 
@@ -480,6 +542,12 @@ void hg_cell_free_global(struct hg_block *hb, void *p)
 		return;
 
 	cell_start = HG_HDR(p);
+	if (!hg_owns(hb, cell_start)) {
+		LM_CRIT("%s: %p does not belong to this arena [%p,%p) - "
+			"refusing to free it\n", hb->name, p, hb->hbase,
+			hb->hbase + hb->hsize);
+		return;
+	}
 	c = *(unsigned char *)cell_start;
 	if (c == HG_LARGE_MARKER) {
 		hg_large_free(hb, (struct hg_lfrag *)(void *)(cell_start - HG_LFRAG_HDR));

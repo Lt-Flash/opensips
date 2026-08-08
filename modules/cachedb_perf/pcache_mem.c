@@ -304,6 +304,9 @@ const char *pcache_mem_tier_str(enum pcache_mem_tier tier)
 		return "THP 2M pages via MADV_COLLAPSE (post-fill retrofit)";
 	case PCACHE_MEM_4K:
 		return "plain 4K pages";
+	case PCACHE_MEM_NO_ARENA:
+		return "core shm_malloc - no dedicated arena; page backing follows "
+			"the core allocator (2M hugepages under HG_MALLOC)";
 	}
 	return "unknown";
 }

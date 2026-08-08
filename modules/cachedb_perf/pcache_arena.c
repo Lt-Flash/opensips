@@ -504,11 +504,17 @@ void pcache_arena_stats(unsigned int *nchunks, unsigned long *bytes)
 
 /* the tier the huge-page reservation actually got (CP-11 MEM_DEGRADED) -
  * distinct from pcache_mem.tier, which is the optimistic probe; with no
- * reservation (arena_hugepage_mb=0 or a failed reserve) the arena is plain
- * shm, reported as 4K */
+ * reservation (arena_hugepage_mb=0 or a failed reserve) there is no arena
+ * to have a tier, reported as PCACHE_MEM_NO_ARENA */
 int pcache_arena_tier(void)
 {
-	return arena->hbase ? (int)arena->htier : PCACHE_MEM_4K;
+	/* No reservation is NOT the same as "backed by 4K pages": with no
+	 * dedicated arena everything goes through the core's shm_malloc(), so
+	 * the real backing is the CORE allocator's - 2M hugepages under
+	 * HG_MALLOC.  Returning PCACHE_MEM_4K here reported a property of an
+	 * arena that does not exist, and was read live as "the cache is on
+	 * small pages" while it was actually on hugepages. */
+	return arena->hbase ? (int)arena->htier : PCACHE_MEM_NO_ARENA;
 }
 
 /*

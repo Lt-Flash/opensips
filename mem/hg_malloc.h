@@ -411,6 +411,23 @@ static inline unsigned long hg_fragments(struct hg_block *hb)
  * since hg_arena.h includes THIS header and cannot be included back) */
 unsigned long hg_slab_recycled(struct hg_block *hb);
 
+/*
+ * Register HG_MALLOC's SHM arena statistics with the statistics collector, so
+ * the allocator's own state is scrapeable and not only reachable through the
+ * hg_stats MI command.  Called from init_stats_collector(); a no-op unless
+ * HG_MALLOC is the shm allocator actually in use.  Returns 0 on success.
+ *
+ * SHM ONLY, deliberately.  Every allocator (qm/fm/hp/f_parallel/hg) reports
+ * through the same 7-field struct mem_info, and the core already turns that
+ * into shmem: plus per-process pkmem: and proc_ statistics - so HG's pkg memory
+ * is ALREADY visible by that generic route.  No allocator exposes
+ * allocator-specific per-process statistics, and doing so would mean extending
+ * the signal_pkg_status()/pkg_status[][] mechanism, since a pkg arena is
+ * private memory that no other process can read.  The shm arena has no such
+ * problem: there is exactly one, and it is shared.
+ */
+int hg_register_stats(void);
+
 /* total cell-slot bytes handed out across every process */
 static inline unsigned long hg_cell_live(struct hg_block *hb)
 {

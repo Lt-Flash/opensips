@@ -44,6 +44,10 @@
 #include "../net/net_tcp.h"
 #include "../mem/mem.h"
 #include "../mem/rpm_mem.h"
+#ifdef HG_MALLOC
+#include "../mem/shm_mem.h"
+#include "../mem/hg_malloc.h"
+#endif
 #include "../cachedb/cachedb.h"
 #include "../evi/event_interface.h"
 #include "../ipc.h"
@@ -986,6 +990,146 @@ static mi_response_t *w_reload_routes(const mi_params_t *params,
 
 
 
+#ifdef HG_MALLOC
+/*
+ * HG_MALLOC keeps state the shared shmem:/pkgmem: statistics cannot express.
+ * Those six figures were designed for a free-list allocator, where freed
+ * memory returns to one general pool; HG_MALLOC instead CARVES the arena into
+ * fixed size-class chunks that are never given back, so "how much is
+ * committed", "how much is live" and "how much can still be handed out" stop
+ * being the same question. Rather than overload the shared names further,
+ * report the allocator's own view here.
+ */
+static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb)
+{
+	mi_item_t *o, *cls_arr, *cls_item;
+	struct hg_chunk *ch;
+	unsigned int chunks_of[HG_NCLASSES], cell_size_of[HG_NCLASSES];
+	unsigned long cells_of[HG_NCLASSES];
+	unsigned long carved;
+	const char *tier;
+	int c;
+
+	if (!hb)
+		return 0;
+
+	o = add_mi_object(parent, name, strlen(name));
+	if (!o)
+		return -1;
+
+	carved = hb->real_used;
+	tier = hg_mem_tier_str(hb->tier);
+
+	if (add_mi_string(o, MI_SSTR("tier"), (char *)tier, strlen(tier)) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("total_size"), hb->size) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("pinned_mb"), hb->locked_mb) < 0)
+		return -1;
+
+	/* carved: bytes taken from the arena and cut into size-class chunks.
+	 * Never returned - this is the figure that only ever grows, and the one
+	 * that free_size counts down from. */
+	if (add_mi_number(o, MI_SSTR("carved"), carved) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("carved_peak"), hb->max_real_used) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("chunks"), hb->nchunks) < 0)
+		return -1;
+	/* what shmem:free_size reports: arena never yet carved */
+	if (add_mi_number(o, MI_SSTR("free_to_carve"), hb->size - carved) < 0)
+		return -1;
+
+	/* live: what is actually handed out right now */
+	if (add_mi_number(o, MI_SSTR("live_cell_bytes"), hg_cell_live(hb)) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("live_payload"), hg_used(hb)) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("live_cells"), hg_fragments(hb)) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("live_peak"), hb->max_live_used) < 0)
+		return -1;
+
+	/* carved but idle: on a private free stack or in the global pool.
+	 * Reusable, but ONLY for its own size class - which is why it is not
+	 * counted as free_to_carve. */
+	if (add_mi_number(o, MI_SSTR("recycled"), hg_slab_recycled(hb)) < 0)
+		return -1;
+
+	memset(chunks_of, 0, sizeof chunks_of);
+	memset(cell_size_of, 0, sizeof cell_size_of);
+	memset(cells_of, 0, sizeof cells_of);
+	for (ch = hb->chunks; ch; ch = ch->next) {
+		if (ch->cls >= HG_NCLASSES)
+			continue;
+		chunks_of[ch->cls]++;
+		cell_size_of[ch->cls] = ch->cell_size;
+		cells_of[ch->cls] += ch->cells;
+	}
+
+	cls_arr = add_mi_array(o, MI_SSTR("classes"));
+	if (!cls_arr)
+		return -1;
+	for (c = 0; c < HG_NCLASSES; c++) {
+		if (!chunks_of[c])
+			continue;
+		cls_item = add_mi_object(cls_arr, 0, 0);
+		if (!cls_item)
+			return -1;
+		if (add_mi_number(cls_item, MI_SSTR("cell_size"),
+			cell_size_of[c]) < 0)
+			return -1;
+		if (add_mi_number(cls_item, MI_SSTR("chunks"), chunks_of[c]) < 0)
+			return -1;
+		if (add_mi_number(cls_item, MI_SSTR("cells"), cells_of[c]) < 0)
+			return -1;
+	}
+
+	return 0;
+}
+
+static mi_response_t *mi_hg_stats(const mi_params_t *params,
+						struct mi_handler *async_hdl)
+{
+	mi_response_t *resp;
+	mi_item_t *resp_obj;
+	int reported = 0;
+
+	resp = init_mi_result_object(&resp_obj);
+	if (!resp)
+		return 0;
+
+	if (mem_allocator_shm == MM_HG_MALLOC ||
+	    mem_allocator_shm == MM_HG_MALLOC_DBG) {
+		if (hg_stats_one(resp_obj, "shm", (struct hg_block *)shm_block) < 0)
+			goto error;
+		reported++;
+	}
+
+	if (mem_allocator_pkg == MM_HG_MALLOC ||
+	    mem_allocator_pkg == MM_HG_MALLOC_DBG) {
+		/* pkg arenas are per-process: this is the arena of whichever
+		 * process answered the command, not a fleet-wide total */
+		if (hg_stats_one(resp_obj, "pkg", (struct hg_block *)mem_block) < 0)
+			goto error;
+		reported++;
+	}
+
+	if (!reported) {
+		free_mi_response(resp);
+		return init_mi_error(400,
+			MI_SSTR("HG_MALLOC is not the active allocator"));
+	}
+
+	return resp;
+
+error:
+	LM_ERR("failed to add mi item\n");
+	free_mi_response(resp);
+	return 0;
+}
+#endif /* HG_MALLOC */
+
 static const mi_export_t mi_core_cmds[] = {
 	{ "uptime", "prints various time information about OpenSIPS - "
 		"when it started to run, for how long it runs", 0, init_mi_uptime, {
@@ -1001,6 +1145,14 @@ static const mi_export_t mi_core_cmds[] = {
 		{mi_pwd, {0}},
 		{EMPTY_MI_RECIPE}}, {0}
 	},
+#ifdef HG_MALLOC
+	{ "hg_stats", "HG_MALLOC arena internals: how much of the arena is "
+		"carved into size-class chunks, how much of that is live versus "
+		"recycled, and the per-class chunk breakdown", 0, 0, {
+		{mi_hg_stats, {0}},
+		{EMPTY_MI_RECIPE}}, {0}
+	},
+#endif
 	{ "arg", "returns the full list of arguments used at startup", 0, 0, {
 		{mi_arg, {0}},
 		{EMPTY_MI_RECIPE}}, {0}

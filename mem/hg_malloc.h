@@ -361,15 +361,35 @@ static inline int hg_owns(struct hg_block *hb, void *cell_start)
 
 #define HG_ARENA_REG_MAX 8
 struct hg_arena_range {
-	char          *base;
-	unsigned long  size;
+	char             *base;
+	unsigned long     size;
+	struct hg_block  *hb;
 };
 /* defined in hg_malloc.c; maintained by hg_malloc_init/destroy. Process-local
  * on purpose - a forked child inherits the parent's entries (its shm mapping
  * really is the same memory) and adds its own private pkg arena on top. */
 extern struct hg_arena_range hg_arena_reg[HG_ARENA_REG_MAX];
 
-static inline int hg_owns_any(const void *p)
+/* count of frees redirected to their true owner; reported by hg_stats */
+extern unsigned long hg_xarena_frees;
+
+/*
+ * Which arena does this pointer belong to, if any?
+ *
+ * A child does NOT only ever free pointers from its current arena, and it is
+ * not a bug when it does not. Every other allocator lets a child inherit the
+ * parent's pkg arena COW, so freeing something the parent allocated pre-fork
+ * is ordinary, supported behaviour - cachedb_redis and six sibling modules do
+ * exactly that in child_init(), releasing the URL list mod_init() built.
+ * HG_MALLOC hands each child a fresh arena instead (see pt.c), which broke
+ * that assumption: those frees arrive addressed to an arena that never issued
+ * them.
+ *
+ * So resolve the owner rather than judging by the caller's block. A pointer
+ * that belongs to some other live arena is redirected there and freed
+ * properly; only a pointer that belongs to NO arena is a real defect.
+ */
+static inline struct hg_block *hg_owner(const void *p)
 {
 	int i;
 
@@ -378,9 +398,14 @@ static inline int hg_owns_any(const void *p)
 			continue;
 		if ((const char *)p >= hg_arena_reg[i].base &&
 		    (const char *)p <  hg_arena_reg[i].base + hg_arena_reg[i].size)
-			return 1;
+			return hg_arena_reg[i].hb;
 	}
-	return 0;
+	return NULL;
+}
+
+static inline int hg_owns_any(const void *p)
+{
+	return hg_owner(p) != NULL;
 }
 
 static inline unsigned long hg_frag_size(void *p)

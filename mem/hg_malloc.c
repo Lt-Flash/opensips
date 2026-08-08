@@ -343,6 +343,15 @@ const char *hg_mem_tier_str(enum hg_mem_tier tier)
  */
 struct hg_arena_range hg_arena_reg[HG_ARENA_REG_MAX];
 
+/*
+ * How many frees this process redirected to an arena other than the one the
+ * caller named. Not an error count - see hg_owner(). It is expected to be a
+ * small constant per child, set at startup and never moving again; a figure
+ * that climbs with traffic would mean something is handing pointers across
+ * arenas at runtime, which nothing should.
+ */
+unsigned long hg_xarena_frees;
+
 static void hg_arena_reg_add(struct hg_block *hb)
 {
 	int i;
@@ -351,6 +360,7 @@ static void hg_arena_reg_add(struct hg_block *hb)
 		if (!hg_arena_reg[i].base) {
 			hg_arena_reg[i].base = hb->hbase;
 			hg_arena_reg[i].size = hb->hsize;
+			hg_arena_reg[i].hb   = hb;
 			return;
 		}
 	}
@@ -369,6 +379,7 @@ static void hg_arena_reg_del(struct hg_block *hb)
 		if (hg_arena_reg[i].base == hb->hbase) {
 			hg_arena_reg[i].base = NULL;
 			hg_arena_reg[i].size = 0;
+			hg_arena_reg[i].hb   = NULL;
 			return;
 		}
 	}

@@ -526,9 +526,26 @@ void hg_cell_free(struct hg_block *hb, void *p)
 	 * not be mapped at all, and reading it would fault here rather
 	 * than merely corrupt a pool. See hg_owns(). */
 	if (!hg_owns(hb, cell_start)) {
-		LM_CRIT("%s: %p does not belong to this arena [%p,%p) - "
-			"refusing to free it\n", hb->name, p, hb->hbase,
-			hb->hbase + hb->hsize);
+		struct hg_block *owner = hg_owner(cell_start);
+
+		if (!owner) {
+			LM_CRIT("%s: %p belongs to no live arena - refusing to "
+				"free it\n", hb->name, p);
+			return;
+		}
+
+		/*
+		 * A different arena of ours issued this cell, which is normal
+		 * after fork: the child runs on its own pkg arena while
+		 * modules still release things the parent allocated pre-fork.
+		 * Hand it back to whoever owns it. Straight to that arena's
+		 * global pool, deliberately - the per-thread cache exists to
+		 * speed up reuse, and this process will never allocate from
+		 * the foreign arena again, so caching there would strand the
+		 * cell instead of freeing it.
+		 */
+		hg_xarena_frees++;
+		hg_cell_free_global(owner, p);
 		return;
 	}
 
@@ -615,10 +632,20 @@ void hg_cell_free_global(struct hg_block *hb, void *p)
 
 	cell_start = HG_HDR(p);
 	if (!hg_owns(hb, cell_start)) {
-		LM_CRIT("%s: %p does not belong to this arena [%p,%p) - "
-			"refusing to free it\n", hb->name, p, hb->hbase,
-			hb->hbase + hb->hsize);
-		return;
+		struct hg_block *owner = hg_owner(cell_start);
+
+		/* see the matching comment in hg_cell_free() - reached both
+		 * directly and by that function's redirect, so the redirect
+		 * must not loop: it only ever passes the resolved owner. */
+		if (!owner) {
+			LM_CRIT("%s: %p belongs to no live arena - refusing to "
+				"free it\n", hb->name, p);
+			return;
+		}
+		if (owner != hb) {
+			hg_xarena_frees++;
+			hb = owner;
+		}
 	}
 	c = *(unsigned char *)cell_start;
 	if (c == HG_LARGE_MARKER) {

@@ -1134,6 +1134,12 @@ static mi_response_t *mi_hg_stats(const mi_params_t *params,
 			MI_SSTR("HG_MALLOC is not the active allocator"));
 	}
 
+	/* per-process, like the pkg figures above: frees this process handed
+	 * back to an arena other than the one named by the caller */
+	if (add_mi_number(resp_obj, MI_SSTR("cross_arena_frees"),
+			hg_xarena_frees) < 0)
+		goto error;
+
 	return resp;
 
 error:

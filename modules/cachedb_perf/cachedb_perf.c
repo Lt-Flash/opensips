@@ -555,6 +555,28 @@ static unsigned long smf_pulls_in_flight(void *ctx)
  * declared collection) because the module-wide names above cannot say WHICH
  * collection is converging - and with a fetch-only collection like rtpdebug in
  * the mix, the aggregate is actively misleading.  @ctx is the collection. */
+/*
+ * "<collection>_<stat>" in shm, for a dynamically registered statistic.
+ *
+ * NOT build_stat_name(): that joins with a HYPHEN, which is fine for the
+ * per-process pkmem statistics because those are STAT_HIDDEN and only their
+ * group name is ever exported - but these are meant to be read individually,
+ * and the prometheus module concatenates a statistic name verbatim with no
+ * sanitising.  A hyphen is not legal in a Prometheus metric name, so
+ * "default-pulled_from_cluster" would have produced a metric that breaks the
+ * scrape rather than one that merely looks odd.
+ */
+static char *pcache_stat_name(pcache_col_t *col, const char *what)
+{
+	int n = col->col_name.len + 1 + strlen(what) + 1;
+	char *s = shm_malloc(n);
+
+	if (!s)
+		return NULL;
+	snprintf(s, n, "%.*s_%s", col->col_name.len, col->col_name.s, what);
+	return s;
+}
+
 static unsigned long smf_col_pulled_in(void *ctx)
 {
 	return ctx ? ((pcache_col_t *)ctx)->pulled_in : 0;
@@ -4201,14 +4223,14 @@ static int mod_init(void)
 
 					if (!sc->replicate)
 						continue;   /* cannot be pulled, so always 0 */
-					nm = build_stat_name(&sc->col_name, "pulled_from_cluster");
+					nm = pcache_stat_name(sc, "pulled_from_cluster");
 					if (!nm || register_stat2("cachedb_perf", nm,
 					        (stat_var **)smf_col_pulled_in,
 					        STAT_SHM_NAME|STAT_IS_FUNC, (void *)sc, 0) != 0)
 						LM_WARN("could not register the pulled_from_cluster "
 							"statistic for collection <%.*s>\n",
 							sc->col_name.len, sc->col_name.s);
-					nm = build_stat_name(&sc->col_name, "served_to_cluster");
+					nm = pcache_stat_name(sc, "served_to_cluster");
 					if (!nm || register_stat2("cachedb_perf", nm,
 					        (stat_var **)smf_col_served_out,
 					        STAT_SHM_NAME|STAT_IS_FUNC, (void *)sc, 0) != 0)

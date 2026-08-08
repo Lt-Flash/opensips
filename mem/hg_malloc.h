@@ -327,11 +327,73 @@ unsigned int hg_cell_total_size(unsigned char cls);
  * to depend on hg_large.h, which itself includes hg_malloc.h. */
 unsigned long hg_large_frag_size_at(const void *frag);
 
+/*
+ * Arena ownership tests.
+ *
+ * Everything hg hands out lives inside some block's hb->hbase reservation,
+ * whose bounds are fixed at init. A pointer from outside it - a foreign
+ * arena, a stale pointer, or a corrupted one - has a "class byte" at
+ * HG_HDR(p) that is either garbage or, worse, unmapped, so simply reading it
+ * faults. That is not hypothetical: it took a process down (staging RGS,
+ * 2026-08-09, si_addr == p-32 inside hg_frag_size()).
+ *
+ * Two flavours, because the callers differ:
+ *
+ *   hg_owns()     - for code that already knows which block it is working on.
+ *                   Exact, one range, no loop.
+ *
+ *   hg_owns_any() - for code that does NOT. hg_frag_size() is the reason this
+ *                   exists: it is installed into the shared
+ *                   "unsigned long (*shm_frag_size)(void *)" function pointer
+ *                   next to fm_/qm_/hp_/parallel_frag_size(), so its signature
+ *                   belongs to an interface we do not own and cannot grow an
+ *                   hb parameter. It walks a registry of live arenas instead -
+ *                   at most a handful, and never on the alloc/free fast path.
+ *
+ * Both are advisory: they turn "dereference and die" into "decline and carry
+ * on". They do not make a bad pointer good.
+ */
+static inline int hg_owns(struct hg_block *hb, void *cell_start)
+{
+	return (char *)cell_start >= hb->hbase &&
+	       (char *)cell_start < hb->hbase + hb->hsize;
+}
+
+#define HG_ARENA_REG_MAX 8
+struct hg_arena_range {
+	char          *base;
+	unsigned long  size;
+};
+/* defined in hg_malloc.c; maintained by hg_malloc_init/destroy. Process-local
+ * on purpose - a forked child inherits the parent's entries (its shm mapping
+ * really is the same memory) and adds its own private pkg arena on top. */
+extern struct hg_arena_range hg_arena_reg[HG_ARENA_REG_MAX];
+
+static inline int hg_owns_any(const void *p)
+{
+	int i;
+
+	for (i = 0; i < HG_ARENA_REG_MAX; i++) {
+		if (!hg_arena_reg[i].base)
+			continue;
+		if ((const char *)p >= hg_arena_reg[i].base &&
+		    (const char *)p <  hg_arena_reg[i].base + hg_arena_reg[i].size)
+			return 1;
+	}
+	return 0;
+}
+
 static inline unsigned long hg_frag_size(void *p)
 {
 	unsigned char c;
 
 	if (!p)
+		return 0;
+
+	/* the header may not be mapped at all - check before reading it.
+	 * Returning 0 matches the "unknown size" answer this function already
+	 * gives for an out-of-range class. */
+	if (!hg_owns_any(HG_HDR(p)))
 		return 0;
 
 	c = HG_CLASS(p);
@@ -353,14 +415,20 @@ void hg_stats_set_index(void *ptr, unsigned long idx);
 #ifdef DBG_MALLOC
 static inline const char *hg_frag_file(void *p)
 {
+	if (!hg_owns_any(HG_HDR(p)))
+		return NULL;
 	return *(const char **)(HG_HDR(p) + HG_ROUNDTO);
 }
 static inline const char *hg_frag_func(void *p)
 {
+	if (!hg_owns_any(HG_HDR(p)))
+		return NULL;
 	return *(const char **)(HG_HDR(p) + HG_ROUNDTO * 2);
 }
 static inline unsigned long hg_frag_line(void *p)
 {
+	if (!hg_owns_any(HG_HDR(p)))
+		return 0;
 	return *(unsigned long *)(HG_HDR(p) + HG_ROUNDTO * 3);
 }
 #else

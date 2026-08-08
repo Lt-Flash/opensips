@@ -130,6 +130,16 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 	 * frag's neighbors. That optimization is real future work, not
 	 * needed for correctness - large reallocs are rarer still than large
 	 * allocs to begin with. */
+	/* validate ownership BEFORE reading the class - the old order read the
+	 * header first and only then complained about a bad class, so a
+	 * foreign or unmapped pointer faulted before reaching that check. */
+	if (!hg_owns(hb, HG_HDR(p))) {
+		LM_CRIT("%s: realloc of %p, which is not from this arena "
+			"[%p,%p) - refusing it\n", hb->name, p, hb->hbase,
+			hb->hbase + hb->hsize);
+		return NULL;
+	}
+
 	cls = HG_CLASS(p);
 	if (cls == HG_LARGE_MARKER) {
 		cur_total = hg_large_frag_size_at(HG_HDR(p) - HG_LFRAG_HDR_SIZE);

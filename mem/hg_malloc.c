@@ -327,6 +327,54 @@ const char *hg_mem_tier_str(enum hg_mem_tier tier)
 }
 
 /*
+ * Registry of live arena ranges, for the ownership tests in hg_malloc.h.
+ *
+ * hg_owns_any() needs to answer "is this pointer from ANY of our arenas?"
+ * without being handed a block, because hg_frag_size() is installed into a
+ * shared function-pointer interface whose signature we do not control. A
+ * fixed-size array is deliberate: this is bootstrap bookkeeping for the
+ * allocator itself, so it must not be allocated THROUGH the allocator.
+ *
+ * Process-local, and correct under fork by construction: a child inherits the
+ * parent's entries (its shm mapping is genuinely the same memory) and adds its
+ * own private pkg arena when pt.c swaps one in. Keeping the parent's stale pkg
+ * entry is a feature here - a parent-allocated pkg pointer freed in a child
+ * still resolves to mapped memory, so it is declined rather than dereferenced.
+ */
+struct hg_arena_range hg_arena_reg[HG_ARENA_REG_MAX];
+
+static void hg_arena_reg_add(struct hg_block *hb)
+{
+	int i;
+
+	for (i = 0; i < HG_ARENA_REG_MAX; i++) {
+		if (!hg_arena_reg[i].base) {
+			hg_arena_reg[i].base = hb->hbase;
+			hg_arena_reg[i].size = hb->hsize;
+			return;
+		}
+	}
+	/* Not fatal: hg_owns_any() then declines pointers it cannot vouch for,
+	 * which costs diagnostics, never correctness. */
+	LM_WARN("%s: more than %d live HG_MALLOC arenas in one process - "
+		"ownership checks will be incomplete\n", hb->name,
+		HG_ARENA_REG_MAX);
+}
+
+static void hg_arena_reg_del(struct hg_block *hb)
+{
+	int i;
+
+	for (i = 0; i < HG_ARENA_REG_MAX; i++) {
+		if (hg_arena_reg[i].base == hb->hbase) {
+			hg_arena_reg[i].base = NULL;
+			hg_arena_reg[i].size = 0;
+			return;
+		}
+	}
+}
+
+/*
  * hg_malloc_init() reserves its own memory (unlike fm_malloc_init(), which
  * receives an already-mmap'd address from shm_getmem()) and lays the block
  * control structure out at the very start of that reservation - the same
@@ -374,6 +422,8 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 		return NULL;
 	}
 
+	hg_arena_reg_add(hb);
+
 	/* the region right after the block header is the first thing chunks
 	 * bump-carve from - hg_arena_init() sets hoff past it */
 	if (hg_arena_init(hb, ROUNDUP_TO(sizeof(struct hg_block))) < 0) {
@@ -417,6 +467,7 @@ void hg_malloc_destroy(struct hg_block *hb)
 	if (!hb)
 		return;
 
+	hg_arena_reg_del(hb);
 	hg_arena_destroy(hb);
 	lock_destroy(&hb->lock);
 	/* munmap last: hb itself lives inside hbase */
@@ -513,6 +564,19 @@ static void hg_dbg_dump_cb(void *payload, void *ctx)
 	char *tag = HG_HDR(payload);
 	const char *file, *func;
 	unsigned long line;
+
+	/*
+	 * The walker derives cell addresses from chunk bookkeeping rather than
+	 * from a live-cell list, so a single corrupted chunk hands us an
+	 * address that need not be mapped - and this is a DIAGNOSTIC path. A
+	 * memory dump must never be the thing that kills the process, which is
+	 * exactly what happened on 2026-08-09 before this check existed.
+	 */
+	if (!hg_owns_any(tag)) {
+		LM_CRIT("%s: dump walker produced %p, outside every arena - "
+			"skipping it\n", "HG_MALLOC", payload);
+		return;
+	}
 
 	/*
 	 * Read the DBG fields directly from the tag region, like

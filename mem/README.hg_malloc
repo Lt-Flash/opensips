@@ -78,6 +78,86 @@ while the other allocators on the same machine and workload ranged from
 still worth using.
 
 
+Carving, and what the memory statistics mean
+--------------------------------------------
+
+HG_MALLOC does not treat the arena as one pool of interchangeable bytes.
+It CARVES it: the first time a process needs a cell of some size class, a
+whole chunk is cut out of the arena, divided into equal cells of that
+class, and given to that process. A chunk is never handed back. Freeing a
+cell returns it to a per-process free stack, ready to be reused - but only
+for the same size class, and preferentially by the same process.
+
+That single property is why the memory statistics read differently here
+than under q_malloc or f_malloc, where a freed fragment returns to a
+general pool and can serve a request of any size.
+
+    used_size        payload bytes currently handed to callers. Rises and
+                     falls with load; same meaning as everywhere else.
+
+    real_used_size   live commitment - the cell slots currently handed
+                     out, including each cell's header and the round-up to
+                     its size class. Rises and falls with load.
+
+    max_used_size    high-water mark of real_used_size. Climbs to the
+                     working set and then holds, as for the other
+                     allocators.
+
+    free_size        arena not yet carved. This is the figure that
+                     predicts "no more HG_MALLOC arena memory": it counts
+                     down as chunks are cut, and never goes back up.
+
+    fragments        live cells.
+
+Two consequences are worth stating plainly.
+
+First, free_size + real_used_size does not add up to total_size. Under
+q_malloc it does. Here the difference is the carved-but-idle capacity -
+cells sitting on a free stack. They are genuinely reusable, so calling
+them "used" would overstate demand; they are also already committed to one
+size class, so calling them "free" would overstate what is available. The
+identity that does hold is:
+
+    free_size + carved = total_size
+
+Second, recycled capacity is not interchangeable. An arena can report a
+large free_size and still fail an allocation, if what has been carved does
+not match the size being asked for. In practice a given workload settles
+into a stable mix of sizes and this does not arise, but it is the reason
+free_size is defined as "not yet carved" rather than "not in use".
+
+None of this has to be inferred: hg_stats below reports each quantity
+separately.
+
+
+hg_stats
+--------
+
+    opensips-cli -x mi hg_stats
+
+Reports the allocator's own view of each arena it manages: shm, and the
+pkg arena of whichever process answered the command. pkg arenas are
+per-process, so that half is one process's arena, not a server-wide total.
+
+    tier              which of the four huge-page tiers the arena got
+    total_size        arena size, as given by -m / -M
+    pinned_mb         MB protected from swapping
+    carved            bytes ever cut out of the arena into chunks
+    carved_peak       high-water mark of the above
+    chunks            how many chunks that is
+    free_to_carve     total_size - carved, i.e. shmem:free_size
+    live_cell_bytes   cell slots currently handed out
+    live_payload      of which, requested payload, i.e. shmem:used_size
+    live_cells        number of live cells, i.e. shmem:fragments
+    live_peak         high-water mark, i.e. shmem:max_used_size
+    recycled          carved but idle: on a free stack or in the global
+                      pool
+    classes           per size class: cell size, chunk count, total cells
+
+The per-class breakdown is the quickest way to tell whether an arena is
+being carved into the sizes the workload actually asks for.
+
+
 Per-module memory accounting
 ----------------------------
 

@@ -477,11 +477,12 @@ void hg_info(struct hg_block *hb, struct mem_info *info)
 	info->real_used = hb->real_used > recycled ? hb->real_used - recycled : 0;
 	info->free = hb->size - info->real_used;
 
-	/* peak carve: chunks are only ever carved when demand outruns the
-	 * recycled supply, so this is the high-water mark of live commitment
-	 * (and a safe upper bound on it), and stays monotonic like every other
-	 * allocator's max_used */
-	info->max_used = hb->max_real_used;
+	/* the peak of what real_used above actually reached - NOT the peak
+	 * carve (hb->max_real_used), which only ever grows and would drift
+	 * away from real_used forever */
+	if (info->real_used > hb->max_live_used)
+		hb->max_live_used = info->real_used;
+	info->max_used = hb->max_live_used;
 	info->total_frags = hg_fragments(hb);
 }
 

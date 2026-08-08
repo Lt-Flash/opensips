@@ -229,6 +229,16 @@ struct hg_block {
 	 * lock-free fast path, so a plain field is safe here. */
 	unsigned long real_used;
 	unsigned long max_real_used;
+	/* High-water mark of the LIVE figure that hg_get_real_used() reports, as
+	 * opposed to max_real_used above, which is the peak CARVE. They are
+	 * different quantities: carve only ever grows (chunks are never
+	 * un-carved), so reporting it as max_used made max_used drift away from
+	 * real_used forever instead of meaning "the peak real_used reached" -
+	 * unlike every other allocator. Sampled, not exact: refreshed whenever
+	 * the stats are read, so a spike between two reads can be missed. The
+	 * unsynchronized max update is a benign race - a lost update can only
+	 * under-report, never over-report. */
+	unsigned long max_live_used;
 
 	/* the fast-path counters - see struct hg_pstat above. Summed by
 	 * hg_used()/hg_fragments(); never read directly. */
@@ -436,12 +446,18 @@ static inline unsigned long hg_get_free(struct hg_block *hb)
 static inline unsigned long hg_get_real_used(struct hg_block *hb)
 {
 	unsigned long recycled = hg_slab_recycled(hb);
+	unsigned long live = hb->real_used > recycled ?
+	                     hb->real_used - recycled : 0;
 
-	return hb->real_used > recycled ? hb->real_used - recycled : 0;
+	if (live > hb->max_live_used)
+		hb->max_live_used = live;
+	return live;
 }
 static inline unsigned long hg_get_max_real_used(struct hg_block *hb)
 {
-	return hb->max_real_used;
+	/* refresh the mark first, so reading max on its own is not stale */
+	(void)hg_get_real_used(hb);
+	return hb->max_live_used;
 }
 static inline unsigned long hg_get_frags(struct hg_block *hb)
 {

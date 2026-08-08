@@ -46,16 +46,47 @@ static const unsigned int cell_sizes[HG_NCLASSES] = {
 #define HG_DONATE         128            /*   donation of this many cells    */
 
 /*
- * Per-process private free-stack state, one slot per hg_block instance live
- * in this process (see the hg_arena.h comment on why this can't be the
+ * Per-THREAD private free-stack state, one slot per hg_block instance live
+ * in this thread (see the hg_arena.h comment on why this can't be the
  * single static global cachedb_perf uses: HG_MALLOC can back shm, shm_dbg
  * AND pkg simultaneously). A fixed-size static array, not heap-allocated -
  * this state is exactly the kind of bootstrap-before-any-allocator-exists
  * bookkeeping that must NOT go through pkg_malloc()/shm_malloc(), since
  * HG_MALLOC may itself be backing one or both of those.
+ *
+ * __thread, NOT merely static, and that is a correctness requirement rather
+ * than a tuning choice. The whole fast path is lock-free precisely because
+ * this state is private to its owner; a plain static makes it private to the
+ * PROCESS, which was true of OpenSIPS's classic one-thread-per-process model
+ * but is NOT true since 4.1 - TCP main now runs a pthread IO pool
+ * (tcp_pool_init(), net_tcp.c, one thread per CPU by default, started
+ * unconditionally), and those threads run the read callbacks that reach
+ * tcp_dispatch_msg() -> shm_malloc(). Several threads therefore hit these
+ * lists at once.
+ *
+ * Observed on real traffic before this was made per-thread:
+ *   - lost "nfree--" updates, so the counter UNDERFLOWED and wrapped
+ *     (logged: "nfree claimed 4294966733", i.e. 2^32-563), which trivially
+ *     exceeds HG_PRIVATE_MAX and drove the donation loop off the end of a
+ *     chain that had far fewer cells than claimed;
+ *   - two threads popping the SAME cell, handing one block to two callers -
+ *     a tcp_ipc_payload struct came back with SIP text where its conn
+ *     pointer belonged, and tcpconn_put() died on it.
+ * Both faults were the same race wearing different masks. si_addr on the
+ * first is 0x20 == HG_CELL_HDR, i.e. cell_next(NULL).
+ *
+ * Cost: sizeof(struct hg_palloc) is ~512B, so ~2KB of TLS per thread for all
+ * four instances - trivial next to what it buys, and the fast path stays
+ * lock-free rather than gaining a mutex.
+ *
+ * Note what stays process-wide on purpose: hb->gpool (the shared pool, taken
+ * under hb->lock) is unchanged, so cells still circulate between threads and
+ * processes normally. A thread that exits leaves its cached cells parked in
+ * its own dead TLS rather than returning them - harmless here, because the
+ * IO pool threads live for the lifetime of the process.
  */
 #define HG_MAX_INSTANCES 4
-static struct hg_palloc palloc_slots[HG_MAX_INSTANCES];
+static __thread struct hg_palloc palloc_slots[HG_MAX_INSTANCES];
 
 static struct hg_palloc *hg_get_palloc(struct hg_block *hb)
 {
@@ -331,6 +362,12 @@ void hg_arena_child_init(struct hg_block *hb)
 	 * which hit exactly this as the CP-16 corruption bug. The leftover
 	 * cells belong to the parent; the child discards its inherited copy
 	 * and starts empty, carving its own chunk on first use.
+	 *
+	 * Since palloc_slots became __thread this clears only the CALLING
+	 * thread's slots, which is exactly right: fork() clones just the
+	 * calling thread, so the child starts life single-threaded and there
+	 * are no other slots in it to clear. Any IO threads it later spawns
+	 * get freshly-zeroed TLS of their own.
 	 */
 	for (i = 0; i < HG_MAX_INSTANCES; i++)
 		if (palloc_slots[i].owner == hb)

@@ -438,10 +438,18 @@ static inline unsigned long hg_get_used(struct hg_block *hb)
  * report the raw carve footprint. */
 static inline unsigned long hg_get_free(struct hg_block *hb)
 {
-	unsigned long recycled = hg_slab_recycled(hb);
-
-	return hb->size - (hb->real_used > recycled ?
-	                   hb->real_used - recycled : 0);
+	/* Headroom left to CARVE - deliberately NOT size minus the live figure.
+	 * Carved-but-recycled cells are reusable only within their own size
+	 * class, so counting them as free reports ~95% available right up until
+	 * an allocation of a DIFFERENT size fails with "no more HG_MALLOC arena
+	 * memory". hb->real_used is the carve footprint, so this is the number
+	 * that actually predicts that failure.
+	 *
+	 * Consequence: free + real_used != size here (real_used is live), unlike
+	 * q_malloc. The invariant that does hold is free + carve == size. Each
+	 * figure answers a different question: used = live payload, real_used /
+	 * max_used = live commitment and its peak, free = room left to carve. */
+	return hb->size - hb->real_used;
 }
 static inline unsigned long hg_get_real_used(struct hg_block *hb)
 {

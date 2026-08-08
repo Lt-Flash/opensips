@@ -7319,7 +7319,15 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param)
                     cl->session_key,
                     reliable ? CL_CTR_PKT_CONSUMER_REL : CL_CTR_PKT_CONSUMER);
             if (reliable)
-                cl_ctr_retx_enqueue_bcast(cl, ntohl(seq), pkt, plain_len);
+                /* pkt is a char[] because cl_ctr_seal_and_send() writes
+                 * into it in place; the retx queue takes it read-only as
+                 * unsigned char, which is the natural type for wire bytes.
+                 * The cast is the sign difference only - same address, same
+                 * bytes - and silences -Wpointer-sign without retyping the
+                 * buffer, which would only move the warning to the
+                 * seal_and_send() calls that legitimately need char *. */
+                cl_ctr_retx_enqueue_bcast(cl, ntohl(seq),
+                        (const unsigned char *)pkt, plain_len);
         } else {
             struct sockaddr_in d;
 
@@ -7351,8 +7359,10 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param)
                                      : CL_CTR_PKT_CONSUMER,
                             (const struct sockaddr *)&d, sizeof d);
                     if (reliable)
+                        /* same sign-only cast as the broadcast path above */
                         cl_ctr_retx_enqueue_consumer(cl, ntohl(seq),
-                                CL_CTR_PKT_CONSUMER_REL, pkt, plain_len,
+                                CL_CTR_PKT_CONSUMER_REL,
+                                (const unsigned char *)pkt, plain_len,
                                 (const struct sockaddr *)&d, sizeof d);
                 }
             }

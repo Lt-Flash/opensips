@@ -88,13 +88,42 @@ static const unsigned int cell_sizes[HG_NCLASSES] = {
 #define HG_MAX_INSTANCES 4
 static __thread struct hg_palloc palloc_slots[HG_MAX_INSTANCES];
 
-static struct hg_palloc *hg_get_palloc(struct hg_block *hb)
+/*
+ * One-entry lookup cache for the slot this thread used last.
+ *
+ * Every alloc and every free begins by resolving hb -> palloc, so this is
+ * the single hottest lookup in the allocator, and it was a linear walk of
+ * HG_MAX_INSTANCES slots comparing owner pointers - on EVERY call, since
+ * before this the only way in was the slow path below. In practice a worker
+ * bounces between two instances at most (shm and pkg), and overwhelmingly
+ * hits the same one many times in a row, so the walk almost always finds its
+ * answer after re-testing slots it just rejected.
+ *
+ * Splitting it lets the fast path inline into hg_cell_alloc()/hg_cell_free()
+ * as a TLS load and one compare, while the cold path stays out of line. That
+ * matters beyond the instruction count: the slow path carries a stack-
+ * protector prologue (GCC adds one once __thread and the memset() are in
+ * play), and an inlined fast path skips the call and the canary entirely
+ * rather than paying them per allocation.
+ *
+ * Staleness is safe by construction: the cache is only trusted when
+ * pl->owner still equals the requested block. hg_arena_child_init() and
+ * hg_arena_destroy() zero a slot's owner, so a cached pointer to a recycled
+ * slot simply fails that test and falls through to the walk - but both also
+ * clear hg_last outright, so the invalidation is explicit rather than
+ * relying on that.
+ */
+static __thread struct hg_palloc *hg_last;
+
+static struct hg_palloc *hg_palloc_lookup(struct hg_block *hb)
 {
 	int i, free_slot = -1;
 
 	for (i = 0; i < HG_MAX_INSTANCES; i++) {
-		if (palloc_slots[i].owner == hb)
+		if (palloc_slots[i].owner == hb) {
+			hg_last = &palloc_slots[i];
 			return &palloc_slots[i];
+		}
 		if (free_slot < 0 && !palloc_slots[i].owner)
 			free_slot = i;
 	}
@@ -107,7 +136,17 @@ static struct hg_palloc *hg_get_palloc(struct hg_block *hb)
 
 	memset(&palloc_slots[free_slot], 0, sizeof(struct hg_palloc));
 	palloc_slots[free_slot].owner = hb;
+	hg_last = &palloc_slots[free_slot];
 	return &palloc_slots[free_slot];
+}
+
+static inline struct hg_palloc *hg_get_palloc(struct hg_block *hb)
+{
+	struct hg_palloc *pl = hg_last;
+
+	if (pl && pl->owner == hb)
+		return pl;
+	return hg_palloc_lookup(hb);
 }
 
 /*
@@ -340,6 +379,7 @@ void hg_arena_destroy(struct hg_block *hb)
 	for (i = 0; i < HG_MAX_INSTANCES; i++)
 		if (palloc_slots[i].owner == hb)
 			memset(&palloc_slots[i], 0, sizeof(struct hg_palloc));
+	hg_last = NULL;
 
 	hg_large_destroy(hb);
 }
@@ -372,6 +412,7 @@ void hg_arena_child_init(struct hg_block *hb)
 	for (i = 0; i < HG_MAX_INSTANCES; i++)
 		if (palloc_slots[i].owner == hb)
 			memset(&palloc_slots[i], 0, sizeof(struct hg_palloc));
+	hg_last = NULL;
 }
 
 unsigned int hg_cell_total_size(unsigned char cls)

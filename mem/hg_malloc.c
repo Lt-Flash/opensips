@@ -184,7 +184,8 @@ static int hg_range_is_huge(unsigned long addr)
 }
 
 /*
- * Keep the arena out of core dumps.
+ * Keep the arena out of core dumps - unless someone is trying to debug the
+ * allocator, in which case the arena is the only thing worth having.
  *
  * HG_MALLOC pre-faults and mlocks its whole reservation, so unlike the
  * lazily-faulted F_MALLOC/Q_MALLOC pools every page is resident - a
@@ -194,12 +195,34 @@ static int hg_range_is_huge(unsigned long addr)
  * enough page-cache churn to push a busy box into reclaim, and it buries
  * the actually-useful stack/heap in gigabytes of allocator slab.
  *
+ * The cost of that default only became clear when a core was actually needed:
+ * VM_DONTDUMP wins over coredump_filter, so no filter setting can bring the
+ * arena back, and every core taken during the 2026-08 crash investigation had
+ * "Cannot access memory" where shm_block should be. The free lists, the class
+ * counters, the cell headers - the entire state that decides whether a crash
+ * was corruption or a race - are all inside the region being skipped.
+ *
+ * So it is opt-in: set HG_DUMP_ARENA=1 in the environment (a systemd
+ * Environment= line is enough) and the arena is dumped. Sized deliberately as
+ * an environment variable rather than a config parameter, because it must take
+ * effect during allocator init, long before the config file is parsed.
+ *
  * Best-effort: MADV_DONTDUMP is Linux 3.4+, and failure is harmless
  * (bigger cores, nothing incorrect), so the return value is ignored.
  */
 static void hg_exclude_from_core(void *base, unsigned long size)
 {
 #ifdef MADV_DONTDUMP
+	const char *want = getenv("HG_DUMP_ARENA");
+
+	if (want && *want && *want != '0') {
+		/* explicit, not merely "leave the default alone" - the mapping
+		 * may have inherited VM_DONTDUMP from a previous madvise on an
+		 * overlapping range */
+		madvise(base, size, MADV_DODUMP);
+		return;
+	}
+
 	madvise(base, size, MADV_DONTDUMP);
 #endif
 }

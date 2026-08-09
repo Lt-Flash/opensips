@@ -347,8 +347,18 @@ unsigned long hg_large_frag_size_at(const void *frag);
  *                   "unsigned long (*shm_frag_size)(void *)" function pointer
  *                   next to fm_/qm_/hp_/parallel_frag_size(), so its signature
  *                   belongs to an interface we do not own and cannot grow an
- *                   hb parameter. It walks a registry of live arenas instead -
- *                   at most a handful, and never on the alloc/free fast path.
+ *                   hb parameter. It walks a registry of live arenas instead.
+ *
+ *                   This IS on the free fast path, contrary to what this
+ *                   comment used to claim: _shm_free() calls shm_frag_size()
+ *                   unconditionally on every free (mem/shm_mem.h), so every
+ *                   shm_free walks the registry. Measured anyway, three
+ *                   alternating pairs at 800 cps on the bench harness:
+ *                   2.747% allocator self-time without the checks, 2.807%
+ *                   with, against a within-arm spread of ~0.2pp. The cost is
+ *                   below the noise floor, so the registry stays a plain
+ *                   linear walk - a cache here would be unmeasurable
+ *                   complexity. Revisit only if HG_ARENA_REG_MAX grows.
  *
  * Both are advisory: they turn "dereference and die" into "decline and carry
  * on". They do not make a bad pointer good.

@@ -119,7 +119,25 @@ static int  pc_shtag_cid;              /* parsed tag cluster                 */
 #define PCACHE_PULL_RPL     3
 
 #define PCACHE_PULL_SLOTS      64     /* concurrent in-flight pulls        */
-#define PCACHE_PULL_MAX_VAL    8192   /* value size a pull will carry      */
+/* Defaults for the pull_max_value / pull_max_key modparams below. Sized from
+ * measurement rather than round numbers: the live cachedb_perf collections on
+ * the billing gateways hold values of 1-20 bytes under keys of at most 33, and
+ * sql_cacher's are ~70 bytes. 512/128 is roughly 25x and 4x that headroom.
+ *
+ * dns_cache is the deliberate exception - it serialises whole record sets and
+ * runs to several KB with no real bound - which is exactly why these are
+ * configurable instead of constants. A dns_cache deployment raises
+ * pull_max_value and accepts a larger slot (hence fewer slots for the same
+ * memory); everything above the cap already degrades through the existing
+ * PCACHE_FOUND_OVERSIZE path, so the cost is "not pulled cross-node", never a
+ * wrong answer. */
+#define PCACHE_PULL_MAX_VAL_DEF  512
+#define PCACHE_PULL_MAX_KEY_DEF  128
+/* Hard ceilings for the runtime caps below. They stay compile-time because
+ * three per-call scratch buffers are stack arrays and the negative-cache slot
+ * embeds a key inline - a modparam able to grow those without bound would
+ * trade a queue limit for a stack overflow. */
+#define PCACHE_PULL_MAX_VAL    8192
 #define PCACHE_PULL_MAX_KEY    256
 #define PCACHE_NEG_SLOTS       256    /* direct-mapped negative cache      */
 /* how long past its deadline a woken slot is left for its caller to come
@@ -131,6 +149,11 @@ static int  pc_shtag_cid;              /* parsed tag cluster                 */
 #define PCACHE_PEER_FRESH_S    300
 #define CL_MAX_NODE_ID         256    /* the cluster stack's design cap    */
 static char *pull_transport_str;       /* "bin" (default) | "clctr"          */
+static int   pull_max_value  = PCACHE_PULL_MAX_VAL_DEF;
+static int   pull_max_key    = PCACHE_PULL_MAX_KEY_DEF;
+/* byte offsets into a slot, computed once from the caps above - the key and
+ * value buffers are no longer fixed members, so slots are sized at init */
+static int   pull_slot_sz;
 static int   pull_timeout_ms = 50;     /* how long a miss waits for peers    */
 static char *replicate_collections;    /* CSV opt-in; nothing pulls by default */
 static int   pull_ready;               /* transport up AND a collection opted in */
@@ -188,12 +211,20 @@ struct pcache_pull_slot {
 	int          partial;            /* more peers than the snapshot held */
 	unsigned int expires;            /* ABSOLUTE, as the owner holds it   */
 	unsigned int vlen;
-	char         key[PCACHE_PULL_MAX_KEY];
 	int          klen;
 	char         col[64];
 	int          collen;
-	char         val[PCACHE_PULL_MAX_VAL];
+	/* key[pull_max_key] then val[pull_max_value] follow this header; reach
+	 * them with pull_slot_key()/pull_slot_val(). Kept as a trailing blob
+	 * rather than two fixed arrays so the caps can be configured without
+	 * every slot paying for the largest value anyone might ever store. */
+	char         buf[];
 };
+
+#define pull_slot_key(sl)  ((sl)->buf)
+#define pull_slot_val(sl)  ((sl)->buf + pull_max_key)
+#define pull_slot_at(i)    ((struct pcache_pull_slot *)((char *)pull_slots \
+                            + (size_t)(i) * pull_slot_sz))
 static struct pcache_pull_slot *pull_slots;
 static gen_lock_t *pull_lock;
 static unsigned int *pull_next_id;     /* shm: ids must be unique per node  */
@@ -450,6 +481,8 @@ static const param_export_t params[] = {
 	{ "pull_timeout_ms",     INT_PARAM, &pull_timeout_ms },
 	{ "pull_negative_ms",    INT_PARAM, &pull_negative_ms },
 	{ "pull_on_miss",        INT_PARAM, &pull_on_miss },
+	{ "pull_max_value",      INT_PARAM, &pull_max_value },
+	{ "pull_max_key",        INT_PARAM, &pull_max_key },
 	{ "replicate_collections", STR_PARAM, &replicate_collections },
 	{0,0,0}
 };
@@ -545,7 +578,7 @@ static unsigned long smf_pulls_in_flight(void *ctx)
 		return 0;
 	lock_get(pull_lock);
 	for (k = 0; k < PCACHE_PULL_SLOTS; k++)
-		if (pull_slots[k].id)
+		if (pull_slot_at(k)->id)
 			busy++;
 	lock_release(pull_lock);
 	return busy;
@@ -915,7 +948,7 @@ static mi_response_t *mi_perf_stats(str *col_s)
 
 			lock_get(pull_lock);
 			for (k = 0; k < PCACHE_PULL_SLOTS; k++)
-				if (pull_slots[k].id)
+				if (pull_slot_at(k)->id)
 					busy++;
 			lock_release(pull_lock);
 			if (add_mi_number(clobj, MI_SSTR("pulls_in_flight"), busy) < 0 ||
@@ -1673,7 +1706,7 @@ static void pcache_neg_add(pcache_col_t *col, const str *key)
 	unsigned int h;
 
 	if (!neg_slots || pull_negative_ms <= 0 ||
-	        key->len > PCACHE_PULL_MAX_KEY || col->col_name.len > 63)
+	        key->len > pull_max_key || col->col_name.len > 63)
 		return;
 	h = neg_hash(col, key);
 	sl = &neg_slots[h % PCACHE_NEG_SLOTS];
@@ -1722,8 +1755,8 @@ static struct pcache_pull_slot *pull_slot_get(unsigned int id)
 	int i;
 
 	for (i = 0; i < PCACHE_PULL_SLOTS; i++)
-		if (pull_slots[i].id == id)
-			return &pull_slots[i];
+		if (pull_slot_at(i)->id == id)
+			return pull_slot_at(i);
 	return NULL;
 }
 
@@ -1816,10 +1849,10 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 
 	/* The key arrives from a peer and is echoed back in the reply, so it
 	 * is sized before anything else touches it.  A requester never asks
-	 * for more than PCACHE_PULL_MAX_KEY; anything longer is a peer that
+	 * for more than pull_max_key; anything longer is a peer that
 	 * is broken, of another version, or hostile, and answering it at all
 	 * would mean copying it into a fixed reply buffer. */
-	if (key->len <= 0 || key->len > PCACHE_PULL_MAX_KEY ||
+	if (key->len <= 0 || key->len > pull_max_key ||
 	        coll->len <= 0 || coll->len > 63) {
 		LM_ERR("pull request from node %d has a %d byte key in a %d byte "
 			"collection - out of range, ignored\n", src_node, key->len,
@@ -1871,7 +1904,7 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 	 * demonstrably holds it. */
 	budget = via_clctr
 		? CLCTR_MAX_PAYLOAD - (int)(PCACHE_CLCTR_RPL_HDR + key->len)
-		: PCACHE_PULL_MAX_VAL;
+		: pull_max_value;
 	if (val.len > budget) {
 		LM_DBG("pull: <%.*s> is %d bytes, over this transport's %d - "
 			"reporting held-but-unsendable\n", key->len, key->s, val.len,
@@ -1921,7 +1954,7 @@ static void pcache_pull_do_reply(int src_node, unsigned int id, str *key,
 	sl = pull_slot_get(id);
 	/* the echoed key must match the slot's, or this is an answer to a
 	 * request that has already been recycled */
-	if (!sl || sl->klen != key->len || memcmp(sl->key, key->s, key->len)) {
+	if (!sl || sl->klen != key->len || memcmp(pull_slot_key(sl), key->s, key->len)) {
 		lock_release(pull_lock);
 		LM_DBG("late or unmatched pull reply (id %u) from node %d\n",
 			id, src_node);
@@ -1963,8 +1996,8 @@ static void pcache_pull_do_reply(int src_node, unsigned int id, str *key,
 		/* someone HAS it - so the key is not absent, whatever the rest of
 		 * the cluster says.  Not a negative, and not a value either. */
 		sl->oversize = 1;
-	} else if (!sl->done && val->len <= PCACHE_PULL_MAX_VAL) {
-		memcpy(sl->val, val->s, val->len);
+	} else if (!sl->done && val->len <= pull_max_value) {
+		memcpy(pull_slot_val(sl), val->s, val->len);
 		sl->vlen = val->len;
 		/* back to an absolute deadline on our own clock */
 		sl->expires = ttl_left ? get_ticks() + (unsigned int)ttl_left : 0;
@@ -2022,7 +2055,7 @@ static void pcache_pull_reap(utime_t ticks, void *param)
 
 	lock_get(pull_lock);
 	for (i = 0; i < PCACHE_PULL_SLOTS; i++) {
-		struct pcache_pull_slot *sl = &pull_slots[i];
+		struct pcache_pull_slot *sl = pull_slot_at(i);
 
 		if (!sl->id || now <= sl->deadline)
 			continue;
@@ -2155,7 +2188,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 	int ids[CL_MAX_NODE_ID], nmembers, i, truncated = 0;
 	unsigned int gen = 0, id;
 
-	if (!pcache_pull_enabled(col) || key->len > PCACHE_PULL_MAX_KEY ||
+	if (!pcache_pull_enabled(col) || key->len > pull_max_key ||
 	        col->col_name.len > 63)
 		return -1;
 	if (pcache_neg_check(col, key)) {
@@ -2186,8 +2219,8 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 
 	lock_get(pull_lock);
 	for (i = 0; i < PCACHE_PULL_SLOTS; i++)
-		if (!pull_slots[i].id) {
-			sl = &pull_slots[i];
+		if (!pull_slot_at(i)->id) {
+			sl = pull_slot_at(i);
 			break;
 		}
 	if (!sl) {
@@ -2220,7 +2253,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 	/* one node was asked, so one answer settles it */
 	sl->expect   = hint_node > 0 ? 1 : nmembers;
 	sl->deadline = get_uticks() + (utime_t)pull_timeout_ms * 1000;
-	memcpy(sl->key, key->s, key->len);
+	memcpy(pull_slot_key(sl), key->s, key->len);
 	sl->klen = key->len;
 	memcpy(sl->col, col->col_name.s, col->col_name.len);
 	sl->collen = col->col_name.len;
@@ -2309,7 +2342,7 @@ static int pcache_pull_finish(pcache_col_t *col, const str *key,
 	while (read(sl->efd, &drain, sizeof drain) == (ssize_t)sizeof drain)
 		;
 	if (sl->done && sl->vlen <= outlen) {
-		memcpy(out, sl->val, sl->vlen);
+		memcpy(out, pull_slot_val(sl), sl->vlen);
 		*vlen = sl->vlen;
 		exp = sl->expires;
 		if (expires)
@@ -4150,7 +4183,26 @@ static int mod_init(void)
 			LM_ERR("pull_timeout_ms must be within 1..5000\n");
 			return -1;
 		} else {
-			pull_slots = shm_malloc(PCACHE_PULL_SLOTS * sizeof *pull_slots);
+			if (pull_max_value < 1 || pull_max_value > PCACHE_PULL_MAX_VAL) {
+				LM_WARN("pull_max_value %d out of range 1..%d - clamping\n",
+					pull_max_value, PCACHE_PULL_MAX_VAL);
+				pull_max_value = pull_max_value < 1
+					? PCACHE_PULL_MAX_VAL_DEF : PCACHE_PULL_MAX_VAL;
+			}
+			if (pull_max_key < 1 || pull_max_key > PCACHE_PULL_MAX_KEY) {
+				LM_WARN("pull_max_key %d out of range 1..%d - clamping\n",
+					pull_max_key, PCACHE_PULL_MAX_KEY);
+				pull_max_key = pull_max_key < 1
+					? PCACHE_PULL_MAX_KEY_DEF : PCACHE_PULL_MAX_KEY;
+			}
+			pull_slot_sz = (int)sizeof(struct pcache_pull_slot)
+				+ pull_max_key + pull_max_value;
+			LM_INFO("cross-node pull: %d slots x %d bytes "
+				"(key %d, value %d) = %d KB of shm\n",
+				PCACHE_PULL_SLOTS, pull_slot_sz, pull_max_key,
+				pull_max_value,
+				(PCACHE_PULL_SLOTS * pull_slot_sz + 1023) / 1024);
+			pull_slots = shm_malloc((size_t)PCACHE_PULL_SLOTS * pull_slot_sz);
 			pull_next_id = shm_malloc(sizeof *pull_next_id);
 			pull_stats = shm_malloc(PULL_ST_MAX * sizeof *pull_stats);
 			peer_stats = shm_malloc((CL_MAX_NODE_ID + 1) * sizeof *peer_stats);
@@ -4160,7 +4212,7 @@ static int mod_init(void)
 				LM_ERR("no shm for the cross-node pull state\n");
 				return -1;
 			}
-			memset(pull_slots, 0, PCACHE_PULL_SLOTS * sizeof *pull_slots);
+			memset(pull_slots, 0, (size_t)PCACHE_PULL_SLOTS * pull_slot_sz);
 			memset(peer_stats, 0,
 				(CL_MAX_NODE_ID + 1) * sizeof *peer_stats);
 			/* One eventfd per slot, created HERE - before the fork - so
@@ -4170,8 +4222,8 @@ static int mod_init(void)
 			 * able to wake the process that asked.  An fd created after
 			 * the fork exists only in its own process and could not. */
 			for (i = 0; i < PCACHE_PULL_SLOTS; i++) {
-				pull_slots[i].efd = eventfd(0, EFD_NONBLOCK);
-				if (pull_slots[i].efd < 0) {
+				pull_slot_at(i)->efd = eventfd(0, EFD_NONBLOCK);
+				if (pull_slot_at(i)->efd < 0) {
 					LM_ERR("cannot create the pull wakeup fds: %s\n",
 						strerror(errno));
 					return -1;
@@ -4412,8 +4464,8 @@ static void mod_destroy(void)
 		int i;
 
 		for (i = 0; i < PCACHE_PULL_SLOTS; i++)
-			if (pull_slots[i].efd >= 0)
-				close(pull_slots[i].efd);
+			if (pull_slot_at(i)->efd >= 0)
+				close(pull_slot_at(i)->efd);
 		shm_free(pull_slots);
 		pull_slots = NULL;
 	}

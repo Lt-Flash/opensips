@@ -41,7 +41,12 @@
 #include <sys/eventfd.h>
 #include <poll.h>
 #include "../clusterer/api.h"
+#ifdef CLUSTERER_CTRL_SUPPORT
+/* Optional at build time: the controller offers an alternative (encrypted
+ * multicast) transport for pulls, but cachedb_perf must never require it.
+ * Without this flag every pull and sync rides the clusterer's bin links. */
 #include "../clusterer_controller/api.h"
+#endif
 #include "pull_api.h"
 
 #include "cachedb_perf.h"
@@ -163,9 +168,12 @@ static int   pull_ready;               /* transport up AND a collection opted in
  * regardless of cluster size, and it is encrypted - which the BIN links
  * are not.  Everything above the transport is identical; only how a
  * request leaves and a reply comes back changes. */
+#ifdef CLUSTERER_CTRL_SUPPORT
 static clctr_api_t clctr_api;
-static int  pull_via_clctr;
 static str  pull_channel = str_init("cdbperf-pull");
+#endif
+/* stays 0 for the whole run when the controller is not compiled in */
+static int  pull_via_clctr;
 
 /* flat wire format for the controller plane, which carries bytes rather
  * than the BIN push/pop stream.  All integers network order.
@@ -992,6 +1000,7 @@ static mi_response_t *mi_perf_stats(str *col_s)
 			 * reader cannot tell which box they are looking at.  It is
 			 * also the fastest way to spot the failure that matters:
 			 * a node resolving its own IP onto the wrong interface. */
+#ifdef CLUSTERER_CTRL_SUPPORT
 			if (pull_via_clctr && clctr_api.get_my_ip) {
 				const char *mip = NULL, *mif = NULL, *msrc = NULL;
 
@@ -1005,6 +1014,7 @@ static mi_response_t *mi_perf_stats(str *col_s)
 						goto err;
 				}
 			}
+#endif
 
 			list = cluster_ready ?
 				clusterer_api.get_nodes(sync_cluster_id) : NULL;
@@ -1770,6 +1780,7 @@ static struct pcache_pull_slot *pull_slot_get(unsigned int id)
 static void pcache_pull_send_rpl(int dst_node, unsigned int id, const str *key,
 		int found, int ttl, const str *val, int via_clctr)
 {
+#ifdef CLUSTERER_CTRL_SUPPORT
 	if (via_clctr) {
 		char buf[CLCTR_MAX_PAYLOAD];
 		str pl;
@@ -1810,6 +1821,7 @@ static void pcache_pull_send_rpl(int dst_node, unsigned int id, const str *key,
 			__sync_fetch_and_add(&pull_stats[PULL_ST_SERVED], 1);
 		return;
 	}
+#endif
 
 	{
 		bin_packet_t out;
@@ -1902,9 +1914,13 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 	 * it.  Say "I have it but cannot send it" rather than "not here":
 	 * the requester must not conclude the key is absent from a node that
 	 * demonstrably holds it. */
+#ifdef CLUSTERER_CTRL_SUPPORT
 	budget = via_clctr
 		? CLCTR_MAX_PAYLOAD - (int)(PCACHE_CLCTR_RPL_HDR + key->len)
 		: pull_max_value;
+#else
+	budget = pull_max_value;
+#endif
 	if (val.len > budget) {
 		LM_DBG("pull: <%.*s> is %d bytes, over this transport's %d - "
 			"reporting held-but-unsendable\n", key->len, key->s, val.len,
@@ -2100,6 +2116,7 @@ static void pcache_pull_reply(bin_packet_t *in)
 	pcache_pull_do_reply(in->src_id, id, &key, found, ttl_left, &val);
 }
 
+#ifdef CLUSTERER_CTRL_SUPPORT
 /* Controller-plane framing -> the shared paths.  Runs in the controller's
  * receiving process; the cache is in shm, so serving from here is fine. */
 static void pcache_clctr_recv(int cluster_id, int src_node_id, str *channel,
@@ -2156,6 +2173,7 @@ bad:
 	LM_ERR("malformed pull message from node %d on <%.*s>\n", src_node_id,
 		channel->len, channel->s);
 }
+#endif
 
 /* ---- asynchronous face -------------------------------------------------
  *
@@ -2260,6 +2278,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 	lock_release(pull_lock);
 
 	__sync_fetch_and_add(&pull_stats[PULL_ST_REQUESTED], 1);
+#ifdef CLUSTERER_CTRL_SUPPORT
 	if (pull_via_clctr) {
 		char buf[CLCTR_MAX_PAYLOAD];
 		str pl;
@@ -2292,7 +2311,9 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 		        : clctr_api.send_mcast(sync_cluster_id, &pull_channel,
 		              &pl, 0) < 0)
 			LM_DBG("pull request could not be sent\n");
-	} else {
+	} else
+#endif
+	{
 		if (bin_init(&packet, &pcache_sync_cap, PCACHE_PULL_REQ,
 		        PCACHE_SYNC_VERSION, 0) < 0)
 			goto fail;
@@ -4160,20 +4181,27 @@ static int mod_init(void)
 			return -1;
 		}
 		if (use_clctr) {
-			/* An explicit transport choice: if the controller is not
-			 * there, fail rather than quietly using the other one. */
+			/* The controller is optional at build time AND at run time.
+			 * An explicit clctr choice this deployment cannot honour
+			 * degrades to the bin transport - or to no pull at all if
+			 * the clusterer is missing too, which the cluster_ready
+			 * check below already handles.  Loudly, but the cache
+			 * itself is never held hostage by its cluster plane. */
+#ifdef CLUSTERER_CTRL_SUPPORT
 			if (load_clctr_api(&clctr_api) < 0) {
-				LM_ERR("pull_transport 'clctr' needs clusterer_controller "
-					"loaded before cachedb_perf\n");
-				return -1;
-			}
-			if (clctr_api.register_channel(&pull_channel,
+				LM_WARN("pull_transport 'clctr' but clusterer_controller "
+					"is not loaded - falling back to 'bin'\n");
+			} else if (clctr_api.register_channel(&pull_channel,
 			        pcache_clctr_recv) < 0) {
-				LM_ERR("cannot register the pull channel with "
-					"clusterer_controller\n");
-				return -1;
+				LM_WARN("cannot register the pull channel with "
+					"clusterer_controller - falling back to 'bin'\n");
+			} else {
+				pull_via_clctr = 1;
 			}
-			pull_via_clctr = 1;
+#else
+			LM_WARN("pull_transport 'clctr' but this build carries no "
+				"clusterer_controller support - falling back to 'bin'\n");
+#endif
 		}
 		if (!cluster_ready) {
 			LM_WARN("replicate_collections is set but the cluster is not "

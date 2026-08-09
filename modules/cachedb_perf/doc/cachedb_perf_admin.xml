@@ -445,10 +445,19 @@ modparam("cachedb_perf", "replicate_collections", "th")
 		<title><varname>pull_transport</varname> (string)</title>
 		<para>
 		How cross-node pulls travel: <emphasis>bin</emphasis> (default)
-		uses the clusterer's BIN links.  <emphasis>clctr</emphasis> is
-		reserved for the clusterer_controller multicast plane and is not
-		implemented yet - configuring it fails at startup rather than
-		quietly falling back, since the choice is deliberate.
+		uses the clusterer's BIN links.  <emphasis>clctr</emphasis> rides
+		the clusterer_controller module's encrypted multicast plane
+		instead: one datagram reaches every peer, and the payload is
+		encrypted, which the BIN links are not.
+		</para>
+		<para>
+		The controller is optional, at build time and at run time.  When
+		this build does not include clusterer_controller, or the module
+		is not loaded, <emphasis>clctr</emphasis> logs a warning and
+		degrades to <emphasis>bin</emphasis>; if the clusterer module is
+		unavailable too, cross-node pull and sync are disabled and the
+		cache runs purely node-local.  Missing cluster infrastructure
+		never stops the module from starting.
 		</para>
 		<para>
 		<emphasis>

@@ -324,9 +324,19 @@ Limitations
     allocator. Raise -m / -M.
   * NUMA-aware arena placement is not implemented - see CPU pinning
     above for why.
-  * The arena is excluded from core dumps (MADV_DONTDUMP). Since every
-    page is resident, including it would add the full arena size to every
-    worker's core file.
+  * The arena is excluded from core dumps (MADV_DONTDUMP) by default. Since
+    every page is resident, including it would add the full arena size to
+    every worker's core file.
+
+    Set HG_DUMP_ARENA=1 in the environment to include it instead. Needed
+    whenever the allocator itself is under suspicion: VM_DONTDUMP overrides
+    coredump_filter, so no filter value can recover the arena, and without it
+    a core has no free lists, no class counters and no cell headers - gdb
+    simply reports "Cannot access memory" for shm_block. It is an environment
+    variable rather than a config parameter because it must apply during
+    allocator init, before the config file is read. Budget the full arena
+    size per crashing worker, and remember coredump_filter must also carry
+    bit 6 (shared huge pages, 0x40) - the kernel default 0x33 does not.
 
 
 Testing

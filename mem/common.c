@@ -69,7 +69,15 @@ int parse_mm(const char *mm_name, enum osips_mm *mm)
 		return 0;
 	}
 
-	if (!strcasecmp(mm_name, "HG_MALLOC")) {
+	/* Both spellings select the same allocator.  The binary names ITSELF
+	 * with the generation suffix (mm_str(), opensips -V), so a log or a -V
+	 * paste says which arena is running; but the plain name has to keep
+	 * selecting it, because every /etc/default/opensips in the fleet passes
+	 * "-a HG_MALLOC" and swapping a binary must not require editing the
+	 * sizing file in lockstep - nor break the rollback in the other
+	 * direction.  See mem/hg_version.h. */
+	if (!strcasecmp(mm_name, "HG_MALLOC") ||
+	    !strcasecmp(mm_name, HG_MALLOC_NAME)) {
 		*mm = MM_HG_MALLOC;
 		return 0;
 	}
@@ -95,7 +103,8 @@ int parse_mm(const char *mm_name, enum osips_mm *mm)
 		return 0;
 	}
 
-	if (!strcasecmp(mm_name, "HG_MALLOC_DBG")) {
+	if (!strcasecmp(mm_name, "HG_MALLOC_DBG") ||
+	    !strcasecmp(mm_name, HG_MALLOC_NAME "_DBG")) {
 		*mm = MM_HG_MALLOC_DBG;
 		return 0;
 	}

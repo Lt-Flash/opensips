@@ -106,7 +106,8 @@
 #endif
 
 #ifdef HG_MALLOC
-#define HG_MALLOC_STR ", HG_MALLOC"
+#include "mem/hg_version.h"
+#define HG_MALLOC_STR ", " HG_MALLOC_NAME
 #else
 #define HG_MALLOC_STR ""
 #endif

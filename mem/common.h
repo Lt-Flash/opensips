@@ -85,6 +85,11 @@ enum osips_mm {
 #include "hg_malloc.h"
 #endif
 
+/* the allocator's own name for itself; see mem/hg_version.h.  Included
+ * unconditionally so that mm_str() below spells MM_HG_MALLOC the same way in
+ * every build, including the ones that did not compile the arena in. */
+#include "hg_version.h"
+
 extern int mem_warming_enabled;
 extern char *mem_warming_pattern_file;
 extern int mem_warming_percentage;
@@ -102,12 +107,12 @@ int parse_mm(const char *mm_name, enum osips_mm *mm);
 	 (mm) == MM_Q_MALLOC ? "Q_MALLOC" : \
 	 (mm) == MM_HP_MALLOC ? "HP_MALLOC" : \
 	 (mm) == MM_F_PARALLEL_MALLOC ? "F_PARALLEL_MALLOC" : \
-	 (mm) == MM_HG_MALLOC ? "HG_MALLOC" : \
+	 (mm) == MM_HG_MALLOC ? HG_MALLOC_NAME : \
 	 (mm) == MM_F_MALLOC_DBG ? "F_MALLOC_DBG" : \
 	 (mm) == MM_Q_MALLOC_DBG ? "Q_MALLOC_DBG" : \
 	 (mm) == MM_F_PARALLEL_MALLOC_DBG ? "F_PARALLEL_MALLOC_DBG" : \
 	 (mm) == MM_HP_MALLOC_DBG ? "HP_MALLOC_DBG" : \
-	 (mm) == MM_HG_MALLOC_DBG ? "HG_MALLOC_DBG" : "unknown")
+	 (mm) == MM_HG_MALLOC_DBG ? HG_MALLOC_NAME "_DBG" : "unknown")
 
 #ifdef DBG_MALLOC
 typedef void *(*osips_block_malloc_f) (void *block, unsigned long size,

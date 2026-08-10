@@ -249,179 +249,144 @@ static inline void **cell_next_slot(void *cell_start)
  * the pool.
  */
 /* global pool ops - hb->lock must be held. Both take/return cell_start. */
-/* --- the GC work queue: blocks whose cells are all free -------------- */
+/* --- shared free cells, held per block and graded by fullness ---------- */
 
-static inline void drained_push(struct hg_block *hb, int c, struct hg_chunk *ch)
+/*
+ * Which fullness list a block belongs on, from its own free-cell count.
+ * Grade 0 is the FULLEST partial (fewest free cells), which is what a refill
+ * wants: draining the fullest block leaves the emptier ones alone to reach
+ * zero, instead of topping every block up a little.
+ */
+static inline unsigned int grade_of(const struct hg_chunk *ch)
 {
-	ch->fprev = NULL;
-	ch->fnext = hb->drained[c];
-	if (ch->fnext)
-		ch->fnext->fprev = ch;
-	hb->drained[c] = ch;
-	hb->ndrained[c]++;
-	ch->flags |= HG_CHUNK_DRAINED;
+	unsigned int g;
+
+	if (ch->in_gpool == 0)
+		return HG_GRADE_NONE;
+	if (ch->in_gpool >= ch->cells)
+		return HG_GRADE_DRAINED;
+	g = (ch->in_gpool * HG_GRADES) / ch->cells;
+	if (g >= HG_GRADES)
+		g = HG_GRADES - 1;
+	return g;
 }
 
-static inline void drained_remove(struct hg_block *hb, int c,
-                                  struct hg_chunk *ch)
+static inline void list_unlink(struct hg_block *hb, int c, struct hg_chunk *ch)
 {
+	struct hg_chunk **head;
+
+	if (ch->grade == HG_GRADE_NONE)
+		return;
+	head = (ch->grade == HG_GRADE_DRAINED) ? &hb->drained[c]
+	                                       : &hb->bucket[c][ch->grade];
 	if (ch->fprev)
 		ch->fprev->fnext = ch->fnext;
 	else
-		hb->drained[c] = ch->fnext;
+		*head = ch->fnext;
 	if (ch->fnext)
 		ch->fnext->fprev = ch->fprev;
 	ch->fnext = ch->fprev = NULL;
-	hb->ndrained[c]--;
-	ch->flags &= ~HG_CHUNK_DRAINED;
+	if (ch->grade == HG_GRADE_DRAINED) {
+		hb->ndrained[c]--;
+		ch->flags &= ~HG_CHUNK_DRAINED;
+	}
+	ch->grade = HG_GRADE_NONE;
+}
+
+static inline void list_link(struct hg_block *hb, int c, struct hg_chunk *ch,
+                             unsigned int g)
+{
+	struct hg_chunk **head;
+
+	if (g == HG_GRADE_NONE) {
+		ch->grade = HG_GRADE_NONE;
+		return;
+	}
+	head = (g == HG_GRADE_DRAINED) ? &hb->drained[c] : &hb->bucket[c][g];
+	ch->fprev = NULL;
+	ch->fnext = *head;
+	if (ch->fnext)
+		ch->fnext->fprev = ch;
+	*head = ch;
+	ch->grade = g;
+	if (g == HG_GRADE_DRAINED) {
+		hb->ndrained[c]++;
+		ch->flags |= HG_CHUNK_DRAINED;
+	}
+}
+
+/* move @ch to the list its current fullness calls for; a no-op when the grade
+ * has not changed, which is the common case - a block crosses a grade
+ * boundary far less often than it gains or loses a cell */
+static inline void block_regrade(struct hg_block *hb, int c,
+                                 struct hg_chunk *ch)
+{
+	unsigned int g = grade_of(ch);
+
+	if (g == ch->grade)
+		return;
+	list_unlink(hb, c, ch);
+	list_link(hb, c, ch, g);
 }
 
 /*
- * Attribute a cell to its block and move that block's global-pool count.
- *
- * This is the cache/block transition the whole reclaim design turns on. It is
- * O(1) - two shifts, a table byte and a mask (hg_buddy_block_of) - and it runs
- * only when a cell crosses between a thread's private cache and the global
- * pool, never on the private-LIFO fast path.
- *
- * Silently does nothing for a cell whose block cannot be resolved. That is not
- * laxity: cells carved before the buddy owned the arena do not exist, but a
- * cell from a multi-page run legitimately resolves to NULL, and a wild pointer
- * must not be allowed to increment some innocent block's counter towards a
- * false "wholly free".
+ * Resolve a cell to its block, and refuse anything that is not a class chunk
+ * of THIS class. The large tier allocates buddy blocks too, and those start
+ * with a struct hg_large_chunk - writing in_gpool there would land inside its
+ * first_frag pointer and corrupt the large heap. Only class cells reach here
+ * today, so this should never trip; it is present because the cost of being
+ * wrong is silent corruption of a different allocator tier.
  */
-static inline void block_gpool_delta(struct hg_block *hb, int c,
-                                     void *cell_start, int delta)
+static inline struct hg_chunk *cell_block(struct hg_block *hb, int c, void *p)
 {
-	struct hg_chunk *ch = hg_buddy_block_of(hb, cell_start);
+	struct hg_chunk *ch = hg_buddy_block_of(hb, p);
 
 	if (!ch)
-		return;
-	/*
-	 * Confirm the block really is a class chunk of THIS class before
-	 * writing to it. The large tier allocates buddy blocks too, and those
-	 * start with a struct hg_large_chunk - ch->in_gpool would land inside
-	 * its first_frag pointer and corrupt the large heap. Only class cells
-	 * reach the global pool today, so this should never trip; it is here
-	 * because the cost of being wrong is silent corruption of a different
-	 * allocator tier, and the check is one already-cached load.
-	 */
+		return NULL;
 	if (ch->cls != (unsigned int)c) {
 		LM_CRIT("%s: cell %p resolves to block %p of class %u, expected "
 			"class %d - not touching it\n",
-			hb->name, cell_start, (void *)ch, ch->cls, c);
-		return;
+			hb->name, p, (void *)ch, ch->cls, c);
+		return NULL;
 	}
-	if (delta > 0) {
-		if (ch->in_gpool >= ch->cells) {
-			LM_CRIT("%s: block %p already has all %u cells in the global "
-				"pool, refusing to count another\n",
-				hb->name, (void *)ch, ch->cells);
-			return;
-		}
-		ch->in_gpool++;
-		/* every cell of this block is now free and globally visible -
-		 * the one condition under which it can be handed back */
-		if (ch->in_gpool == ch->cells && !(ch->flags & HG_CHUNK_DRAINED))
-			drained_push(hb, c, ch);
-	} else {
-		if (ch->in_gpool == 0) {
-			LM_CRIT("%s: block %p has no cells in the global pool to "
-				"remove\n", hb->name, (void *)ch);
-			return;
-		}
-		ch->in_gpool--;
-		/* someone took a cell back out, so it is no longer whole */
-		if ((ch->flags & HG_CHUNK_DRAINED) && ch->in_gpool < ch->cells)
-			drained_remove(hb, c, ch);
-	}
+	return ch;
 }
 
-/* --- the GC: return blocks whose cells are all free ------------------- */
-
 /*
- * Hand every fully-drained block of class @c back to the buddy, except the
- * last HG_GC_KEEP, in ONE pass over that class's free list.
+ * Hand fully-drained blocks of class @c back to the buddy, keeping the last
+ * HG_GC_KEEP as hysteresis.
  *
- * The batching is the whole point. Detecting a drained block is O(1), but
- * reclaiming it is not: its cells are scattered through a singly-linked
- * global free list and every one has to come out. Doing that per block would
- * be a full list walk per reclaim - quadratic under exactly the churn this is
- * supposed to be cheap for. Accumulating drained blocks and walking once
- * makes the walk amortised across all of them.
- *
- * It stays event-driven rather than periodic, as the design requires: the
- * trigger is still a cache/block transition, only the payment is deferred to
- * the point where it is worth making.
- *
- * HG_GC_KEEP is the hysteresis. A class that oscillates between zero and one
- * free block would otherwise carve and return on every cycle; keeping one in
- * hand makes the common case free.
+ * With per-block free lists this is O(1) per block: every cell of a drained
+ * block is on that block's OWN list, so there is nothing to unlink from a
+ * shared structure - the list is simply discarded with the block. The
+ * previous shape had to walk the whole per-class free list pulling the
+ * block's cells out of it.
  *
  * hb->lock must be held.
  */
 static void gc_class(struct hg_block *hb, int c)
 {
-	struct hg_chunk *ch, *nx, *doomed = NULL;
-	void **pp, *cur;
-	unsigned int n = 0, freed = 0;
-	unsigned long cells_pulled = 0;
+	struct hg_chunk *ch;
+	unsigned int freed = 0;
 
-	/*
-	 * 1. Select everything except the HG_GC_KEEP most recently drained.
-	 *    Push is at the head, so those are exactly the first entries -
-	 *    keeping them is the hysteresis, and keeping the RECENT ones is
-	 *    the point: a class that just freed a block is the one most likely
-	 *    to want it back.
-	 */
-	for (ch = hb->drained[c]; ch; ch = ch->fnext) {
-		if (n++ < HG_GC_KEEP)
-			continue;
-		ch->flags |= HG_CHUNK_RECLAIMING;
-		freed++;                    /* reuse as "selected" for now */
-	}
-	if (!freed)
-		return;
-	freed = 0;
+	while (hb->ndrained[c] > HG_GC_KEEP) {
+		unsigned int ord;
+		unsigned long sz;
 
-	/* 2. one pass over the class free list, pulling the marked blocks'
-	 *    cells out of it */
-	pp = &hb->gpool[c];
-	cur = *pp;
-	while (cur) {
-		struct hg_chunk *owner = hg_buddy_block_of(hb, cur);
-		void *nxt = cell_next(cur);
+		/* take from the tail-most entry we can reach cheaply: the head is
+		 * the most recently drained, which is the one worth keeping */
+		ch = hb->drained[c];
+		while (ch->fnext)
+			ch = ch->fnext;
 
-		if (owner && (owner->flags & HG_CHUNK_RECLAIMING)) {
-			*pp = nxt;
-			hb->gpool_n[c]--;
-			cells_pulled++;
-		} else {
-			pp = cell_next_slot(cur);
-		}
-		cur = nxt;
-	}
+		list_unlink(hb, c, ch);
+		hb->gpool_n[c] -= ch->in_gpool;
+		ch->in_gpool = 0;
+		ch->free_head = NULL;
 
-	/* 3. return the blocks themselves. Every read of ch must happen before
-	 *    hg_buddy_free(), which immediately reuses the block's first bytes
-	 *    for its own free-list linkage. */
-	for (ch = hb->drained[c]; ch; ch = nx) {
-		nx = ch->fnext;
-		if (!(ch->flags & HG_CHUNK_RECLAIMING))
-			continue;
-		drained_remove(hb, c, ch);
-		ch->flags &= ~HG_CHUNK_RECLAIMING;
-		ch->fnext = doomed;         /* park it, the list links are free now */
-		doomed = ch;
-	}
-	for (ch = doomed; ch; ch = nx) {
-		unsigned int ord = ch->order;
-		unsigned long sz = HG_LEAF_SIZE << ord;
-
-		nx = ch->fnext;
 		/* out of the registry, or hg_slab_recycled() keeps counting a
 		 * capacity that no longer exists and the DBG walker reads a block
-		 * that now belongs to another class */
+		 * the buddy has since handed to another class */
 		if (ch->prev)
 			ch->prev->next = ch->next;
 		else
@@ -429,38 +394,85 @@ static void gc_class(struct hg_block *hb, int c)
 		if (ch->next)
 			ch->next->prev = ch->prev;
 		hb->nchunks--;
+
+		ord = ch->order;
+		sz = HG_LEAF_SIZE << ord;
 		hb->real_used -= sz;
 
+		/* every read of ch must precede this: the buddy immediately reuses
+		 * the block's first bytes for its own free-list linkage */
 		hg_buddy_free(hb, ch, ord);
 		freed++;
 	}
 
-	hb->gc_blocks_returned += freed;
-	hb->gc_passes++;
-	LM_DBG("%s gc class %d: returned %u blocks, pulled %lu cells from the "
-		"free list, %u drained kept\n",
-		hb->name, c, freed, cells_pulled, hb->ndrained[c]);
+	if (freed) {
+		hb->gc_blocks_returned += freed;
+		hb->gc_passes++;
+		LM_DBG("%s gc class %d: returned %u blocks, %u drained kept\n",
+			hb->name, c, freed, hb->ndrained[c]);
+	}
 }
 
+/* a cell becomes shared: onto its OWN block's free list */
 static inline void gpool_push(struct hg_block *hb, int c, void *cell_start)
 {
-	cell_set_next(cell_start, hb->gpool[c]);
-	hb->gpool[c] = cell_start;
+	struct hg_chunk *ch = cell_block(hb, c, cell_start);
+
+	if (!ch)
+		return;                     /* refused above, with a CRIT */
+	if (ch->in_gpool >= ch->cells) {
+		LM_CRIT("%s: block %p already has all %u cells free, refusing to "
+			"add another - this is a double free\n",
+			hb->name, (void *)ch, ch->cells);
+		return;
+	}
+	cell_set_next(cell_start, ch->free_head);
+	ch->free_head = cell_start;
+	ch->in_gpool++;
 	hb->gpool_n[c]++;
-	block_gpool_delta(hb, c, cell_start, +1);
+	block_regrade(hb, c, ch);
+
 	if (hb->ndrained[c] > HG_GC_KEEP)
 		gc_class(hb, c);
 }
 
+/*
+ * Take a shared cell, from the FULLEST partial block - the concentration the
+ * whole reclaim depends on. Scanning grades upward from 0 finds it in at most
+ * HG_GRADES pointer tests.
+ */
 static inline void *gpool_pop(struct hg_block *hb, int c)
 {
-	void *cell_start = hb->gpool[c];
+	struct hg_chunk *ch = NULL;
+	void *cell_start;
+	unsigned int g;
 
-	if (cell_start) {
-		hb->gpool[c] = cell_next(cell_start);
-		hb->gpool_n[c]--;
-		block_gpool_delta(hb, c, cell_start, -1);
+	for (g = 0; g < HG_GRADES; g++)
+		if (hb->bucket[c][g]) {
+			ch = hb->bucket[c][g];
+			break;
+		}
+	/* nothing partial - reuse a drained block rather than carve a fresh
+	 * one; it is already ours and already the right class */
+	if (!ch)
+		ch = hb->drained[c];
+	if (!ch)
+		return NULL;
+
+	cell_start = ch->free_head;
+	if (!cell_start) {
+		LM_CRIT("%s: block %p claims %u free cells but its list is empty - "
+			"dropping it from the pool\n",
+			hb->name, (void *)ch, ch->in_gpool);
+		hb->gpool_n[c] -= ch->in_gpool;
+		ch->in_gpool = 0;
+		block_regrade(hb, c, ch);
+		return NULL;
 	}
+	ch->free_head = cell_next(cell_start);
+	ch->in_gpool--;
+	hb->gpool_n[c]--;
+	block_regrade(hb, c, ch);
 	return cell_start;
 }
 
@@ -631,6 +643,8 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 	ch->in_gpool = 0;
 	ch->flags = 0;
 	ch->order = (unsigned int)ord;
+	ch->free_head = NULL;
+	ch->grade = HG_GRADE_NONE;
 	ch->fnext = NULL;
 	ch->fprev = NULL;
 	ch->cls = c;
@@ -1412,11 +1426,16 @@ static void hg_free_set_populate(struct hg_block *hb, struct hg_free_set *set)
 {
 	int c;
 	void *cur;
+	struct hg_chunk *ch;
 	struct hg_palloc *pl = hg_get_palloc(hb);
 
-	for (c = 0; c < HG_NCLASSES; c++) {
-		for (cur = hb->gpool[c]; cur; cur = cell_next(cur))
+	/* the shared free cells are per BLOCK now, so walk the registry rather
+	 * than one list per class - hb->chunks reaches every live block */
+	for (ch = hb->chunks; ch; ch = ch->next)
+		for (cur = ch->free_head; cur; cur = cell_next(cur))
 			hg_free_set_add(set, cur);
+
+	for (c = 0; c < HG_NCLASSES; c++) {
 		if (pl)
 			for (cur = pl->cls[c].free_head; cur; cur = cell_next(cur))
 				hg_free_set_add(set, cur);

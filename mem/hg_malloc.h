@@ -154,6 +154,16 @@ struct hg_lfrag;         /* opaque here, defined in hg_large.h */
  * the class from the CELL's own header byte rather than from the chunk, so a
  * page can host blocks of different classes with no fast-path change.
  */
+/*
+ * Fullness grades. Eight is the design's figure: enough that "fullest
+ * partial" is meaningfully sorted, few enough that a block changes grade
+ * rarely rather than on every cell, and that the scan for a source block is
+ * eight pointer tests.
+ */
+#define HG_GRADES         8
+#define HG_GRADE_NONE     0xffffffffu   /* no free cells, on no list */
+#define HG_GRADE_DRAINED  0xfffffffeu   /* every cell free, on drained[] */
+
 /* a block whose cells are ALL in the global pool - the GC's work queue */
 #define HG_CHUNK_DRAINED    (1u << 0)
 /* selected by this GC pass; its cells are being unlinked right now */
@@ -191,6 +201,24 @@ struct hg_chunk {
 	unsigned int in_gpool;
 	unsigned int flags;       /* HG_CHUNK_DRAINED / _RECLAIMING */
 	unsigned int order;       /* buddy order, so the GC can hand it back */
+
+	/*
+	 * This block's OWN free cells, and which fullness list it currently sits
+	 * on. The shared pool used to be one mixed list per class, so a 32-cell
+	 * refill skimmed cells from whichever blocks happened to be at its head
+	 * and topped every block up a little - measured, that left blocks
+	 * stalled at 88% drained and the GC with nothing to collect.
+	 *
+	 * Per block, a refill can instead take all 32 from ONE block, and the
+	 * fullness grading makes it the FULLEST partial - so that block is used
+	 * up while emptier ones are left alone to reach zero.
+	 *
+	 * This costs the fast path nothing: hg_cell_free() still pushes to the
+	 * thread-private TLS LIFO with no lock, and only the donation/refill
+	 * path - already under hb->lock, 1-3% of operations - touches this.
+	 */
+	void        *free_head;
+	unsigned int grade;       /* HG_GRADE_NONE / _DRAINED, or 0..HG_GRADES-1 */
 
 	/*
 	 * The list this block is currently on. Today that is only the per-class
@@ -307,8 +335,16 @@ struct hg_block {
 	unsigned int priv_max[HG_NCLASSES];
 	unsigned int priv_donate[HG_NCLASSES];
 	struct hg_region *regions;
-	void *gpool[HG_NCLASSES];       /* global free cells, per class */
-	unsigned int gpool_n[HG_NCLASSES];
+	/*
+	 * Shared free cells, per class, held as BLOCKS graded by fullness
+	 * rather than as one mixed cell list. bucket[c][0] holds the blocks
+	 * with the fewest free cells, so scanning from 0 up finds the fullest
+	 * partial in O(HG_GRADES) - the "concentration" the design requires.
+	 * A block with no free cells is on no list; one with every cell free is
+	 * on drained[] instead, which is the GC's queue.
+	 */
+	struct hg_chunk *bucket[HG_NCLASSES][HG_GRADES];
+	unsigned int gpool_n[HG_NCLASSES];   /* free cells of the class, total */
 	unsigned long lo, hi;           /* extent watermarks */
 
 	/* large-object tier (hg_large.c): list of independently-carved

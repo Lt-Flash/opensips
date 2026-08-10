@@ -764,7 +764,15 @@ unsigned long hg_slab_recycled(struct hg_block *hb);
  * private memory that no other process can read.  The shm arena has no such
  * problem: there is exactly one, and it is shared.
  */
+#ifdef HG_MALLOC
 int hg_register_stats(void);
+#else
+/* No-op without the allocator, so callers (statistics.c) need no #ifdef of
+ * their own. Building with -DHG_MALLOC removed previously failed at link with
+ * an undefined reference here - the definition lives in mem/hg_arena.c, which
+ * is entirely inside "#ifdef HG_MALLOC". */
+static inline int hg_register_stats(void) { return 0; }
+#endif
 
 /* total cell-slot bytes handed out across every process */
 static inline unsigned long hg_cell_live(struct hg_block *hb)

@@ -1938,13 +1938,8 @@ static void pcache_pull_send_rpl(int dst_node, unsigned int id, const str *key,
 		}
 		pl.s = buf;
 		pl.len = n;
-		/* RELIABLE: one ACK per reply, resent while unacked.  Before the
-		 * late-store support this would have been pointless - a reply
-		 * resent past the waiter's timeout hit a freed slot and was
-		 * dropped.  Now it lands in the orphaned slot and converges the
-		 * cache, so a lost datagram no longer wastes the serve. */
 		if (clctr_api.send_ucast(sync_cluster_id, dst_node, &pull_channel,
-		        &pl, CLCTR_SEND_RELIABLE) < 0)
+		        &pl, 0) < 0)
 			pull_send_failed("a reply did not get through", dst_node);
 		else if (found == PCACHE_FOUND_YES)
 			__sync_fetch_and_add(&pull_stats[PULL_ST_SERVED], 1);
@@ -2541,19 +2536,11 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 		pl.len = n;
 		/* one packet, whatever the cluster size - and encrypted, which
 		 * the BIN links are not */
-		/* RELIABLE on the question too: a request retried past the 50 ms
-		 * window used to be a waste (its answer would hit a freed slot),
-		 * so the request relied on "the next miss asks again" - which is
-		 * exactly the non-convergence the orphan slots ended.  A late
-		 * question now produces a late answer that gets stored.  The
-		 * retries are bounded (consumer_retries x consumer_retry_ms) and
-		 * duplicates are harmless: the answered[] bitmap ignores repeated
-		 * verdicts and a second value reply finds done=1 or no slot. */
 		if (hint_node > 0
 		        ? clctr_api.send_ucast(sync_cluster_id, hint_node,
-		              &pull_channel, &pl, CLCTR_SEND_RELIABLE) < 0
+		              &pull_channel, &pl, 0) < 0
 		        : clctr_api.send_mcast(sync_cluster_id, &pull_channel,
-		              &pl, CLCTR_SEND_RELIABLE) < 0)
+		              &pl, 0) < 0)
 			pull_send_failed("a request could not be sent", hint_node);
 	} else
 #endif

@@ -63,14 +63,8 @@
  * Costs one ACK per recipient, so a reliable send to the whole cluster is
  * N-1 packets back where a plain one was nothing - deliberately opt-in, and
  * deliberately per send rather than per channel: most consumer traffic is
- * better served by being idempotent and retried by its own logic.
- *
- * (The cross-node cache fetch originally asked for nothing here on exactly
- * that argument - and stopped once it learned to store answers that arrive
- * after the asker gave up.  From then on a retried datagram is never wasted:
- * a late answer converges the cache instead of hitting a freed slot.  Its
- * duplicates were already harmless.  History kept because the trade-off is
- * real for any consumer whose late deliveries are worthless.) */
+ * better served by being idempotent and retried by its own logic, which is
+ * how the cross-node cache fetch works and why it asks for nothing here. */
 #define CLCTR_SEND_RELIABLE  (1 << 1)
 
 /* limits a consumer can rely on */

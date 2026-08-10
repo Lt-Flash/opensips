@@ -211,6 +211,17 @@ struct hg_block {
 	/* upper bound on one chunk, derived from the arena size at init -
 	 * see chunk_size_for() in hg_arena.c */
 	unsigned int chunk_max;
+	/* Per-THREAD private free-cache bound, in CELLS, one entry per class,
+	 * derived from the arena size at init - see private_caps_init() in
+	 * hg_arena.c.  A flat cell count cannot bound anything, because the
+	 * same count means 16 KB in class 64 and 16 MB in class 65536; these
+	 * are the byte budget expressed per class.  priv_max may legitimately
+	 * be 0, which means "never cache this class privately" - the class is
+	 * large enough that one cell already exceeds a thread's whole share,
+	 * and such allocations are rare enough that the shared pool is the
+	 * right home for them. */
+	unsigned int priv_max[HG_NCLASSES];
+	unsigned int priv_donate[HG_NCLASSES];
 	struct hg_region *regions;
 	void *gpool[HG_NCLASSES];       /* global free cells, per class */
 	unsigned int gpool_n[HG_NCLASSES];

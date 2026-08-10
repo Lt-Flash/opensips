@@ -27,6 +27,7 @@
 
 #include "hg_malloc.h"
 #include "hg_arena.h"
+#include "hg_buddy.h"
 #include "hg_large.h"
 #include "../dprint.h"
 #include "../globals.h"
@@ -256,7 +257,26 @@ static inline void *gpool_pop(struct hg_block *hb, int c)
 void *hg_chunk_backing(struct hg_block *hb, unsigned long size)
 {
 	unsigned long asz = (size + 63) & ~63UL;   /* keep 64-aligned */
-	unsigned long off = __atomic_fetch_add(&hb->hoff, asz, __ATOMIC_RELAXED);
+	unsigned long off;
+
+	/*
+	 * Init only, once the buddy owns the arena.
+	 *
+	 * hg_buddy_init() reserves every leaf below hoff and publishes the rest
+	 * as free. A bump AFTER that returns memory the buddy already considers
+	 * free, so the same bytes get handed to two owners - silently, and with
+	 * a delay before the corruption shows. There is exactly one legitimate
+	 * caller left (the buddy carving its own metadata, before it is ready),
+	 * so anything else is a bug and says so rather than corrupting.
+	 */
+	if (hb->buddy_ready) {
+		LM_CRIT("%s: bump carve of %lu bytes after the buddy owns the "
+			"arena - refusing, this would double-allocate\n",
+			hb->name, size);
+		return NULL;
+	}
+
+	off = __atomic_fetch_add(&hb->hoff, asz, __ATOMIC_RELAXED);
 
 	if (off + asz <= hb->hsize)
 		return hb->hbase + off;
@@ -346,11 +366,28 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 	struct hg_chunk *ch;
 	unsigned int size = chunk_size_for(hb, c), i;
 	char *cells;
+	int ord;
 
-	ch = hg_chunk_backing(hb, size);
+	/*
+	 * Chunks are buddy blocks now, so the size rounds UP to an order. That
+	 * is not waste: a chunk is a bag of cells, so a bigger block simply
+	 * holds more of them, and in exchange the block is naturally aligned
+	 * and - once the GC lands - returnable. The bump allocator it replaces
+	 * could never give any of that back.
+	 */
+	ord = hg_buddy_order_for(hb, size);
+	if (ord < 0) {
+		LM_ERR("%s: class %d wants a %u byte chunk, larger than the %lu byte "
+			"page the buddy tops out at\n", hb->name, c, size,
+			(unsigned long)hb->hps);
+		return -1;
+	}
+	size = (unsigned int)(HG_LEAF_SIZE << ord);
+	ch = hg_buddy_alloc(hb, (unsigned int)ord);
 	if (!ch) {
 		LM_ERR("%s: no more HG_MALLOC arena memory for a %u byte chunk "
-			"(class %d) - increase the arena size\n", hb->name, size, c);
+			"(class %d, order %d) - increase the arena size\n",
+			hb->name, size, c, ord);
 		return -1;
 	}
 
@@ -621,21 +658,47 @@ int hg_arena_init(struct hg_block *hb, unsigned long hdr_size)
 	LM_DBG("%s arena ready: %d classes, %u B to %u B cells (header=%zu B)\n",
 		hb->name, HG_NCLASSES, cell_sizes[0], cell_sizes[HG_NCLASSES-1],
 		HG_CELL_HDR);
+
+	/*
+	 * Last, because it carves its metadata with the bump allocator and then
+	 * reserves everything below the resulting hoff. Anything that bump-carves
+	 * after this point would be handing out memory the buddy believes is
+	 * free, which is why hg_chunk_backing() refuses once buddy_ready is set.
+	 */
+	if (hg_buddy_init(hb) < 0)
+		return -1;
 	return 0;
 }
 
+/*
+ * NOTE: this has no callers anywhere in the tree - checked across all of
+ * modules/ and the core - and is kept only as a published arena API. It is
+ * routed through the buddy rather than the bump allocator regardless: left on
+ * the bump it would be a loaded gun, silently double-allocating the moment
+ * anyone did start calling it (see the guard in hg_chunk_backing()).
+ */
 void *hg_region_alloc(struct hg_block *hb, unsigned long size)
 {
 	struct hg_region *rg;
 	unsigned long need = size + sizeof(struct hg_region) + 64;
 	char *aligned;
+	int ord;
 
-	rg = hg_chunk_backing(hb, need);
+	lock_get(&hb->lock);
+	ord = hg_buddy_order_for(hb, need);
+	rg = ord < 0 ? NULL : hg_buddy_alloc(hb, (unsigned int)ord);
+	if (!rg && ord < 0)
+		rg = hg_buddy_alloc_run(hb,
+			(need + hb->hps - 1) >> hb->hps_shift);
+	lock_release(&hb->lock);
+
 	if (!rg) {
 		LM_ERR("%s: no more HG_MALLOC arena memory for a %lu byte "
 			"region\n", hb->name, need);
 		return NULL;
 	}
+	if (ord >= 0)
+		need = HG_LEAF_SIZE << ord;
 	rg->size = need;
 	aligned = (char *)(((unsigned long)rg + sizeof(struct hg_region) + 63)
 	                   & ~63UL);

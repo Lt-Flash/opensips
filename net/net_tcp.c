@@ -64,9 +64,6 @@
 #include "tcp_common.h"
 #include "tcp_conn.h"
 #include "tcp_conn_profile.h"
-#ifdef HG_MALLOC
-#include "../mem/hg_arena.h"
-#endif
 #include "trans.h"
 #include "net_tcp_dbg.h"
 
@@ -1247,9 +1244,26 @@ static void *tcp_thread_routine(void *arg)
 	/* Reactor operations stay in TCP main; IO threads only run read/write
 	 * callbacks and notify completion back to the main thread. */
 	while (1) {
-		/* ISOLATION: the hg_cache_flush_if_due() hook that lived here is
-		 * temporarily removed to determine whether it is the cause of the
-		 * glibc heap corruption seen at startup with a TCP listener. */
+#if defined(HG_MALLOC) && !defined(INLINE_ALLOC)
+		/*
+		 * Job boundary: no locks held, no job in flight. The allocator's
+		 * idle sweep cannot reach this thread by IPC - it waits on the
+		 * condition variable below rather than on a reactor - so it leaves
+		 * a generation counter and we act on it here.
+		 *
+		 * Declared locally rather than by including mem/hg_arena.h. That
+		 * include is what caused the glibc heap corruption this hook was
+		 * first shipped with: it drags in mem/hg_malloc.h, which #undefs
+		 * and redefines HG_ROUNDTO and pulls mem/common.h into this
+		 * translation unit, and thread_malloc/thread_free here are MACROS
+		 * whose expansion depends on what is in scope. Allocate with one
+		 * form and free with the other and libc's allocator reports an
+		 * "unaligned fastbin chunk" at startup. The network layer has no
+		 * business importing the allocator's internal headers for one
+		 * void(void) call.
+		 */
+		hg_cache_flush_if_due();
+#endif
 		cond_lock(&tcp_write_queue->cond);
 		while (!tcp_pool.stop && tcp_pool.task_head == NULL &&
 				tcp_write_queue->head == NULL)
@@ -1334,6 +1348,10 @@ done_job:
 
 	return NULL;
 }
+
+#if defined(HG_MALLOC) && !defined(INLINE_ALLOC)
+void hg_cache_flush_if_due(void);
+#endif
 
 static int tcp_pool_init(void)
 {

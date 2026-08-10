@@ -51,11 +51,21 @@ static const unsigned int cell_sizes[HG_NCLASSES] = {
  */
 #define HG_CELLS_PER_BLOCK 32
 /*
- * Drained blocks kept per class rather than returned. Pure hysteresis: a class
- * oscillating between zero and one free block would otherwise carve and return
- * on every cycle, paying a buddy split/merge for nothing.
+ * Drained blocks kept per class rather than returned.
+ *
+ * ZERO, deliberately, after measuring: with concentration in place a refill
+ * drives partial blocks to no free cells at all, so gpool_pop() falls back to
+ * the one drained block and un-drains it - and with a keep of 1 the queue
+ * could never reach the 2 entries the collector waited for. Reclaim went from
+ * 1 block returned to 0. The hysteresis was fighting the thing it sits in
+ * front of.
+ *
+ * Keeping none costs less than it appears: a returned block goes onto the
+ * buddy's free list at its own order, so carve_chunk() can take the very same
+ * block straight back with no split and no merge. The buddy IS the cache, and
+ * holding a block back from it only hides the memory.
  */
-#define HG_GC_KEEP 1
+#define HG_GC_KEEP 0
 #define HG_REFILL_BATCH   32             /* cells pulled from the global pool */
 
 /*
@@ -1316,8 +1326,20 @@ unsigned long hg_slab_recycled(struct hg_block *hb)
 	struct hg_chunk *ch;
 	unsigned long capacity = 0, live;
 
+	/*
+	 * Under the lock, which it did not need while chunks were immortal.
+	 * gc_class() now unlinks a chunk and immediately hands the block to
+	 * hg_buddy_free(), whose fl_push() overwrites the first 24 bytes -
+	 * next, prev, cls, cell_size. A reader walking this list lock-free
+	 * (every SHM_GET_RUSED, every stats scrape, from any process at any
+	 * time) would follow a ch->next that is now a free-list pointer or a
+	 * magic value. Reading stats must not be able to walk into a block the
+	 * allocator has already recycled.
+	 */
+	lock_get(&hb->lock);
 	for (ch = hb->chunks; ch; ch = ch->next)
 		capacity += (unsigned long)ch->cells * ch->cell_size;
+	lock_release(&hb->lock);
 
 	live = hg_cell_live(hb);
 	return capacity > live ? capacity - live : 0;

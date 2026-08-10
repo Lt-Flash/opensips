@@ -256,6 +256,13 @@ int hg_buddy_init(struct hg_block *hb)
 	}
 
 	hb->buddy_ready = 1;
+	/*
+	 * Reserve floor at 1/16 of the grid. A fraction rather than a constant
+	 * because the arenas differ by three orders of magnitude - 8 MB pkg to
+	 * 5 GB shm - and a fixed page count would be either meaningless on one
+	 * or most of the other.
+	 */
+	hb->reserve_floor = (hb->npages * hg_leaves_per_page(hb)) / 16;
 	LM_DBG("%s buddy: %lu pages, orders 0..%u (%lu B..%lu B), %lu B metadata "
 		"(%lu B/page, %.3f%%), %lu of %lu leaves free after reserving %lu\n",
 		hb->name, hb->npages, top, HG_LEAF_SIZE, HG_LEAF_SIZE << top,

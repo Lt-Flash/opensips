@@ -229,6 +229,17 @@ static void hg_cache_sweep(unsigned int ticks, void *param)
 {
 	int i;
 
+	/*
+	 * Publish the sweep to threads IPC cannot reach BEFORE dispatching to
+	 * the ones it can. TCP main's IO pool waits on a condition variable
+	 * rather than the reactor, so those threads never receive an RPC job;
+	 * they compare this counter at a job boundary instead
+	 * (hg_cache_flush_if_due()). Bumping it first means a thread that is
+	 * between jobs right now picks the sweep up immediately rather than
+	 * waiting for the next one.
+	 */
+	hg_sweep_gen++;
+
 	for (i = 0; i < counted_max_processes; i++) {
 		if (i == process_no) {
 			/* never RPC ourselves - see signal_pkg_status() */

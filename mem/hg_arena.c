@@ -553,6 +553,35 @@ static unsigned int cache_flush_locked(struct hg_block *hb,
  * each worker do its own (and call this inline for itself rather than sending
  * itself an IPC job to order against - see signal_pkg_status()).
  */
+/*
+ * Sweep generation. Bumped once per sweep by the dispatcher; a thread that
+ * cannot be reached by IPC compares its own last-seen value against it at a
+ * job boundary and flushes when they differ.
+ *
+ * This exists for exactly one caller: TCP main's IO pool. Those threads wait
+ * on a condition variable rather than the reactor, so ipc_send_rpc() has no
+ * way to reach them - and they are the worst case for a stranded cache,
+ * because pkg is MAP_PRIVATE per process and that pool runs one thread per
+ * CPU against a single 8 MB arena.
+ *
+ * A plain counter, deliberately not a lock or a handshake: a missed
+ * generation only delays a flush to the next sweep, which is the same
+ * fire-and-forget contract the IPC path already has.
+ */
+volatile unsigned long hg_sweep_gen;
+
+static __thread unsigned long hg_sweep_seen;
+
+void hg_cache_flush_if_due(void)
+{
+	unsigned long g = hg_sweep_gen;
+
+	if (g == hg_sweep_seen)
+		return;
+	hg_sweep_seen = g;
+	hg_cache_flush_self();
+}
+
 void hg_cache_flush_self(void)
 {
 	int i;
@@ -727,6 +756,38 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 	}
 	size = (unsigned int)(HG_LEAF_SIZE << ord);
 	ch = hg_buddy_alloc(hb, (unsigned int)ord);
+
+	/*
+	 * Reserve floor. Checked HERE, at the one point where the arena's free
+	 * space actually shrinks, rather than on a timer - the design's "trigger
+	 * the sweep on reserve pressure, not only on time".
+	 *
+	 * Crossing it publishes a sweep for every thread (the generation counter
+	 * reaches even the TCP IO pool, which IPC cannot) and says so once. The
+	 * below_floor latch is the hysteresis: without it a workload sitting on
+	 * the boundary would log and re-sweep on every single carve, which is
+	 * both useless and expensive exactly when the arena is under pressure.
+	 */
+	if (hb->buddy_ready && hb->reserve_floor) {
+		if (hb->buddy_free_leaves < hb->reserve_floor) {
+			if (!hb->below_floor) {
+				hb->below_floor = 1;
+				hb->floor_crossings++;
+				hg_sweep_gen++;
+				LM_WARN("%s: free space fell below the reserve floor "
+					"(%lu of %lu leaves free, floor %lu) - sweeping every "
+					"thread's cache; raise -m/-M if this repeats\n",
+					hb->name, hb->buddy_free_leaves,
+					hb->npages * hg_leaves_per_page(hb), hb->reserve_floor);
+			}
+		} else if (hb->below_floor &&
+		           hb->buddy_free_leaves > hb->reserve_floor * 2) {
+			/* back above, with a 2x margin so it cannot flap */
+			hb->below_floor = 0;
+			LM_NOTICE("%s: free space recovered above the reserve floor "
+				"(%lu leaves free)\n", hb->name, hb->buddy_free_leaves);
+		}
+	}
 	if (!ch) {
 		LM_ERR("%s: no more HG_MALLOC arena memory for a %u byte chunk "
 			"(class %d, order %d) - increase the arena size\n",

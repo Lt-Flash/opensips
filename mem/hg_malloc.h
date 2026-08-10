@@ -154,8 +154,21 @@ struct hg_lfrag;         /* opaque here, defined in hg_large.h */
  * the class from the CELL's own header byte rather than from the chunk, so a
  * page can host blocks of different classes with no fast-path change.
  */
+/* a block whose cells are ALL in the global pool - the GC's work queue */
+#define HG_CHUNK_DRAINED    (1u << 0)
+/* selected by this GC pass; its cells are being unlinked right now */
+#define HG_CHUNK_RECLAIMING (1u << 1)
+
 struct hg_chunk {
-	struct hg_chunk *next;    /* global registry, append-only */
+	/*
+	 * Global registry. Doubly linked, which it did not need to be while
+	 * chunks were immortal: hg_slab_recycled() and the DBG dump walker both
+	 * traverse it, so a reclaimed block MUST come out of it - otherwise the
+	 * first keeps counting capacity that no longer exists and the second
+	 * reads a block the buddy has already handed to another class.
+	 */
+	struct hg_chunk *next;
+	struct hg_chunk *prev;
 	unsigned int cls;         /* immutable */
 	unsigned int cell_size;   /* total slot size, header included */
 	unsigned int cells;
@@ -176,9 +189,15 @@ struct hg_chunk {
 	 * visible, which is the condition the GC in task #57 acts on.
 	 */
 	unsigned int in_gpool;
+	unsigned int flags;       /* HG_CHUNK_DRAINED / _RECLAIMING */
+	unsigned int order;       /* buddy order, so the GC can hand it back */
 
-	/* fullness lists, for the "take the FULLEST partial" policy in task
-	 * #58. Unused until then. */
+	/*
+	 * The list this block is currently on. Today that is only the per-class
+	 * drained queue; task #58 generalises it into fullness buckets, of
+	 * which "drained" is simply the empty one - which is why the design
+	 * calls the empty bucket the GC's work queue.
+	 */
 	struct hg_chunk *fnext;
 	struct hg_chunk *fprev;
 } __attribute__ ((aligned (64)));
@@ -363,6 +382,17 @@ struct hg_block {
 	unsigned long       buddy_free_leaves;        /* free leaves, whole arena */
 	unsigned int        buddy_top;                /* whole-page order, cached */
 	unsigned int        buddy_ready;              /* 0 until hg_buddy_init() */
+
+	/*
+	 * GC work queue: blocks whose every cell is in the global pool, per
+	 * class. Reclaiming one means unlinking its cells from that class's
+	 * free list, which is a walk - so drained blocks accumulate here and a
+	 * single walk serves all of them, rather than one walk per block.
+	 */
+	struct hg_chunk    *drained[HG_NCLASSES];
+	unsigned int        ndrained[HG_NCLASSES];
+	unsigned long       gc_blocks_returned;       /* lifetime, for stats */
+	unsigned long       gc_passes;
 
 	unsigned char size2class[(HG_CELL_MAX / HG_ROUNDTO) + 1];
 } __attribute__ ((aligned (HG_ROUNDTO)));

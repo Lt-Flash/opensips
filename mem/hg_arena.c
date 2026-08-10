@@ -42,8 +42,44 @@ static const unsigned int cell_sizes[HG_NCLASSES] = {
 #define HG_CHUNK_SMALL    (256 * 1024)  /* cells <= 8K share 256K chunks */
 #define HG_CHUNK_MIN      (8 * 1024)    /* floor, however tiny the arena */
 #define HG_REFILL_BATCH   32             /* cells pulled from the global pool */
-#define HG_PRIVATE_MAX    256            /* private stack size that triggers */
-#define HG_DONATE         128            /*   donation of this many cells    */
+
+/*
+ * Private free-cache budget.
+ *
+ * This used to be a flat count - 256 cells per class, whatever the class -
+ * which bounds nothing, because the same number means 16 KB in class 64 and
+ * 16 MB in class 65536.  One thread could therefore hoard 16 MB of a single
+ * class, and nothing but an arena smaller than the ceiling stopped it.
+ *
+ * The bound that matters is BYTES, so express it that way and convert to a
+ * per-class cell count at init.  Two numbers define the policy:
+ *
+ *   HG_PRIVATE_PCT       what share of the arena ALL private caches together
+ *                        may hold - the whole fleet of threads, every class;
+ *   HG_PRIVATE_CONSUMERS how many threads to divide that share between.
+ *
+ * So one thread gets PCT/CONSUMERS of the arena (25/16 ~ 1.6%), and the
+ * aggregate stays at PCT by construction however many classes exist.
+ * Measured on the real ladder: shm 256 MB gives a thread at most 3.0 MB
+ * across all 21 classes, and pkg 24 MB gives it 0.29 MB.  The class that
+ * motivated this - 65536 - drops from 256 cells (16 MB!) to 3 on shm and to
+ * none at all on pkg.
+ *
+ * The binding case is PKG, not SHM, and it is new in 4.1: pkg is MAP_PRIVATE
+ * per process, and TCP main is ONE process running an IO thread pool (one
+ * thread per CPU by default) against a single 8 MB pkg arena.  Sixteen threads
+ * each hoarding "a few cells of every class" is how an 8 MB arena disappears
+ * into caches that no other thread can reach.  Budgeting for the pool size
+ * keeps the total bounded by construction: worst case is
+ * HG_PRIVATE_PCT percent of the arena, however many classes exist.
+ *
+ * HG_PRIVATE_CAP keeps the old ceiling for the small classes, where the byte
+ * budget alone would now permit MORE hoarding than before on a large arena -
+ * this change is meant to lower the bound, never raise it.
+ */
+#define HG_PRIVATE_PCT        25   /* of the arena, per thread, all classes */
+#define HG_PRIVATE_CONSUMERS  16   /* budget for a per-CPU IO pool          */
+#define HG_PRIVATE_CAP        256  /* never above the historical flat cap   */
 
 /*
  * Per-THREAD private free-stack state, one slot per hg_block instance live
@@ -67,7 +103,8 @@ static const unsigned int cell_sizes[HG_NCLASSES] = {
  * Observed on real traffic before this was made per-thread:
  *   - lost "nfree--" updates, so the counter UNDERFLOWED and wrapped
  *     (logged: "nfree claimed 4294966733", i.e. 2^32-563), which trivially
- *     exceeds HG_PRIVATE_MAX and drove the donation loop off the end of a
+ *     exceeds any sane private-cache bound and drove the donation loop off
+ *     the end of a
  *     chain that had far fewer cells than claimed;
  *   - two threads popping the SAME cell, handing one block to two callers -
  *     a tcp_ipc_payload struct came back with SIP text where its conn
@@ -301,6 +338,45 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 	return 0;
 }
 
+/*
+ * Turn the byte budget into a per-class cell count, once, at arena init.
+ *
+ * A class whose single cell already exceeds one thread's per-class share gets
+ * priv_max 0: it is never cached privately and every free goes straight to the
+ * shared pool.  That is the correct answer rather than a degenerate one - those
+ * allocations are rare, so the lock they now take is rare too, and the memory
+ * they would have pinned is large.
+ *
+ * priv_donate is half the cap, so the donation loop can always be satisfied by
+ * a chain whose length matches nfree - the invariant the old fixed HG_DONATE
+ * relied on, now maintained per class instead of by two constants that had to
+ * be kept in the right order by hand.
+ */
+static void private_caps_init(struct hg_block *hb)
+{
+	unsigned long per_thread = (unsigned long)hb->size / 100 * HG_PRIVATE_PCT
+	                           / HG_PRIVATE_CONSUMERS;
+	unsigned long per_class  = per_thread / HG_NCLASSES;
+	unsigned int c;
+
+	for (c = 0; c < HG_NCLASSES; c++) {
+		unsigned long n = per_class / cell_sizes[c];
+
+		if (n > HG_PRIVATE_CAP)
+			n = HG_PRIVATE_CAP;
+		hb->priv_max[c]    = (unsigned int)n;
+		hb->priv_donate[c] = (unsigned int)(n / 2);
+		if (hb->priv_donate[c] == 0)
+			hb->priv_donate[c] = 1;
+	}
+
+	LM_DBG("%s: private cache budget %lu B/thread (%lu B/class): "
+		"class %u caches %u cells, class %u caches %u\n",
+		hb->name, per_thread, per_class,
+		cell_sizes[0], hb->priv_max[0],
+		cell_sizes[HG_NCLASSES - 1], hb->priv_max[HG_NCLASSES - 1]);
+}
+
 int hg_arena_init(struct hg_block *hb, unsigned long hdr_size)
 {
 	unsigned int idx, c, needed;
@@ -316,6 +392,8 @@ int hg_arena_init(struct hg_block *hb, unsigned long hdr_size)
 		hb->chunk_max = HG_CHUNK_SMALL;
 	if (hb->chunk_max < HG_CHUNK_MIN)
 		hb->chunk_max = HG_CHUNK_MIN;
+
+	private_caps_init(hb);
 
 	/* size -> class LUT: needed = requested payload + hidden header */
 	for (idx = 0; idx <= HG_CELL_MAX / HG_ROUNDTO; idx++) {
@@ -585,16 +663,21 @@ void hg_cell_free(struct hg_block *hb, void *p)
 	pl->cls[c].free_head = cell_start;
 	pl->cls[c].nfree++;
 
-	/* keep hoarding bounded: donate half once over the threshold */
-	if (pl->cls[c].nfree > HG_PRIVATE_MAX) {
+	/* keep hoarding bounded: donate half once over this class's threshold.
+	 * The threshold is a cell count derived from a byte budget, so a big
+	 * class trips it after very few cells - and a class whose priv_max is 0
+	 * trips it on the first free, which is exactly the intent: never cache
+	 * that class privately. */
+	if (pl->cls[c].nfree > hb->priv_max[c]) {
 		unsigned int claimed = pl->cls[c].nfree;
+		unsigned int donate  = hb->priv_donate[c];
 
 		lock_get(&hb->lock);
-		for (i = 0; i < HG_DONATE; i++) {
+		for (i = 0; i < donate; i++) {
 			d = pl->cls[c].free_head;
-			/* HG_DONATE (128) < HG_PRIVATE_MAX (256), so a chain
-			 * whose length matches nfree can always satisfy this
-			 * loop. Reaching a NULL here therefore means nfree has
+			/* priv_donate is half priv_max, so a chain whose
+			 * length matches nfree can always satisfy this loop.
+			 * Reaching a NULL here therefore means nfree has
 			 * drifted ABOVE the number of cells actually on the
 			 * chain, and walking on would evaluate cell_next(NULL)
 			 * - the production SIGSEGV this guard replaces (a TCP
@@ -610,11 +693,11 @@ void hg_cell_free(struct hg_block *hb, void *p)
 		 * cosmetic: leaving nfree high would re-enter this block on
 		 * the very next free of this class and trip the guard again
 		 * on every single call, burying the log. */
-		if (i < HG_DONATE)
+		if (i < donate)
 			pl->cls[c].nfree = 0;
 		lock_release(&hb->lock);
 
-		if (i < HG_DONATE)
+		if (i < donate)
 			LM_CRIT("%s: class %u free list ran dry after %u cells "
 				"but nfree claimed %u - counter resynced to 0, "
 				"pool accounting drifted\n",

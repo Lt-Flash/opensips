@@ -429,6 +429,11 @@ struct hg_block {
 	unsigned int        ndrained[HG_NCLASSES];
 	unsigned long       gc_blocks_returned;       /* lifetime, for stats */
 	unsigned long       gc_passes;
+	unsigned long       cache_flushes;            /* sweeps run */
+	unsigned long       cells_flushed;            /* cells recovered from TLS */
+	/* set while a flush walks a cache chain: pushing a cell can reclaim its
+	 * block, and the next cell on the chain may live in that same block */
+	unsigned int        gc_deferred;
 
 	unsigned char size2class[(HG_CELL_MAX / HG_ROUNDTO) + 1];
 } __attribute__ ((aligned (HG_ROUNDTO)));

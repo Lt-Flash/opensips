@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <sys/mman.h>
 
+#include "hg_version.h"
 #include "hg_malloc.h"
 #include "hg_arena.h"
 #include "hg_large.h"
@@ -475,11 +476,11 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 	 * (looks like "an mlock() call happened") and was caught live during
 	 * a real diagnosis session mid-2026-08-07 being misread that way. */
 	if (proc_desc)
-		LM_NOTICE("%s HG_MALLOC arena (%s): %lu MB on %s, %lu MB "
+		LM_NOTICE("%s " HG_MALLOC_NAME " arena (%s): %lu MB on %s, %lu MB "
 			"pinned from swapping\n",
 			name, proc_desc, size >> 20, hg_mem_tier_str(tier), locked_mb);
 	else
-		LM_NOTICE("%s HG_MALLOC arena: %lu MB on %s, %lu MB "
+		LM_NOTICE("%s " HG_MALLOC_NAME " arena: %lu MB on %s, %lu MB "
 			"pinned from swapping\n",
 			name, size >> 20, hg_mem_tier_str(tier), locked_mb);
 
@@ -608,7 +609,7 @@ static void hg_dbg_dump_cb(void *payload, void *ctx)
 	 */
 	if (!hg_owns_any(tag)) {
 		LM_CRIT("%s: dump walker produced %p, outside every arena - "
-			"skipping it\n", "HG_MALLOC", payload);
+			"skipping it\n", HG_MALLOC_NAME, payload);
 		return;
 	}
 
@@ -631,7 +632,7 @@ static void hg_dbg_dump_cb(void *payload, void *ctx)
 	line = *(unsigned long *)(tag + HG_ROUNDTO * 3);
 
 	if (dbg_ht_update(*c->allocd, file, func, line, hg_frag_size(payload)) < 0)
-		LM_ERR("unable to update the %s allocation summary\n", "HG_MALLOC");
+		LM_ERR("unable to update the %s allocation summary\n", HG_MALLOC_NAME);
 }
 
 /*

@@ -307,6 +307,7 @@ void *hg_buddy_alloc(struct hg_block *hb, unsigned int order)
 		memset(pg->leaforder + bleaf, (int)o, (size_t)1UL << o);
 		bit_set(pg->bitmap, node_id(top, o, bleaf));
 		fl_push(hb, buddy, o);
+		hb->buddy_splits++;
 	}
 
 	memset(pg->leaforder + leaf, (int)order, (size_t)1UL << order);
@@ -387,6 +388,7 @@ void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order)
 
 		fl_unlink(hb, buddy, o);
 		bit_clear(pg->bitmap, node_id(top, o, bleaf));
+		hb->buddy_merges++;
 		pg->leaforder[bleaf] = HG_LEAF_NONE;
 
 		if (bleaf < leaf) {           /* we are the upper half - move down */

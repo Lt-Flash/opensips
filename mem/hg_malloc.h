@@ -431,6 +431,9 @@ struct hg_block {
 	unsigned long       gc_passes;
 	unsigned long       cache_flushes;            /* sweeps run */
 	unsigned long       cells_flushed;            /* cells recovered from TLS */
+	unsigned long       buddy_splits;             /* blocks split down an order */
+	unsigned long       buddy_merges;             /* blocks merged with a buddy */
+	unsigned long       blocks_carved;            /* class blocks cut, lifetime */
 	/* set while a flush walks a cache chain: pushing a cell can reclaim its
 	 * block, and the next cell on the chain may live in that same block */
 	unsigned int        gc_deferred;

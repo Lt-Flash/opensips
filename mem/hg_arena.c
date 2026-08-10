@@ -758,6 +758,7 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 		ch->next->prev = ch;
 	hb->chunks = ch;
 	hb->nchunks++;
+	hb->blocks_carved++;
 	hb->real_used += size;
 	if (hb->real_used > hb->max_real_used)
 		hb->max_real_used = hb->real_used;
@@ -1653,6 +1654,12 @@ enum hg_stat_field {
 	HGS_TIER = 0, HGS_TOTAL, HGS_PINNED_BYTES, HGS_CARVED, HGS_CARVED_PEAK,
 	HGS_CHUNKS, HGS_FREE_TO_CARVE, HGS_LIVE, HGS_LIVE_PEAK, HGS_PAYLOAD,
 	HGS_CELLS, HGS_SLAB_LIVE, HGS_SLAB_RECYCLED,
+	/* v2 reclaim rates. Counters, not events: at 800 CPS the allocator sees
+	 * ~10^5 cell ops/s and cache/block transitions are 1-3% of that, so an
+	 * EVI event here would cost more than the allocator it reports on. */
+	HGS_BLOCKS_CARVED, HGS_BLOCKS_RETURNED, HGS_GC_PASSES,
+	HGS_CACHE_FLUSHES, HGS_CELLS_FLUSHED,
+	HGS_BUDDY_SPLITS, HGS_BUDDY_MERGES, HGS_BUDDY_FREE_LEAVES,
 };
 
 static unsigned long hg_shm_stat(void *ctx)
@@ -1685,6 +1692,20 @@ static unsigned long hg_shm_stat(void *ctx)
 	 * appear here, so this is deliberately NOT comparable with payload */
 	case HGS_SLAB_LIVE:     return hg_cell_live(hb);
 	case HGS_SLAB_RECYCLED: return hg_slab_recycled(hb);
+	/* Reclaim rates. blocks_carved counts every block ever cut and
+	 * blocks_returned every one handed back, so carved-minus-returned is
+	 * the live block count and the RATIO is how well reclaim is keeping
+	 * up - which is the figure the whole v2 rework is judged on, and the
+	 * one that must be readable from MI rather than grepped out of a debug
+	 * log under load. */
+	case HGS_BLOCKS_CARVED:   return hb->blocks_carved;
+	case HGS_BLOCKS_RETURNED: return hb->gc_blocks_returned;
+	case HGS_GC_PASSES:       return hb->gc_passes;
+	case HGS_CACHE_FLUSHES:   return hb->cache_flushes;
+	case HGS_CELLS_FLUSHED:   return hb->cells_flushed;
+	case HGS_BUDDY_SPLITS:    return hb->buddy_splits;
+	case HGS_BUDDY_MERGES:    return hb->buddy_merges;
+	case HGS_BUDDY_FREE_LEAVES: return hb->buddy_free_leaves;
 	}
 	return 0;
 }
@@ -1706,6 +1727,14 @@ static const struct {
 	{"hg_shm_live_cells",    HGS_CELLS},
 	{"hg_shm_slab_live",     HGS_SLAB_LIVE},
 	{"hg_shm_slab_recycled", HGS_SLAB_RECYCLED},
+	{"hg_shm_blocks_carved",   HGS_BLOCKS_CARVED},
+	{"hg_shm_blocks_returned", HGS_BLOCKS_RETURNED},
+	{"hg_shm_gc_passes",       HGS_GC_PASSES},
+	{"hg_shm_cache_flushes",   HGS_CACHE_FLUSHES},
+	{"hg_shm_cells_flushed",   HGS_CELLS_FLUSHED},
+	{"hg_shm_buddy_splits",    HGS_BUDDY_SPLITS},
+	{"hg_shm_buddy_merges",    HGS_BUDDY_MERGES},
+	{"hg_shm_buddy_free_leaves", HGS_BUDDY_FREE_LEAVES},
 	{NULL, 0}
 };
 

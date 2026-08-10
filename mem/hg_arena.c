@@ -40,8 +40,16 @@ static const unsigned int cell_sizes[HG_NCLASSES] = {
 	3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536
 };
 
-#define HG_CHUNK_SMALL    (256 * 1024)  /* cells <= 8K share 256K chunks */
+#define HG_CHUNK_SMALL    (256 * 1024)  /* ceiling on chunk_max, see below */
 #define HG_CHUNK_MIN      (8 * 1024)    /* floor, however tiny the arena */
+/*
+ * Target cells per block. A block is the unit of reclaim, so this is a
+ * fragmentation knob, not an amortisation one: fewer cells per block means a
+ * block drains sooner, more means fewer carves. 32 is the design's figure and
+ * puts class 2048 on a 64 KB block; do not raise it without re-measuring what
+ * fraction of blocks actually reach empty.
+ */
+#define HG_CELLS_PER_BLOCK 32
 #define HG_REFILL_BATCH   32             /* cells pulled from the global pool */
 
 /*
@@ -228,11 +236,66 @@ static inline void cell_set_next(void *cell_start, void *next)
  * the pool.
  */
 /* global pool ops - hb->lock must be held. Both take/return cell_start. */
+/*
+ * Attribute a cell to its block and move that block's global-pool count.
+ *
+ * This is the cache/block transition the whole reclaim design turns on. It is
+ * O(1) - two shifts, a table byte and a mask (hg_buddy_block_of) - and it runs
+ * only when a cell crosses between a thread's private cache and the global
+ * pool, never on the private-LIFO fast path.
+ *
+ * Silently does nothing for a cell whose block cannot be resolved. That is not
+ * laxity: cells carved before the buddy owned the arena do not exist, but a
+ * cell from a multi-page run legitimately resolves to NULL, and a wild pointer
+ * must not be allowed to increment some innocent block's counter towards a
+ * false "wholly free".
+ */
+static inline void block_gpool_delta(struct hg_block *hb, int c,
+                                     void *cell_start, int delta)
+{
+	struct hg_chunk *ch = hg_buddy_block_of(hb, cell_start);
+
+	if (!ch)
+		return;
+	/*
+	 * Confirm the block really is a class chunk of THIS class before
+	 * writing to it. The large tier allocates buddy blocks too, and those
+	 * start with a struct hg_large_chunk - ch->in_gpool would land inside
+	 * its first_frag pointer and corrupt the large heap. Only class cells
+	 * reach the global pool today, so this should never trip; it is here
+	 * because the cost of being wrong is silent corruption of a different
+	 * allocator tier, and the check is one already-cached load.
+	 */
+	if (ch->cls != (unsigned int)c) {
+		LM_CRIT("%s: cell %p resolves to block %p of class %u, expected "
+			"class %d - not touching it\n",
+			hb->name, cell_start, (void *)ch, ch->cls, c);
+		return;
+	}
+	if (delta > 0) {
+		if (ch->in_gpool >= ch->cells) {
+			LM_CRIT("%s: block %p already has all %u cells in the global "
+				"pool, refusing to count another\n",
+				hb->name, (void *)ch, ch->cells);
+			return;
+		}
+		ch->in_gpool++;
+	} else {
+		if (ch->in_gpool == 0) {
+			LM_CRIT("%s: block %p has no cells in the global pool to "
+				"remove\n", hb->name, (void *)ch);
+			return;
+		}
+		ch->in_gpool--;
+	}
+}
+
 static inline void gpool_push(struct hg_block *hb, int c, void *cell_start)
 {
 	cell_set_next(cell_start, hb->gpool[c]);
 	hb->gpool[c] = cell_start;
 	hb->gpool_n[c]++;
+	block_gpool_delta(hb, c, cell_start, +1);
 }
 
 static inline void *gpool_pop(struct hg_block *hb, int c)
@@ -242,6 +305,7 @@ static inline void *gpool_pop(struct hg_block *hb, int c)
 	if (cell_start) {
 		hb->gpool[c] = cell_next(cell_start);
 		hb->gpool_n[c]--;
+		block_gpool_delta(hb, c, cell_start, -1);
 	}
 	return cell_start;
 }
@@ -345,9 +409,25 @@ void *hg_backing_aligned(struct hg_block *hb, unsigned long size,
  */
 static inline unsigned int chunk_size_for(struct hg_block *hb, int c)
 {
-	unsigned int want = cell_sizes[c] <= 8192 ?
-		HG_CHUNK_SMALL : cell_sizes[c] * 32;
-	unsigned int least = sizeof(struct hg_chunk) + cell_sizes[c] * 2;
+	unsigned int want, least = sizeof(struct hg_chunk) + cell_sizes[c] * 2;
+
+	/*
+	 * Aim for HG_CELLS_PER_BLOCK cells, floored at one buddy leaf.
+	 *
+	 * This deliberately REPLACES the old "256 KB for every class up to
+	 * 8 KB cells". A block is the unit of reclaim now, and a block only
+	 * comes back when every one of its cells is free, so a block holding
+	 * 2730 cells of class 96 is a block that will essentially never drain -
+	 * one survivor pins 256 KB. That is exactly the "too coarse" failure
+	 * the design rejects whole-chunk reclaim for.
+	 *
+	 * The sizes fall where the design says: class 96 lands on the 8 KB
+	 * floor (85 cells), class 2048 on 64 KB (32 cells) rather than an 8 KB
+	 * block holding only four.
+	 */
+	want = cell_sizes[c] * HG_CELLS_PER_BLOCK;
+	if (want < HG_LEAF_SIZE)
+		want = HG_LEAF_SIZE;
 
 	if (want > hb->chunk_max)
 		want = hb->chunk_max;
@@ -391,6 +471,12 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 		return -1;
 	}
 
+	/* the block comes from the buddy carrying whatever the free-list
+	 * linkage left in its first bytes, so every field is set here, not
+	 * assumed zero */
+	ch->in_gpool = 0;
+	ch->fnext = NULL;
+	ch->fprev = NULL;
 	ch->cls = c;
 	ch->cell_size = cell_sizes[c];
 	ch->cells = (size - sizeof(struct hg_chunk)) / cell_sizes[c];

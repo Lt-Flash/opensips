@@ -140,11 +140,47 @@ struct hg_lfrag;         /* opaque here, defined in hg_large.h */
  * field change there fails the build here instead of drifting silently. */
 #define HG_LFRAG_HDR_SIZE (4 * HG_ROUNDTO)
 
+/*
+ * A chunk is one buddy block dedicated to one cell class, and its header sits
+ * in the FIRST bytes OF THAT BLOCK.
+ *
+ * In-block rather than in a side array, and the arithmetic is the whole
+ * argument: at ~32 bytes per block, a separate array over a 5 GB arena would
+ * be 20 MB - twenty times every other piece of metadata combined - where
+ * in-block costs nothing external, shares a cache line with the block being
+ * touched anyway, and gives up exactly one cell.
+ *
+ * The enabler was already in the tree before any of v2: hg_cell_free() reads
+ * the class from the CELL's own header byte rather than from the chunk, so a
+ * page can host blocks of different classes with no fast-path change.
+ */
 struct hg_chunk {
 	struct hg_chunk *next;    /* global registry, append-only */
 	unsigned int cls;         /* immutable */
 	unsigned int cell_size;   /* total slot size, header included */
 	unsigned int cells;
+
+	/*
+	 * Cells of this block currently parked in the GLOBAL pool, i.e.
+	 * definitively free and reachable by anyone. Maintained only at
+	 * cache/block transitions (gpool_push/gpool_pop), which are 1-3% of
+	 * operations and already under hb->lock - a free that lands in a
+	 * thread's private LIFO does not touch this, by design.
+	 *
+	 * A cell sitting in some thread's private cache therefore still counts
+	 * as live. That is deliberately conservative: it can only delay a
+	 * reclaim, never cause a premature one, and flushing those caches is
+	 * exactly what the idle sweep (task #59) is for.
+	 *
+	 * in_gpool == cells means every cell of this block is free and globally
+	 * visible, which is the condition the GC in task #57 acts on.
+	 */
+	unsigned int in_gpool;
+
+	/* fullness lists, for the "take the FULLEST partial" policy in task
+	 * #58. Unused until then. */
+	struct hg_chunk *fnext;
+	struct hg_chunk *fprev;
 } __attribute__ ((aligned (64)));
 
 /*

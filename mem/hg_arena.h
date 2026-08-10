@@ -64,6 +64,12 @@ int hg_arena_init(struct hg_block *hb, unsigned long hdr_size);
  * Exposed for hg_large.c, which grows by carving additional chunks from
  * this SAME underlying arena rather than a separate reservation. */
 void *hg_chunk_backing(struct hg_block *hb, unsigned long size);
+
+/* Flush this THREAD's cached cells back to the shared pool, in every arena it
+ * caches in. Must run on the owning thread - the caches are __thread and are
+ * unreachable from anywhere else, which is the whole reason the sweep is
+ * dispatched rather than executed centrally. */
+void hg_cache_flush_self(void);
 void *hg_backing_aligned(struct hg_block *hb, unsigned long size,
                          unsigned long align);
 

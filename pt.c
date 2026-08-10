@@ -423,6 +423,16 @@ int init_multi_proc_support(void)
 	}
 	#endif
 
+	/* HG_MALLOC's per-thread caches are __thread, so only their owner can
+	 * give them back; this registers the timer that asks each worker to.
+	 * Here because it must happen PRE-FORK - register_timer() is closed to
+	 * new registrations once the timer processes exist - and because
+	 * counted_max_processes, which the sweep iterates, is known by now. */
+	if (hg_register_cache_sweep()!=0) {
+		LM_ERR("failed to register the HG_MALLOC cache sweep\n");
+		return -1;
+	}
+
 	/* set the pid for the starter process */
 	set_proc_attrs("starter");
 

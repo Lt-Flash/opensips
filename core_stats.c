@@ -187,6 +187,81 @@ static unsigned long get_pkg_fragments( void*proc_id)
 }
 
 
+
+#if defined(HG_MALLOC) && !defined(INLINE_ALLOC)
+#include "mem/hg_arena.h"
+
+/*
+ * The HG_MALLOC idle-cache sweep.
+ *
+ * HG_MALLOC's per-thread free caches live in __thread storage, so no other
+ * process or thread can reach them - a cell parked there is invisible to the
+ * block accounting and pins a whole block from being reclaimed. The allocator
+ * flushes its own cache when it is about to grow the arena, but nothing fires
+ * on a thread that has simply STOPPED allocating, which is precisely what a
+ * worker does after a traffic burst subsides - the case that strands memory.
+ *
+ * So the flush has to be dispatched to each worker to run in its own context,
+ * exactly the problem signal_pkg_status() above already solves: ipc_send_rpc()
+ * makes the target execute the job on its own reactor. Two things are carried
+ * over from it deliberately:
+ *
+ *   - the self case runs INLINE. Sending ourselves an IPC job would order
+ *     behind the job we are currently running.
+ *   - nothing waits for a result. Its read side blocks on usleep(20) for a
+ *     value that is a request behind; a flush is not a reader, so it is
+ *     fire-and-forget and the next tick simply tries again.
+ *
+ * NOT covered, and it needs saying: TCP main's IO pool threads wait on a
+ * condition variable rather than the reactor, so IPC never reaches them. Their
+ * caches still need a flag checked at a job boundary.
+ */
+#define HG_SWEEP_INTERVAL 30   /* seconds; the caches are a slow leak, not a
+                                * fast one, and each sweep costs a lock per
+                                * arena per process */
+
+static void rpc_hg_cache_flush(int sender, void *param)
+{
+	hg_cache_flush_self();
+}
+
+static void hg_cache_sweep(unsigned int ticks, void *param)
+{
+	int i;
+
+	for (i = 0; i < counted_max_processes; i++) {
+		if (i == process_no) {
+			/* never RPC ourselves - see signal_pkg_status() */
+			hg_cache_flush_self();
+			continue;
+		}
+		if (IPC_FD_WRITE(i) <= 0)
+			continue;
+		/* fire and forget: a failed dispatch is not worth logging every
+		 * 30 seconds for a process that may simply be shutting down */
+		ipc_send_rpc(i, rpc_hg_cache_flush, NULL);
+	}
+}
+
+int hg_register_cache_sweep(void)
+{
+	if (mem_allocator_shm != MM_HG_MALLOC &&
+	    mem_allocator_pkg != MM_HG_MALLOC)
+		return 0;   /* not our allocator - nothing caches anything */
+
+	if (register_timer("hg-cache-sweep", hg_cache_sweep, NULL,
+	                   HG_SWEEP_INTERVAL, TIMER_FLAG_SKIP_ON_DELAY) < 0) {
+		LM_ERR("failed to register the HG_MALLOC cache sweep\n");
+		return -1;
+	}
+	LM_DBG("HG_MALLOC idle-cache sweep registered, every %d s\n",
+		HG_SWEEP_INTERVAL);
+	return 0;
+}
+#else
+int hg_register_cache_sweep(void) { return 0; }
+#endif /* HG_MALLOC */
+
 int init_pkg_stats(int procs_no)
 {
 	int n;

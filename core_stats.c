@@ -256,8 +256,17 @@ static void hg_cache_sweep(unsigned int ticks, void *param)
 
 int hg_register_cache_sweep(void)
 {
+	/*
+	 * Both variants, for correctness rather than for a bug that was
+	 * observed: with -a HG_MALLOC the allocator resolves to MM_HG_MALLOC,
+	 * but -a HG_MALLOC_DBG resolves to MM_HG_MALLOC_DBG and would otherwise
+	 * silently decline to register. Every other such test in the tree pairs
+	 * them (mem/shm_mem.c:327, :918, :948, :1033, :1226).
+	 */
 	if (mem_allocator_shm != MM_HG_MALLOC &&
-	    mem_allocator_pkg != MM_HG_MALLOC)
+	    mem_allocator_shm != MM_HG_MALLOC_DBG &&
+	    mem_allocator_pkg != MM_HG_MALLOC &&
+	    mem_allocator_pkg != MM_HG_MALLOC_DBG)
 		return 0;   /* not our allocator - nothing caches anything */
 
 	if (register_timer("hg-cache-sweep", hg_cache_sweep, NULL,
@@ -265,8 +274,9 @@ int hg_register_cache_sweep(void)
 		LM_ERR("failed to register the HG_MALLOC cache sweep\n");
 		return -1;
 	}
-	LM_DBG("HG_MALLOC idle-cache sweep registered, every %d s\n",
-		HG_SWEEP_INTERVAL);
+	LM_NOTICE("HG_MALLOC idle-cache sweep registered, every %d s "
+		"(shm=%s pkg=%s)\n", HG_SWEEP_INTERVAL,
+		mm_str(mem_allocator_shm), mm_str(mem_allocator_pkg));
 	return 0;
 }
 #else

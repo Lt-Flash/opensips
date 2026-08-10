@@ -161,6 +161,18 @@ struct hg_chunk {
 #define HG_LEAF_SHIFT  13
 #define HG_LEAF_SIZE   (1UL << HG_LEAF_SHIFT)
 
+/*
+ * Ceiling on the number of buddy orders, for the fixed free-list array in
+ * struct hg_block. The REAL count is derived per arena as
+ * hps_shift - HG_LEAF_SHIFT: 8 on a 2 MB page with 8 KB leaves, 16 on a
+ * 512 MB arm64 page. 24 leaves room for a 128 GB page that does not exist yet
+ * and costs 25 pointers in one struct.
+ */
+#define HG_MAX_ORDERS  24
+
+struct hg_page;      /* hg_buddy.h */
+struct hg_free_blk;  /* hg_buddy.h */
+
 /* the accessors that turn an address into a page and a leaf live just after
  * struct hg_block below - they dereference it, so they cannot precede it */
 
@@ -303,6 +315,18 @@ struct hg_block {
 	unsigned int  hps_shift;   /* log2(hps), so page-of is a shift */
 	char         *pbase;       /* page 0 - hbase rounded up to hps */
 	unsigned long npages;      /* whole pages from pbase to the reservation end */
+
+	/*
+	 * Buddy state (hg_buddy.c). Every field here is written only while
+	 * holding hb->lock - the buddy is entirely slow path, reached from
+	 * carve_chunk() and the large tier, never from the cell fast path.
+	 */
+	struct hg_page     *pages;                    /* npages descriptors */
+	struct hg_free_blk *bfree[HG_MAX_ORDERS + 1]; /* free list per order */
+	unsigned long       nfree[HG_MAX_ORDERS + 1]; /* its length, per order */
+	unsigned long       buddy_free_leaves;        /* free leaves, whole arena */
+	unsigned int        buddy_top;                /* whole-page order, cached */
+	unsigned int        buddy_ready;              /* 0 until hg_buddy_init() */
 
 	unsigned char size2class[(HG_CELL_MAX / HG_ROUNDTO) + 1];
 } __attribute__ ((aligned (HG_ROUNDTO)));

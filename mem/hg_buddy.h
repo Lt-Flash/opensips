@@ -111,9 +111,33 @@ void *hg_buddy_alloc(struct hg_block *hb, unsigned int order);
  * its buddy as far up as it will go. hb->lock must be held. */
 void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order);
 
-/* Order of the block starting at @p, or -1 if @p does not start one. Used by
- * the layers above to size a block they only hold a pointer to. */
+/* Order of the block containing @p, or -1 if @p is not in buddy space. */
 int hg_buddy_order_of(const struct hg_block *hb, const void *p);
+
+/*
+ * The block CONTAINING @p, from any address inside it - two shifts, a table
+ * byte and a mask, no search. This is the lookup the design is built around:
+ * a cell being freed sits somewhere in the middle of its block, and reaching
+ * the block is the only way its live count can ever be decremented, which is
+ * the only way a block can ever be recognised as empty and reclaimed.
+ *
+ * Returns NULL if @p is outside the page grid or in a multi-page run.
+ */
+static inline void *hg_buddy_block_of(const struct hg_block *hb, const void *p)
+{
+	const struct hg_page *pg;
+	unsigned long leaf;
+	unsigned char o;
+
+	if (!hb->buddy_ready || !hg_in_pages(hb, p))
+		return NULL;
+	pg = &hb->pages[hg_page_of(hb, p)];
+	leaf = hg_leaf_of(hb, p);
+	o = pg->leaforder[leaf];
+	if (o == HG_LEAF_NONE)
+		return NULL;
+	return pg->base + ((leaf & ~((1UL << o) - 1)) << HG_LEAF_SHIFT);
+}
 
 /*
  * A run of @npages CONTIGUOUS whole pages, for the one thing the tree cannot

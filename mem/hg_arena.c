@@ -539,6 +539,41 @@ static unsigned int cache_flush_locked(struct hg_block *hb,
 }
 
 /*
+ * Flush THIS thread's caches, in every arena it holds cache state for.
+ *
+ * The entry point the idle sweep dispatches to. It takes no block argument on
+ * purpose: the caller (a timer, or an IPC job running in some worker) has no
+ * business knowing which arenas exist, and palloc_slots[] already records
+ * exactly the set this thread caches in - shm, pkg, and the debug arenas if
+ * they are live.
+ *
+ * Must run ON the owning thread. That is not a preference: the caches are
+ * __thread, so no other process or thread can even address them, which is why
+ * the design rules out a central sweeper and why the dispatcher has to make
+ * each worker do its own (and call this inline for itself rather than sending
+ * itself an IPC job to order against - see signal_pkg_status()).
+ */
+void hg_cache_flush_self(void)
+{
+	int i;
+
+	for (i = 0; i < HG_MAX_INSTANCES; i++) {
+		struct hg_block *hb = palloc_slots[i].owner;
+		unsigned int n;
+
+		if (!hb)
+			continue;
+		lock_get(&hb->lock);
+		n = cache_flush_locked(hb, &palloc_slots[i]);
+		hb->cache_flushes++;
+		hb->cells_flushed += n;
+		lock_release(&hb->lock);
+		if (n)
+			LM_DBG("%s: idle sweep returned %u cached cells\n", hb->name, n);
+	}
+}
+
+/*
  * Every byte of arena memory funnels through here: bump the atomic offset
  * within the block's own huge-page reservation. No fallback to another
  * allocator on exhaustion (unlike cachedb_perf's shm_malloc() fallback) -

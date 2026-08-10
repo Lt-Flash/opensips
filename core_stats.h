@@ -76,6 +76,11 @@ extern stat_var* slow_msgs;
 
 #ifdef PKG_MALLOC
 int init_pkg_stats(int no_procs);
+
+/* Registers the HG_MALLOC idle-cache sweep. No-op unless HG_MALLOC is the
+ * live allocator. Must be called PRE-FORK: register_timer() only accepts
+ * registrations before the timer processes are created. */
+int hg_register_cache_sweep(void);
 #endif
 
 #endif /*STATISTICS*/

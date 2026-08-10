@@ -34,11 +34,17 @@
  * Two records describe the same tree, because they answer different
  * questions and neither answers both cheaply:
  *
- *   leaforder[leaf]  the order of the block STARTING at that leaf, whether
- *                    free or allocated, or HG_LEAF_NONE if no block starts
- *                    there. This is what turns a bare pointer back into a
- *                    block - hg_buddy_free() is handed an address and must
- *                    learn its size without being told.
+ *   leaforder[leaf]  the order of the block CONTAINING that leaf - every leaf
+ *                    of a block carries it, not just the first. That is what
+ *                    turns any interior address into its block with a mask,
+ *                    which the layers above need: a cell being freed sits
+ *                    somewhere in the middle of its block, and finding the
+ *                    block is how the live count gets decremented at all.
+ *                    Filling the range costs a memset of 2^order bytes on the
+ *                    slow path (256 B for a whole 2 MB page) and buys an O(1)
+ *                    lookup on a path that would otherwise need a search.
+ *                    HG_LEAF_NONE means the leaf is not buddy space - it
+ *                    belongs to a multi-page run.
  *
  *   bitmap[node]     1 iff that tree node is a WHOLE FREE block, i.e. it is
  *                    sitting in a free list right now. Not "free" in the
@@ -128,7 +134,7 @@ static void page_publish_whole(struct hg_block *hb, struct hg_page *pg)
 {
 	unsigned int top = hb->buddy_top;
 
-	pg->leaforder[0] = (unsigned char)top;
+	memset(pg->leaforder, (int)top, (size_t)hg_leaves_per_page(hb));
 	bit_set(pg->bitmap, node_id(top, top, 0));
 	fl_push(hb, pg->base, top);
 	pg->free_leaves = (unsigned int)hg_leaves_per_page(hb);
@@ -298,12 +304,12 @@ void *hg_buddy_alloc(struct hg_block *hb, unsigned int order)
 		o--;
 		bleaf = leaf + (1UL << o);
 		buddy = pg->base + (bleaf << HG_LEAF_SHIFT);
-		pg->leaforder[bleaf] = (unsigned char)o;
+		memset(pg->leaforder + bleaf, (int)o, (size_t)1UL << o);
 		bit_set(pg->bitmap, node_id(top, o, bleaf));
 		fl_push(hb, buddy, o);
 	}
 
-	pg->leaforder[leaf] = (unsigned char)order;
+	memset(pg->leaforder + leaf, (int)order, (size_t)1UL << order);
 	pg->free_leaves -= 1U << order;
 	hb->buddy_free_leaves -= 1UL << order;
 	return blk;
@@ -330,6 +336,12 @@ void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order)
 	    ((unsigned long)pg->base & ((HG_LEAF_SIZE << order) - 1))) {
 		LM_CRIT("%s: buddy free of %p at order %u, which is not aligned to "
 			"its own size - ignoring\n", hb->name, p, order);
+		return;
+	}
+	if (leaf & ((1UL << order) - 1)) {
+		LM_CRIT("%s: buddy free of %p as order %u, but leaf %lu does not "
+			"start a block of that order - ignoring\n",
+			hb->name, p, order, leaf);
 		return;
 	}
 	if (pg->leaforder[leaf] != order) {
@@ -378,14 +390,13 @@ void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order)
 		pg->leaforder[bleaf] = HG_LEAF_NONE;
 
 		if (bleaf < leaf) {           /* we are the upper half - move down */
-			pg->leaforder[leaf] = HG_LEAF_NONE;
 			leaf = bleaf;
 			blk = buddy;
 		}
 		o++;
 	}
 
-	pg->leaforder[leaf] = (unsigned char)o;
+	memset(pg->leaforder + leaf, (int)o, (size_t)1UL << o);
 	bit_set(pg->bitmap, node_id(top, o, leaf));
 	fl_push(hb, blk, o);
 }
@@ -429,7 +440,8 @@ void *hg_buddy_alloc_run(struct hg_block *hb, unsigned long npages)
 
 		fl_unlink(hb, pg->base, top);
 		bit_clear(pg->bitmap, node_id(top, top, 0));
-		pg->leaforder[0] = HG_LEAF_NONE;
+		memset(pg->leaforder, HG_LEAF_NONE,
+		       (size_t)hg_leaves_per_page(hb));
 		pg->free_leaves = 0;
 		pg->run_len = (i == start) ? (unsigned int)npages : HG_RUN_MEMBER;
 		hb->buddy_free_leaves -= hg_leaves_per_page(hb);

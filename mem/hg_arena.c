@@ -1688,7 +1688,6 @@ void hg_arena_stats_core_init(struct hg_block *hb, int core_index)
 }
 #endif
 
-#endif /* HG_MALLOC */
 
 
 /* =========================================================================
@@ -1817,3 +1816,11 @@ int hg_register_stats(void)
 	}
 	return 0;
 }
+
+#endif /* HG_MALLOC - covers the statistics section below the arena
+         * code too. It used to close at what is now ~line 1690, leaving
+         * hg_shm_stat() and hg_register_stats() - which dereference
+         * struct hg_block and shm_block - compiled unconditionally. A
+         * build without -DHG_MALLOC failed there with 22 "invalid use of
+         * undefined type" errors. Nothing in that section is meaningful
+         * without the allocator. */

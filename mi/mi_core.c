@@ -1066,6 +1066,30 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb)
 	/* carved but idle: on a private free stack or in the global pool.
 	 * Reusable, but ONLY for its own size class - which is why it is not
 	 * counted as free_to_carve. */
+	/*
+	 * v2 reclaim. blocks_carved counts every block ever cut and
+	 * blocks_returned every one handed back, so the difference is the live
+	 * block count and the ratio is how well reclaim keeps up. Watch
+	 * carved against carved_peak too: under v1 carve was monotonic and the
+	 * two were always equal, so carved BELOW its peak is itself the proof
+	 * that memory is being given back.
+	 */
+	if (add_mi_number(o, MI_SSTR("blocks_carved"), hb->blocks_carved) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("blocks_returned"), hb->gc_blocks_returned) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("gc_passes"), hb->gc_passes) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("cache_flushes"), hb->cache_flushes) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("cells_flushed"), hb->cells_flushed) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("buddy_splits"), hb->buddy_splits) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("buddy_merges"), hb->buddy_merges) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("buddy_free_leaves"), hb->buddy_free_leaves) < 0)
+		return -1;
 	if (add_mi_number(o, MI_SSTR("slab_recycled"), hg_slab_recycled(hb)) < 0)
 		return -1;
 

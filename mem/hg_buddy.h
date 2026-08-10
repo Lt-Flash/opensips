@@ -1,0 +1,133 @@
+/*
+ * buddy allocator over the HG_MALLOC huge-page grid
+ *
+ * Copyright (C) 2026 Yury Kirsanov
+ *
+ * This file is part of opensips, a free SIP server.
+ *
+ * opensips is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version
+ *
+ * opensips is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+/*
+ * One buddy tree per huge page - see mem/README.hg_arena_v2, "Structure".
+ *
+ * Order 0 is the leaf (HG_LEAF_SIZE, 8 KB); the top order is the whole page,
+ * so the hierarchy terminates at the page and there is no cross-page merging
+ * to implement. A wholly free top block IS one huge page.
+ *
+ * Splitting is pure bookkeeping: the arena is already mapped and pre-faulted
+ * at init, so turning a 16 KB block into two 8 KB blocks changes records
+ * only. Merging is the reverse and is the only legal defragmentation here,
+ * because it moves free space rather than live objects (constraint 1 of the
+ * design: callers hold raw pointers, so nothing live can ever be relocated).
+ *
+ * Everything in here runs under hb->lock, on the slow path that already takes
+ * it. Nothing on the cell fast path calls into this file.
+ */
+
+#ifndef HG_BUDDY_H
+#define HG_BUDDY_H
+
+#include "hg_malloc.h"
+
+/* HG_MAX_ORDERS lives in hg_malloc.h - struct hg_block needs it for the
+ * free-list array, and this header includes that one, not the other way. */
+
+/* A free block stores its own list linkage in its first bytes. Legitimate
+ * because the block is free - nothing else is using those bytes - and it is
+ * what keeps the free lists free of external metadata. The smallest block is
+ * HG_LEAF_SIZE, vastly larger than this struct. */
+struct hg_free_blk {
+	struct hg_free_blk *next;
+	struct hg_free_blk *prev;
+	/* Guards against a double free and against freeing a wild pointer as if
+	 * it were a block. Cheap: one word, checked only on the slow path. */
+	unsigned long magic;
+};
+
+#define HG_FREE_MAGIC  0x62756464796672eeUL   /* "buddyfr" */
+
+/*
+ * Per-page descriptor. Lives in the metadata region carved from the front of
+ * the arena, NOT inside the page it describes - a page must be able to become
+ * wholly free, and it cannot if its own bookkeeping sits in it.
+ */
+struct hg_page {
+	char          *base;       /* first byte of this page */
+	unsigned char *leaforder;  /* per leaf: order of the block starting here */
+	unsigned long *bitmap;     /* per tree node: 1 = free, whole, not split */
+
+	/* Fullness lists. Unused until the allocation policy lands (task #58,
+	 * "page preference"); kept here because the descriptor is sized to the
+	 * design's 64 byte budget and these two fit inside it. */
+	struct hg_page *next;
+	struct hg_page *prev;
+
+	unsigned int idx;          /* page index within the arena */
+	unsigned int free_leaves;  /* leaves not currently allocated */
+};
+/* Deliberately NOT carrying a per-order free count per page: at HG_MAX_ORDERS
+ * that array alone is 100 bytes and would take the descriptor from 48 to 148,
+ * over double the design's 64 byte budget and, on a 5 GB arena, from 160 KB to
+ * 370 KB of descriptors. Per-order counts are global, on hg_block. */
+
+/* leaforder[] value for a leaf that does not START a block (it is in the
+ * middle of a larger one, or its block is allocated and recorded elsewhere) */
+#define HG_LEAF_NONE  0xff
+
+/*
+ * Set up the page grid's buddy state. Carves the metadata for every page from
+ * the front of the arena, marks the region already consumed by the block
+ * header and that metadata as allocated, and publishes the rest as free
+ * blocks. Call once, from hg_arena_init(), after pages_init().
+ *
+ * Returns 0 on success, -1 if the metadata cannot be carved.
+ */
+int hg_buddy_init(struct hg_block *hb);
+
+/* Allocate one block of exactly (HG_LEAF_SIZE << order) bytes, naturally
+ * aligned. hb->lock must be held. Returns NULL when no page can serve it. */
+void *hg_buddy_alloc(struct hg_block *hb, unsigned int order);
+
+/* Return a block previously handed out by hg_buddy_alloc(), merging it with
+ * its buddy as far up as it will go. hb->lock must be held. */
+void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order);
+
+/* Order of the block starting at @p, or -1 if @p does not start one. Used by
+ * the layers above to size a block they only hold a pointer to. */
+int hg_buddy_order_of(const struct hg_block *hb, const void *p);
+
+/* Highest order this arena can serve, i.e. the whole-page order. */
+static inline unsigned int hg_buddy_top_order(const struct hg_block *hb)
+{
+	return hb->hps_shift - HG_LEAF_SHIFT;
+}
+
+/* Smallest order whose block is at least @bytes. Returns -1 if @bytes exceeds
+ * a whole page, which the caller must route to the large tier instead. */
+static inline int hg_buddy_order_for(const struct hg_block *hb,
+                                     unsigned long bytes)
+{
+	unsigned int o = 0;
+
+	while ((HG_LEAF_SIZE << o) < bytes) {
+		if (o >= hg_buddy_top_order(hb))
+			return -1;
+		o++;
+	}
+	return (int)o;
+}
+
+#endif /* HG_BUDDY_H */

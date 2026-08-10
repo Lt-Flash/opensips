@@ -77,7 +77,13 @@ struct hg_page {
 
 	unsigned int idx;          /* page index within the arena */
 	unsigned int free_leaves;  /* leaves not currently allocated */
+	/* >0 on the FIRST page of a multi-page run, giving its length; the
+	 * other pages of the run carry HG_RUN_MEMBER. See hg_buddy_alloc_run(). */
+	unsigned int run_len;
 };
+
+/* run_len marker for a page that belongs to a run but does not head it */
+#define HG_RUN_MEMBER  0xffffffffu
 /* Deliberately NOT carrying a per-order free count per page: at HG_MAX_ORDERS
  * that array alone is 100 bytes and would take the descriptor from 48 to 148,
  * over double the design's 64 byte budget and, on a 5 GB arena, from 160 KB to
@@ -108,6 +114,29 @@ void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order);
 /* Order of the block starting at @p, or -1 if @p does not start one. Used by
  * the layers above to size a block they only hold a pointer to. */
 int hg_buddy_order_of(const struct hg_block *hb, const void *p);
+
+/*
+ * A run of @npages CONTIGUOUS whole pages, for the one thing the tree cannot
+ * express: an allocation larger than a huge page. The large tier needs it -
+ * a dialog or usrloc hash table is routinely several MB in one piece - and
+ * before the buddy those went to the bump allocator, which had no upper bound.
+ * Losing that would be a regression, not a simplification.
+ *
+ * Deliberately a linear scan for a free run, not an index: it is reached only
+ * when the large tier grows past a page, the scan is over page descriptors
+ * (2560 of them on a 5 GB arena) and it happens orders of magnitude less often
+ * than a cell allocation. Paying for an index here would be paying for
+ * nothing.
+ *
+ * hb->lock must be held. Returns the run's first byte, or NULL.
+ */
+void *hg_buddy_alloc_run(struct hg_block *hb, unsigned long npages);
+
+/* Release a run obtained from hg_buddy_alloc_run(). hb->lock must be held. */
+void hg_buddy_free_run(struct hg_block *hb, void *p);
+
+/* Length in pages of the run starting at @p, or 0 if @p heads no run. */
+unsigned long hg_buddy_run_len(const struct hg_block *hb, const void *p);
 
 /* Highest order this arena can serve, i.e. the whole-page order. */
 static inline unsigned int hg_buddy_top_order(const struct hg_block *hb)

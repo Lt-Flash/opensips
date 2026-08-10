@@ -390,6 +390,85 @@ void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order)
 	fl_push(hb, blk, o);
 }
 
+/* --- multi-page runs -------------------------------------------------- */
+
+/* is this whole page free and unsplit, i.e. available to a run? */
+static inline int page_is_whole_free(const struct hg_block *hb,
+                                     const struct hg_page *pg)
+{
+	unsigned int top = hb->buddy_top;
+
+	return pg->run_len == 0 && bit_test(pg->bitmap, node_id(top, top, 0)) &&
+	       pg->leaforder[0] == top;
+}
+
+void *hg_buddy_alloc_run(struct hg_block *hb, unsigned long npages)
+{
+	unsigned int top = hb->buddy_top;
+	unsigned long i, start, run = 0;
+
+	if (!hb->buddy_ready || npages == 0)
+		return NULL;
+	if (npages == 1)
+		return hg_buddy_alloc(hb, top);
+
+	for (i = 0, start = 0; i < hb->npages; i++) {
+		if (!page_is_whole_free(hb, &hb->pages[i])) {
+			run = 0;
+			start = i + 1;
+			continue;
+		}
+		if (++run == npages)
+			break;
+	}
+	if (run < npages)
+		return NULL;
+
+	for (i = start; i < start + npages; i++) {
+		struct hg_page *pg = &hb->pages[i];
+
+		fl_unlink(hb, pg->base, top);
+		bit_clear(pg->bitmap, node_id(top, top, 0));
+		pg->leaforder[0] = HG_LEAF_NONE;
+		pg->free_leaves = 0;
+		pg->run_len = (i == start) ? (unsigned int)npages : HG_RUN_MEMBER;
+		hb->buddy_free_leaves -= hg_leaves_per_page(hb);
+	}
+	LM_DBG("%s: run of %lu pages at page %lu\n", hb->name, npages, start);
+	return hb->pages[start].base;
+}
+
+unsigned long hg_buddy_run_len(const struct hg_block *hb, const void *p)
+{
+	const struct hg_page *pg;
+
+	if (!hb->buddy_ready || !hg_in_pages(hb, p))
+		return 0;
+	pg = &hb->pages[hg_page_of(hb, p)];
+	if (pg->base != p || pg->run_len == 0 || pg->run_len == HG_RUN_MEMBER)
+		return 0;
+	return pg->run_len;
+}
+
+void hg_buddy_free_run(struct hg_block *hb, void *p)
+{
+	unsigned long n, i, start;
+	struct hg_page *pg;
+
+	n = hg_buddy_run_len(hb, p);
+	if (n == 0) {
+		LM_CRIT("%s: run free of %p, which heads no run - ignoring\n",
+			hb->name, p);
+		return;
+	}
+	start = hg_page_of(hb, p);
+	for (i = start; i < start + n; i++) {
+		pg = &hb->pages[i];
+		pg->run_len = 0;
+		page_publish_whole(hb, pg);
+	}
+}
+
 int hg_buddy_order_of(const struct hg_block *hb, const void *p)
 {
 	const struct hg_page *pg;

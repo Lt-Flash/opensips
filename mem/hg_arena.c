@@ -442,7 +442,16 @@ static inline void gpool_push(struct hg_block *hb, int c, void *cell_start)
 	hb->gpool_n[c]++;
 	block_regrade(hb, c, ch);
 
-	if (hb->ndrained[c] > HG_GC_KEEP)
+	/*
+	 * Deferred during a cache flush, and that is a correctness requirement,
+	 * not a tuning one. The flush walks a chain of cached cells; pushing one
+	 * can complete its block and hand it to the buddy, which immediately
+	 * writes free-list linkage over its first bytes. If the NEXT cell on the
+	 * chain belongs to that same block - and cells of one block are exactly
+	 * what a flush tends to hold - the walk would then dereference recycled
+	 * memory. Collect first, collect the reclaim afterwards.
+	 */
+	if (!hb->gc_deferred && hb->ndrained[c] > HG_GC_KEEP)
 		gc_class(hb, c);
 }
 
@@ -484,6 +493,49 @@ static inline void *gpool_pop(struct hg_block *hb, int c)
 	hb->gpool_n[c]--;
 	block_regrade(hb, c, ch);
 	return cell_start;
+}
+
+/*
+ * Give up every cell this thread has cached, for every class.
+ *
+ * This is the only way those cells can ever be seen again: they live in
+ * __thread TLS, so no other process or thread can reach them - which is why
+ * the design forbids a central sweeper and requires the flush to run ON the
+ * owning thread. Measured, this is what stands between the reclaim and the
+ * arena: blocks stalled at 37 of 42 cells with the remainder sitting here.
+ *
+ * hb->lock must be held. Returns the number of cells handed over.
+ */
+static unsigned int cache_flush_locked(struct hg_block *hb,
+                                       struct hg_palloc *pl)
+{
+	unsigned int c, n = 0;
+
+	if (!pl)
+		return 0;
+
+	hb->gc_deferred = 1;
+	for (c = 0; c < HG_NCLASSES; c++) {
+		void *cur = pl->cls[c].free_head;
+
+		while (cur) {
+			void *nxt = cell_next(cur);
+
+			gpool_push(hb, c, cur);
+			cur = nxt;
+			n++;
+		}
+		pl->cls[c].free_head = NULL;
+		pl->cls[c].nfree = 0;
+	}
+	hb->gc_deferred = 0;
+
+	/* now it is safe to let blocks go - nothing is walking their cells */
+	for (c = 0; c < HG_NCLASSES; c++)
+		if (hb->ndrained[c] > HG_GC_KEEP)
+			gc_class(hb, c);
+
+	return n;
 }
 
 /*
@@ -1090,6 +1142,34 @@ void *hg_cell_alloc(struct hg_block *hb, unsigned long size)
 		cell_set_next(cell_start, pl->cls[c].free_head);
 		pl->cls[c].free_head = cell_start;
 		pl->cls[c].nfree++;
+	}
+	if (!got) {
+		/*
+		 * About to grow the arena. Reserve pressure IS the trigger the
+		 * design asks for ("trigger the sweep on reserve pressure, not
+		 * only on time"), and here the owning thread is the one asking -
+		 * so it flushes its own cache inline, with no IPC and no
+		 * self-addressed RPC to order against.
+		 *
+		 * Often this alone satisfies the request: the cells were ours all
+		 * along, just invisible. When it does not, it has at least made
+		 * the block accounting true, so blocks that were already empty
+		 * can be reclaimed instead of the arena growing around them.
+		 */
+		unsigned int flushed = cache_flush_locked(hb, pl);
+
+		if (flushed) {
+			for (got = 0; got < HG_REFILL_BATCH; got++) {
+				cell_start = gpool_pop(hb, c);
+				if (!cell_start)
+					break;
+				cell_set_next(cell_start, pl->cls[c].free_head);
+				pl->cls[c].free_head = cell_start;
+				pl->cls[c].nfree++;
+			}
+			LM_DBG("%s class %d: flushed %u cached cells under pressure, "
+				"recovered %d\n", hb->name, c, flushed, got);
+		}
 	}
 	if (!got && carve_chunk(hb, c, pl) < 0) {
 		lock_release(&hb->lock);

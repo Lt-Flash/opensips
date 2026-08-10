@@ -64,6 +64,8 @@ int hg_arena_init(struct hg_block *hb, unsigned long hdr_size);
  * Exposed for hg_large.c, which grows by carving additional chunks from
  * this SAME underlying arena rather than a separate reservation. */
 void *hg_chunk_backing(struct hg_block *hb, unsigned long size);
+void *hg_backing_aligned(struct hg_block *hb, unsigned long size,
+                         unsigned long align);
 
 /* a cell of at least @size usable bytes (header excluded), or NULL if
  * size > HG_CELL_MAX or the arena is exhausted. No fallback to another

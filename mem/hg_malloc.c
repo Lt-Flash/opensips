@@ -448,6 +448,9 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 	hb->lo = ~0UL;
 	hb->hbase = base;
 	hb->hsize = HG_HPS_ROUND(size);
+	/* hg_hps() is private to this file, and hg_arena_init() needs the probed
+	 * value to lay out the page grid - hand it over rather than re-probing */
+	hb->hps = HG_HPS;
 	hb->tier = tier;
 	hb->locked_mb = locked_mb;
 

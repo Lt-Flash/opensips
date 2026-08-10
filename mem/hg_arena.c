@@ -268,6 +268,51 @@ void *hg_chunk_backing(struct hg_block *hb, unsigned long size)
 }
 
 /*
+ * As hg_chunk_backing(), but the returned address is @align-aligned.
+ *
+ * The buddy layer needs whole huge pages at their natural alignment, and
+ * over-allocating by align-1 to trim afterwards would throw away up to a
+ * whole 2 MB page per page claimed. So this bumps by the EXACT padded amount
+ * under a compare-exchange instead: the pad is computed from the candidate
+ * offset, and if another bumper wins the race the pad is recomputed against
+ * the new offset rather than reused.
+ *
+ * Unlike hg_chunk_backing() a failed reservation does not consume the tail -
+ * the CAS simply never commits - so an oversized request cannot poison the
+ * arena for the smaller ones behind it.
+ *
+ * @align must be a power of two. Alignment is applied to the ADDRESS, not to
+ * the offset, because hbase itself is not guaranteed aligned on the non-Linux
+ * reserve path.
+ */
+void *hg_backing_aligned(struct hg_block *hb, unsigned long size,
+                         unsigned long align)
+{
+	unsigned long asz = (size + 63) & ~63UL;
+	unsigned long cur, aligned_off, newoff;
+
+	if (align < 64)
+		align = 64;
+	if (align & (align - 1)) {
+		LM_ERR("%s: alignment %lu is not a power of two\n", hb->name, align);
+		return NULL;
+	}
+
+	cur = __atomic_load_n(&hb->hoff, __ATOMIC_RELAXED);
+	do {
+		unsigned long addr = (unsigned long)hb->hbase + cur;
+
+		aligned_off = cur + ((~addr + 1) & (align - 1));
+		newoff = aligned_off + asz;
+		if (newoff > hb->hsize)
+			return NULL;
+	} while (!__atomic_compare_exchange_n(&hb->hoff, &cur, newoff, 1,
+	                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+
+	return hb->hbase + aligned_off;
+}
+
+/*
  * Chunk granularity has to scale with the arena, not be a fixed 256K.
  *
  * A chunk is claimed whole the first time its size class is touched, so
@@ -377,12 +422,181 @@ static void private_caps_init(struct hg_block *hb)
 		cell_sizes[HG_NCLASSES - 1], hb->priv_max[HG_NCLASSES - 1]);
 }
 
+/*
+ * Lay out the page grid the v2 buddy addresses through, and PROVE the
+ * arithmetic on real addresses before anything is built on top of it.
+ *
+ * Everything above the cell level resolves an address to its block with
+ * two shifts and a mask (README.hg_arena_v2, "Address to block"). That is
+ * only sound if the origin is huge-page aligned and the derived page and
+ * leaf indices round-trip. Getting it wrong would not fail loudly at the
+ * point of the mistake - it would hand out a block descriptor belonging to
+ * a different block, which surfaces much later as corruption, so it is
+ * checked here rather than assumed.
+ *
+ * Returns 0 when the grid is usable, -1 when the arithmetic does not hold.
+ */
+static int pages_init(struct hg_block *hb)
+{
+	unsigned long hps = hb->hps, off;
+	unsigned int shift = 0;
+	const char *end;
+	int i;
+
+	if (!hps || (hps & (hps - 1))) {
+		LM_ERR("%s: huge page size %lu is not a power of two - cannot "
+			"build the page grid\n", hb->name, hps);
+		return -1;
+	}
+	while ((1UL << shift) < hps)
+		shift++;
+	hb->hps_shift = shift;
+
+	/*
+	 * Anchor the shift to the probed size. Everything below derives page
+	 * indices FROM hps_shift and checks them against each other, so a shift
+	 * that disagrees with hps is self-consistent and would sail through the
+	 * probe loop - the corrupted-grid harness caught exactly that. This is
+	 * the one comparison that ties the grid to physical reality.
+	 */
+	if ((1UL << shift) != hps) {
+		LM_ERR("%s: page shift %u describes %lu bytes, but the probed huge "
+			"page is %lu\n", hb->name, shift, 1UL << shift, hps);
+		return -1;
+	}
+
+	if (shift <= HG_LEAF_SHIFT) {
+		LM_ERR("%s: huge page size %lu is not larger than the %lu byte "
+			"buddy leaf\n", hb->name, hps, HG_LEAF_SIZE);
+		return -1;
+	}
+
+	/* page 0 starts at the first aligned address at or after hbase. On
+	 * Linux every reserve path already aligns, so this is hbase and the
+	 * subtraction below is zero; the non-Linux fallback is a plain mmap()
+	 * and loses the unaligned head. */
+	hb->pbase = (char *)(((unsigned long)hb->hbase + hps - 1) & ~(hps - 1));
+	end = hb->hbase + hb->hsize;
+	hb->npages = (unsigned long)(end - hb->pbase) >> shift;
+
+	if (hb->pbase != hb->hbase)
+		LM_INFO("%s: reservation base %p is not %lu-aligned, losing %lu "
+			"bytes of head to align the page grid\n", hb->name,
+			hb->hbase, hps, (unsigned long)(hb->pbase - hb->hbase));
+
+	if (hb->npages == 0) {
+		/* An arena smaller than one huge page is legitimate (a tiny -M on
+		 * a 512M-page arm64 box), it just cannot carry a buddy page. The
+		 * chunk allocator below is unaffected, so this is not fatal. */
+		LM_INFO("%s: arena of %lu bytes holds no whole %lu byte page - "
+			"buddy reclaim will be inactive\n",
+			hb->name, hb->hsize, hps);
+		return 0;
+	}
+
+	/* The grid must not describe memory the reservation does not own. Also
+	 * caught by the harness: an npages one too large keeps every internal
+	 * relation intact and only shows up against the reservation end. */
+	if (hb->pbase + (hb->npages << shift) > end) {
+		LM_ERR("%s: page grid of %lu pages ends at %p, past the %lu byte "
+			"reservation ending at %p\n", hb->name, hb->npages,
+			hb->pbase + (hb->npages << shift), hb->hsize, end);
+		return -1;
+	}
+
+	/* --- the proof. Real addresses, spanning the whole grid. --- */
+	for (i = 0; i < 5; i++) {
+		unsigned long pg, leaf, want_pg;
+		const char *probe, *pbase_of;
+
+		switch (i) {
+		case 0: want_pg = 0;               off = 0;                 break;
+		case 1: want_pg = 0;               off = HG_LEAF_SIZE;      break;
+		case 2: want_pg = hb->npages / 2;  off = hps / 2;           break;
+		case 3: want_pg = hb->npages - 1;  off = 0;                 break;
+		default:want_pg = hb->npages - 1;  off = hps - 1;           break;
+		}
+		probe = hb->pbase + (want_pg << shift) + off;
+
+		if (!hg_in_pages(hb, probe)) {
+			LM_ERR("%s: addressing self-test %d: %p should be inside the "
+				"%lu-page grid at %p but is not\n",
+				hb->name, i, probe, hb->npages, hb->pbase);
+			return -1;
+		}
+		pg = hg_page_of(hb, probe);
+		if (pg != want_pg) {
+			LM_ERR("%s: addressing self-test %d: %p resolved to page %lu, "
+				"expected %lu\n", hb->name, i, probe, pg, want_pg);
+			return -1;
+		}
+		pbase_of = hg_page_base(hb, probe);
+		if ((unsigned long)pbase_of & (hps - 1)) {
+			LM_ERR("%s: addressing self-test %d: page base %p is not "
+				"%lu-aligned\n", hb->name, i, pbase_of, hps);
+			return -1;
+		}
+		if (probe - pbase_of != (long)off) {
+			LM_ERR("%s: addressing self-test %d: %p is %ld bytes into its "
+				"page, expected %lu\n", hb->name, i, probe,
+				(long)(probe - pbase_of), off);
+			return -1;
+		}
+		leaf = hg_leaf_of(hb, probe);
+		if (leaf != off >> HG_LEAF_SHIFT ||
+		    leaf >= hg_leaves_per_page(hb)) {
+			LM_ERR("%s: addressing self-test %d: %p is leaf %lu, expected "
+				"%lu of %lu\n", hb->name, i, probe, leaf,
+				off >> HG_LEAF_SHIFT, hg_leaves_per_page(hb));
+			return -1;
+		}
+	}
+
+	/* and the negative side - the header region and the byte past the end
+	 * must NOT classify as page memory, or a stray pointer would be
+	 * "resolved" to a block that does not exist */
+	if (hb->pbase != hb->hbase && hg_in_pages(hb, hb->hbase)) {
+		LM_ERR("%s: addressing self-test: unaligned head %p classifies as "
+			"page memory\n", hb->name, hb->hbase);
+		return -1;
+	}
+	if (hg_in_pages(hb, hb->pbase + (hb->npages << shift))) {
+		LM_ERR("%s: addressing self-test: the byte past the last page "
+			"classifies as page memory\n", hb->name);
+		return -1;
+	}
+
+	LM_DBG("%s page grid: %lu pages of %lu B at %p (shift %u), %lu leaves "
+		"of %lu B per page; addressing verified\n",
+		hb->name, hb->npages, hps, hb->pbase, shift,
+		hg_leaves_per_page(hb), HG_LEAF_SIZE);
+	return 0;
+}
+
 int hg_arena_init(struct hg_block *hb, unsigned long hdr_size)
 {
 	unsigned int idx, c, needed;
 
-	/* leave the block header itself untouched by the bump allocator */
-	hb->hoff = (hdr_size + 63) & ~63UL;
+	if (pages_init(hb) < 0)
+		return -1;
+
+	/*
+	 * Leave the block header itself untouched by the bump allocator, and
+	 * start on a leaf boundary: a buddy block must be naturally aligned to
+	 * its own size, and every size is a multiple of the leaf, so aligning
+	 * the very first carve is what makes all of them aligned. Costs one
+	 * rounding here - under one leaf, once per arena - and is the whole
+	 * reason the address mask above can be a mask at all.
+	 */
+	hb->hoff = (hdr_size + HG_LEAF_SIZE - 1) & ~(HG_LEAF_SIZE - 1);
+	if (hb->pbase != hb->hbase) {
+		/* the grid does not start at hbase, so the first carve must clear
+		 * the discarded head too */
+		unsigned long skip = (unsigned long)(hb->pbase - hb->hbase);
+
+		if (hb->hoff < skip)
+			hb->hoff = skip;
+	}
 
 	/* see chunk_size_for(): no single chunk may swallow a big slice of a
 	 * small arena. /64 keeps all 21 classes plus the large tier inside a

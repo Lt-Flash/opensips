@@ -25,6 +25,7 @@
 #include "hg_malloc.h"
 #include "hg_large.h"
 #include "hg_arena.h"
+#include "hg_buddy.h"
 #include "../dprint.h"
 
 #define HG_LARGE_MIN_FRAG    HG_ROUNDTO
@@ -114,7 +115,37 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 		}
 		chunk_size = (chunk_size + 63) & ~63UL;
 
-		base = hg_chunk_backing(hb, chunk_size + sizeof(struct hg_large_chunk));
+		/*
+		 * Large chunks come from the buddy now, not the bump allocator.
+		 * Two shapes, because the tree tops out at one huge page:
+		 *
+		 *   up to a page  - one buddy block, rounded up to its order. The
+		 *                   slack is not lost, it becomes free-list space
+		 *                   inside the chunk.
+		 *   over a page   - a run of contiguous whole pages. Rare, but it
+		 *                   MUST work: a dialog or usrloc hash table is one
+		 *                   allocation of several MB, and the bump allocator
+		 *                   this replaces had no upper bound at all.
+		 */
+		{
+			unsigned long total = chunk_size + sizeof(struct hg_large_chunk);
+			int ord = hg_buddy_order_for(hb, total);
+
+			if (ord >= 0) {
+				base = hg_buddy_alloc(hb, (unsigned int)ord);
+				if (base)
+					chunk_size = (HG_LEAF_SIZE << ord) -
+					             sizeof(struct hg_large_chunk);
+			} else {
+				unsigned long np = (total + hb->hps - 1) >> hb->hps_shift;
+
+				base = hg_buddy_alloc_run(hb, np);
+				if (base)
+					chunk_size = (np << hb->hps_shift) -
+					             sizeof(struct hg_large_chunk);
+			}
+			chunk_size &= ~63UL;
+		}
 		if (!base) {
 			lock_release(&hb->lock);
 			LM_ERR("%s: no more HG_MALLOC arena memory for a %lu byte "

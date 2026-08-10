@@ -147,6 +147,23 @@ struct hg_chunk {
 	unsigned int cells;
 } __attribute__ ((aligned (64)));
 
+/*
+ * v2 buddy geometry - mem/README.hg_arena_v2, "Address to block".
+ *
+ * The leaf is the minimum buddy order. 8 KB is a deliberate floor: the leaf
+ * array is one byte per leaf per page, so dropping to 1 KB would multiply that
+ * array by eight for no measured gain. Do not lower it without evidence.
+ *
+ * Leaves per page is NOT a constant, because the huge page size is probed -
+ * 256 leaves on a 2M page, 65536 on a 512M arm64 page - so it is derived from
+ * hb->hps_shift rather than baked in.
+ */
+#define HG_LEAF_SHIFT  13
+#define HG_LEAF_SIZE   (1UL << HG_LEAF_SHIFT)
+
+/* the accessors that turn an address into a page and a leaf live just after
+ * struct hg_block below - they dereference it, so they cannot precede it */
+
 struct hg_region {
 	struct hg_region *next;
 	unsigned long size;
@@ -265,8 +282,72 @@ struct hg_block {
 	enum hg_mem_tier      tier;
 	unsigned long         locked_mb;
 
+	/*
+	 * v2 buddy substrate - see mem/README.hg_arena_v2.
+	 *
+	 * The whole design turns "which block owns this address" into two shifts
+	 * and a mask, which needs a known-aligned origin. hbase is NOT reliably
+	 * that origin: all three Linux reserve paths align it (MAP_HUGETLB is
+	 * aligned by the kernel, the THP tiers align explicitly at
+	 * hg_malloc.c:301), but the non-Linux fallback takes a plain
+	 * mmap(NULL, ...) and gets only page alignment. So page 0 starts at
+	 * pbase, hbase rounded up to a huge page - equal to hbase everywhere it
+	 * matters, and correct where it is not.
+	 *
+	 * hps is PROBED, not assumed: it is 2M on x86_64 and on arm64 with 4K
+	 * base pages, but 32M with 16K pages and 512M with 64K. A hardcoded
+	 * ">> 21" would mis-address every block on those machines, which is the
+	 * same trap hg_hps() already exists to avoid for the mapping itself.
+	 */
+	unsigned long hps;         /* huge page size, probed at reserve time */
+	unsigned int  hps_shift;   /* log2(hps), so page-of is a shift */
+	char         *pbase;       /* page 0 - hbase rounded up to hps */
+	unsigned long npages;      /* whole pages from pbase to the reservation end */
+
 	unsigned char size2class[(HG_CELL_MAX / HG_ROUNDTO) + 1];
 } __attribute__ ((aligned (HG_ROUNDTO)));
+
+/*
+ * Address -> page/leaf, the arithmetic the whole v2 buddy layer rests on.
+ * See the HG_LEAF_SHIFT block above and mem/README.hg_arena_v2.
+ * pages_init() in hg_arena.c verifies these against real addresses at every
+ * arena init, and refuses to start the arena if they do not round-trip.
+ */
+
+/* how many leaves tile one huge page */
+static inline unsigned long hg_leaves_per_page(const struct hg_block *hb)
+{
+	return 1UL << (hb->hps_shift - HG_LEAF_SHIFT);
+}
+
+/* Is @p inside the page-addressable region? Everything before pbase (the
+ * block header, and on a non-Linux fallback the unaligned head) is arena
+ * memory but not buddy memory, so it must answer NO. */
+static inline int hg_in_pages(const struct hg_block *hb, const void *p)
+{
+	return (const char *)p >= hb->pbase &&
+	       (const char *)p <  hb->pbase + (hb->npages << hb->hps_shift);
+}
+
+/* page index of @p; only meaningful when hg_in_pages() */
+static inline unsigned long hg_page_of(const struct hg_block *hb, const void *p)
+{
+	return (unsigned long)((const char *)p - hb->pbase) >> hb->hps_shift;
+}
+
+/* first byte of the page holding @p */
+static inline char *hg_page_base(const struct hg_block *hb, const void *p)
+{
+	return hb->pbase + (hg_page_of(hb, p) << hb->hps_shift);
+}
+
+/* leaf index of @p WITHIN its own page */
+static inline unsigned long hg_leaf_of(const struct hg_block *hb, const void *p)
+{
+	unsigned long off = (unsigned long)((const char *)p - hb->pbase);
+
+	return (off & ((1UL << hb->hps_shift) - 1)) >> HG_LEAF_SHIFT;
+}
 
 /*
  * Reserves its own huge-page-backed (or gracefully degraded) region of

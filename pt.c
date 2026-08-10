@@ -694,7 +694,16 @@ int internal_fork(const struct internal_fork_params *ifpp)
 				child_startup_failed();
 			}
 		}
-#ifdef PKG_MALLOC
+#if defined(PKG_MALLOC) && defined(HG_MALLOC)
+		/*
+		 * HG_MALLOC as well as PKG_MALLOC: the body calls hg_malloc_init()
+		 * and names struct hg_block, neither of which exists when the
+		 * allocator is not compiled in. PKG_MALLOC alone is not enough -
+		 * a build with pkg on and HG off failed here with an implicit
+		 * declaration, which is how this was found. mem_allocator_pkg can
+		 * never hold MM_HG_MALLOC in such a build (parse_mm rejects the
+		 * name), so the runtime test below is unreachable there anyway.
+		 */
 		if (mem_allocator_pkg == MM_HG_MALLOC ||
 		    mem_allocator_pkg == MM_HG_MALLOC_DBG) {
 			/*

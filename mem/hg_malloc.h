@@ -437,6 +437,15 @@ struct hg_block {
 	/* set while a flush walks a cache chain: pushing a cell can reclaim its
 	 * block, and the next cell on the chain may live in that same block */
 	unsigned int        gc_deferred;
+	/*
+	 * Reserve floor: free leaves below which the arena is treated as under
+	 * pressure. Set once at init as a fraction of the grid. Not consumable
+	 * by an expanding class in the sense that crossing it triggers a sweep
+	 * BEFORE the failure, which is the only warning an operator can act on.
+	 */
+	unsigned long       reserve_floor;
+	unsigned int        below_floor;      /* hysteresis: already reported */
+	unsigned long       floor_crossings;
 
 	unsigned char size2class[(HG_CELL_MAX / HG_ROUNDTO) + 1];
 } __attribute__ ((aligned (HG_ROUNDTO)));

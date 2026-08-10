@@ -70,6 +70,12 @@ void *hg_chunk_backing(struct hg_block *hb, unsigned long size);
  * unreachable from anywhere else, which is the whole reason the sweep is
  * dispatched rather than executed centrally. */
 void hg_cache_flush_self(void);
+
+/* Flush only if a sweep has been requested since this thread last looked.
+ * For threads IPC cannot reach - TCP main's IO pool waits on a condvar, not
+ * the reactor - called at a job boundary. Cheap: one read of a global. */
+extern volatile unsigned long hg_sweep_gen;
+void hg_cache_flush_if_due(void);
 void *hg_backing_aligned(struct hg_block *hb, unsigned long size,
                          unsigned long align);
 

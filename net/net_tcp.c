@@ -64,6 +64,9 @@
 #include "tcp_common.h"
 #include "tcp_conn.h"
 #include "tcp_conn_profile.h"
+#ifdef HG_MALLOC
+#include "../mem/hg_arena.h"
+#endif
 #include "trans.h"
 #include "net_tcp_dbg.h"
 
@@ -1264,6 +1267,16 @@ static void *tcp_thread_routine(void *arg)
 	/* Reactor operations stay in TCP main; IO threads only run read/write
 	 * callbacks and notify completion back to the main thread. */
 	while (1) {
+#if defined(HG_MALLOC) && !defined(INLINE_ALLOC)
+		/*
+		 * Job boundary: no locks held, no job in flight. The allocator's
+		 * idle sweep cannot reach this thread by IPC - it waits on the
+		 * condition variable below rather than on a reactor - so it leaves
+		 * a generation counter instead and we act on it here. Costs one
+		 * read of a global per job when no sweep is pending.
+		 */
+		hg_cache_flush_if_due();
+#endif
 		cond_lock(&tcp_write_queue->cond);
 		while (!tcp_pool.stop && tcp_pool.task_head == NULL &&
 				tcp_write_queue->head == NULL)

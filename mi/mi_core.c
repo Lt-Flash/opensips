@@ -47,6 +47,7 @@
 #ifdef HG_MALLOC
 #include "../mem/shm_mem.h"
 #include "../mem/hg_malloc.h"
+#include "../core_stats.h"   /* hg_pkg_peak_all: the per-process pkg high-water */
 #endif
 #include "../cachedb/cachedb.h"
 #include "../evi/event_interface.h"
@@ -1209,6 +1210,164 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 	return 0;
 }
 
+/*
+ * Sizing advice for -m / -M, from what the arenas have actually reached.
+ *
+ * Both margins are multipliers on the observed HIGH-WATER, not on current
+ * use: an arena that is 90% idle right now may still have peaked at 90% full
+ * during the busy hour, and it is the peak that has to fit.  They differ
+ * because the two failure modes differ - shm exhaustion makes an allocation
+ * fail and a call drop, pkg exhaustion kills the process outright, so pkg
+ * gets the wider margin.
+ */
+#define HG_ADVISE_SHM_MARGIN   2
+#define HG_ADVISE_PKG_MARGIN   3
+#define HG_ADVISE_SHM_FLOOR_MB 64
+#define HG_ADVISE_PKG_FLOOR_MB 4
+
+/* peak x margin, in MB, never below @floor, rounded up to a whole huge page
+ * so the arena does not map a partial one */
+static unsigned long hg_advise_mb(unsigned long peak, unsigned int margin,
+                                  unsigned long floor_mb, unsigned long hps)
+{
+	unsigned long mb = ((peak * margin) + (1UL << 20) - 1) >> 20;
+	unsigned long step = (hps >= (1UL << 20)) ? (hps >> 20) : 1;
+
+	if (mb < floor_mb)
+		mb = floor_mb;
+	if (step > 1)
+		mb = ((mb + step - 1) / step) * step;
+	return mb;
+}
+
+static const char *hg_advise_verdict(unsigned long peak, unsigned long size)
+{
+	unsigned long pct = size ? (peak * 100 / size) : 0;
+
+	if (pct > 80)
+		return "TIGHT - raise it before the next busy period";
+	if (pct < 20)
+		return "oversized - the surplus is pinned and unusable elsewhere";
+	return "reasonable";
+}
+
+static int hg_advise_one(mi_item_t *parent, const char *name,
+		struct hg_block *hb, unsigned long peak, unsigned int margin,
+		unsigned long floor_mb, int nproc)
+{
+	mi_item_t *o;
+	unsigned long rec;
+
+	o = add_mi_object(parent, (char *)name, strlen(name));
+	if (!o)
+		return -1;
+
+	rec = hg_advise_mb(peak, margin, floor_mb, hb->hps);
+
+	if (add_mi_number(o, MI_SSTR("configured_mb"), hb->size >> 20) < 0 ||
+	    add_mi_number(o, MI_SSTR("peak_bytes"), peak) < 0 ||
+	    add_mi_number(o, MI_SSTR("peak_pct_of_configured"),
+	        hb->size ? (peak * 100 / hb->size) : 0) < 0 ||
+	    add_mi_number(o, MI_SSTR("margin_applied"), margin) < 0 ||
+	    add_mi_number(o, MI_SSTR("recommended_mb"), rec) < 0 ||
+	    add_mi_string(o, MI_SSTR("verdict"),
+	        (char *)hg_advise_verdict(peak, hb->size),
+	        strlen(hg_advise_verdict(peak, hb->size))) < 0)
+		return -1;
+
+	/* pkg is per-process, so the interesting number is the whole fleet of
+	 * arenas, not one of them - that is what is pinned out of the hugepage
+	 * pool and cannot be used by anything else */
+	if (nproc > 0) {
+		if (add_mi_number(o, MI_SSTR("processes"), nproc) < 0 ||
+		    add_mi_number(o, MI_SSTR("pinned_total_mb"),
+		        (unsigned long)nproc * (hb->size >> 20)) < 0 ||
+		    add_mi_number(o, MI_SSTR("recommended_total_mb"),
+		        (unsigned long)nproc * rec) < 0)
+			return -1;
+	}
+	return 0;
+}
+
+static mi_response_t *mi_hg_advise(const mi_params_t *params,
+						struct mi_handler *async_hdl)
+{
+	mi_response_t *resp;
+	mi_item_t *resp_obj, *notes;
+	struct hg_block *hb;
+	unsigned long uptime = (unsigned long)(time(NULL) - startup_time);
+	int reported = 0;
+
+	resp = init_mi_result_object(&resp_obj);
+	if (!resp)
+		return 0;
+
+	if (add_mi_number(resp_obj, MI_SSTR("uptime_s"), uptime) < 0)
+		goto error;
+
+	if (mem_allocator_shm == MM_HG_MALLOC ||
+	    mem_allocator_shm == MM_HG_MALLOC_DBG) {
+		hb = (struct hg_block *)shm_block;
+		/* the CARVE high-water, not the live one: carve is what has to
+		 * fit in the arena, and in v2 it can sit well above live */
+		if (hg_advise_one(resp_obj, "shm", hb, hb->max_real_used,
+				HG_ADVISE_SHM_MARGIN, HG_ADVISE_SHM_FLOOR_MB, 0) < 0)
+			goto error;
+		reported++;
+	}
+
+	if (mem_allocator_pkg == MM_HG_MALLOC ||
+	    mem_allocator_pkg == MM_HG_MALLOC_DBG) {
+		unsigned long peak = 0, sum = 0;
+		int nproc = 0;
+
+		hb = (struct hg_block *)mem_block;
+#ifdef PKG_MALLOC
+		if (hg_pkg_peak_all(&peak, &sum, &nproc) < 0)
+			nproc = 0;
+#endif
+		/* fall back to this process's own arena if the shared array is
+		 * not populated - better a narrow answer than none, but say so
+		 * in the notes below */
+		if (!nproc)
+			peak = hb->max_real_used;
+
+		if (hg_advise_one(resp_obj, "pkg", hb, peak,
+				HG_ADVISE_PKG_MARGIN, HG_ADVISE_PKG_FLOOR_MB, nproc) < 0)
+			goto error;
+		reported++;
+	}
+
+	if (!reported) {
+		free_mi_response(resp);
+		return init_mi_error(400,
+			MI_SSTR("HG_MALLOC is not the active allocator"));
+	}
+
+	notes = add_mi_array(resp_obj, MI_SSTR("notes"));
+	if (!notes)
+		goto error;
+	if (add_mi_string(notes, 0, 0, MI_SSTR(
+		"advice is based on the high-water reached SO FAR; a longer or "
+		"heavier window can only raise it")) < 0)
+		goto error;
+	if (uptime < 7200 && add_mi_string(notes, 0, 0, MI_SSTR(
+		"uptime is under 2 hours - too short to have seen a busy period, "
+		"treat the numbers as provisional")) < 0)
+		goto error;
+	if (add_mi_string(notes, 0, 0, MI_SSTR(
+		"pkg peak is the worst single process, which is the one -M has to "
+		"cover; every process gets its own arena of that size")) < 0)
+		goto error;
+
+	return resp;
+
+error:
+	LM_ERR("failed to add mi item\n");
+	free_mi_response(resp);
+	return 0;
+}
+
 static mi_response_t *mi_hg_stats(const mi_params_t *params,
 						struct mi_handler *async_hdl)
 {
@@ -1288,6 +1447,12 @@ static const mi_export_t mi_core_cmds[] = {
 		"carved into size-class chunks, how much of that is live versus "
 		"recycled, and the per-class chunk breakdown", 0, 0, {
 		{mi_hg_stats, {0}},
+		{EMPTY_MI_RECIPE}}, {0}
+	},
+	{ "hg_advise", "what -m and -M should be set to, derived from the "
+		"high-water each arena has actually reached; pkg advice covers the "
+		"worst single process, not the one answering", 0, 0, {
+		{mi_hg_advise, {0}},
 		{EMPTY_MI_RECIPE}}, {0}
 	},
 #endif

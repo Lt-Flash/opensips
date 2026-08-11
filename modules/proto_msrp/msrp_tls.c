@@ -25,6 +25,7 @@
 #include "../../net/net_tcp_report.h"
 #include "../../net/trans_trace.h"
 #include "msrp_common.h"
+#include "../../timer.h"   /* get_ticks() */
 
 
 int msrps_conn_extra_match(struct tcp_connection *c, void *id)

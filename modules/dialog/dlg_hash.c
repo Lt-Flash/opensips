@@ -40,6 +40,7 @@
 #include "dlg_db_handler.h"
 #include "../../evi/evi_params.h"
 #include "../../evi/evi_modules.h"
+#include "../../timer.h"   /* get_ticks() */
 
 #define MAX_LDG_LOCKS  2048
 #define MIN_LDG_LOCKS  2

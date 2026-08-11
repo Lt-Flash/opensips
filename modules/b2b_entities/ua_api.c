@@ -44,6 +44,7 @@
 #include "client.h"
 #include "ua_api.h"
 #include "b2b_entities.h"
+#include "../../timer.h"   /* get_ticks() */
 
 static str b2be_mod_name = str_init("b2b_entities");
 

@@ -32,6 +32,7 @@
 #include "b2b_logic.h"
 #include "b2bl_db.h"
 #include "entity_storage.h"
+#include "../../timer.h"   /* get_ticks() */
 
 #define B2BL_FETCH_SIZE  128
 static str str_key_col         = str_init("si_key");

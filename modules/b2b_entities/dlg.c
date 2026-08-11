@@ -49,6 +49,7 @@
 #include "b2be_db.h"
 #include "b2be_clustering.h"
 #include "ua_api.h"
+#include "../../timer.h"   /* get_ticks() */
 
 #define BUF_LEN              65535
 #define RACK_HDR_PREFIX      "RAck: "

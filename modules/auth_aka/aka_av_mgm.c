@@ -25,6 +25,7 @@
 #include "../../lib/hash.h"
 #include "aka_av_mgm.h"
 #include "auth_aka.h"
+#include "../../timer.h"   /* get_ticks() */
 #include <math.h>
 
 static gen_hash_t *aka_users;

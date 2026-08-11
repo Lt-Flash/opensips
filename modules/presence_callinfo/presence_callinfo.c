@@ -45,6 +45,7 @@
 #include "add_events.h"
 #include "sca_hash.h"
 #include "sca_dialog.h"
+#include "../../timer.h"   /* get_ticks() */
 
 int call_info_timeout_notification = 1;
 int line_seize_timeout_notification = 0;

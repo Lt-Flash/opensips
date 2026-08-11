@@ -56,6 +56,7 @@
 #include "b2bl_db.h"
 #include "entity_storage.h"
 #include "bridging.h"
+#include "../../timer.h"   /* get_ticks() */
 
 static str cancel_reason_hdr=
 	{"Reason: SIP;cause=200;text=\"Call completed elsewhere\"\r\n", 55};

@@ -28,6 +28,7 @@
 #include "../tm/tm_load.h"
 
 #include "../msrp_ua/api.h"
+#include "../../timer.h"   /* get_ticks() */
 
 struct msrpgw_session {
 	str key;

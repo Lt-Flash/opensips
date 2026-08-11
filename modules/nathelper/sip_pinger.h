@@ -34,6 +34,7 @@
 #include "../../ut.h"
 #include "../../ip_addr.h"
 #include "nh_table.h"
+#include "../../timer.h"   /* get_ticks() */
 
 /* size of buffer used for building SIP PING req */
 #define MAX_SIPPING_SIZE 65536

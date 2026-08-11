@@ -96,6 +96,7 @@
 #endif
 #ifdef EXTRA_DEBUG
 #include "lib/dbg/backtrace.h"
+#include "timer.h"   /* get_ticks() */
 #endif
 
 #ifndef FD_TYPE_DEFINED

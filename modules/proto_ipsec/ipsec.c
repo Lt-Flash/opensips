@@ -27,6 +27,7 @@
 #include "ipsec_algo.h"
 #include "../../dprint.h"
 #include "../../context.h"
+#include "../../timer.h"   /* get_ticks() */
 
 /*
  * Socket - IPSec Netlink/MNL socket

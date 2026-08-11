@@ -33,6 +33,7 @@
 #define _io_wait_loop_h
 
 #include "io_wait.h"
+#include "timer.h"   /* get_ticks() */
 
 
 #ifdef HANDLE_IO_INLINE

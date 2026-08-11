@@ -91,7 +91,7 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 #endif
 {
 	unsigned char cls;
-	unsigned int cur_total = 0, need_total;
+	unsigned long cur_total = 0, need_total, cur_payload = 0, copy;
 	void *ptr;
 
 #ifdef DBG_MALLOC
@@ -140,15 +140,31 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 		return NULL;
 	}
 
+	/* cur_payload is what the CALLER can legally read from @p, which is not
+	 * cur_total minus one fixed header: the two tiers stack different
+	 * headers in front of the payload.
+	 *
+	 *   small : [ HG_CELL_HDR | payload ]
+	 *   large : [ HG_LFRAG_HDR_SIZE | HG_CELL_HDR | payload ]
+	 *
+	 * hg_large_frag_size() returns HG_LFRAG_HDR + frag->size (hg_large.c),
+	 * i.e. the whole frag, and the large tier puts the cell header INSIDE
+	 * that frag so the returned pointer looks like any other cell. Measured
+	 * on the shipped geometry: a 70000-byte request yields frag_size 70072
+	 * = 32 + 40 + 70000. Subtracting only HG_CELL_HDR therefore over-counts
+	 * by exactly HG_LFRAG_HDR_SIZE, on every ABI and every build config. */
 	cls = HG_CLASS(p);
 	if (cls == HG_LARGE_MARKER) {
 		cur_total = hg_large_frag_size_at(HG_HDR(p) - HG_LFRAG_HDR_SIZE);
+		cur_payload = cur_total > HG_LFRAG_HDR_SIZE + HG_CELL_HDR ?
+			cur_total - HG_LFRAG_HDR_SIZE - HG_CELL_HDR : 0;
 	} else if (cls >= HG_NCLASSES) {
 		LM_CRIT("%s: cell %p carries invalid class %u - aborting "
 			"realloc\n", hb->name, p, cls);
 		return NULL;
 	} else {
 		cur_total = hg_cell_total_size(cls);
+		cur_payload = cur_total > HG_CELL_HDR ? cur_total - HG_CELL_HDR : 0;
 		need_total = ((size + HG_ROUNDTO - 1) / HG_ROUNDTO) * HG_ROUNDTO + HG_CELL_HDR;
 		if (need_total <= cur_total)
 			return p;
@@ -163,7 +179,15 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 	#endif
 
 	if (ptr) {
-		memcpy(ptr, p, cur_total > HG_CELL_HDR ? cur_total - HG_CELL_HDR : 0);
+		/* realloc copies min(old, new) - never more than the caller had,
+		 * and never more than the new allocation can hold. The missing
+		 * clamp was the dangerous half: small cells are shielded by the
+		 * need_total <= cur_total early return above, which catches every
+		 * shrink, but the large branch has no such return, so a shrink
+		 * from the large tier copied the WHOLE old payload into whatever
+		 * the new (possibly thousand-fold smaller) allocation was. */
+		copy = cur_payload < size ? cur_payload : size;
+		memcpy(ptr, p, copy);
 		#if !defined INLINE_ALLOC && defined DBG_MALLOC
 		hg_free_dbg(hb, p, file, func, line);
 		#elif !defined HG_MALLOC_DYN && !defined DBG_MALLOC

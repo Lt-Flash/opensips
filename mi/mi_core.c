@@ -1000,7 +1000,10 @@ static mi_response_t *w_reload_routes(const mi_params_t *params,
  * being the same question. Rather than overload the shared names further,
  * report the allocator's own view here.
  */
-static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb)
+/* @per_process: this arena is private to the answering process (pkg), so stamp
+ * whose it is into the payload - see the call site for why that matters */
+static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
+                        int per_process)
 {
 	mi_item_t *o, *cls_arr, *cls_item;
 	struct hg_chunk *ch;
@@ -1016,6 +1019,18 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb)
 	o = add_mi_object(parent, name, strlen(name));
 	if (!o)
 		return -1;
+
+	if (per_process) {
+		const char *d = (process_no >= 0 && pt) ? pt[process_no].desc : "?";
+
+		if (add_mi_number(o, MI_SSTR("pid"), my_pid()) < 0)
+			return -1;
+		if (add_mi_string(o, MI_SSTR("process"), (char *)d, strlen(d)) < 0)
+			return -1;
+		if (add_mi_string(o, MI_SSTR("scope"),
+			MI_SSTR("this process only - see pkmem: for every process")) < 0)
+			return -1;
+	}
 
 	carved = hb->real_used;
 	tier = hg_mem_tier_str(hb->tier);
@@ -1088,10 +1103,60 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("buddy_merges"), hb->buddy_merges) < 0)
 		return -1;
+	if (add_mi_number(o, MI_SSTR("buddy_merges_init"), hb->buddy_merges_init) < 0)
+		return -1;
 	if (add_mi_number(o, MI_SSTR("buddy_free_leaves"), hb->buddy_free_leaves) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("slab_recycled"), hg_slab_recycled(hb)) < 0)
 		return -1;
+	/* the large tier's own footprint, so the split between the two tiers
+	 * inside carved is readable rather than inferred by subtraction */
+	if (add_mi_number(o, MI_SSTR("large_backing"), hb->large_backing) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("large_live"), hb->large_live) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("large_recycled"), hg_large_recycled(hb)) < 0)
+		return -1;
+	/*
+	 * Reserve-floor state.  Without these the floor is unobservable in
+	 * production: crossing it only emits one LM_WARN and bumps a sweep
+	 * generation that is indistinguishable from the periodic sweep.
+	 */
+	if (add_mi_number(o, MI_SSTR("reserve_floor"), hb->reserve_floor) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("below_floor"), hb->below_floor) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("floor_crossings"), hb->floor_crossings) < 0)
+		return -1;
+
+	/*
+	 * Per-order buddy free lists.  buddy_free_leaves alone cannot say
+	 * whether the free space is one contiguous run or the same number of
+	 * leaves scattered at order 0 - which is the difference between an
+	 * arena that can still serve a large chunk and one that cannot.
+	 */
+	{
+		mi_item_t *ord_arr, *ord_item;
+		unsigned int ord;
+
+		ord_arr = add_mi_array(o, MI_SSTR("buddy_free_orders"));
+		if (!ord_arr)
+			return -1;
+		for (ord = 0; ord <= hb->buddy_top && ord <= HG_MAX_ORDERS; ord++) {
+			if (!hb->nfree[ord])
+				continue;
+			ord_item = add_mi_object(ord_arr, 0, 0);
+			if (!ord_item)
+				return -1;
+			if (add_mi_number(ord_item, MI_SSTR("order"), ord) < 0)
+				return -1;
+			if (add_mi_number(ord_item, MI_SSTR("bytes"),
+				(unsigned long)HG_LEAF_SIZE << ord) < 0)
+				return -1;
+			if (add_mi_number(ord_item, MI_SSTR("blocks"), hb->nfree[ord]) < 0)
+				return -1;
+		}
+	}
 
 	memset(chunks_of, 0, sizeof chunks_of);
 	memset(cell_size_of, 0, sizeof cell_size_of);
@@ -1120,6 +1185,19 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb)
 			return -1;
 		if (add_mi_number(cls_item, MI_SSTR("cells"), cells_of[c]) < 0)
 			return -1;
+		/*
+		 * Free cells of this class in the SHARED pool.  Cells sitting in
+		 * a thread's private cache are not counted - they are unreachable
+		 * from here by construction - so this is a lower bound on what is
+		 * reusable.  It is still the missing half of the picture: "cells"
+		 * alone is capacity, and capacity cannot distinguish a class that
+		 * is fully occupied from one that carved a lot and then went idle,
+		 * which is precisely the shape of the 2026-08-10 wrong-class
+		 * exhaustion on the staging SBCs.
+		 */
+		if (add_mi_number(cls_item, MI_SSTR("free_shared"),
+			hb->gpool_n[c]) < 0)
+			return -1;
 	}
 
 	return 0;
@@ -1138,16 +1216,22 @@ static mi_response_t *mi_hg_stats(const mi_params_t *params,
 
 	if (mem_allocator_shm == MM_HG_MALLOC ||
 	    mem_allocator_shm == MM_HG_MALLOC_DBG) {
-		if (hg_stats_one(resp_obj, "shm", (struct hg_block *)shm_block) < 0)
+		if (hg_stats_one(resp_obj, "shm", (struct hg_block *)shm_block, 0) < 0)
 			goto error;
 		reported++;
 	}
 
 	if (mem_allocator_pkg == MM_HG_MALLOC ||
 	    mem_allocator_pkg == MM_HG_MALLOC_DBG) {
-		/* pkg arenas are per-process: this is the arena of whichever
-		 * process answered the command, not a fleet-wide total */
-		if (hg_stats_one(resp_obj, "pkg", (struct hg_block *)mem_block) < 0)
+		/*
+		 * pkg arenas are per-process, and the payload now says so rather
+		 * than leaving it to a comment here. Over mi_fifo the answering
+		 * process is the FIFO listener, which does no SIP work at all -
+		 * reading its arena as "the" pkg arena is exactly how a worker
+		 * running out of pkg stays invisible. The all-process picture is
+		 * in the generic pkmem: statistics group.
+		 */
+		if (hg_stats_one(resp_obj, "pkg", (struct hg_block *)mem_block, 1) < 0)
 			goto error;
 		reported++;
 	}
@@ -1158,9 +1242,14 @@ static mi_response_t *mi_hg_stats(const mi_params_t *params,
 			MI_SSTR("HG_MALLOC is not the active allocator"));
 	}
 
-	/* per-process, like the pkg figures above: frees this process handed
-	 * back to an arena other than the one named by the caller */
-	if (add_mi_number(resp_obj, MI_SSTR("cross_arena_frees"),
+	/*
+	 * Per-process, like the pkg figures above: frees this process handed
+	 * back to an arena other than the one named by the caller. The name
+	 * says so, because read over mi_fifo this only ever samples the FIFO
+	 * listener and will sit at 0 no matter what the SIP workers do - a
+	 * zero here is not evidence of anything.
+	 */
+	if (add_mi_number(resp_obj, MI_SSTR("cross_arena_frees_this_proc"),
 			hg_xarena_frees) < 0)
 		goto error;
 

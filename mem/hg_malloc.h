@@ -313,6 +313,28 @@ struct hg_pstat {
 	char _pad[HG_STAT_LINE - 3 * sizeof(long)];
 } __attribute__ ((aligned (HG_STAT_LINE)));
 
+/*
+ * What kind of corruption a check caught. Grouped by what an operator would do
+ * about it rather than by which line found it: several sites detect the same
+ * defect from different angles, and splitting them would make a recurrence
+ * look like several unrelated rare events instead of one repeated one.
+ */
+enum hg_corrupt_kind {
+	HG_C_CLASS_MISMATCH = 0, /* cell resolves to a block of another class   */
+	HG_C_DOUBLE_FREE,        /* block already fully free, or buddy re-freed */
+	HG_C_NFREE_UNDERFLOW,    /* free list shorter than nfree claims - THIS  */
+	                         /* is the __thread palloc_slots signature      */
+	HG_C_BAD_CLASS,          /* cell header carries an impossible class id  */
+	HG_C_FOREIGN_PTR,        /* pointer belongs to no live arena            */
+	HG_C_BUDDY_BAD_FREE,     /* outside the grid, misaligned, wrong order   */
+	HG_C_INTERNAL,           /* allocator API used in a way that would      */
+	                         /* double-allocate - a bug here, not in a peer */
+	HG_CORRUPT_KINDS
+};
+
+/* for the two checks that fire where no arena pointer exists */
+extern unsigned long hg_corrupt_noarena[HG_CORRUPT_KINDS];
+
 struct hg_block {
 	char *name; /* purpose of this memory block */
 
@@ -452,6 +474,22 @@ struct hg_block {
 	unsigned long       gc_passes;
 	unsigned long       cache_flushes;            /* sweeps run */
 	unsigned long       cells_flushed;            /* cells recovered from TLS */
+	/*
+	 * Corruption counters, one per kind.
+	 *
+	 * Every consistency check in this allocator used to emit LM_CRIT and
+	 * increment nothing, so a log grep was the ONLY detector - and on the
+	 * production gateways the log sink is a file that journalctl does not
+	 * see, while OpenSIPS also logs unrelated DNS failures at CRITICAL. A
+	 * recurrence of the tcp payload use-after-free would move no number at
+	 * all. These make it numeric, so it can be alerted on and graphed.
+	 *
+	 * They count DETECTIONS, not repairs: every site that bumps one has
+	 * already decided to refuse the operation or leak the cell. A non-zero
+	 * value means memory was corrupted and the allocator noticed - it is
+	 * never routine.
+	 */
+	unsigned long       corrupt[HG_CORRUPT_KINDS];
 	unsigned long       buddy_splits;             /* blocks split down an order */
 	/*
 	 * RUNTIME merges only.  hg_buddy_init() publishes the one page that the
@@ -806,6 +844,25 @@ int hg_register_stats(void);
  * is entirely inside "#ifdef HG_MALLOC". */
 static inline int hg_register_stats(void) { return 0; }
 #endif
+
+/* bump a corruption counter; hb may be NULL where no arena is in scope */
+static inline void hg_corrupt(struct hg_block *hb, enum hg_corrupt_kind k)
+{
+	if (hb)
+		hb->corrupt[k]++;
+	else
+		hg_corrupt_noarena[k]++;
+}
+
+static inline unsigned long hg_corrupt_total(struct hg_block *hb)
+{
+	unsigned long t = 0;
+	int i;
+
+	for (i = 0; i < HG_CORRUPT_KINDS; i++)
+		t += hb->corrupt[i];
+	return t;
+}
 
 /* total cell-slot bytes handed out across every process */
 static inline unsigned long hg_cell_live(struct hg_block *hb)

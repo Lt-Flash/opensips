@@ -38,6 +38,9 @@ struct hg_large_chunk {
 	 * any rounding slack - what the grid actually lost, as opposed to
 	 * ->size, which is only the part available to fragments */
 	unsigned long backing;
+	/* how it was taken, so it can be given back the same way: a buddy
+	 * block of this order, or -1 for a run of whole pages */
+	int ord;
 	struct hg_lfrag *first_frag;
 	struct hg_lfrag *last_frag;  /* sentinel: size=0, prev always NULL,
 	                               * naturally stops forward coalescing at
@@ -76,6 +79,7 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 #endif
 {
 	unsigned long need, chunk_size, rest, backing = 0;
+	int chunk_ord = -1;
 	struct hg_lfrag *f, *n;
 	struct hg_large_chunk *ch;
 	char *base, *tag;
@@ -139,6 +143,7 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 				base = hg_buddy_alloc(hb, (unsigned int)ord);
 				if (base) {
 					backing    = HG_LEAF_SIZE << ord;
+					chunk_ord  = ord;
 					chunk_size = backing - sizeof(struct hg_large_chunk);
 				}
 			} else {
@@ -176,6 +181,8 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 		ch->next = hb->large_chunks;
 		hb->large_chunks = ch;
 		ch->backing = backing;
+		ch->ord = chunk_ord;
+		hb->large_chunks_carved++;
 
 		/*
 		 * Charge the WHOLE buddy block the chunk sits in, the moment it
@@ -273,6 +280,56 @@ void hg_large_free(struct hg_block *hb, struct hg_lfrag *frag)
 		neigh->size += HG_LFRAG_HDR + frag->size;
 		HG_LFRAG_NEXT(frag)->pf = neigh;
 		frag = neigh;
+	}
+
+	/*
+	 * Chunk empty?  O(1), and it needs no search: only a chunk's first
+	 * fragment has a NULL pf (hg_large_alloc sets it once at chunk setup
+	 * and every split gives the remainder a non-NULL one), and only the
+	 * chunk's sentinel has size 0.  So a fragment that is BOTH first and
+	 * followed by the sentinel spans the entire chunk - nothing else in it
+	 * is allocated.  The chunk header sits immediately in front of that
+	 * first fragment, which is how we get back to it.
+	 *
+	 * Returning it unconditionally, with no keep-one hysteresis: the slab
+	 * tier's equivalent is HG_GC_KEEP 0, and holding a chunk back is
+	 * exactly the invisible retention this tier was just fixed for. The
+	 * risk it trades against is alloc/free thrash on a workload that
+	 * repeatedly empties and refills the tier, which is why both a carve
+	 * and a return counter are exported - carved climbing far faster than
+	 * returned is what that would look like.
+	 */
+	if (!frag->pf && HG_LFRAG_NEXT(frag)->size == 0) {
+		struct hg_large_chunk *ch = (struct hg_large_chunk *)(void *)
+			((char *)frag - sizeof(struct hg_large_chunk));
+
+		if (ch->first_frag == frag) {
+			struct hg_large_chunk **pp;
+			void *base = ch;
+			unsigned long backing = ch->backing;
+			int ord = ch->ord;
+
+			for (pp = &hb->large_chunks; *pp; pp = &(*pp)->next)
+				if (*pp == ch) {
+					*pp = ch->next;
+					break;
+				}
+
+			hb->large_backing -= backing;
+			hb->real_used     -= backing;
+			hb->large_chunks_returned++;
+
+			/* nothing below may touch ch or frag: the buddy writes
+			 * its free-list linkage over the first bytes of what it
+			 * is handed */
+			if (ord >= 0)
+				hg_buddy_free(hb, base, (unsigned int)ord);
+			else
+				hg_buddy_free_run(hb, base);
+
+			lock_release(&hb->lock);
+			return;
+		}
 	}
 
 	lfrag_insert_free(hb, frag);

@@ -369,6 +369,11 @@ struct hg_block {
 	 */
 	unsigned long large_backing;
 	unsigned long large_live;
+	/* chunk churn: a chunk goes back to the buddy the moment its last
+	 * fragment is freed, so carved climbing far faster than returned is
+	 * the signature of alloc/free thrash in this tier */
+	unsigned long large_chunks_carved;
+	unsigned long large_chunks_returned;
 
 	/* Bytes carved from the reservation into chunks/regions, i.e. the
 	 * arena's own footprint. Only ever changed while holding hb->lock

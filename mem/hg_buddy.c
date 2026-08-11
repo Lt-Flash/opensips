@@ -333,6 +333,7 @@ void *hg_buddy_alloc(struct hg_block *hb, unsigned int order)
 	memset(pg->leaforder + leaf, (int)order, (size_t)1UL << order);
 	pg->free_leaves -= 1U << order;
 	hb->buddy_free_leaves -= 1UL << order;
+	hg_reserve_floor_check(hb);
 	return blk;
 }
 
@@ -421,6 +422,7 @@ void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order)
 	memset(pg->leaforder + leaf, (int)o, (size_t)1UL << o);
 	bit_set(pg->bitmap, node_id(top, o, leaf));
 	fl_push(hb, blk, o);
+	hg_reserve_floor_check(hb);
 }
 
 /* --- multi-page runs -------------------------------------------------- */
@@ -468,6 +470,7 @@ void *hg_buddy_alloc_run(struct hg_block *hb, unsigned long npages)
 		pg->run_len = (i == start) ? (unsigned int)npages : HG_RUN_MEMBER;
 		hb->buddy_free_leaves -= hg_leaves_per_page(hb);
 	}
+	hg_reserve_floor_check(hb);
 	LM_DBG("%s: run of %lu pages at page %lu\n", hb->name, npages, start);
 	return hb->pages[start].base;
 }
@@ -501,6 +504,7 @@ void hg_buddy_free_run(struct hg_block *hb, void *p)
 		pg->run_len = 0;
 		page_publish_whole(hb, pg);
 	}
+	hg_reserve_floor_check(hb);
 }
 
 int hg_buddy_order_of(const struct hg_block *hb, const void *p)

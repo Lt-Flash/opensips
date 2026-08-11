@@ -75,6 +75,12 @@ void hg_cache_flush_self(void);
  * For threads IPC cannot reach - TCP main's IO pool waits on a condvar, not
  * the reactor - called at a job boundary. Cheap: one read of a global. */
 extern volatile unsigned long hg_sweep_gen;
+
+/* Evaluate the reserve floor. Called from the buddy layer on every grid
+ * allocation and free, because that is the one point every consumer passes -
+ * see the definition in hg_arena.c for what went wrong when it lived in
+ * carve_chunk() instead. hb->lock must be held. */
+void hg_reserve_floor_check(struct hg_block *hb);
 void hg_cache_flush_if_due(void);
 void *hg_backing_aligned(struct hg_block *hb, unsigned long size,
                          unsigned long align);

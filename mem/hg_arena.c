@@ -570,6 +570,55 @@ static unsigned int cache_flush_locked(struct hg_block *hb,
  */
 volatile unsigned long hg_sweep_gen;
 
+/*
+ * Reserve floor: when free grid space falls below hb->reserve_floor (1/16 of
+ * the grid, set in hg_buddy_init), publish a sweep to every thread and say so
+ * once. Crossing it bumps hg_sweep_gen, which reaches even the TCP IO pool -
+ * IPC cannot. The below_floor latch is the hysteresis: without it a workload
+ * sitting on the boundary would log and re-sweep on every single allocation,
+ * which is both useless and expensive exactly when the arena is under
+ * pressure. Recovery needs a 2x margin so it cannot flap.
+ *
+ * THIS MUST BE CALLED FROM THE BUDDY LAYER, not from its callers. It used to
+ * live inline in carve_chunk(), which meant it only ever saw the SLAB carve
+ * path - and the large tier takes grid space directly via hg_buddy_alloc()
+ * and hg_buddy_alloc_run(), as does hg_region_alloc(). A burst of large
+ * allocations could therefore drive free leaves from 3303 to 51 against a
+ * floor of 256 - five times past it - with floor_crossings still reading 0 and
+ * no warning logged. Measured exactly that on 2026-08-11 before this moved.
+ *
+ * Calling it from hg_buddy_alloc/_free instead puts it on the one choke point
+ * every consumer must pass, so a consumer added later cannot silently skip it,
+ * which is precisely how it was missed the first time. Called on the free path
+ * too: recovery is a rise in free leaves, and nothing on the alloc path can
+ * observe that.
+ *
+ * hb->lock is held by every caller.
+ */
+void hg_reserve_floor_check(struct hg_block *hb)
+{
+	if (!hb->buddy_ready || !hb->reserve_floor)
+		return;
+
+	if (hb->buddy_free_leaves < hb->reserve_floor) {
+		if (!hb->below_floor) {
+			hb->below_floor = 1;
+			hb->floor_crossings++;
+			hg_sweep_gen++;
+			LM_WARN("%s: free space fell below the reserve floor "
+				"(%lu of %lu leaves free, floor %lu) - sweeping every "
+				"thread's cache; raise -m/-M if this repeats\n",
+				hb->name, hb->buddy_free_leaves,
+				hb->npages * hg_leaves_per_page(hb), hb->reserve_floor);
+		}
+	} else if (hb->below_floor &&
+	           hb->buddy_free_leaves > hb->reserve_floor * 2) {
+		hb->below_floor = 0;
+		LM_NOTICE("%s: free space recovered above the reserve floor "
+			"(%lu leaves free)\n", hb->name, hb->buddy_free_leaves);
+	}
+}
+
 static __thread unsigned long hg_sweep_seen;
 
 void hg_cache_flush_if_due(void)
@@ -768,26 +817,8 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 	 * the boundary would log and re-sweep on every single carve, which is
 	 * both useless and expensive exactly when the arena is under pressure.
 	 */
-	if (hb->buddy_ready && hb->reserve_floor) {
-		if (hb->buddy_free_leaves < hb->reserve_floor) {
-			if (!hb->below_floor) {
-				hb->below_floor = 1;
-				hb->floor_crossings++;
-				hg_sweep_gen++;
-				LM_WARN("%s: free space fell below the reserve floor "
-					"(%lu of %lu leaves free, floor %lu) - sweeping every "
-					"thread's cache; raise -m/-M if this repeats\n",
-					hb->name, hb->buddy_free_leaves,
-					hb->npages * hg_leaves_per_page(hb), hb->reserve_floor);
-			}
-		} else if (hb->below_floor &&
-		           hb->buddy_free_leaves > hb->reserve_floor * 2) {
-			/* back above, with a 2x margin so it cannot flap */
-			hb->below_floor = 0;
-			LM_NOTICE("%s: free space recovered above the reserve floor "
-				"(%lu leaves free)\n", hb->name, hb->buddy_free_leaves);
-		}
-	}
+	/* the floor is evaluated inside the buddy layer now - see
+	 * hg_reserve_floor_check() for why it cannot live here */
 	if (!ch) {
 		LM_ERR("%s: no more HG_MALLOC arena memory for a %u byte chunk "
 			"(class %d, order %d) - increase the arena size\n",

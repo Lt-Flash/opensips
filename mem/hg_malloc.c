@@ -594,6 +594,7 @@ void hg_status(struct hg_block *hb)
 #if !defined INLINE_ALLOC && defined DBG_MALLOC
 struct hg_dbg_dump_ctx {
 	mem_dbg_htable_t *allocd;
+	unsigned long skipped_notlive;   /* see hg_dbg_dump_cb() */
 };
 
 static void hg_dbg_dump_cb(void *payload, void *ctx)
@@ -635,6 +636,25 @@ static void hg_dbg_dump_cb(void *payload, void *ctx)
 	func = *(const char **)(tag + HG_ROUNDTO * 2);
 	line = *(unsigned long *)(tag + HG_ROUNDTO * 3);
 
+	/*
+	 * Defence in depth, on top of the walker sizing its set exactly.
+	 *
+	 * The walker infers liveness by absence from that set, so anything that
+	 * leaves the set incomplete turns a FREE cell into an apparently live
+	 * one - and a free cell's payload holds the free-list link, so these
+	 * file/func would be pointers INTO THE ARENA rather than string
+	 * literals. dbg_ht_update() would then consume them as strings.
+	 *
+	 * hg_owns_any() is the exact discriminator: a real __FILE__ lives in the
+	 * binary's rodata and can never be inside an arena; a free-list link
+	 * always is. Costs nothing on a diagnostic path, and turns what was an
+	 * abort into a skipped line.
+	 */
+	if (hg_owns_any((void *)file) || hg_owns_any((void *)func)) {
+		c->skipped_notlive++;
+		return;
+	}
+
 	if (dbg_ht_update(*c->allocd, file, func, line, hg_frag_size(payload)) < 0)
 		LM_ERR("unable to update the %s allocation summary\n", HG_MALLOC_NAME);
 }
@@ -663,6 +683,7 @@ void hg_status_dbg(struct hg_block *hb)
 
 	dbg_ht_init(allocd);
 	ctx.allocd = &allocd;
+	ctx.skipped_notlive = 0;
 
 	hg_arena_walk_live(hb, hg_dbg_dump_cb, &ctx);
 	hg_large_walk_live(hb, hg_dbg_dump_cb, &ctx);
@@ -677,6 +698,10 @@ void hg_status_dbg(struct hg_block *hb)
 				it->size, it->no_fragments, it->file, it->func, it->line);
 	}
 	LM_GEN1(memdump, "----------------------------------------------------\n");
+	if (ctx.skipped_notlive)
+		LM_GEN1(memdump, " %lu cell(s) skipped: header held free-list linkage, "
+			"so the cell was free despite not being in the free set\n",
+			ctx.skipped_notlive);
 
 	dbg_ht_free(allocd);
 }

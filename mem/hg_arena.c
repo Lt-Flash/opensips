@@ -1626,29 +1626,34 @@ void hg_arena_stats(struct hg_block *hb, unsigned int *nchunks,
  * misreported as live - an inherent consequence of the lock-free private-
  * cache design, not a bug. Documented, not silently pretended away.
  */
-struct hg_free_set_entry {
-	void *addr;
-	struct hg_free_set_entry *next;
-};
-
+/*
+ * The set of currently-free cells, for the live-cell walker.
+ *
+ * OPEN ADDRESSED, in ONE allocation. It used to be bucket chains with a
+ * malloc() per free cell, and that was not merely slow: hg_free_set_add()
+ * silently gave up when an entry allocation failed, the walker infers
+ * liveness by ABSENCE from this set, and so a dropped insert handed a FREE
+ * cell to the callback as live. Under DBG_MALLOC the callback then reads
+ * file/func out of that cell's header - which, for a free cell, holds the
+ * free-list link - and consumes arena pointers as strings. The comment there
+ * called it "never a correctness issue"; it was an abort, and it triggered
+ * under memory pressure, which is exactly when someone takes a memory dump.
+ *
+ * One allocation removes that entirely: there is no per-cell allocation left
+ * to fail mid-walk, and nothing is malloc'd while hb->lock is held except the
+ * single table. If that one allocation fails the walk is skipped cleanly,
+ * which is a refusal rather than a corruption.
+ *
+ * Linear probing at a load factor of 0.5, so a probe always terminates on an
+ * empty slot, and the whole table is one contiguous array of pointers -
+ * better locality than chasing chains, on a walk that touches every cell.
+ */
 struct hg_free_set {
-	struct hg_free_set_entry **buckets;
-	unsigned int nbuckets;
+	void         **slots;    /* NULL = empty; power-of-two count */
+	unsigned int   nslots;
+	unsigned int   nused;
+	unsigned int   overflow; /* inserts refused - must stay 0, see below */
 };
-
-static int hg_free_set_init(struct hg_free_set *set, unsigned int expected)
-{
-	unsigned int n = 64;
-
-	while (n < expected * 2 && n < (1U << 24))
-		n <<= 1;
-	set->buckets = malloc(n * sizeof(*set->buckets));
-	if (!set->buckets)
-		return -1;
-	memset(set->buckets, 0, n * sizeof(*set->buckets));
-	set->nbuckets = n;
-	return 0;
-}
 
 static inline unsigned int hg_ptr_hash(const void *p, unsigned int nbuckets)
 {
@@ -1660,41 +1665,82 @@ static inline unsigned int hg_ptr_hash(const void *p, unsigned int nbuckets)
 	return (unsigned int)(v & (nbuckets - 1));
 }
 
+static int hg_free_set_init(struct hg_free_set *set, unsigned int expected)
+{
+	unsigned int n = 64;
+
+	while (n < expected * 2 && n < (1U << 24))
+		n <<= 1;
+	set->slots = calloc(n, sizeof(*set->slots));
+	if (!set->slots)
+		return -1;
+	set->nslots   = n;
+	set->nused    = 0;
+	set->overflow = 0;
+	return 0;
+}
+
 static void hg_free_set_add(struct hg_free_set *set, void *addr)
 {
-	unsigned int h = hg_ptr_hash(addr, set->nbuckets);
-	struct hg_free_set_entry *e = malloc(sizeof *e);
+	unsigned int h = hg_ptr_hash(addr, set->nslots);
 
-	if (!e)
-		return; /* best-effort: a missed insert only risks a free cell
-		         * being misreported as live in a diagnostic dump, never
-		         * a correctness issue for the allocator itself */
-	e->addr = addr;
-	e->next = set->buckets[h];
-	set->buckets[h] = e;
+	/*
+	 * Refuse rather than wrap forever. The count was taken under the same
+	 * hb->lock that is still held, so the table cannot be undersized unless
+	 * a free list is longer than its own counter claims - which is the
+	 * nfree-drift the allocator already detects elsewhere. Counting it lets
+	 * the caller say the set is incomplete instead of the walker quietly
+	 * reporting free cells as live.
+	 */
+	if (set->nused * 2 >= set->nslots) {
+		set->overflow++;
+		return;
+	}
+	while (set->slots[h]) {
+		if (set->slots[h] == addr)
+			return;
+		h = (h + 1) & (set->nslots - 1);
+	}
+	set->slots[h] = addr;
+	set->nused++;
 }
 
 static int hg_free_set_has(struct hg_free_set *set, void *addr)
 {
-	struct hg_free_set_entry *e;
+	unsigned int h = hg_ptr_hash(addr, set->nslots);
 
-	for (e = set->buckets[hg_ptr_hash(addr, set->nbuckets)]; e; e = e->next)
-		if (e->addr == addr)
+	while (set->slots[h]) {
+		if (set->slots[h] == addr)
 			return 1;
+		h = (h + 1) & (set->nslots - 1);
+	}
 	return 0;
 }
 
 static void hg_free_set_destroy(struct hg_free_set *set)
 {
-	unsigned int i;
-	struct hg_free_set_entry *e, *n;
+	free(set->slots);
+	set->slots = NULL;
+}
 
-	for (i = 0; i < set->nbuckets; i++)
-		for (e = set->buckets[i]; e; e = n) {
-			n = e->next;
-			free(e);
-		}
-	free(set->buckets);
+/* exact number of cells on every free list this process can see, counted
+ * under hb->lock so the table can be sized once and never grown */
+static unsigned int hg_free_set_count(struct hg_block *hb)
+{
+	struct hg_palloc *pl = hg_get_palloc(hb);
+	struct hg_chunk *ch;
+	unsigned int n = 0;
+	void *cur;
+	int c;
+
+	for (ch = hb->chunks; ch; ch = ch->next)
+		for (cur = ch->free_head; cur; cur = cell_next(cur))
+			n++;
+	if (pl)
+		for (c = 0; c < HG_NCLASSES; c++)
+			for (cur = pl->cls[c].free_head; cur; cur = cell_next(cur))
+				n++;
+	return n;
 }
 
 static void hg_free_set_populate(struct hg_block *hb, struct hg_free_set *set)
@@ -1727,16 +1773,32 @@ void hg_arena_walk_live(struct hg_block *hb,
 
 	lock_get(&hb->lock);
 
-	for (i = 0; i < HG_NCLASSES; i++)
-		total_free += hb->gpool_n[i];
+	/*
+	 * Count exactly rather than estimating from gpool_n[]: that counts only
+	 * the SHARED pool, while the set must also hold this thread's private
+	 * cache, so the estimate was low and the table was grown by a malloc per
+	 * cell to cover the difference. Both walks run under the same hb->lock,
+	 * so the count cannot go stale between counting and filling.
+	 */
+	total_free = hg_free_set_count(hb);
 
-	if (hg_free_set_init(&set, total_free < 1024 ? 1024 : total_free) < 0) {
+	if (hg_free_set_init(&set, total_free) < 0) {
 		lock_release(&hb->lock);
 		LM_ERR("%s: out of memory building the live-cell diagnostic "
 			"set - skipping the walk\n", hb->name);
 		return;
 	}
 	hg_free_set_populate(hb, &set);
+
+	/*
+	 * Must not happen: the table was sized from a count taken under this
+	 * same lock. If it does, a free list is longer than its own counter
+	 * says, and the walk would report free cells as live - so say so rather
+	 * than emit a quietly wrong dump.
+	 */
+	if (set.overflow)
+		LM_CRIT("%s: live-cell set overflowed by %u - the dump below "
+			"may report free cells as live\n", hb->name, set.overflow);
 
 	for (ch = hb->chunks; ch; ch = ch->next) {
 		for (i = 0; i < ch->cells; i++) {

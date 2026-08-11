@@ -1222,8 +1222,21 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
  */
 #define HG_ADVISE_SHM_MARGIN   2
 #define HG_ADVISE_PKG_MARGIN   3
-#define HG_ADVISE_SHM_FLOOR_MB 64
-#define HG_ADVISE_PKG_FLOOR_MB 4
+/*
+ * Floors, deliberately low. An earlier 64 MB shm floor swallowed the answer:
+ * peak x margin came to ~13 MB on every workload tried, always below it, so
+ * the command replied "64" whatever it was asked and the arithmetic was never
+ * visible. A floor should stop a silly recommendation, not become the
+ * recommendation.
+ */
+#define HG_ADVISE_SHM_FLOOR_MB 8
+#define HG_ADVISE_PKG_FLOOR_MB 2
+
+/* Bands. 80% was too late to be a warning: an arena at 77% of peak reported
+ * "reasonable" while being one busy hour from failing an allocation. */
+#define HG_ADVISE_TIGHT_PCT    70
+#define HG_ADVISE_WATCH_PCT    50
+#define HG_ADVISE_LOOSE_PCT    20
 
 /* peak x margin, in MB, never below @floor, rounded up to a whole huge page
  * so the arena does not map a partial one */
@@ -1244,9 +1257,11 @@ static const char *hg_advise_verdict(unsigned long peak, unsigned long size)
 {
 	unsigned long pct = size ? (peak * 100 / size) : 0;
 
-	if (pct > 80)
+	if (pct > HG_ADVISE_TIGHT_PCT)
 		return "TIGHT - raise it before the next busy period";
-	if (pct < 20)
+	if (pct > HG_ADVISE_WATCH_PCT)
+		return "watch - fine now, no room for a bad day";
+	if (pct < HG_ADVISE_LOOSE_PCT)
 		return "oversized - the surplus is pinned and unusable elsewhere";
 	return "reasonable";
 }
@@ -1274,6 +1289,43 @@ static int hg_advise_one(mi_item_t *parent, const char *name,
 	        (char *)hg_advise_verdict(peak, hb->size),
 	        strlen(hg_advise_verdict(peak, hb->size))) < 0)
 		return -1;
+
+	/*
+	 * Split the live figure into the part that is a property of the
+	 * WORKLOAD and the part that is a property of the ARENA SIZE, because
+	 * the second one makes any "shrink to N x observed" advice circular.
+	 *
+	 * Measured on an idle pkg arena across -M 32/16/8/4: slab live stayed
+	 * at exactly 6,560 bytes while the large tier halved with every halving
+	 * of -M. The cause is in reactor.c:85 -
+	 *     reactor_size = mem_size / n * FD_MEM_PERCENT / 100;
+	 * the reactor's fd table is a PERCENTAGE of pkg memory, so it shrinks
+	 * when the arena does. Apply a recommendation derived from total live
+	 * and the next reading is smaller again, all the way to the floor.
+	 *
+	 * Reporting both halves is honest; guessing which large allocations are
+	 * size-proportional and which are real workload is not, so no attempt
+	 * is made to net it out automatically.
+	 */
+	{
+		unsigned long slab_live  = hg_cell_live(hb);
+		unsigned long large_live = hb->large_live;
+		unsigned long live       = slab_live + large_live;
+		unsigned long share      = live ? (large_live * 100 / live) : 0;
+
+		if (add_mi_number(o, MI_SSTR("live_slab_bytes"), slab_live) < 0 ||
+		    add_mi_number(o, MI_SSTR("live_large_bytes"), large_live) < 0 ||
+		    add_mi_number(o, MI_SSTR("large_share_pct"), share) < 0)
+			return -1;
+
+		if (share > 50 && add_mi_string(o, MI_SSTR("caveat"), MI_SSTR(
+			"most of this arena's live bytes are in the large tier, and at "
+			"least some large consumers size themselves as a fraction of the "
+			"arena - so this recommendation is an upper bound, not a fixed "
+			"point. Apply it once, restart, and re-read rather than "
+			"iterating.")) < 0)
+			return -1;
+	}
 
 	/* pkg is per-process, so the interesting number is the whole fleet of
 	 * arenas, not one of them - that is what is pinned out of the hugepage

@@ -255,6 +255,19 @@ int hg_buddy_init(struct hg_block *hb)
 		page_release_range(hb, pg, consumed_leaves - first, lpp);
 	}
 
+	/*
+	 * Rebase the coalesce counter.  Publishing the straddling page above
+	 * goes through the ordinary free path on purpose - so the tree is built
+	 * by the same rules it will be maintained by - but that means every one
+	 * of those coalesces has just been counted, and they say nothing about
+	 * fragmentation.  Keep the total for the record and restart from zero,
+	 * so buddy_splits and buddy_merges finally share a zero point: without
+	 * this an idle 8 MB pkg arena reports 7 splits against 244 merges.
+	 */
+	hb->buddy_merges_init = hb->buddy_merges;
+	hb->buddy_merges = 0;
+	hb->buddy_splits = 0;   /* init allocates nothing; make that explicit */
+
 	hb->buddy_ready = 1;
 	/*
 	 * Reserve floor at 1/16 of the grid. A fraction rather than a constant

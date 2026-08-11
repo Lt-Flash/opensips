@@ -353,6 +353,22 @@ struct hg_block {
 	 * already, no separate lock needed) */
 	struct hg_large_chunk *large_chunks;
 	struct hg_lfrag *large_free;
+	/*
+	 * Backing the large tier holds from the buddy grid, and how much of it
+	 * is handed out right now.  Both are needed because the two answer
+	 * different questions and only the first one is what the grid lost:
+	 * a chunk is taken whole from the buddy, then sub-allocated, so
+	 * charging only the live fragments (which is what this tier used to do)
+	 * left real_used under-reporting the arena's true footprint by the
+	 * chunks' unused slack - and free_to_carve over-reporting what was
+	 * left, monotonically, which is exactly the v1 pathology v2 exists to
+	 * remove.  large_backing is charged to real_used at chunk acquisition;
+	 * large_recycled() = large_backing - large_live is the large tier's
+	 * analogue of hg_slab_recycled() and is subtracted back out to get the
+	 * live figure.
+	 */
+	unsigned long large_backing;
+	unsigned long large_live;
 
 	/* Bytes carved from the reservation into chunks/regions, i.e. the
 	 * arena's own footprint. Only ever changed while holding hb->lock
@@ -432,7 +448,19 @@ struct hg_block {
 	unsigned long       cache_flushes;            /* sweeps run */
 	unsigned long       cells_flushed;            /* cells recovered from TLS */
 	unsigned long       buddy_splits;             /* blocks split down an order */
+	/*
+	 * RUNTIME merges only.  hg_buddy_init() publishes the one page that the
+	 * block header and buddy metadata straddle leaf by leaf, through the
+	 * ordinary free path, so the tree is built by the normal rules - and
+	 * every one of those coalesces used to land in this counter.  That gave
+	 * it an arbitrary startup offset with no relation to fragmentation:
+	 * an idle 8 MB pkg arena reads 7 splits against 244 merges purely from
+	 * init.  The init total is snapshotted into buddy_merges_init and this
+	 * counter is rebased to 0, so splits and merges finally share a zero
+	 * point and their difference means something.
+	 */
 	unsigned long       buddy_merges;             /* blocks merged with a buddy */
+	unsigned long       buddy_merges_init;        /* coalesces done building the tree */
 	unsigned long       blocks_carved;            /* class blocks cut, lifetime */
 	/* set while a flush walks a cache chain: pushing a cell can reclaim its
 	 * block, and the next cell on the chain may live in that same block */
@@ -814,9 +842,21 @@ static inline unsigned long hg_get_free(struct hg_block *hb)
 	 * max_used = live commitment and its peak, free = room left to carve. */
 	return hb->size - hb->real_used;
 }
+/* The large tier's counterpart to hg_slab_recycled(): backing held from the
+ * buddy grid that is not currently handed out as a fragment.  O(1), unlike the
+ * slab version, because both terms are maintained under hb->lock as the
+ * fragments come and go. */
+static inline unsigned long hg_large_recycled(struct hg_block *hb)
+{
+	return hb->large_backing > hb->large_live ?
+	       hb->large_backing - hb->large_live : 0;
+}
 static inline unsigned long hg_get_real_used(struct hg_block *hb)
 {
-	unsigned long recycled = hg_slab_recycled(hb);
+	/* real_used is now the true carve footprint of BOTH tiers - slab blocks
+	 * plus whole large chunks - so both tiers' idle-but-held bytes have to
+	 * come back out to leave what is genuinely handed out. */
+	unsigned long recycled = hg_slab_recycled(hb) + hg_large_recycled(hb);
 	unsigned long live = hb->real_used > recycled ?
 	                     hb->real_used - recycled : 0;
 

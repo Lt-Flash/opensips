@@ -1720,6 +1720,10 @@ enum hg_stat_field {
 	HGS_BLOCKS_CARVED, HGS_BLOCKS_RETURNED, HGS_GC_PASSES,
 	HGS_CACHE_FLUSHES, HGS_CELLS_FLUSHED,
 	HGS_BUDDY_SPLITS, HGS_BUDDY_MERGES, HGS_BUDDY_FREE_LEAVES,
+	/* large tier footprint, and the reserve floor - without these last
+	 * three the floor is invisible outside a one-shot log line */
+	HGS_LARGE_BACKING, HGS_LARGE_LIVE, HGS_LARGE_RECYCLED,
+	HGS_RESERVE_FLOOR, HGS_BELOW_FLOOR, HGS_FLOOR_CROSSINGS,
 };
 
 static unsigned long hg_shm_stat(void *ctx)
@@ -1734,9 +1738,11 @@ static unsigned long hg_shm_stat(void *ctx)
 	/* bytes rather than the MB the MI reports, so it composes with the
 	 * other byte-valued statistics and with node_exporter's page counts */
 	case HGS_PINNED_BYTES:  return (unsigned long)hb->locked_mb << 20;
-	/* carved: taken from the arena and cut into size-class chunks.  Never
-	 * returned, so this only ever grows - and it is what free_to_carve
-	 * counts down from. */
+	/* carved: taken from the arena - slab blocks plus whole large-tier
+	 * chunks - and what free_to_carve counts down from.  It is NOT
+	 * monotonic in v2: gc_class() returns a drained block to the buddy and
+	 * subtracts it here, so carved falling below carved_peak is the normal,
+	 * intended signal that reclaim is working. */
 	case HGS_CARVED:        return hb->real_used;
 	case HGS_CARVED_PEAK:   return hb->max_real_used;
 	case HGS_CHUNKS:        return hb->nchunks;
@@ -1766,6 +1772,12 @@ static unsigned long hg_shm_stat(void *ctx)
 	case HGS_BUDDY_SPLITS:    return hb->buddy_splits;
 	case HGS_BUDDY_MERGES:    return hb->buddy_merges;
 	case HGS_BUDDY_FREE_LEAVES: return hb->buddy_free_leaves;
+	case HGS_LARGE_BACKING:   return hb->large_backing;
+	case HGS_LARGE_LIVE:      return hb->large_live;
+	case HGS_LARGE_RECYCLED:  return hg_large_recycled(hb);
+	case HGS_RESERVE_FLOOR:   return hb->reserve_floor;
+	case HGS_BELOW_FLOOR:     return hb->below_floor;
+	case HGS_FLOOR_CROSSINGS: return hb->floor_crossings;
 	}
 	return 0;
 }
@@ -1795,6 +1807,12 @@ static const struct {
 	{"hg_shm_buddy_splits",    HGS_BUDDY_SPLITS},
 	{"hg_shm_buddy_merges",    HGS_BUDDY_MERGES},
 	{"hg_shm_buddy_free_leaves", HGS_BUDDY_FREE_LEAVES},
+	{"hg_shm_large_backing",   HGS_LARGE_BACKING},
+	{"hg_shm_large_live",      HGS_LARGE_LIVE},
+	{"hg_shm_large_recycled",  HGS_LARGE_RECYCLED},
+	{"hg_shm_reserve_floor",   HGS_RESERVE_FLOOR},
+	{"hg_shm_below_floor",     HGS_BELOW_FLOOR},
+	{"hg_shm_floor_crossings", HGS_FLOOR_CROSSINGS},
 	{NULL, 0}
 };
 

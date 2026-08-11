@@ -1460,12 +1460,13 @@ void hg_cell_free(struct hg_block *hb, void *p)
 			pl->cls[c].nfree = 0;
 		lock_release(&hb->lock);
 
-		if (i < donate)
+		if (i < donate) {
 			hg_corrupt(hb, HG_C_NFREE_UNDERFLOW);
 			LM_CRIT("%s: class %u free list ran dry after %u cells "
 				"but nfree claimed %u - counter resynced to 0, "
 				"pool accounting drifted\n",
 				hb->name, c, i, claimed);
+		}
 	}
 }
 

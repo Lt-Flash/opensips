@@ -40,6 +40,7 @@
 #ifndef HG_BUDDY_H
 #define HG_BUDDY_H
 
+#include <stdint.h>
 #include "hg_malloc.h"
 
 /* HG_MAX_ORDERS lives in hg_malloc.h - struct hg_block needs it for the
@@ -52,12 +53,30 @@
 struct hg_free_blk {
 	struct hg_free_blk *next;
 	struct hg_free_blk *prev;
-	/* Guards against a double free and against freeing a wild pointer as if
-	 * it were a block. Cheap: one word, checked only on the slow path. */
-	unsigned long magic;
+	/* Set when the block goes on a free list, cleared when it comes off, so
+	 * a block that is already free is distinguishable from a live one.
+	 *
+	 * NOTHING READS THIS YET. fl_push writes it and fl_unlink clears it and
+	 * that is all - grep the tree for HG_FREE_MAGIC. The double-free and
+	 * wild-pointer guard the previous wording of this comment claimed is not
+	 * implemented, so do not rely on it; hg_buddy_free()'s existing checks
+	 * (alignment, order, page bounds) are the whole of the protection today.
+	 *
+	 * uint64_t, not unsigned long. On ILP32 the constant below does not fit
+	 * an unsigned long, so the STORE truncated it to 0x796672ee (arm32
+	 * reports that as -Woverflow) while a COMPARE did not truncate at all:
+	 * per C11 6.4.4.1p5 the UL suffix's type list continues to unsigned long
+	 * long, so the macro kept its full value and `b->magic == HG_FREE_MAGIC`
+	 * promoted the 32-bit field back to 64 bits and compared 0x796672ee
+	 * against 0x62756464796672ee. Measured with gcc -m32: stores 0x796672ee,
+	 * comparison yields 0. So the check this field exists for would have
+	 * failed for EVERY legitimately free block on 32-bit - not merely lost
+	 * entropy - and it would have compiled without a warning, because the
+	 * -Woverflow fires on the store, never on the compare. */
+	uint64_t magic;
 };
 
-#define HG_FREE_MAGIC  0x62756464796672eeUL   /* "buddyfr" */
+#define HG_FREE_MAGIC  0x62756464796672eeULL   /* "buddyfr" */
 
 /*
  * Per-page descriptor. Lives in the metadata region carved from the front of

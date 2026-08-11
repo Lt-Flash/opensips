@@ -186,6 +186,45 @@ static unsigned long get_pkg_fragments( void*proc_id)
 	return pkg_status[(unsigned long)proc_id][PKG_FRAGMENTS_SIZE_IDX];
 }
 
+int hg_pkg_peak_all(unsigned long *peak, unsigned long *sum, int *nproc)
+{
+	unsigned long mx = 0, tot = 0;
+	int i, n = 0;
+
+	if (!pkg_status || no_pkg_status <= 0)
+		return -1;
+
+	/*
+	 * Two passes on purpose.  signal_pkg_status() only ASKS each process to
+	 * refresh its slot - the answer arrives later over IPC - so reading in
+	 * the same loop that asks would report whatever was there from the
+	 * previous round, and on the very first call that is zero.  Ask
+	 * everyone, give the replies a moment to land, then read.
+	 */
+	for (i = 0; i < no_pkg_status; i++)
+		signal_pkg_status((unsigned long)i);
+
+	usleep(50000);
+
+	for (i = 0; i < no_pkg_status; i++) {
+		unsigned long v = pkg_status[i][PKG_MAX_USED_SIZE_IDX];
+
+		/* a slot with no total_size has never been filled in: that
+		 * process either does not exist or has not answered yet */
+		if (!pkg_status[i][PKG_TOTAL_SIZE_IDX])
+			continue;
+		n++;
+		tot += v;
+		if (v > mx)
+			mx = v;
+	}
+
+	if (peak)  *peak  = mx;
+	if (sum)   *sum   = tot;
+	if (nproc) *nproc = n;
+	return n ? 0 : -1;
+}
+
 
 
 #if defined(HG_MALLOC) && !defined(INLINE_ALLOC)

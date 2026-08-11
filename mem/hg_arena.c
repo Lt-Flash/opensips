@@ -1723,6 +1723,7 @@ enum hg_stat_field {
 	/* large tier footprint, and the reserve floor - without these last
 	 * three the floor is invisible outside a one-shot log line */
 	HGS_LARGE_BACKING, HGS_LARGE_LIVE, HGS_LARGE_RECYCLED,
+	HGS_LARGE_CHUNKS_CARVED, HGS_LARGE_CHUNKS_RETURNED,
 	HGS_RESERVE_FLOOR, HGS_BELOW_FLOOR, HGS_FLOOR_CROSSINGS,
 };
 
@@ -1775,6 +1776,8 @@ static unsigned long hg_shm_stat(void *ctx)
 	case HGS_LARGE_BACKING:   return hb->large_backing;
 	case HGS_LARGE_LIVE:      return hb->large_live;
 	case HGS_LARGE_RECYCLED:  return hg_large_recycled(hb);
+	case HGS_LARGE_CHUNKS_CARVED:   return hb->large_chunks_carved;
+	case HGS_LARGE_CHUNKS_RETURNED: return hb->large_chunks_returned;
 	case HGS_RESERVE_FLOOR:   return hb->reserve_floor;
 	case HGS_BELOW_FLOOR:     return hb->below_floor;
 	case HGS_FLOOR_CROSSINGS: return hb->floor_crossings;
@@ -1810,6 +1813,8 @@ static const struct {
 	{"hg_shm_large_backing",   HGS_LARGE_BACKING},
 	{"hg_shm_large_live",      HGS_LARGE_LIVE},
 	{"hg_shm_large_recycled",  HGS_LARGE_RECYCLED},
+	{"hg_shm_large_chunks_carved",   HGS_LARGE_CHUNKS_CARVED},
+	{"hg_shm_large_chunks_returned", HGS_LARGE_CHUNKS_RETURNED},
 	{"hg_shm_reserve_floor",   HGS_RESERVE_FLOOR},
 	{"hg_shm_below_floor",     HGS_BELOW_FLOOR},
 	{"hg_shm_floor_crossings", HGS_FLOOR_CROSSINGS},

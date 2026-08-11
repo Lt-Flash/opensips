@@ -1117,6 +1117,12 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("large_recycled"), hg_large_recycled(hb)) < 0)
 		return -1;
+	if (add_mi_number(o, MI_SSTR("large_chunks_carved"),
+			hb->large_chunks_carved) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("large_chunks_returned"),
+			hb->large_chunks_returned) < 0)
+		return -1;
 	/*
 	 * Reserve-floor state.  Without these the floor is unobservable in
 	 * production: crossing it only emits one LM_WARN and bumps a sweep

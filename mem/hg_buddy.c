@@ -96,7 +96,6 @@ static inline void fl_push(struct hg_block *hb, void *p, unsigned int order)
 
 	b->prev = NULL;
 	b->next = hb->bfree[order];
-	b->magic = HG_FREE_MAGIC;
 	if (b->next)
 		b->next->prev = b;
 	hb->bfree[order] = b;
@@ -113,7 +112,6 @@ static inline void fl_unlink(struct hg_block *hb, void *p, unsigned int order)
 		hb->bfree[order] = b->next;
 	if (b->next)
 		b->next->prev = b->prev;
-	b->magic = 0;
 	hb->nfree[order]--;
 }
 

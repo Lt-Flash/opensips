@@ -40,7 +40,6 @@
 #ifndef HG_BUDDY_H
 #define HG_BUDDY_H
 
-#include <stdint.h>
 #include "hg_malloc.h"
 
 /* HG_MAX_ORDERS lives in hg_malloc.h - struct hg_block needs it for the
@@ -49,34 +48,28 @@
 /* A free block stores its own list linkage in its first bytes. Legitimate
  * because the block is free - nothing else is using those bytes - and it is
  * what keeps the free lists free of external metadata. The smallest block is
- * HG_LEAF_SIZE, vastly larger than this struct. */
+ * HG_LEAF_SIZE, vastly larger than this struct.
+ *
+ * There was a third field here, a "buddyfr" magic stamped by fl_push and
+ * cleared by fl_unlink, meant to catch a double free or a wild pointer. It was
+ * never read - the tree contained the two writes and nothing else - and it is
+ * gone rather than completed, because both things it promised are already
+ * caught, and caught better:
+ *
+ *   double free   the BITMAP, hg_buddy_free() -> bit_test(pg->bitmap, ...).
+ *                 See the comment there for why it, and not the recorded
+ *                 order, is the authority on "already free and entire".
+ *   wild pointer  hg_buddy_free()'s alignment, order and page-bounds refusals,
+ *                 five more hg_corrupt() sites in the same function.
+ *
+ * A magic living INSIDE the freed block would also have been the weaker of the
+ * two: a caller scribbling on memory it already freed can forge it, while the
+ * bitmap sits in the metadata region carved from the front of the arena and
+ * cannot be reached that way. */
 struct hg_free_blk {
 	struct hg_free_blk *next;
 	struct hg_free_blk *prev;
-	/* Set when the block goes on a free list, cleared when it comes off, so
-	 * a block that is already free is distinguishable from a live one.
-	 *
-	 * NOTHING READS THIS YET. fl_push writes it and fl_unlink clears it and
-	 * that is all - grep the tree for HG_FREE_MAGIC. The double-free and
-	 * wild-pointer guard the previous wording of this comment claimed is not
-	 * implemented, so do not rely on it; hg_buddy_free()'s existing checks
-	 * (alignment, order, page bounds) are the whole of the protection today.
-	 *
-	 * uint64_t, not unsigned long. On ILP32 the constant below does not fit
-	 * an unsigned long, so the STORE truncated it to 0x796672ee (arm32
-	 * reports that as -Woverflow) while a COMPARE did not truncate at all:
-	 * per C11 6.4.4.1p5 the UL suffix's type list continues to unsigned long
-	 * long, so the macro kept its full value and `b->magic == HG_FREE_MAGIC`
-	 * promoted the 32-bit field back to 64 bits and compared 0x796672ee
-	 * against 0x62756464796672ee. Measured with gcc -m32: stores 0x796672ee,
-	 * comparison yields 0. So the check this field exists for would have
-	 * failed for EVERY legitimately free block on 32-bit - not merely lost
-	 * entropy - and it would have compiled without a warning, because the
-	 * -Woverflow fires on the store, never on the compare. */
-	uint64_t magic;
 };
-
-#define HG_FREE_MAGIC  0x62756464796672eeULL   /* "buddyfr" */
 
 /*
  * Per-page descriptor. Lives in the metadata region carved from the front of

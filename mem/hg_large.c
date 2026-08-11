@@ -34,6 +34,10 @@
 struct hg_large_chunk {
 	struct hg_large_chunk *next;
 	unsigned long size;
+	/* the buddy block/run this chunk occupies, INCLUDING this header and
+	 * any rounding slack - what the grid actually lost, as opposed to
+	 * ->size, which is only the part available to fragments */
+	unsigned long backing;
 	struct hg_lfrag *first_frag;
 	struct hg_lfrag *last_frag;  /* sentinel: size=0, prev always NULL,
 	                               * naturally stops forward coalescing at
@@ -71,7 +75,7 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size,
 void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 #endif
 {
-	unsigned long need, chunk_size, rest;
+	unsigned long need, chunk_size, rest, backing = 0;
 	struct hg_lfrag *f, *n;
 	struct hg_large_chunk *ch;
 	char *base, *tag;
@@ -133,16 +137,18 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 
 			if (ord >= 0) {
 				base = hg_buddy_alloc(hb, (unsigned int)ord);
-				if (base)
-					chunk_size = (HG_LEAF_SIZE << ord) -
-					             sizeof(struct hg_large_chunk);
+				if (base) {
+					backing    = HG_LEAF_SIZE << ord;
+					chunk_size = backing - sizeof(struct hg_large_chunk);
+				}
 			} else {
 				unsigned long np = (total + hb->hps - 1) >> hb->hps_shift;
 
 				base = hg_buddy_alloc_run(hb, np);
-				if (base)
-					chunk_size = (np << hb->hps_shift) -
-					             sizeof(struct hg_large_chunk);
+				if (base) {
+					backing    = np << hb->hps_shift;
+					chunk_size = backing - sizeof(struct hg_large_chunk);
+				}
 			}
 			chunk_size &= ~63UL;
 		}
@@ -169,6 +175,21 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 
 		ch->next = hb->large_chunks;
 		hb->large_chunks = ch;
+		ch->backing = backing;
+
+		/*
+		 * Charge the WHOLE buddy block the chunk sits in, the moment it
+		 * is taken - exactly what carve_chunk() does for a slab block.
+		 * Charging only the live fragments (which is what this used to
+		 * do) meant the chunk's slack, and every byte of a chunk whose
+		 * fragments had all been freed, stayed invisible: real_used
+		 * under-reported the arena's footprint and free_to_carve
+		 * over-reported the room left, without bound.
+		 */
+		hb->large_backing += backing;
+		hb->real_used += backing;
+		if (hb->real_used > hb->max_real_used)
+			hb->max_real_used = hb->real_used;
 
 		lfrag_insert_free(hb, ch->first_frag);
 		f = ch->first_frag;
@@ -199,9 +220,11 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 		ps->used += f->size - HG_CELL_HDR;
 		ps->fragments++;
 	}
-	hb->real_used += HG_LFRAG_HDR + f->size;
-	if (hb->real_used > hb->max_real_used)
-		hb->max_real_used = hb->real_used;
+	/* the chunk's backing was charged to real_used when the chunk was
+	 * taken from the buddy; this tracks how much of it is handed out, so
+	 * hg_large_recycled() can hand the idle remainder back to the live
+	 * figure the way hg_slab_recycled() does for the slab tier */
+	hb->large_live += HG_LFRAG_HDR + f->size;
 
 	lock_release(&hb->lock);
 
@@ -232,7 +255,7 @@ void hg_large_free(struct hg_block *hb, struct hg_lfrag *frag)
 		ps->used -= frag->size - HG_CELL_HDR;
 		ps->fragments--;
 	}
-	hb->real_used -= HG_LFRAG_HDR + frag->size;
+	hb->large_live -= HG_LFRAG_HDR + frag->size;
 
 	/* forward coalesce - neigh->prev is NULL both for allocated frags AND
 	 * for a chunk's sentinel, so this naturally stops at the boundary */
@@ -283,11 +306,15 @@ _Static_assert(sizeof(struct hg_lfrag) == HG_LFRAG_HDR_SIZE,
 
 void hg_large_destroy(struct hg_block *hb)
 {
-	/* chunks are bump-carved from hb->hbase, one single mmap - released
-	 * as a whole by hg_malloc_destroy()'s munmap, never individually;
-	 * nothing to do here beyond dropping the (now-meaningless) list head */
+	/* Chunks come from the buddy grid (hg_buddy_alloc / _alloc_run), not
+	 * from the bump allocator as the original comment here claimed. Either
+	 * way the whole reservation goes back in hg_malloc_destroy()'s munmap,
+	 * so there is still nothing to release one chunk at a time - only the
+	 * bookkeeping to drop. */
 	hb->large_chunks = NULL;
 	hb->large_free = NULL;
+	hb->large_backing = 0;
+	hb->large_live = 0;
 }
 
 void hg_large_walk_live(struct hg_block *hb,

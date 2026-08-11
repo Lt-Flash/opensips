@@ -1358,10 +1358,6 @@ done_job:
 	return NULL;
 }
 
-#if defined(HG_MALLOC) && !defined(INLINE_ALLOC)
-void hg_cache_flush_if_due(void);
-#endif
-
 static int tcp_pool_init(void)
 {
 	int i;

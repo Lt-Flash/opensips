@@ -50,6 +50,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdint.h>
+#include <inttypes.h>
 
 #include "../../sr_module.h"
 #include "../../dprint.h"
@@ -80,16 +82,26 @@ struct hgs_blk {
 
 /* the stamp is per (pid, slot) so a foreign writer is identifiable, and it is
  * written to EVERY word - a partial overlap is caught as readily as a whole
- * one */
-static inline unsigned long hgs_stamp(int pid, int slot)
+ * one.
+ *
+ * uint64_t, not unsigned long. The stamp packs the pid into the high 32 bits
+ * and a hash of the slot into the low 32, which needs a 64-bit type to exist
+ * at all: on ILP32 "(unsigned long)pid << 32" shifts a 32-bit value by 32,
+ * which is UNDEFINED BEHAVIOUR, not a truncation. Whatever gcc emitted, the
+ * pid half was gone - so every worker's stamp collapsed to the slot hash
+ * alone, the detector could no longer tell a foreign writer from its own
+ * data, and the "foreign pid" it printed came from a second UB shift in the
+ * diagnostic itself. On LP64, where unsigned long is already 64-bit, this
+ * changes nothing whatsoever. */
+static inline uint64_t hgs_stamp(int pid, int slot)
 {
-	return ((unsigned long)pid << 32) ^ (unsigned long)(slot * 2654435761u);
+	return ((uint64_t)pid << 32) ^ (uint64_t)(slot * 2654435761u);
 }
 
 static void hgs_fill(struct hgs_blk *b, int pid, int slot)
 {
-	unsigned long v = hgs_stamp(pid, slot), *w = (unsigned long *)b->p;
-	unsigned long i, n = b->len / sizeof(unsigned long);
+	uint64_t v = hgs_stamp(pid, slot), *w = (uint64_t *)b->p;
+	unsigned long i, n = b->len / sizeof(uint64_t);
 
 	for (i = 0; i < n; i++)
 		w[i] = v;
@@ -98,16 +110,17 @@ static void hgs_fill(struct hgs_blk *b, int pid, int slot)
 /* returns the number of corrupted words */
 static unsigned long hgs_check(struct hgs_blk *b, int pid, int slot)
 {
-	unsigned long v = hgs_stamp(pid, slot), *w = (unsigned long *)b->p;
-	unsigned long i, n = b->len / sizeof(unsigned long), bad = 0;
+	uint64_t v = hgs_stamp(pid, slot), *w = (uint64_t *)b->p;
+	unsigned long i, n = b->len / sizeof(uint64_t), bad = 0;
 
 	for (i = 0; i < n; i++)
 		if (w[i] != v) {
 			if (bad == 0)
 				LM_CRIT("torn block: slot %d len %lu word %lu: "
-					"got 0x%lx want 0x%lx (foreign pid %ld)\n",
+					"got 0x%" PRIx64 " want 0x%" PRIx64
+					" (foreign pid %" PRIu64 ")\n",
 					slot, b->len, i, w[i], v,
-					(long)(w[i] >> 32));
+					w[i] >> 32);
 			bad++;
 		}
 	return bad;

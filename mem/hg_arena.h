@@ -81,6 +81,11 @@ extern volatile unsigned long hg_sweep_gen;
  * see the definition in hg_arena.c for what went wrong when it lived in
  * carve_chunk() instead. hb->lock must be held. */
 void hg_reserve_floor_check(struct hg_block *hb);
+
+/* Widen the [lo,hi] extent watermarks over a region just handed out. Called
+ * from the buddy layer so every consumer of grid space is covered - the DBG
+ * free guard aborts on pointers outside this range. hb->lock must be held. */
+void hg_extent_note(struct hg_block *hb, void *base, unsigned long size);
 void hg_cache_flush_if_due(void);
 void *hg_backing_aligned(struct hg_block *hb, unsigned long size,
                          unsigned long align);

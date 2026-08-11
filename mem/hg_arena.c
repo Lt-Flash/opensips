@@ -601,6 +601,38 @@ unsigned long hg_corrupt_noarena[HG_CORRUPT_KINDS];
  *
  * hb->lock is held by every caller.
  */
+/*
+ * Widen the [lo, hi] extent watermarks to cover a region just handed out.
+ *
+ * These bound "a pointer this arena could plausibly have returned", and the
+ * DBG free guard in hg_malloc_dyn.h ABORTS on anything outside them. They were
+ * widened in exactly two places - carve_chunk() and hg_region_alloc() - both
+ * written when carving was the only way to get memory. The large tier takes
+ * its backing straight from hg_buddy_alloc()/_alloc_run() and never touched
+ * them, so a large fragment served from grid space above the current hi was a
+ * perfectly valid pointer that the guard killed the process over.
+ *
+ * Observed 2026-08-11: tm freeing a cloned 65 KB request (a large-tier
+ * allocation) at 0x...66100078 against hi 0x...660e0000 - 131,192 bytes past
+ * it, inside the arena by hbase+hsize, and hg_owns() agreed it was ours.
+ *
+ * Lives at the buddy layer for the same reason hg_reserve_floor_check() does:
+ * it is the one point every consumer of grid space must pass, so a consumer
+ * added later cannot silently skip it. That is the third time this exact shape
+ * has bitten - real_used, the reserve floor, and now these.
+ *
+ * hb->lock is held by every caller.
+ */
+void hg_extent_note(struct hg_block *hb, void *base, unsigned long size)
+{
+	unsigned long b = (unsigned long)base;
+
+	if (b < hb->lo)
+		hb->lo = b;
+	if (b + size > hb->hi)
+		hb->hi = b + size;
+}
+
 void hg_reserve_floor_check(struct hg_block *hb)
 {
 	if (!hb->buddy_ready || !hb->reserve_floor)

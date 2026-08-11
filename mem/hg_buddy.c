@@ -347,6 +347,7 @@ void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order)
 	char *blk = p;
 
 	if (!hg_in_pages(hb, p)) {
+		hg_corrupt(hb, HG_C_BUDDY_BAD_FREE);
 		LM_CRIT("%s: buddy free of %p, which is outside the page grid - "
 			"ignoring\n", hb->name, p);
 		return;
@@ -356,17 +357,20 @@ void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order)
 
 	if (((unsigned long)p & ((HG_LEAF_SIZE << order) - 1)) !=
 	    ((unsigned long)pg->base & ((HG_LEAF_SIZE << order) - 1))) {
+		hg_corrupt(hb, HG_C_BUDDY_BAD_FREE);
 		LM_CRIT("%s: buddy free of %p at order %u, which is not aligned to "
 			"its own size - ignoring\n", hb->name, p, order);
 		return;
 	}
 	if (leaf & ((1UL << order) - 1)) {
+		hg_corrupt(hb, HG_C_BUDDY_BAD_FREE);
 		LM_CRIT("%s: buddy free of %p as order %u, but leaf %lu does not "
 			"start a block of that order - ignoring\n",
 			hb->name, p, order, leaf);
 		return;
 	}
 	if (pg->leaforder[leaf] != order) {
+		hg_corrupt(hb, HG_C_BUDDY_BAD_FREE);
 		LM_CRIT("%s: buddy free of %p as order %u, but leaf %lu records "
 			"order %u - ignoring\n", hb->name, p, order, leaf,
 			pg->leaforder[leaf]);
@@ -380,6 +384,7 @@ void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order)
 	 * authority on "already free and entire", which is precisely this.
 	 */
 	if (bit_test(pg->bitmap, node_id(top, order, leaf))) {
+		hg_corrupt(hb, HG_C_DOUBLE_FREE);
 		LM_CRIT("%s: double buddy free of %p at order %u - ignoring\n",
 			hb->name, p, order);
 		return;
@@ -494,6 +499,7 @@ void hg_buddy_free_run(struct hg_block *hb, void *p)
 
 	n = hg_buddy_run_len(hb, p);
 	if (n == 0) {
+		hg_corrupt(hb, HG_C_BUDDY_BAD_FREE);
 		LM_CRIT("%s: run free of %p, which heads no run - ignoring\n",
 			hb->name, p);
 		return;

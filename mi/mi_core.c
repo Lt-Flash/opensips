@@ -1110,6 +1110,33 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("slab_recycled"), hg_slab_recycled(hb)) < 0)
 		return -1;
+
+	/*
+	 * Corruption detections. Zero is the only acceptable value: every site
+	 * that bumps one of these has already refused an operation or leaked a
+	 * cell. Broken out by kind because a recurrence of one defect looks very
+	 * different from several unrelated rare ones, and the nfree_underflow
+	 * kind in particular is the signature of the __thread palloc_slots bug
+	 * family. Until now the ONLY detector was a log grep.
+	 */
+	{
+		static const char * const kind[HG_CORRUPT_KINDS] = {
+			"class_mismatch", "double_free", "nfree_underflow",
+			"bad_class", "foreign_ptr", "buddy_bad_free", "internal"
+		};
+		mi_item_t *co;
+		int k;
+
+		co = add_mi_object(o, MI_SSTR("corruption"));
+		if (!co)
+			return -1;
+		if (add_mi_number(co, MI_SSTR("total"), hg_corrupt_total(hb)) < 0)
+			return -1;
+		for (k = 0; k < HG_CORRUPT_KINDS; k++)
+			if (add_mi_number(co, (char *)kind[k], strlen(kind[k]),
+					hb->corrupt[k]) < 0)
+				return -1;
+	}
 	/* the large tier's own footprint, so the split between the two tiers
 	 * inside carved is readable rather than inferred by subtraction */
 	if (add_mi_number(o, MI_SSTR("large_backing"), hb->large_backing) < 0)

@@ -611,6 +611,7 @@ static void hg_dbg_dump_cb(void *payload, void *ctx)
 	 * exactly what happened on 2026-08-09 before this check existed.
 	 */
 	if (!hg_owns_any(tag)) {
+		hg_corrupt(NULL, HG_C_FOREIGN_PTR);
 		LM_CRIT("%s: dump walker produced %p, outside every arena - "
 			"skipping it\n", HG_MALLOC_NAME, payload);
 		return;

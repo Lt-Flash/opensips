@@ -354,6 +354,7 @@ static inline struct hg_chunk *cell_block(struct hg_block *hb, int c, void *p)
 	if (!ch)
 		return NULL;
 	if (ch->cls != (unsigned int)c) {
+		hg_corrupt(hb, HG_C_CLASS_MISMATCH);
 		LM_CRIT("%s: cell %p resolves to block %p of class %u, expected "
 			"class %d - not touching it\n",
 			hb->name, p, (void *)ch, ch->cls, c);
@@ -431,6 +432,7 @@ static inline void gpool_push(struct hg_block *hb, int c, void *cell_start)
 	if (!ch)
 		return;                     /* refused above, with a CRIT */
 	if (ch->in_gpool >= ch->cells) {
+		hg_corrupt(hb, HG_C_DOUBLE_FREE);
 		LM_CRIT("%s: block %p already has all %u cells free, refusing to "
 			"add another - this is a double free\n",
 			hb->name, (void *)ch, ch->cells);
@@ -480,6 +482,7 @@ static inline void *gpool_pop(struct hg_block *hb, int c)
 
 	cell_start = ch->free_head;
 	if (!cell_start) {
+		hg_corrupt(hb, HG_C_NFREE_UNDERFLOW);
 		LM_CRIT("%s: block %p claims %u free cells but its list is empty - "
 			"dropping it from the pool\n",
 			hb->name, (void *)ch, ch->in_gpool);
@@ -569,6 +572,9 @@ static unsigned int cache_flush_locked(struct hg_block *hb,
  * fire-and-forget contract the IPC path already has.
  */
 volatile unsigned long hg_sweep_gen;
+
+/* the two checks that fire where no arena pointer is in scope */
+unsigned long hg_corrupt_noarena[HG_CORRUPT_KINDS];
 
 /*
  * Reserve floor: when free grid space falls below hb->reserve_floor (1/16 of
@@ -675,6 +681,7 @@ void *hg_chunk_backing(struct hg_block *hb, unsigned long size)
 	 * so anything else is a bug and says so rather than corrupting.
 	 */
 	if (hb->buddy_ready) {
+		hg_corrupt(hb, HG_C_INTERNAL);
 		LM_CRIT("%s: bump carve of %lu bytes after the buddy owns the "
 			"arena - refusing, this would double-allocate\n",
 			hb->name, size);
@@ -1361,6 +1368,7 @@ void hg_cell_free(struct hg_block *hb, void *p)
 		struct hg_block *owner = hg_owner(cell_start);
 
 		if (!owner) {
+			hg_corrupt(hb, HG_C_FOREIGN_PTR);
 			LM_CRIT("%s: %p belongs to no live arena - refusing to "
 				"free it\n", hb->name, p);
 			return;
@@ -1395,6 +1403,7 @@ void hg_cell_free(struct hg_block *hb, void *p)
 		 * detection (has THIS pointer already been freed) needs a
 		 * per-cell allocated/free bit that isn't implemented yet, see
 		 * the file header note on Phase 1 scope. */
+		hg_corrupt(hb, HG_C_BAD_CLASS);
 		LM_CRIT("%s: cell %p carries invalid class %u - leaking it\n",
 			hb->name, p, c);
 		return;
@@ -1452,6 +1461,7 @@ void hg_cell_free(struct hg_block *hb, void *p)
 		lock_release(&hb->lock);
 
 		if (i < donate)
+			hg_corrupt(hb, HG_C_NFREE_UNDERFLOW);
 			LM_CRIT("%s: class %u free list ran dry after %u cells "
 				"but nfree claimed %u - counter resynced to 0, "
 				"pool accounting drifted\n",
@@ -1475,6 +1485,7 @@ void hg_cell_free_global(struct hg_block *hb, void *p)
 		 * directly and by that function's redirect, so the redirect
 		 * must not loop: it only ever passes the resolved owner. */
 		if (!owner) {
+			hg_corrupt(hb, HG_C_FOREIGN_PTR);
 			LM_CRIT("%s: %p belongs to no live arena - refusing to "
 				"free it\n", hb->name, p);
 			return;
@@ -1490,6 +1501,7 @@ void hg_cell_free_global(struct hg_block *hb, void *p)
 		return;
 	}
 	if (c >= HG_NCLASSES) {
+		hg_corrupt(hb, HG_C_BAD_CLASS);
 		LM_CRIT("%s: cell %p carries invalid class %u - leaking it\n",
 			hb->name, p, c);
 		return;
@@ -1756,6 +1768,8 @@ enum hg_stat_field {
 	HGS_LARGE_BACKING, HGS_LARGE_LIVE, HGS_LARGE_RECYCLED,
 	HGS_LARGE_CHUNKS_CARVED, HGS_LARGE_CHUNKS_RETURNED,
 	HGS_RESERVE_FLOOR, HGS_BELOW_FLOOR, HGS_FLOOR_CROSSINGS,
+	/* one number an operator can alert on; the breakdown is in hg_stats */
+	HGS_CORRUPTION,
 };
 
 static unsigned long hg_shm_stat(void *ctx)
@@ -1812,6 +1826,7 @@ static unsigned long hg_shm_stat(void *ctx)
 	case HGS_RESERVE_FLOOR:   return hb->reserve_floor;
 	case HGS_BELOW_FLOOR:     return hb->below_floor;
 	case HGS_FLOOR_CROSSINGS: return hb->floor_crossings;
+	case HGS_CORRUPTION:      return hg_corrupt_total(hb);
 	}
 	return 0;
 }
@@ -1849,6 +1864,7 @@ static const struct {
 	{"hg_shm_reserve_floor",   HGS_RESERVE_FLOOR},
 	{"hg_shm_below_floor",     HGS_BELOW_FLOOR},
 	{"hg_shm_floor_crossings", HGS_FLOOR_CROSSINGS},
+	{"hg_shm_corruption",      HGS_CORRUPTION},
 	{NULL, 0}
 };
 

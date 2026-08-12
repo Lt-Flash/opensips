@@ -183,6 +183,25 @@ static int   pull_ready;               /* transport up AND a collection opted in
  * request leaves and a reply comes back changes. */
 #ifdef CLUSTERER_CTRL_SUPPORT
 static clctr_api_t clctr_api;
+
+/*
+ * Smaller of our own buffer and the controller's runtime payload bound.
+ *
+ * Asked through the bound API, never via `extern int cc_max_payload`: that is
+ * defined in another dlopen'd module, so the direct reference leaves an
+ * undefined symbol in this .so and the whole config fails to parse unless the
+ * controller loaded first. Falls back to the buffer when the API is not bound
+ * (get_max_payload NULL), which is the pre-binding state and also an older
+ * controller that has no such entry point.
+ */
+static inline int pcache_clctr_payload_lim(int buf_sz)
+{
+	int lim = clctr_api.get_max_payload ? clctr_api.get_max_payload() : buf_sz;
+
+	if (lim > CLCTR_MAX_PAYLOAD)
+		lim = CLCTR_MAX_PAYLOAD;   /* our buffers are sized to the constant */
+	return lim < buf_sz ? lim : buf_sz;
+}
 static str  pull_channel = str_init("cdbperf-pull");
 #endif
 /* stays 0 for the whole run when the controller is not compiled in */
@@ -2054,9 +2073,10 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 	 * requester would wait out its timeout instead of being told the value is
 	 * held-but-unsendable - which is precisely the answer this branch exists
 	 * to give. */
+	/* Bound by CLCTR_MAX_PAYLOAD, which is what the reply buffer in
+	 * pcache_pull_send_rpl() is sized to - there is no buffer in scope here. */
 	budget = via_clctr
-		? (cc_max_payload < CLCTR_MAX_PAYLOAD
-		       ? cc_max_payload : CLCTR_MAX_PAYLOAD)
+		? pcache_clctr_payload_lim(CLCTR_MAX_PAYLOAD)
 		  - (int)(PCACHE_CLCTR_RPL_HDR + key->len)
 		: pull_max_value;
 #else
@@ -2625,8 +2645,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 		 * only fire if those ever change - or if the MTU makes
 		 * cc_max_payload smaller than the buffer, which is exactly when
 		 * it should. */
-		int _lim = cc_max_payload < (int)sizeof buf
-		           ? cc_max_payload : (int)sizeof buf;
+		int _lim = pcache_clctr_payload_lim((int)sizeof buf);
 		if (PCACHE_CLCTR_REQ_HDR + col->col_name.len + key->len > _lim) {
 			LM_ERR("pull request for a %d byte key does not fit %d\n",
 				key->len, _lim);

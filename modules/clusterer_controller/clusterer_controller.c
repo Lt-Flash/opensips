@@ -476,6 +476,32 @@ typedef struct {
  * accidental per-node config drift for the same cluster:
  * manage_shtags(1B) + master_stickiness(1B) + query_time(2B BE). */
 #define CL_CTR_CONFIG_SZ          4
+/* The node's cluster-plane MTU, advertised in JOIN_REQ and ALIVE as 2 bytes BE.
+ *
+ * Deliberately NOT folded into CL_CTR_CONFIG_SZ above.  That block is governed
+ * by the on_config_mismatch modparam, and two of its three modes would be wrong
+ * here: "warn" would quietly demote MTU enforcement to a log line, and "adopt"
+ * is meaningless - a node cannot adopt a peer's MTU, the kernel owns it.  There
+ * is deliberately NO modparam for the MTU at all, because a configured value is
+ * a second source of truth that can disagree with the interface: the config
+ * says 1500, the link says 9000, and the node refuses to start while being
+ * perfectly consistent with its own segment.  So the MTU gets its own field and
+ * its own unconditional check.
+ *
+ * 0 means "not advertised" - a peer built before this field existed.  Such a
+ * peer is admitted with a warning rather than rejected, because rejecting it
+ * would make a rolling upgrade impossible: every not-yet-upgraded node would be
+ * refused by the first upgraded master and would self-terminate. */
+#define CL_CTR_MTU_SZ             2
+/* Consecutive polls that must disagree with the MTU we joined on before this
+ * node accepts that its own link really changed.  A single reading is not
+ * enough: bond failover, a driver reset or a VLAN parent bounce can show a
+ * transient value, and acting on the first sample would kill a healthy node
+ * over a blip.  At query_time=5 the default is a ~15 s confirmation. */
+#define CL_CTR_MTU_DRIFT_STRIKES  3
+/* Distinct peers a master may refuse on MTU before it says out loud that IT is
+ * the likely misconfiguration.  See cl_ctr_mtu_note_reject(). */
+#define CL_CTR_MTU_SUSPECT_PEERS  2
 /* Noise handshake message sizes (NNpsk0, X25519, ChaChaPoly, SHA-256):
  *   msg 1 = e(32) + tag over empty payload(16)                 = 48
  *   msg 2 = e(32) + AEAD(master_salt 32 + tag 16)              = 80             */
@@ -484,7 +510,7 @@ typedef struct {
 /* JOIN_REQ: [ip NUL][bin_count 1B][sockets...][noise_msg1 48B][config 4B] */
 #define CL_CTR_JOIN_PKT_MAX_SZ   (CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ + CL_CTR_MAX_IP_LEN + 1 \
                               + CL_CTR_BIN_INFO_MAX_SZ + CL_CTR_NOISE_MSG1_SZ \
-                              + CL_CTR_CONFIG_SZ + CL_CTR_TAG_SZ)
+                              + CL_CTR_CONFIG_SZ + CL_CTR_MTU_SZ + CL_CTR_TAG_SZ)
 /* KEY_GRANT: [target_ip NUL][noise_msg2 80B] */
 #define CL_CTR_KEY_GRANT_SZ      (CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ + CL_CTR_MAX_IP_LEN + 1 \
                               + CL_CTR_NOISE_MSG2_SZ + CL_CTR_TAG_SZ)
@@ -744,6 +770,12 @@ typedef struct cl_ctr_cluster_ {
      * so a peer that keeps sending JOIN_REQ yet never becomes master cannot
      * defer us forever.  Worker-local; reset once we leave the NEW state.     */
     int              join_defer_total;
+    /* Distinct peers we have refused on MTU while acting as master, and whether
+     * we have already said we are probably the one at fault.  Worker-local and
+     * diagnostic only - see cl_ctr_mtu_note_reject().                         */
+    uint32_t         mtu_reject_ips[CL_CTR_MTU_SUSPECT_PEERS * 2];
+    int              mtu_reject_n;
+    int              mtu_suspect_said;
     /* utime (us since start) of the last JOIN_REQ we transmitted, for a
      * minimum-interval throttle so a key-mismatch/split-brain burst cannot
      * flood the group with JOIN_REQs.  0 = never sent.  Worker-local.         */
@@ -794,6 +826,7 @@ static char *password          = CL_CTR_DEFAULT_PASSWORD; /* default; falls back
 /* JOIN_REJECT reason codes (1 byte after the target IP in the payload). */
 #define CL_CTR_REJECT_GENERIC      0   /* wrong password / unauthorized / table full */
 #define CL_CTR_REJECT_CONFIG       1   /* different cluster settings (reject policy)  */
+#define CL_CTR_REJECT_MTU          2   /* different cluster-plane MTU (never optional) */
 static char *on_config_mismatch_s = NULL;              /* raw modparam string   */
 static int   on_config_mismatch   = CL_CTR_CFGMISMATCH_REJECT; /* resolved; default reject */
 
@@ -809,6 +842,62 @@ static char my_interface_buf[IF_NAMESIZE];
  * jumbo-frame interfaces (MTU 9000) are not artificially limited to 1300 B.
  * Read-only after mod_init; safe to access from any process. */
 int cc_max_payload = CLCTR_MAX_PAYLOAD;
+/* This node's cluster-plane MTU as read from my_interface_buf at mod_init.
+ * 0 only before mod_init has resolved it; after that it is always a real
+ * kernel-reported value, because mod_init refuses to start otherwise. */
+static int cc_mtu = 0;
+/* The interface's CURRENT MTU, refreshed by the drift poll.  Distinct from
+ * cc_mtu on purpose, and the distinction is load-bearing:
+ *
+ *   cc_mtu     - what we joined at.  The cluster's MTU, and therefore the only
+ *                thing admission and drift are judged against.  Never changes.
+ *   cc_mtu_now - what the kernel says right now.  This is what we ADVERTISE.
+ *
+ * Advertising the joined-at value instead would make the peer-drift warning
+ * unreachable: a node whose link changed would keep announcing the old number,
+ * so no peer could ever observe the change.  Announcing the live reading means
+ * a healthy peer sees the drift on the next ALIVE - which matters, because the
+ * drifting node is about to remove itself and its own log is the one least
+ * likely to be watched. */
+static int cc_mtu_now = 0;
+/* Consecutive polls that disagreed with cc_mtu (see CL_CTR_MTU_DRIFT_STRIKES). */
+static int cc_mtu_drift_strikes = 0;
+
+/**
+ * cl_ctr_read_iface_mtu() - current MTU of the interface we run the plane on.
+ *
+ * Returns the kernel's value, or -1 if it cannot be read.  This is the ONLY
+ * source of MTU truth in the module; there is no configured alternative to
+ * fall back to, by design.
+ */
+static int cl_ctr_read_iface_mtu(void)
+{
+    struct ifreq ifr;
+    int          s, mtu = -1;
+
+    if (my_interface_buf[0] == '\0')
+        return -1;
+    if ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+        return -1;
+    memset(&ifr, 0, sizeof(ifr));
+    memcpy(ifr.ifr_name, my_interface_buf,
+           strnlen(my_interface_buf, IF_NAMESIZE - 1));
+    if (ioctl(s, SIOCGIFMTU, &ifr) == 0)
+        mtu = ifr.ifr_mtu;
+    close(s);
+    return mtu;
+}
+
+/* The MTU travels the wire as an unsigned 16-bit value.  Loopback reports
+ * 65536, one past what that holds, so clamp - two nodes both on loopback still
+ * agree, and no real cluster link is anywhere near it. */
+static inline uint16_t cl_ctr_mtu_wire(int mtu)
+{
+    if (mtu <= 0)      return 0;
+    if (mtu > 0xFFFF)  return 0xFFFF;
+    return (uint16_t)mtu;
+}
+
 /* Largest packet the retransmit cache will hold, raised in mod_init once the
  * MTU is known.  Provisional value covers the control plane, which is all that
  * can be sent before then anyway. */
@@ -1176,6 +1265,10 @@ typedef struct cl_ctr_peer_ {
     int           cfg_master_stickiness;
     int           cfg_query_time;
     int           cfg_warned;
+    /* Peer's advertised cluster-plane MTU (0 = never advertised, i.e. a build
+     * older than the field).  mtu_warned deduplicates the drift warning. */
+    int           mtu;
+    int           mtu_warned;
 } cl_ctr_peer_t;
 
 struct cl_ctr_peers_ {
@@ -3486,8 +3579,9 @@ static void cl_ctr_send_ack(int sock, cl_ctr_cluster_t *cl, uint32_t acked_seq,
 static void cl_ctr_send_pkt_with_ip(int sock, unsigned char type, cl_ctr_cluster_t *cl,
                                 const struct sockaddr *dest, socklen_t destlen)
 {
-    /* Sized for ALIVE which carries an extra pubkey + config descriptor */
-    char               pkt[CL_CTR_SMALL_PKT_SZ + CL_CTR_PUBKEY_SZ + CL_CTR_CONFIG_SZ];
+    /* Sized for ALIVE which carries an extra pubkey + config descriptor + MTU */
+    char               pkt[CL_CTR_SMALL_PKT_SZ + CL_CTR_PUBKEY_SZ
+                           + CL_CTR_CONFIG_SZ + CL_CTR_MTU_SZ];
     uint32_t           seq     = htonl(++cl->peers->my_seq);
     int                ip_len  = (int)strlen(my_ip);
     int                plain_len;
@@ -3517,6 +3611,14 @@ static void cl_ctr_send_pkt_with_ip(int sock, unsigned char type, cl_ctr_cluster
 	    c[1] = (char)(cl->master_stickiness ? 1 : 0);
 	    memcpy(c + 2, &qt, 2);
 	    plain_len += CL_CTR_CONFIG_SZ;
+	}
+	/* And the MTU of the link this plane runs on, so peers can notice that
+	 * one of them has drifted.  Separate from the config block above
+	 * because it is detected, not configured - see CL_CTR_MTU_SZ. */
+	{
+	    uint16_t m = htons(cl_ctr_mtu_wire(cc_mtu_now));
+	    memcpy(pkt + CL_CTR_WIRE_HDR_SZ + plain_len, &m, CL_CTR_MTU_SZ);
+	    plain_len += CL_CTR_MTU_SZ;
 	}
     }
 
@@ -3667,6 +3769,17 @@ static void cl_ctr_send_join_req_pkt(int sock, cl_ctr_cluster_t *cl)
 	*p++ = (char)(cl->master_stickiness ? 1 : 0);
 	memcpy(p, &qt, 2);
 	p += 2;
+    }
+
+    /* Advertise the MTU of our cluster link.  The master admits only nodes
+     * whose MTU equals its own, which is what keeps the whole cluster uniform:
+     * every member matched at this point, so the backup that eventually
+     * becomes master necessarily carries the same value and a handover cannot
+     * change it. */
+    {
+	uint16_t m = htons(cl_ctr_mtu_wire(cc_mtu_now));
+	memcpy(p, &m, CL_CTR_MTU_SZ);
+	p += CL_CTR_MTU_SZ;
     }
 
     plain_len = (int)(p - (pkt + CL_CTR_WIRE_HDR_SZ));
@@ -4216,6 +4329,91 @@ static void cl_ctr_adopt_config(cl_ctr_cluster_t *cl, int new_manage, int new_st
 }
 
 /**
+ * cl_ctr_drop_peer_locked() - remove a peer from the table by IP.
+ *
+ * Needed because refusing a JOIN_REQ is not by itself enough to keep a node
+ * out: while this node was still NEW it upserts every joiner it hears (the
+ * split-brain defer path), so a peer can already be in the table by the time
+ * we become master and refuse it.  Without this the master goes on counting a
+ * node it just told to go away - and, worse, cl_ctr_mtu_note_reject() would
+ * never see the "holding no members" condition that makes it speak up.
+ *
+ * Same swap-with-last removal cl_ctr_prune_stale uses.  Call WITH the write
+ * lock held.
+ */
+static void cl_ctr_drop_peer_locked(const char *ip, cl_ctr_cluster_t *cl)
+{
+    int i;
+
+    for (i = 0; i < cl->peers->count; i++) {
+        uint16_t dropped_id;
+        if (strcmp(cl->peers->entries[i].ip, ip) != 0)
+            continue;
+        dropped_id = cl->peers->entries[i].node_id;
+        cl->peers->count--;
+        if (i < cl->peers->count)
+            cl->peers->entries[i] = cl->peers->entries[cl->peers->count];
+        memset(&cl->peers->entries[cl->peers->count], 0, sizeof(cl_ctr_peer_t));
+        if (clctl_loaded && dropped_id > 0)
+            clctl.remove_node(cl->cluster_id, dropped_id);
+        return;
+    }
+}
+
+/**
+ * cl_ctr_mtu_note_reject() - remember that we refused a peer on MTU, and if we
+ * have now refused several DIFFERENT peers while holding no members of our own,
+ * say plainly that WE are the likely misconfiguration.
+ *
+ * Why this exists.  Master election is highest-IP (cl_ctr_elect_master) and
+ * entirely MTU-blind, so on a simultaneous cold start the winner is decided by
+ * something with no relationship to which MTU is correct.  If six nodes run at
+ * 9000 and the one 1500 host happens to hold the highest IP, it becomes master
+ * and refuses all six - one misconfigured host takes down the whole fleet,
+ * where that same host booting into an already-formed cluster would only have
+ * killed itself.  Nothing else in the design catches that, so this warning is
+ * the safety net rather than a nicety.
+ *
+ * It WARNS and nothing more.  A master that stepped down or terminated because
+ * OTHERS disagreed would break the rule that a node acts only on its own
+ * condition, and would hand anyone holding the bootstrap key a way to force
+ * re-elections at will.
+ */
+static void cl_ctr_mtu_note_reject(const char *src_ip, cl_ctr_cluster_t *cl)
+{
+    uint32_t ip_num = ip_to_num(src_ip);
+    int      i, members;
+
+    if (ip_num == 0 || cl->mtu_suspect_said)
+        return;
+    for (i = 0; i < cl->mtu_reject_n; i++)
+        if (cl->mtu_reject_ips[i] == ip_num)
+            return;                     /* same peer retrying, not a new one */
+    if (cl->mtu_reject_n < (int)(sizeof(cl->mtu_reject_ips)
+                                 / sizeof(cl->mtu_reject_ips[0])))
+        cl->mtu_reject_ips[cl->mtu_reject_n++] = ip_num;
+
+    /* "Holding no members" means nobody but ourselves is in the table. */
+    lock_start_read(cl->peers->lock);
+    members = cl->peers->count;
+    lock_stop_read(cl->peers->lock);
+
+    if (cl->mtu_reject_n >= CL_CTR_MTU_SUSPECT_PEERS && members <= 1) {
+        cl->mtu_suspect_said = 1;
+        LM_CRIT("clusterer_controller: [cluster %d] THIS NODE IS PROBABLY THE "
+                "MISCONFIGURED ONE: it is master at MTU %d on %s, has refused %d "
+                "different peers for not matching, and holds no members of its "
+                "own. Master election is by highest IP and ignores the MTU, so a "
+                "single wrongly-configured host that wins it will refuse an "
+                "otherwise healthy fleet. Check this node's MTU before changing "
+                "any of the others\n",
+                cl->cluster_id, cc_mtu,
+                my_interface_buf[0] ? my_interface_buf : "(unknown)",
+                cl->mtu_reject_n);
+    }
+}
+
+/**
  * cl_ctr_handle_alive() - process a CL_CTR_PKT_ALIVE packet.
  *
  * Regular heartbeat path: upsert the sender, re-elect.
@@ -4226,10 +4424,12 @@ static void cl_ctr_handle_alive(const char *src_ip,
                             const unsigned char *pubkey, /* may be NULL */
                             int cfg_present, int peer_manage,
                             int peer_stick, int peer_qt,
+                            int peer_mtu,
                             cl_ctr_cluster_t *cl)
 {
     int  prev_master, now_master;
     int  warn = 0, adopt = 0, is_active = 0, ent = -1;
+    int  mtu_warn = 0, mtu_seen = 0;
     char warn_ip[CL_CTR_MAX_IP_LEN + 1] = "";
     int  loc_manage = cl->manage_shtags ? 1 : 0;
     int  loc_stick  = cl->master_stickiness ? 1 : 0;
@@ -4261,6 +4461,21 @@ static void cl_ctr_handle_alive(const char *src_ip,
                 e->cfg_manage_shtags     = peer_manage;
                 e->cfg_master_stickiness = peer_stick;
                 e->cfg_query_time        = peer_qt;
+            }
+            /* A peer whose MTU no longer matches ours: WARN ONLY, never act.
+             * That peer's own drift poll will notice and remove itself, which
+             * is the node terminating on its OWN condition.  Terminating here
+             * instead would mean one `ip link set mtu` on any single host
+             * taking down every other node that heard about it. */
+            if (peer_mtu > 0) {
+                if (cc_mtu > 0 && peer_mtu != cc_mtu && !e->mtu_warned) {
+                    e->mtu_warned = 1;
+                    mtu_warn      = 1;
+                    mtu_seen      = peer_mtu;
+                } else if (cc_mtu > 0 && peer_mtu == cc_mtu) {
+                    e->mtu_warned = 0;   /* re-arm once it agrees again */
+                }
+                e->mtu = peer_mtu;
             }
             break;
         }
@@ -4301,6 +4516,14 @@ static void cl_ctr_handle_alive(const char *src_ip,
                 "values cause inconsistent failover/sharing-tag behaviour (%s)\n",
                 cl->cluster_id, warn_ip, diff);
     }
+    if (mtu_warn)
+        LM_WARN("clusterer_controller: [cluster %d] peer %s now advertises MTU %d "
+                "but this cluster runs at %d. Traffic larger than the smaller of "
+                "the two is dropped silently in that direction. NOT acting on it "
+                "here - that peer detects its own change and removes itself; "
+                "terminating on someone else's reading would turn one `ip link` "
+                "command into a fleet outage\n",
+                cl->cluster_id, src_ip, mtu_seen, cc_mtu);
     if (adopt)
         cl_ctr_adopt_config(cl, peer_manage, peer_stick, peer_qt, is_active);
     /* Defer acting as master until we hold the cluster key.  In normal
@@ -4344,6 +4567,7 @@ static void cl_ctr_handle_join_req(int sock, const char *payload, int payload_le
     uint8_t        bin_cnt   = 0;
     int            ip_len, was_master, i;
     int            j_cfg_present = 0, j_manage = 0, j_stick = 0, j_qt = 0;
+    int            j_mtu = 0;   /* 0 = joiner advertised none (older build) */
     uint16_t       new_id;
 
     /* --- Parse IP --- */
@@ -4390,6 +4614,14 @@ static void cl_ctr_handle_join_req(int sock, const char *payload, int payload_le
 	j_qt          = ntohs(qt_be);
 	j_cfg_present = 1;
 	p += CL_CTR_CONFIG_SZ;
+    }
+
+    /* --- Parse the joiner's cluster-plane MTU (absent on older builds) --- */
+    if (p + CL_CTR_MTU_SZ <= end) {
+	uint16_t m_be;
+	memcpy(&m_be, p, CL_CTR_MTU_SZ);
+	j_mtu = ntohs(m_be);
+	p += CL_CTR_MTU_SZ;
     }
 
     LM_INFO("clusterer_controller: [cluster %d] JOIN_REQ from %s "
@@ -4442,6 +4674,51 @@ static void cl_ctr_handle_join_req(int sock, const char *payload, int payload_le
 	    cl_ctr_send_join_reject(sock, src_ip, cl, CL_CTR_REJECT_CONFIG);
 	    return;
 	}
+    }
+
+    /* MTU gate (master side).  A cluster must have ONE MTU: an oversized
+     * datagram is dropped by the small-MTU node's NIC with no ICMP to report
+     * it (same L2 segment, so there is no router to generate one), and a
+     * multicast sender has no path to discover.  So the receiver can never
+     * observe the packet it failed to receive - the mismatch has to be caught
+     * here, while both sides are still exchanging small handshake packets that
+     * do arrive.
+     *
+     * Refuse BEFORE KEY_GRANT, which is key custody rather than speed: the
+     * joiner holds no session key until KEY_GRANT hands it the ECDH-wrapped
+     * master_salt, so refusing now means a mismatched node never obtains the
+     * group key at all.  Admitting it and ejecting it later would have handed
+     * it multicast decryption and required a key rotation to take that back.
+     *
+     * Unconditional - there is no policy modparam here, unlike the config gate
+     * above.  A node that cannot participate must not serve SIP: without shared
+     * usrloc, dialog replication and shtag coordination it would answer
+     * REGISTERs into a local store and route on a partial view while the load
+     * balancer kept feeding it calls.  Down is the honest state. */
+    if (j_mtu > 0 && cc_mtu > 0 && j_mtu != cc_mtu) {
+	/* Drop it before releasing the lock: while we were ourselves NEW we
+	 * upserted every joiner we heard, so this peer may already be in the
+	 * table and refusing the join alone would leave it there. */
+	cl_ctr_drop_peer_locked(src_ip, cl);
+	lock_stop_write(cl->peers->lock);
+	LM_WARN("clusterer_controller: [cluster %d] rejecting JOIN_REQ from %s: "
+	        "its cluster-plane MTU is %d, this cluster runs at %d. Every "
+	        "member must agree, because an oversized datagram is dropped "
+	        "silently by the smaller link.\n",
+	        cl->cluster_id, src_ip, j_mtu, cc_mtu);
+	cl_ctr_send_join_reject(sock, src_ip, cl, CL_CTR_REJECT_MTU);
+	cl_ctr_mtu_note_reject(src_ip, cl);
+	return;
+    }
+    if (j_mtu == 0) {
+	/* Older build: it cannot tell us, so uniformity is unenforceable for
+	 * this peer.  Admitting it is deliberate - refusing would make a
+	 * rolling upgrade impossible, since every not-yet-upgraded node would
+	 * be turned away by the first upgraded master. */
+	LM_WARN("clusterer_controller: [cluster %d] %s did not advertise an "
+	        "MTU (older build) - admitting it, but MTU uniformity is NOT "
+	        "enforced for this peer until it is upgraded\n",
+	        cl->cluster_id, src_ip);
     }
 
     /* Reject JOIN_REQ from an unknown IP when the peer table is full.
@@ -5524,7 +5801,10 @@ static int cl_ctr_join_fail_check(const char *src_ip, cl_ctr_cluster_t *cl)
 static void cl_ctr_send_join_reject(int sock, const char *target_ip, cl_ctr_cluster_t *cl,
                                 int reason)
 {
-    char               pkt[CL_CTR_SMALL_PKT_SZ + 1];   /* +1 for the reason byte */
+    /* +1 reason byte, +2 the master's MTU (diagnostic only - it is NOT cluster
+     * state the joiner adopts; it exists so the log line can name both
+     * numbers instead of leaving an operator to guess which side is wrong) */
+    char               pkt[CL_CTR_SMALL_PKT_SZ + 1 + CL_CTR_MTU_SZ];
     uint32_t           seq = htonl(++cl->peers->my_seq);
     int                ip_len, plain_len;
 
@@ -5537,12 +5817,19 @@ static void cl_ctr_send_join_reject(int sock, const char *target_ip, cl_ctr_clus
     pkt[CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ + ip_len]     = '\0';
     /* reason byte follows the NUL-terminated target IP */
     pkt[CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ + ip_len + 1] = (char)reason;
+    /* then our MTU, so a rejected node can log what it should have been */
+    {
+        uint16_t m = htons(cl_ctr_mtu_wire(cc_mtu));
+        memcpy(pkt + CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ + ip_len + 2,
+               &m, CL_CTR_MTU_SZ);
+    }
 
-    plain_len = CL_CTR_PLAIN_HDR_SZ + ip_len + 1 + 1;
+    plain_len = CL_CTR_PLAIN_HDR_SZ + ip_len + 1 + 1 + CL_CTR_MTU_SZ;
     if (cl_ctr_seal_and_send(sock, cl, pkt, plain_len, cl->key, CL_CTR_PKT_JOIN_REJECT) == 0)
         LM_WARN("clusterer_controller: [cluster %d] sent JOIN_REJECT to %s (%s)\n",
                 cl->cluster_id, target_ip,
-                reason == CL_CTR_REJECT_CONFIG ? "different cluster settings"
+                reason == CL_CTR_REJECT_CONFIG ? "different cluster settings" :
+                reason == CL_CTR_REJECT_MTU    ? "different cluster-plane MTU"
                                            : "repeated auth failure - wrong password?");
 }
 
@@ -5559,7 +5846,18 @@ static void cl_ctr_handle_join_reject(const char *payload, int payload_len,
     lock_start_read(cl->peers->lock);
     still_new = (cl->peers->node_state == CL_CTR_NODE_NEW);
     lock_stop_read(cl->peers->lock);
-    if (!still_new) return;
+    /* cl->join_pending is set whenever we have an admission request in flight -
+     * including the split-brain merge, where cl_ctr_rejoin_superior_master()
+     * sends a JOIN_REQ from the ACTIVE state to fetch the superior master's
+     * key.  Testing node_state alone missed exactly that case: on a
+     * simultaneous cold start BOTH nodes reach the join deadline, BOTH
+     * self-promote, and the loser then merges - so it is ACTIVE, not NEW, when
+     * its JOIN_REQ is refused, and it went on running with the reject
+     * discarded.  A node that ASKED to be admitted must honour the refusal of
+     * that request whatever state it thinks it is in.  A settled member with
+     * no request outstanding still ignores rejects, which is what stops one
+     * member from evicting another. */
+    if (!still_new && !cl->join_pending) return;
 
     l = (int)strnlen(payload, CL_CTR_MAX_IP_LEN);
     if (l >= payload_len) return;
@@ -5572,9 +5870,37 @@ static void cl_ctr_handle_join_reject(const char *payload, int payload_len,
     /* reason byte follows the NUL-terminated target IP (older senders omit it) */
     {
         int reason = CL_CTR_REJECT_GENERIC;
+        int their_mtu = 0;
         if (payload_len > l + 1)
             reason = (unsigned char)payload[l + 1];
-        if (reason == CL_CTR_REJECT_CONFIG)
+        if (payload_len >= l + 2 + CL_CTR_MTU_SZ) {
+            uint16_t m_be;
+            memcpy(&m_be, payload + l + 2, CL_CTR_MTU_SZ);
+            their_mtu = ntohs(m_be);
+        }
+        /* Only act if the refusal is self-consistent with what WE measure: the
+         * master says the cluster runs at X, and our own interface really is
+         * not X.  A reject quoting our own MTU back at us is bogus and is
+         * ignored - we check the kernel, not the sender's assertion. */
+        if (reason == CL_CTR_REJECT_MTU && their_mtu > 0 && their_mtu == cc_mtu) {
+            LM_WARN("clusterer_controller: [cluster %d] ignoring an MTU "
+                    "JOIN_REJECT from %s that quotes %d - which is exactly this "
+                    "node's own MTU, so the refusal contradicts itself\n",
+                    cl->cluster_id, sender_ip, their_mtu);
+            return;
+        }
+        if (reason == CL_CTR_REJECT_MTU)
+            LM_CRIT("clusterer_controller: [cluster %d] JOIN_REJECT from %s - the "
+                    "cluster runs at MTU %d, this node has %d on %s. Every member "
+                    "must agree, because an oversized datagram is dropped silently "
+                    "by the smaller link. Change the MTU of %s to %d (and persist "
+                    "it in the boot config) or move this node to a matching "
+                    "segment; shutting down\n",
+                    cl->cluster_id, sender_ip, their_mtu, cc_mtu,
+                    my_interface_buf[0] ? my_interface_buf : "(unknown interface)",
+                    my_interface_buf[0] ? my_interface_buf : "the cluster interface",
+                    their_mtu);
+        else if (reason == CL_CTR_REJECT_CONFIG)
             LM_CRIT("clusterer_controller: [cluster %d] JOIN_REJECT from %s - the "
                     "running cluster has different settings than this node; fix the "
                     "local config (manage_shtags/master_stickiness/query_time) to "
@@ -5861,6 +6187,7 @@ static void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	    int            ip_len = (int)strnlen(payload, CL_CTR_MAX_IP_LEN);
 	    const unsigned char *pubkey = NULL;
 	    int            cfg_present = 0, p_manage = 0, p_stick = 0, p_qt = 0;
+	    int            p_mtu = 0;
 	    memcpy(ip_buf, payload, ip_len);
 	    ip_buf[ip_len] = '\0';
 	    /* Pubkey appended after NUL-terminated IP */
@@ -5876,7 +6203,16 @@ static void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 		p_qt        = ntohs(qt_be);
 		cfg_present = 1;
 	    }
-	    cl_ctr_handle_alive(ip_buf, pubkey, cfg_present, p_manage, p_stick, p_qt, cl);
+	    /* MTU appended after the config block (optional - older builds) */
+	    if (payload_len >= ip_len + 1 + (int)CL_CTR_PUBKEY_SZ
+	                       + CL_CTR_CONFIG_SZ + CL_CTR_MTU_SZ) {
+		uint16_t m_be;
+		memcpy(&m_be, payload + ip_len + 1 + CL_CTR_PUBKEY_SZ
+		              + CL_CTR_CONFIG_SZ, CL_CTR_MTU_SZ);
+		p_mtu = ntohs(m_be);
+	    }
+	    cl_ctr_handle_alive(ip_buf, pubkey, cfg_present, p_manage, p_stick, p_qt,
+	                        p_mtu, cl);
 	    break;
 	}
 
@@ -6107,6 +6443,58 @@ static int cl_ctr_on_alive_tfd(int fd, void *param, int was_timeout)
     cl_ctr_cluster_t *cl = (cl_ctr_cluster_t *)param;
     int prev_master, now_master;
     cl_ctr_drain_tfd(fd);
+
+    /* --- Has our OWN link changed under us? ---------------------------------
+     * Nothing notifies this module: cc_mtu is read once at mod_init.  Poll it
+     * here rather than subscribing to netlink RTM_NEWLINK, because netlink
+     * DROPS events on ENOBUFS - so a reconcile poll would have to exist anyway,
+     * and a missed MTU change is exactly the silent failure this is meant to
+     * remove.  One ioctl per query_time is free.
+     *
+     * Terminate rather than warn, because SHRINKING an MTU breaks RECEIVE, not
+     * send: the kernel still fragments on egress, so this node keeps emitting
+     * ALIVEs and looks perfectly healthy to everyone while silently no longer
+     * receiving anything larger than its new MTU.  CL_CTR_LIST_PKT_MAX_SZ
+     * scales with CL_CTR_MAX_PEERS, so MEMBER_LIST on a real cluster is well
+     * over 1500 - the node would sit on stale membership and an incomplete BIN
+     * mesh, invisible to its peers, while the LB kept handing it calls.
+     *
+     * This is the node acting on its OWN condition, which is what makes it safe
+     * to act at all - it reads its own interface, and a switch-side change does
+     * not move /sys/class/net/X/mtu; only a host-local action does. */
+    if (cc_mtu > 0) {
+        int now_mtu = cl_ctr_read_iface_mtu();
+        if (now_mtu > 0)
+            cc_mtu_now = now_mtu;   /* what we advertise: the live reading */
+        if (now_mtu > 0 && now_mtu != cc_mtu) {
+            if (++cc_mtu_drift_strikes >= CL_CTR_MTU_DRIFT_STRIKES) {
+                LM_CRIT("clusterer_controller: [cluster %d] the MTU of %s changed "
+                        "from %d to %d and stayed there for %d checks. This node "
+                        "joined at %d and every other member still uses it, so it "
+                        "can no longer RECEIVE full-size cluster traffic - it would "
+                        "keep sending heartbeats and look healthy while silently "
+                        "missing membership updates. Shutting down; restore the MTU "
+                        "to %d and restart\n",
+                        cl->cluster_id,
+                        my_interface_buf[0] ? my_interface_buf : "(unknown)",
+                        cc_mtu, now_mtu, cc_mtu_drift_strikes, cc_mtu, cc_mtu);
+                exit(-1);
+            }
+            LM_WARN("clusterer_controller: [cluster %d] MTU of %s reads %d, this "
+                    "node joined at %d (%d/%d consecutive) - confirming before "
+                    "acting, since a bond failover or driver reset can report a "
+                    "transient value\n",
+                    cl->cluster_id,
+                    my_interface_buf[0] ? my_interface_buf : "(unknown)",
+                    now_mtu, cc_mtu, cc_mtu_drift_strikes,
+                    CL_CTR_MTU_DRIFT_STRIKES);
+        } else if (cc_mtu_drift_strikes) {
+            LM_INFO("clusterer_controller: [cluster %d] MTU of %s is back to %d - "
+                    "the earlier reading was a transient\n", cl->cluster_id,
+                    my_interface_buf[0] ? my_interface_buf : "(unknown)", cc_mtu);
+            cc_mtu_drift_strikes = 0;
+        }
+    }
     /* ALIVE transport: a settled non-master unicasts its heartbeat to the master,
      * which relays liveness to the whole group via the MASTER_ALIVE bitmap - so
      * the old all-to-all O(N^2) becomes O(N).  During formation (no settled master
@@ -6631,7 +7019,8 @@ static mi_response_t *mi_cl_ctr_members(const mi_params_t *params,
 		lock_stop_read(cl->peers->lock);
 		goto error;
 	    }
-	    if (add_mi_string(peer_obj, MI_SSTR("ip"),
+	    if (add_mi_number(peer_obj, MI_SSTR("mtu"), e->mtu) < 0 ||
+	        add_mi_string(peer_obj, MI_SSTR("ip"),
 	                      e->ip, strlen(e->ip)) < 0 ||
 	        add_mi_number(peer_obj, MI_SSTR("node_id"), e->node_id) < 0 ||
 	        add_mi_string(peer_obj, MI_SSTR("status"),
@@ -6701,7 +7090,8 @@ static mi_response_t *mi_cl_ctr_node_info(const mi_params_t *params,
 		lock_stop_read(cl->peers->lock);
 		return NULL;
 	    }
-	    if (add_mi_number(root, MI_SSTR("node_id"),    e->node_id)             < 0 ||
+	    if (add_mi_number(root, MI_SSTR("mtu"),        e->mtu)                 < 0 ||
+	        add_mi_number(root, MI_SSTR("node_id"),    e->node_id)             < 0 ||
 	        add_mi_string(root, MI_SSTR("ip"),         e->ip, strlen(e->ip))   < 0 ||
 	        add_mi_number(root, MI_SSTR("cluster_id"), cl->cluster_id)          < 0 ||
 	        add_mi_string(root, MI_SSTR("status"),
@@ -6802,6 +7192,10 @@ static mi_response_t *mi_cl_ctr_config(const mi_params_t *params,
 	    add_mi_string(cl_obj, MI_SSTR("my_ip"),        my_ip, strlen(my_ip))  < 0 ||
 	    add_mi_string(cl_obj, MI_SSTR("bin_socket"),
 	                  cl->bin_socket, strlen(cl->bin_socket))                 < 0 ||
+	    add_mi_number(cl_obj, MI_SSTR("mtu"),          cc_mtu)                 < 0 ||
+	    add_mi_string(cl_obj, MI_SSTR("interface"),
+	                  my_interface_buf[0] ? my_interface_buf : "(unknown)",
+	                  my_interface_buf[0] ? strlen(my_interface_buf) : 9)      < 0 ||
 	    add_mi_number(cl_obj, MI_SSTR("query_time"),   eff_qt)                < 0 ||
 	    add_mi_number(cl_obj, MI_SSTR("master_stickiness"), eff_stick)        < 0 ||
 	    add_mi_number(cl_obj, MI_SSTR("manage_shtags"), eff_manage)           < 0 ||
@@ -7247,12 +7641,24 @@ static int cl_ctr_resolve_local_identity(void)
 		break;
 	    }
 	}
-	if (found)
+	if (found) {
 	    LM_INFO("clusterer_controller: auto-detected IP %s on "
 	            "interface %s\n", my_ip, my_interface_buf);
-	else
-	    LM_WARN("clusterer_controller: auto-detected IP %s but could "
-	            "not determine interface name\n", my_ip);
+	} else {
+	    /* Fatal, where it used to warn and continue.  The interface name is
+	     * the only route to the MTU, and the MTU is what admission to the
+	     * cluster is decided on - a node that cannot name its own interface
+	     * cannot know whether it belongs, and would previously have run on
+	     * the compile-time default as if it did.  Both explicit modes
+	     * (my_ip, interface) always yield a name, so this is only reachable
+	     * from auto-detection, and naming either one is the fix. */
+	    LM_ERR("clusterer_controller: auto-detected IP %s but no interface "
+	           "owns it, so its MTU cannot be read - and the cluster admits "
+	           "only nodes whose MTU matches. Set the 'interface' modparam "
+	           "(or 'my_ip') so the link is unambiguous\n", my_ip);
+	    freeifaddrs(ifap);
+	    return -1;
+	}
     }
 
     freeifaddrs(ifap);
@@ -7439,6 +7845,22 @@ static int mod_init(void)
      * Overhead per consumer datagram:
      *   IP(20) + UDP(8) + wire_hdr(28) + plain_hdr(5) +
      *   consumer_hdr(3) + max_chan(31) + poly1305_tag(16) = 111 bytes. */
+    {
+	int _probe_mtu = cl_ctr_read_iface_mtu();
+	if (_probe_mtu <= 0) {
+	    /* No modparam can supply this: the MTU is detected, never
+	     * configured, precisely so it cannot disagree with the kernel.
+	     * Without it this node cannot know whether it may join, and a node
+	     * that cannot participate must not serve SIP. */
+	    LM_ERR("clusterer_controller: cannot read the MTU of %s (%s) - the "
+	           "cluster admits only nodes whose MTU matches, so this node "
+	           "cannot establish whether it belongs and will not start\n",
+	           my_interface_buf[0] ? my_interface_buf : "(no interface)",
+	           my_interface_buf[0] ? strerror(errno) : "interface unresolved");
+	    return -1;
+	}
+	cc_mtu = cc_mtu_now = _probe_mtu;
+    }
     if (my_interface_buf[0] != '\0') {
 	struct ifreq _mtu_ifr;
 	int _mtu_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -7487,7 +7909,9 @@ static int mod_init(void)
 		    return -1;
 		}
 		LM_INFO("clusterer_controller: interface %s MTU=%d, "
-		        "max consumer payload=%d bytes\n",
+		        "max consumer payload=%d bytes - every cluster member "
+		        "must run at this MTU; one that does not is refused at "
+		        "join\n",
 		        my_interface_buf, _mtu, cc_max_payload);
 	    } else {
 		LM_WARN("clusterer_controller: SIOCGIFMTU on %s failed: %s - "

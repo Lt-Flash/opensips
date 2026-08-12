@@ -60,47 +60,67 @@
 #define CLCTR_SEND_TO_SELF   (1 << 0)
 /* Ask for the message to be acknowledged, and resent while it is not.
  *
- * ONLY USE THIS ON A CHANNEL WHERE ONE MESSAGE PER PEER IS IN FLIGHT AT A
- * TIME.  It is not a general-purpose reliability option, and on a channel
- * with concurrent traffic it does not merely cost extra packets - it does
- * not work, and it fails silently.
+ * Valid on any channel, including one carrying concurrent messages.  That was
+ * NOT true before the receiver grew a replay window, and code or notes
+ * predating it may still say the flag is for serialised 1:1 exchanges only.
  *
- * Why: every packet carries a sequence number, and a receiver drops anything
- * whose seq is not strictly greater than the last it accepted from that peer
- * (cl_ctr_check_and_update_seq(), the anti-replay guard).  A retransmit
- * re-sends the cached bytes, so it carries its ORIGINAL seq.  On a serialised
- * 1:1 exchange - the join handshake this was built for - nothing else is in
- * flight from that peer, so the retransmit is still the highest seq and is
- * accepted.  As soon as a second message can overtake it, the retransmit
- * arrives behind a higher seq and is discarded as out of order.  The receive
- * path then re-ACKs it, deliberately, so the sender stops retransmitting and
- * believes it delivered.  Nothing is logged above debug level at either end.
+ * How it behaves.  Every packet carries a sequence number and the receiver
+ * accepts each one exactly once.  A retransmit re-sends the cached bytes, so
+ * it carries its ORIGINAL seq; the receiver looks that seq up in a window of
+ * the last CL_CTR_REPLAY_WIN_BITS it has seen from that peer and can tell the
+ * two cases apart - never delivered (accept it now, ACK) versus already
+ * delivered (do not deliver twice, but re-ACK, because a duplicate means our
+ * previous ACK was lost).  Delivery is therefore at-most-once, and the sender
+ * retransmits until acknowledged or its budget runs out.
  *
- * Measured, rather than reasoned about: applying this flag to the
- * cross-node cache pull channel (concurrent by nature) made the delivery rate
- * WORSE - 61% -> 49% under 40% reply loss, at two to three times the packet
- * count - and not one retransmitted payload was ever delivered.  See the
- * clusterer_controller notes for the harness.
+ * The one limit worth knowing: the window spans a number of MESSAGES, so a
+ * peer sending faster than the window divided by the retransmit horizon
+ * (consumer_retries x consumer_retry_ms) can outrun it.  A repair arriving
+ * that late is dropped and deliberately NOT acknowledged - the sender is told,
+ * by silence, that delivery is unconfirmed, and the receiver logs it.  With
+ * the defaults that ceiling is ~12,800 msg/s from one peer; mod_init logs the
+ * value in force.
  *
- * So most consumer traffic is better served by being idempotent and retried
- * by its own logic, which is how the cross-node cache fetch works and why it
- * asks for nothing here.  That was always the recommendation; the point of
- * this note is that for a concurrent channel it is the only thing that works.
+ * The cost: one ACK per recipient, so a reliable send to the whole cluster is
+ * N-1 packets back where a plain one was nothing - hence opt-in, and per send
+ * rather than per channel.  Traffic that can simply be made idempotent and
+ * retried by its own logic should still prefer that, which is what the
+ * cross-node cache fetch does and why it asks for nothing here.
  *
- * The cost, where it IS applicable: one ACK per recipient, so a reliable send
- * to the whole cluster is N-1 packets back where a plain one was nothing -
- * hence opt-in, and per send rather than per channel. */
+ * KILL SWITCH.  The flag is honoured unless the deployment sets
+ *     modparam("clusterer_controller", "enable_reliable_send", 0)
+ * which degrades every reliable send to a plain one - the payload still goes
+ * out, it is simply neither acknowledged nor retransmitted - and logs one
+ * rate-limited warning.  That exists for fleets that would rather not pay the
+ * ACK traffic, not because the mechanism is in doubt. */
 #define CLCTR_SEND_RELIABLE  (1 << 1)
 
 /* limits a consumer can rely on */
 #define CLCTR_MAX_CHAN_LEN   31
-/* Compile-time lower bound for consumer payload; the actual runtime limit is
- * cc_max_payload, which is derived from the interface MTU at mod_init and may
- * be larger on jumbo-frame links.  Consumers that size local buffers at
- * compile time should use CLCTR_MAX_PAYLOAD; consumers that want to send the
- * largest possible message at runtime should check cc_max_payload instead. */
+/* A constant to size compile-time buffers with - nothing more.  It is NOT a
+ * guaranteed payload size.
+ *
+ * The runtime limit is cc_max_payload, derived from the interface MTU at
+ * mod_init: LARGER on a jumbo-frame link, and SMALLER on a VPN, tunnel or
+ * PPPoE link whose MTU is under about 1411.  It used to be padded up to this
+ * constant when the link was smaller, which made the constant a promise the
+ * network could not keep and fragmented every full-size datagram to pretend
+ * otherwise; the module now honours the link and warns at startup instead.
+ *
+ * So: size a stack buffer with CLCTR_MAX_PAYLOAD - that is always safe, since
+ * a buffer can only be too big - but test the length you actually intend to
+ * send against the runtime bound, which is the only one that will be enforced,
+ * and which you obtain through get_max_payload() below.
+ *
+ * Do NOT declare `extern int cc_max_payload` in a consumer. It is defined in
+ * clusterer_controller.c, and OpenSIPS modules are dlopen'd, so referencing it
+ * directly makes the consumer's .so carry an undefined symbol that resolves
+ * only if clusterer_controller happens to have been loaded first. It does not
+ * fail at build time - it fails at startup with
+ *   "cachedb_perf.so: undefined symbol: cc_max_payload"
+ * and takes the whole config down with it. Every other cross-module call here
+ * goes through the bound API for exactly this reason. */
 #define CLCTR_MAX_PAYLOAD    1300
-extern int cc_max_payload;
 
 typedef void (*clctr_msg_cb_f)(int cluster_id, int src_node_id,
 		str *channel, str *payload);
@@ -135,6 +155,12 @@ typedef int (*clctr_send_list_f)(int cluster_id, const int *node_ids, int n,
 
 typedef int (*clctr_get_my_node_id_f)(int cluster_id);
 
+/* The runtime maximum consumer payload, derived from the interface MTU at
+ * mod_init.  May be LARGER than CLCTR_MAX_PAYLOAD on a jumbo link or SMALLER on
+ * one under ~1411 MTU, so a consumer that cares must ask rather than assume.
+ * Safe to call any time after the controller's mod_init. */
+typedef int (*clctr_get_max_payload_f)(void);
+
 /*
  * This node's own address on the cluster plane, as RESOLVED at startup - not
  * the raw modparam.  It comes from one of three places (explicit `my_ip`, the
@@ -159,6 +185,7 @@ typedef struct clctr_api {
 	clctr_send_list_f         send_list;
 	clctr_get_my_node_id_f    get_my_node_id;
 	clctr_get_my_ip_f         get_my_ip;
+	clctr_get_max_payload_f   get_max_payload;
 } clctr_api_t;
 
 typedef int (*load_clctr_f)(clctr_api_t *api);

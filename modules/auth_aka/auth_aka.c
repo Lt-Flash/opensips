@@ -45,6 +45,7 @@
 #include "../../parser/parse_from.h"
 #include "../../parser/parse_to.h"
 #include "../../parser/parse_uri.h"
+#include "../../timer.h"   /* get_ticks() */
 
 
 auth_api_t auth_api;

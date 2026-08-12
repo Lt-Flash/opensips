@@ -25,6 +25,7 @@
 #include "../../dprint.h"
 #include "../../ut.h"
 #include "../../ipc.h"
+#include "../../timer.h"   /* get_ticks() */
 
 static ipc_handler_type ipc_hdl_run_esl;
 

@@ -28,6 +28,7 @@
 #include "b2b_logic.h"
 #include "b2b_load.h"
 #include "bridging.h"
+#include "../../timer.h"   /* get_ticks() */
 
 extern b2bl_tuple_t *local_ctx_tuple;
 extern struct b2b_ctx_val *local_ctx_vals;

@@ -27,6 +27,7 @@
 #include "trans.h"
 #include "../tsend.h"
 #include "proto_tcp/tcp_common_defs.h"
+#include "../timer.h"   /* get_ticks() */
 
 #define TCP_DEFAULT_ASYNC_CHUNKS 32
 

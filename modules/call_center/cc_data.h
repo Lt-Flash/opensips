@@ -32,6 +32,7 @@
 #include "../../locking.h"
 #include "../../hash_func.h"
 #include "../../parser/msg_parser.h"
+#include "../../timer.h"   /* get_ticks() */
 
 
 typedef enum {

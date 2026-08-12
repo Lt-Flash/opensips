@@ -31,6 +31,7 @@
 
 #include "ebr_data.h"
 #include "api.h"
+#include "../../timer.h"   /* get_ticks() */
 
 /* structure holding all the needed data to be passed via IPC to 
  * the process that has to run the notification route */

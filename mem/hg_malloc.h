@@ -140,12 +140,124 @@ struct hg_lfrag;         /* opaque here, defined in hg_large.h */
  * field change there fails the build here instead of drifting silently. */
 #define HG_LFRAG_HDR_SIZE (4 * HG_ROUNDTO)
 
+/*
+ * A chunk is one buddy block dedicated to one cell class, and its header sits
+ * in the FIRST bytes OF THAT BLOCK.
+ *
+ * In-block rather than in a side array, and the arithmetic is the whole
+ * argument: at ~32 bytes per block, a separate array over a 5 GB arena would
+ * be 20 MB - twenty times every other piece of metadata combined - where
+ * in-block costs nothing external, shares a cache line with the block being
+ * touched anyway, and gives up exactly one cell.
+ *
+ * The enabler was already in the tree before any of v2: hg_cell_free() reads
+ * the class from the CELL's own header byte rather than from the chunk, so a
+ * page can host blocks of different classes with no fast-path change.
+ */
+/*
+ * Fullness grades. Eight is the design's figure: enough that "fullest
+ * partial" is meaningfully sorted, few enough that a block changes grade
+ * rarely rather than on every cell, and that the scan for a source block is
+ * eight pointer tests.
+ */
+#define HG_GRADES         8
+#define HG_GRADE_NONE     0xffffffffu   /* no free cells, on no list */
+#define HG_GRADE_DRAINED  0xfffffffeu   /* every cell free, on drained[] */
+
+/* a block whose cells are ALL in the global pool - the GC's work queue */
+#define HG_CHUNK_DRAINED    (1u << 0)
+/* selected by this GC pass; its cells are being unlinked right now */
+#define HG_CHUNK_RECLAIMING (1u << 1)
+
 struct hg_chunk {
-	struct hg_chunk *next;    /* global registry, append-only */
+	/*
+	 * Global registry. Doubly linked, which it did not need to be while
+	 * chunks were immortal: hg_slab_recycled() and the DBG dump walker both
+	 * traverse it, so a reclaimed block MUST come out of it - otherwise the
+	 * first keeps counting capacity that no longer exists and the second
+	 * reads a block the buddy has already handed to another class.
+	 */
+	struct hg_chunk *next;
+	struct hg_chunk *prev;
 	unsigned int cls;         /* immutable */
 	unsigned int cell_size;   /* total slot size, header included */
 	unsigned int cells;
+
+	/*
+	 * Cells of this block currently parked in the GLOBAL pool, i.e.
+	 * definitively free and reachable by anyone. Maintained only at
+	 * cache/block transitions (gpool_push/gpool_pop), which are 1-3% of
+	 * operations and already under hb->lock - a free that lands in a
+	 * thread's private LIFO does not touch this, by design.
+	 *
+	 * A cell sitting in some thread's private cache therefore still counts
+	 * as live. That is deliberately conservative: it can only delay a
+	 * reclaim, never cause a premature one, and flushing those caches is
+	 * exactly what the idle sweep (task #59) is for.
+	 *
+	 * in_gpool == cells means every cell of this block is free and globally
+	 * visible, which is the condition the GC in task #57 acts on.
+	 */
+	unsigned int in_gpool;
+	unsigned int flags;       /* HG_CHUNK_DRAINED / _RECLAIMING */
+	unsigned int order;       /* buddy order, so the GC can hand it back */
+
+	/*
+	 * This block's OWN free cells, and which fullness list it currently sits
+	 * on. The shared pool used to be one mixed list per class, so a 32-cell
+	 * refill skimmed cells from whichever blocks happened to be at its head
+	 * and topped every block up a little - measured, that left blocks
+	 * stalled at 88% drained and the GC with nothing to collect.
+	 *
+	 * Per block, a refill can instead take all 32 from ONE block, and the
+	 * fullness grading makes it the FULLEST partial - so that block is used
+	 * up while emptier ones are left alone to reach zero.
+	 *
+	 * This costs the fast path nothing: hg_cell_free() still pushes to the
+	 * thread-private TLS LIFO with no lock, and only the donation/refill
+	 * path - already under hb->lock, 1-3% of operations - touches this.
+	 */
+	void        *free_head;
+	unsigned int grade;       /* HG_GRADE_NONE / _DRAINED, or 0..HG_GRADES-1 */
+
+	/*
+	 * The list this block is currently on. Today that is only the per-class
+	 * drained queue; task #58 generalises it into fullness buckets, of
+	 * which "drained" is simply the empty one - which is why the design
+	 * calls the empty bucket the GC's work queue.
+	 */
+	struct hg_chunk *fnext;
+	struct hg_chunk *fprev;
 } __attribute__ ((aligned (64)));
+
+/*
+ * v2 buddy geometry - mem/README.hg_arena_v2, "Address to block".
+ *
+ * The leaf is the minimum buddy order. 8 KB is a deliberate floor: the leaf
+ * array is one byte per leaf per page, so dropping to 1 KB would multiply that
+ * array by eight for no measured gain. Do not lower it without evidence.
+ *
+ * Leaves per page is NOT a constant, because the huge page size is probed -
+ * 256 leaves on a 2M page, 65536 on a 512M arm64 page - so it is derived from
+ * hb->hps_shift rather than baked in.
+ */
+#define HG_LEAF_SHIFT  13
+#define HG_LEAF_SIZE   (1UL << HG_LEAF_SHIFT)
+
+/*
+ * Ceiling on the number of buddy orders, for the fixed free-list array in
+ * struct hg_block. The REAL count is derived per arena as
+ * hps_shift - HG_LEAF_SHIFT: 8 on a 2 MB page with 8 KB leaves, 16 on a
+ * 512 MB arm64 page. 24 leaves room for a 128 GB page that does not exist yet
+ * and costs 25 pointers in one struct.
+ */
+#define HG_MAX_ORDERS  24
+
+struct hg_page;      /* hg_buddy.h */
+struct hg_free_blk;  /* hg_buddy.h */
+
+/* the accessors that turn an address into a page and a leaf live just after
+ * struct hg_block below - they dereference it, so they cannot precede it */
 
 struct hg_region {
 	struct hg_region *next;
@@ -201,6 +313,28 @@ struct hg_pstat {
 	char _pad[HG_STAT_LINE - 3 * sizeof(long)];
 } __attribute__ ((aligned (HG_STAT_LINE)));
 
+/*
+ * What kind of corruption a check caught. Grouped by what an operator would do
+ * about it rather than by which line found it: several sites detect the same
+ * defect from different angles, and splitting them would make a recurrence
+ * look like several unrelated rare events instead of one repeated one.
+ */
+enum hg_corrupt_kind {
+	HG_C_CLASS_MISMATCH = 0, /* cell resolves to a block of another class   */
+	HG_C_DOUBLE_FREE,        /* block already fully free, or buddy re-freed */
+	HG_C_NFREE_UNDERFLOW,    /* free list shorter than nfree claims - THIS  */
+	                         /* is the __thread palloc_slots signature      */
+	HG_C_BAD_CLASS,          /* cell header carries an impossible class id  */
+	HG_C_FOREIGN_PTR,        /* pointer belongs to no live arena            */
+	HG_C_BUDDY_BAD_FREE,     /* outside the grid, misaligned, wrong order   */
+	HG_C_INTERNAL,           /* allocator API used in a way that would      */
+	                         /* double-allocate - a bug here, not in a peer */
+	HG_CORRUPT_KINDS
+};
+
+/* for the two checks that fire where no arena pointer exists */
+extern unsigned long hg_corrupt_noarena[HG_CORRUPT_KINDS];
+
 struct hg_block {
 	char *name; /* purpose of this memory block */
 
@@ -223,8 +357,16 @@ struct hg_block {
 	unsigned int priv_max[HG_NCLASSES];
 	unsigned int priv_donate[HG_NCLASSES];
 	struct hg_region *regions;
-	void *gpool[HG_NCLASSES];       /* global free cells, per class */
-	unsigned int gpool_n[HG_NCLASSES];
+	/*
+	 * Shared free cells, per class, held as BLOCKS graded by fullness
+	 * rather than as one mixed cell list. bucket[c][0] holds the blocks
+	 * with the fewest free cells, so scanning from 0 up finds the fullest
+	 * partial in O(HG_GRADES) - the "concentration" the design requires.
+	 * A block with no free cells is on no list; one with every cell free is
+	 * on drained[] instead, which is the GC's queue.
+	 */
+	struct hg_chunk *bucket[HG_NCLASSES][HG_GRADES];
+	unsigned int gpool_n[HG_NCLASSES];   /* free cells of the class, total */
 	unsigned long lo, hi;           /* extent watermarks */
 
 	/* large-object tier (hg_large.c): list of independently-carved
@@ -233,6 +375,27 @@ struct hg_block {
 	 * already, no separate lock needed) */
 	struct hg_large_chunk *large_chunks;
 	struct hg_lfrag *large_free;
+	/*
+	 * Backing the large tier holds from the buddy grid, and how much of it
+	 * is handed out right now.  Both are needed because the two answer
+	 * different questions and only the first one is what the grid lost:
+	 * a chunk is taken whole from the buddy, then sub-allocated, so
+	 * charging only the live fragments (which is what this tier used to do)
+	 * left real_used under-reporting the arena's true footprint by the
+	 * chunks' unused slack - and free_to_carve over-reporting what was
+	 * left, monotonically, which is exactly the v1 pathology v2 exists to
+	 * remove.  large_backing is charged to real_used at chunk acquisition;
+	 * large_recycled() = large_backing - large_live is the large tier's
+	 * analogue of hg_slab_recycled() and is subtracted back out to get the
+	 * live figure.
+	 */
+	unsigned long large_backing;
+	unsigned long large_live;
+	/* chunk churn: a chunk goes back to the buddy the moment its last
+	 * fragment is freed, so carved climbing far faster than returned is
+	 * the signature of alloc/free thrash in this tier */
+	unsigned long large_chunks_carved;
+	unsigned long large_chunks_returned;
 
 	/* Bytes carved from the reservation into chunks/regions, i.e. the
 	 * arena's own footprint. Only ever changed while holding hb->lock
@@ -265,8 +428,140 @@ struct hg_block {
 	enum hg_mem_tier      tier;
 	unsigned long         locked_mb;
 
+	/*
+	 * v2 buddy substrate - see mem/README.hg_arena_v2.
+	 *
+	 * The whole design turns "which block owns this address" into two shifts
+	 * and a mask, which needs a known-aligned origin. hbase is NOT reliably
+	 * that origin: all three Linux reserve paths align it (MAP_HUGETLB is
+	 * aligned by the kernel, the THP tiers align explicitly at
+	 * hg_malloc.c:301), but the non-Linux fallback takes a plain
+	 * mmap(NULL, ...) and gets only page alignment. So page 0 starts at
+	 * pbase, hbase rounded up to a huge page - equal to hbase everywhere it
+	 * matters, and correct where it is not.
+	 *
+	 * hps is PROBED, not assumed: it is 2M on x86_64 and on arm64 with 4K
+	 * base pages, but 32M with 16K pages and 512M with 64K. A hardcoded
+	 * ">> 21" would mis-address every block on those machines, which is the
+	 * same trap hg_hps() already exists to avoid for the mapping itself.
+	 */
+	unsigned long hps;         /* huge page size, probed at reserve time */
+	unsigned int  hps_shift;   /* log2(hps), so page-of is a shift */
+	char         *pbase;       /* page 0 - hbase rounded up to hps */
+	unsigned long npages;      /* whole pages from pbase to the reservation end */
+
+	/*
+	 * Buddy state (hg_buddy.c). Every field here is written only while
+	 * holding hb->lock - the buddy is entirely slow path, reached from
+	 * carve_chunk() and the large tier, never from the cell fast path.
+	 */
+	struct hg_page     *pages;                    /* npages descriptors */
+	struct hg_free_blk *bfree[HG_MAX_ORDERS + 1]; /* free list per order */
+	unsigned long       nfree[HG_MAX_ORDERS + 1]; /* its length, per order */
+	unsigned long       buddy_free_leaves;        /* free leaves, whole arena */
+	unsigned int        buddy_top;                /* whole-page order, cached */
+	unsigned int        buddy_ready;              /* 0 until hg_buddy_init() */
+
+	/*
+	 * GC work queue: blocks whose every cell is in the global pool, per
+	 * class. Reclaiming one means unlinking its cells from that class's
+	 * free list, which is a walk - so drained blocks accumulate here and a
+	 * single walk serves all of them, rather than one walk per block.
+	 */
+	struct hg_chunk    *drained[HG_NCLASSES];
+	unsigned int        ndrained[HG_NCLASSES];
+	unsigned long       gc_blocks_returned;       /* lifetime, for stats */
+	unsigned long       gc_passes;
+	unsigned long       cache_flushes;            /* sweeps run */
+	unsigned long       cells_flushed;            /* cells recovered from TLS */
+	/*
+	 * Corruption counters, one per kind.
+	 *
+	 * Every consistency check in this allocator used to emit LM_CRIT and
+	 * increment nothing, so a log grep was the ONLY detector - and on the
+	 * production gateways the log sink is a file that journalctl does not
+	 * see, while OpenSIPS also logs unrelated DNS failures at CRITICAL. A
+	 * recurrence of the tcp payload use-after-free would move no number at
+	 * all. These make it numeric, so it can be alerted on and graphed.
+	 *
+	 * They count DETECTIONS, not repairs: every site that bumps one has
+	 * already decided to refuse the operation or leak the cell. A non-zero
+	 * value means memory was corrupted and the allocator noticed - it is
+	 * never routine.
+	 */
+	unsigned long       corrupt[HG_CORRUPT_KINDS];
+	unsigned long       buddy_splits;             /* blocks split down an order */
+	/*
+	 * RUNTIME merges only.  hg_buddy_init() publishes the one page that the
+	 * block header and buddy metadata straddle leaf by leaf, through the
+	 * ordinary free path, so the tree is built by the normal rules - and
+	 * every one of those coalesces used to land in this counter.  That gave
+	 * it an arbitrary startup offset with no relation to fragmentation:
+	 * an idle 8 MB pkg arena reads 7 splits against 244 merges purely from
+	 * init.  The init total is snapshotted into buddy_merges_init and this
+	 * counter is rebased to 0, so splits and merges finally share a zero
+	 * point and their difference means something.
+	 */
+	unsigned long       buddy_merges;             /* blocks merged with a buddy */
+	unsigned long       buddy_merges_init;        /* coalesces done building the tree */
+	unsigned long       blocks_carved;            /* class blocks cut, lifetime */
+	/* set while a flush walks a cache chain: pushing a cell can reclaim its
+	 * block, and the next cell on the chain may live in that same block */
+	unsigned int        gc_deferred;
+	/*
+	 * Reserve floor: free leaves below which the arena is treated as under
+	 * pressure. Set once at init as a fraction of the grid. Not consumable
+	 * by an expanding class in the sense that crossing it triggers a sweep
+	 * BEFORE the failure, which is the only warning an operator can act on.
+	 */
+	unsigned long       reserve_floor;
+	unsigned int        below_floor;      /* hysteresis: already reported */
+	unsigned long       floor_crossings;
+
 	unsigned char size2class[(HG_CELL_MAX / HG_ROUNDTO) + 1];
 } __attribute__ ((aligned (HG_ROUNDTO)));
+
+/*
+ * Address -> page/leaf, the arithmetic the whole v2 buddy layer rests on.
+ * See the HG_LEAF_SHIFT block above and mem/README.hg_arena_v2.
+ * pages_init() in hg_arena.c verifies these against real addresses at every
+ * arena init, and refuses to start the arena if they do not round-trip.
+ */
+
+/* how many leaves tile one huge page */
+static inline unsigned long hg_leaves_per_page(const struct hg_block *hb)
+{
+	return 1UL << (hb->hps_shift - HG_LEAF_SHIFT);
+}
+
+/* Is @p inside the page-addressable region? Everything before pbase (the
+ * block header, and on a non-Linux fallback the unaligned head) is arena
+ * memory but not buddy memory, so it must answer NO. */
+static inline int hg_in_pages(const struct hg_block *hb, const void *p)
+{
+	return (const char *)p >= hb->pbase &&
+	       (const char *)p <  hb->pbase + (hb->npages << hb->hps_shift);
+}
+
+/* page index of @p; only meaningful when hg_in_pages() */
+static inline unsigned long hg_page_of(const struct hg_block *hb, const void *p)
+{
+	return (unsigned long)((const char *)p - hb->pbase) >> hb->hps_shift;
+}
+
+/* first byte of the page holding @p */
+static inline char *hg_page_base(const struct hg_block *hb, const void *p)
+{
+	return hb->pbase + (hg_page_of(hb, p) << hb->hps_shift);
+}
+
+/* leaf index of @p WITHIN its own page */
+static inline unsigned long hg_leaf_of(const struct hg_block *hb, const void *p)
+{
+	unsigned long off = (unsigned long)((const char *)p - hb->pbase);
+
+	return (off & ((1UL << hb->hps_shift) - 1)) >> HG_LEAF_SHIFT;
+}
 
 /*
  * Reserves its own huge-page-backed (or gracefully degraded) region of
@@ -540,7 +835,34 @@ unsigned long hg_slab_recycled(struct hg_block *hb);
  * private memory that no other process can read.  The shm arena has no such
  * problem: there is exactly one, and it is shared.
  */
+#ifdef HG_MALLOC
 int hg_register_stats(void);
+#else
+/* No-op without the allocator, so callers (statistics.c) need no #ifdef of
+ * their own. Building with -DHG_MALLOC removed previously failed at link with
+ * an undefined reference here - the definition lives in mem/hg_arena.c, which
+ * is entirely inside "#ifdef HG_MALLOC". */
+static inline int hg_register_stats(void) { return 0; }
+#endif
+
+/* bump a corruption counter; hb may be NULL where no arena is in scope */
+static inline void hg_corrupt(struct hg_block *hb, enum hg_corrupt_kind k)
+{
+	if (hb)
+		hb->corrupt[k]++;
+	else
+		hg_corrupt_noarena[k]++;
+}
+
+static inline unsigned long hg_corrupt_total(struct hg_block *hb)
+{
+	unsigned long t = 0;
+	int i;
+
+	for (i = 0; i < HG_CORRUPT_KINDS; i++)
+		t += hb->corrupt[i];
+	return t;
+}
 
 /* total cell-slot bytes handed out across every process */
 static inline unsigned long hg_cell_live(struct hg_block *hb)
@@ -582,9 +904,21 @@ static inline unsigned long hg_get_free(struct hg_block *hb)
 	 * max_used = live commitment and its peak, free = room left to carve. */
 	return hb->size - hb->real_used;
 }
+/* The large tier's counterpart to hg_slab_recycled(): backing held from the
+ * buddy grid that is not currently handed out as a fragment.  O(1), unlike the
+ * slab version, because both terms are maintained under hb->lock as the
+ * fragments come and go. */
+static inline unsigned long hg_large_recycled(struct hg_block *hb)
+{
+	return hb->large_backing > hb->large_live ?
+	       hb->large_backing - hb->large_live : 0;
+}
 static inline unsigned long hg_get_real_used(struct hg_block *hb)
 {
-	unsigned long recycled = hg_slab_recycled(hb);
+	/* real_used is now the true carve footprint of BOTH tiers - slab blocks
+	 * plus whole large chunks - so both tiers' idle-but-held bytes have to
+	 * come back out to leave what is genuinely handed out. */
+	unsigned long recycled = hg_slab_recycled(hb) + hg_large_recycled(hb);
 	unsigned long live = hb->real_used > recycled ?
 	                     hb->real_used - recycled : 0;
 

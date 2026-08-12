@@ -25,6 +25,7 @@
 
 #include "../../pvar.h"
 #include "../../ut.h"
+#include "../../timer.h"   /* get_ticks() */
 
 unsigned int connect_wait = 500;       //milliseconds
 unsigned int re_init_interval = 10;    //seconds

@@ -39,6 +39,7 @@
 #include "b2bl_db.h"
 #include "records.h"
 #include "b2b_logic.h"
+#include "../../timer.h"   /* get_ticks() */
 
 int entity_add_dlginfo(b2bl_entity_id_t* entity, b2b_dlginfo_t* dlginfo);
 

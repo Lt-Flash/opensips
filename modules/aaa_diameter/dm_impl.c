@@ -35,6 +35,7 @@
 #include "app_opensips/avps.h"
 #include "diameter_api.h"
 #include "diameter_api_impl.h"
+#include "../../timer.h"   /* get_ticks() */
 
 struct local_rules_definition {
 	char *avp_name;

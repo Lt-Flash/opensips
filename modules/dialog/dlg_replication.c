@@ -28,6 +28,7 @@
 #include "../../resolve.h"
 #include "../../forward.h"
 #include "../../pt.h"
+#include "../../timer.h"   /* get_ticks() */
 
 extern int active_dlgs_cnt;
 extern int early_dlgs_cnt;

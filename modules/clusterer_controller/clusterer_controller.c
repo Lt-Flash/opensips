@@ -266,9 +266,21 @@ static const unsigned char CL_CTR_CONSUMER_MAGIC[CL_CTR_MAGIC_SZ]  = { 0xCC, 0x0
  * consumer's problem (the API contract says fall back to BIN for bulk). */
 #define CL_CTR_MAX_CHANNELS         8
 #define CL_CTR_CONSUMER_HDR_SZ      (CL_CTR_NODE_ID_SZ + 1)
-#define CL_CTR_CONSUMER_PKT_MAX     (CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ \
+/* Everything a consumer datagram carries BESIDES the payload. Split out from
+ * the old CL_CTR_CONSUMER_PKT_MAX because the packet buffer is now sized at
+ * runtime from cc_max_payload: a jumbo-frame link is meant to carry a bigger
+ * payload, and a buffer fixed at CLCTR_MAX_PAYLOAD could not - it just let the
+ * MTU-derived bound run off the end of it. */
+#define CL_CTR_PKT_OVERHEAD         (CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ \
                                      + CL_CTR_CONSUMER_HDR_SZ + CLCTR_MAX_CHAN_LEN \
-                                     + CLCTR_MAX_PAYLOAD + CL_CTR_TAG_SZ)
+                                     + CL_CTR_TAG_SZ)
+#define CL_CTR_CONSUMER_PKT_MAX     (CL_CTR_PKT_OVERHEAD + CLCTR_MAX_PAYLOAD)
+/* how often one process may repeat the reliable-send refusal */
+#define CL_CTR_RELIABLE_WARN_IVL    60
+/* A datagram cannot exceed the UDP payload maximum no matter what the MTU
+ * says - loopback reports 65536, which would otherwise compute a payload one
+ * byte past what sendto() can accept. */
+#define CL_CTR_UDP_PAYLOAD_MAX      65507
 #define CL_CTR_PKT_MASTER_BEACON    0x0A  /* master-only announce (BOOTSTRAP key) so
                                        * masters with divergent session keys can
                                        * still discover each other and merge a
@@ -363,6 +375,20 @@ static const unsigned char CL_CTR_CONSUMER_MAGIC[CL_CTR_MAGIC_SZ]  = { 0xCC, 0x0
 #define CL_CTR_RETX_INTERVAL_US  (CL_CTR_JOIN_REQ_MIN_US / 2)  /* 250 ms          */
 #define CL_CTR_RETX_MAX_RETRIES  3                             /* then give up     */
 #define CL_CTR_RETX_QUEUE_SZ     128  /* max outstanding unacked 1:1 packets      */
+/* The cached packet is either a control-plane handshake packet, whose largest
+ * is NODE_ASSIGN, or a consumer message, whose largest is set by the MTU at
+ * mod_init.  So the bound is a RUNTIME value (cl_ctr_retx_pkt_max), not a
+ * constant: a fixed cache would either be sized for NODE_ASSIGN (~580 B, which
+ * silently excluded any reliable consumer send above ~540 B) or for the
+ * compile-time CLCTR_MAX_PAYLOAD (1300), which on a jumbo-frame link would cap
+ * repair at a seventh of what the link and cc_max_payload happily carry. Same
+ * trap the transmit buffers had before they were sized from cc_max_payload.
+ *
+ * Each entry's buffer is allocated for the packet actually being held and
+ * freed when the entry is released, so the cost tracks outstanding reliable
+ * messages rather than reserving queue x MTU up front - which at a 9000 MTU
+ * would be 1.1 MB per cluster sitting idle, and far more on a link that
+ * reports more. */
 #if (CL_CTR_RETX_MAX_RETRIES * CL_CTR_RETX_INTERVAL_US) >= (CL_CTR_JOIN_DEFER_SECS * 1000000)
 #error "retransmit budget must stay shorter than the JOIN_REQ retry interval"
 #endif
@@ -555,9 +581,11 @@ static inline const char *cl_ctr_role_name(int r)
 /*
  * One outstanding 1:1 handshake packet awaiting an ACK.  The full sealed bytes
  * are cached so a retransmit is a single sendto() with no re-encryption: the
- * same seq/nonce is resent, which a peer that already got it (and ACKed) will
- * not see again, while one that lost it still has an older last_seq and accepts
- * it.  Worker-local (only the controller worker touches the queue), so no lock.
+ * same seq/nonce is resent, and the receiver's replay window sorts out which
+ * is which - a peer that already got it (and ACKed) finds the bit set and only
+ * re-ACKs, while one that lost it finds the bit clear and accepts it, however
+ * many of its peer's later messages arrived in between.  Worker-local (only
+ * the controller worker touches the queue), so no lock.
  */
 typedef struct {
     int                     used;
@@ -565,6 +593,13 @@ typedef struct {
     unsigned char           type;         /* packet type, for logging             */
     int                     retries_left;
     utime_t                 next_due_us;   /* get_uticks() deadline for next send  */
+    /* Gap to the NEXT send after this one.  Per entry, not a constant, because
+     * the control plane and the consumer plane share this queue and want
+     * different cadences - the handshake's is pinned to the JOIN_REQ retry,
+     * the consumer's is the per-cluster consumer_retry_ms.  Holding it here is
+     * what lets one sweep serve both without either inheriting the other's
+     * timing. */
+    utime_t                 retry_ivl_us;
     struct sockaddr_storage dest;         /* unicast destination                  */
     socklen_t               destlen;
     int                     pkt_len;      /* sealed length                        */
@@ -587,7 +622,8 @@ typedef struct {
     uint16_t                expect_n;     /* members at send time            */
     uint16_t                acked_n;
     unsigned char           acked_map[(CL_CTR_MAX_PEERS + 7) / 8];
-    unsigned char           pkt[CL_CTR_NODE_ASSIGN_MAX_SZ]; /* cached sealed bytes */
+    unsigned char          *pkt;         /* cached sealed bytes, pkg, owned by
+                                          * the entry; NULL when released    */
 } cl_ctr_retx_entry_t;
 
 /**
@@ -773,6 +809,31 @@ static char my_interface_buf[IF_NAMESIZE];
  * jumbo-frame interfaces (MTU 9000) are not artificially limited to 1300 B.
  * Read-only after mod_init; safe to access from any process. */
 int cc_max_payload = CLCTR_MAX_PAYLOAD;
+/* Largest packet the retransmit cache will hold, raised in mod_init once the
+ * MTU is known.  Provisional value covers the control plane, which is all that
+ * can be sent before then anyway. */
+static int cl_ctr_retx_pkt_max = CL_CTR_NODE_ASSIGN_MAX_SZ;
+
+/* The two transmit buffers, sized from cc_max_payload once the MTU is known.
+ *
+ * They were `char buf[CLCTR_MAX_PAYLOAD]` and `char pkt[CL_CTR_CONSUMER_PKT_MAX]`
+ * on the stack, while the length gates in front of them tested against the
+ * MTU-derived cc_max_payload - so on any link above MTU 1411 a caller could
+ * pass the gate and write past the end. A production gateway logs
+ * "interface ens18 MTU=1500, max consumer payload=1389" against a 1300-byte
+ * buffer: an 89-byte stack overrun with caller-supplied bytes.
+ *
+ * pkg, allocated in mod_init, which runs PRE-FORK: every worker inherits its
+ * own copy-on-write copy, so there is no sharing between processes and no
+ * per-call allocation on the send path (cachedb_perf's pull replies go through
+ * the consumer one for every message). Each is written only by the process
+ * that owns it, and neither send function can re-enter itself - script
+ * functions run to completion inside one route execution, and the consumer
+ * send runs in the cluster worker's own loop. */
+static char *cl_ctr_script_buf;
+static int   cl_ctr_script_buf_sz;
+static char *cl_ctr_consumer_pkt;
+static int   cl_ctr_consumer_pkt_sz;
 
 
 /* Local node identity - populated at mod_init by scanning the config file */
@@ -830,6 +891,7 @@ static int clctr_send_list(int cluster_id, const int *node_ids, int n,
 static int clctr_get_my_node_id(int cluster_id);
 int cl_ctr_get_my_ip(const char **ip, const char **iface, const char **src);
 int load_clctr(clctr_api_t *api);
+static int clctr_get_max_payload(void);
 
 /* clusterer integration - loaded at mod_init if clusterer use_controller=1 */
 static clusterer_ctrl_binds_t clctl;
@@ -837,6 +899,31 @@ static int                    clctl_loaded  = 0;
 static int                    manage_shtags = 1;
 static int                    consumer_retries = CL_CTR_CONSUMER_RETRIES_DEFAULT;
 static int                    consumer_retry_ms = CL_CTR_CONSUMER_RETRY_MS_DEFAULT;
+/*
+ * enable_reliable_send - kill switch for the consumer ARQ (ACK + retransmit).
+ *
+ * ON by default, which it was NOT when it was first added hours earlier: the
+ * flag then could not work on a channel carrying concurrent messages, and
+ * failed silently when it did not. A retransmit reuses its original seq, and
+ * the receiver's anti-replay guard was a bare high-water mark, so once any
+ * later message had been accepted the repair copy was rejected as
+ * out-of-order AND re-ACKed - which stopped the sender retransmitting and left
+ * it believing it had delivered. Measured on the cross-node cache pull channel
+ * under 40% reply loss: plain 61.2% delivered, RELIABLE 49.4%, at two to three
+ * times the packets, with not one retransmitted payload ever delivered.
+ *
+ * The replay window (cl_ctr_replay_t) removes that: a seq below the mark whose
+ * bit is clear was never delivered, so its retransmit is accepted, while a seq
+ * whose bit is set is a true duplicate and is re-ACKed without being delivered
+ * twice. The flag now does what it says on any channel.
+ *
+ * The switch survives the fix rather than being deleted with it, because ARQ
+ * still has a cost the operator may not want on a given fleet: a reliable
+ * broadcast draws one ACK per member, so on a large cluster a single message
+ * becomes an event. Turning this off degrades every reliable send to a plain
+ * one - lossy, but cheap and never silent about it.
+ */
+static int                    enable_reliable_send = 1;
 /* master_stickiness (global default; per-cluster override via "cluster" string):
  *   1 (default) = the master is "sticky": a live master keeps the role and is
  *                 NOT displaced when a higher-IP node joins.  The highest-IP
@@ -911,6 +998,7 @@ static const param_export_t params[] = {
     {"consumer_rate_limit", INT_PARAM, &consumer_rate_limit},
     {"consumer_retries",    INT_PARAM, &consumer_retries},
     {"consumer_retry_ms",   INT_PARAM, &consumer_retry_ms},
+    {"enable_reliable_send", INT_PARAM, &enable_reliable_send},
     {"manage_shtags", INT_PARAM, &manage_shtags},
     {"master_stickiness", INT_PARAM, &master_stickiness},
     {"on_config_mismatch", STR_PARAM, &on_config_mismatch_s},
@@ -920,6 +1008,145 @@ static const param_export_t params[] = {
 /* =========================================================================
  * Peer table (shared memory)
  * ========================================================================= */
+
+/*
+ * Anti-replay window - a high-water mark PLUS a bitmap of what has already
+ * been accepted at or below it, which is the standard construction (IPsec
+ * RFC 4303 A.2, DTLS RFC 6347 4.1.2.6).
+ *
+ * A bare high-water mark cannot tell "already delivered" from "delivered out
+ * of order", so it has to reject both, and that breaks two things at once:
+ *
+ *   - a retransmit carries its ORIGINAL seq, so once any later message has
+ *     been accepted the repair copy is discarded - the reliable-send defect;
+ *   - ordinary reordering, which any multipath network produces, silently
+ *     drops consumer payloads that were never duplicated at all.
+ *
+ * The bitmap separates the two.  A seq below the mark is accepted exactly
+ * once: the first copy is delivered and its bit set, and every later copy of
+ * that same seq finds the bit set and is a genuine duplicate.  Replay
+ * protection is unchanged - no seq is ever accepted twice - while loss repair
+ * and reordering now work.
+ *
+ * The bitmap is circular: the slot for seq s is s % CL_CTR_REPLAY_WIN_BITS,
+ * so advancing the mark clears only the slots the window moved onto (one, in
+ * the in-order case) instead of shifting 128 bytes per packet.
+ *
+ * SIZING.  The window has to span the longest interval over which a repair for
+ * seq s can still arrive, expressed in messages from that peer on that plane:
+ *
+ *     window > peak per-peer send rate x retransmit horizon
+ *
+ * The consumer horizon is consumer_retries x consumer_retry_ms = 80 ms with
+ * the defaults, so 1024 slots hold out to ~12,800 msg/s from a single peer -
+ * two orders above anything this plane carries (the cross-node cache pull
+ * channel measures ~0.3/s).  The control plane's horizon is longer, 3 x 250 ms,
+ * but it sends a handful of packets a second.  mod_init logs the derived
+ * ceiling because both horizon terms are admin-settable and a config that
+ * narrows it should say so rather than wait to be discovered as loss.
+ *
+ * Cost is 128 bytes per peer per plane: 64 KB of shm for a full 256-peer table.
+ *
+ * WRAP.  The comparison is serial-number arithmetic - (int32_t)(seq - last) -
+ * not plain unsigned, because the 32-bit counters do wrap inside one key
+ * epoch and a plain comparison rejects everything after the wrap until the
+ * next rotation.  That is fail-closed but silent, and the rotation it waits
+ * for may never come: a fresh master_salt is generated only in
+ * cl_ctr_on_became_master(), so a cluster with a stable master never rekeys
+ * on its own.  Nor is the wrap far off - every ACK bumps my_seq, so the
+ * control plane advances at the rate of the CONSUMER traffic it acknowledges,
+ * and at the window's own 12,800 msg/s ceiling 2^32 is under four days.
+ *
+ * Serial arithmetic alone would trade that outage for something worse: a
+ * packet captured 2^31 or more messages ago has a difference that reads back
+ * as a large POSITIVE, so it would be accepted as fresh.  Hence the forward
+ * jump is bounded as well - a step of CL_CTR_REPLAY_MAX_JUMP or more is
+ * refused as implausible rather than believed.  Real gaps stay far below it
+ * (it is 16.7M messages, ~22 minutes of one peer's output at that ceiling),
+ * and a peer that somehow exceeds it is recovered by the window reset that
+ * already runs when it re-joins or reappears in a MEMBER_LIST.
+ *
+ * What remains, and is inherent to a 32-bit counter: a packet held across a
+ * FULL 2^32 cycle lands back inside the window and is accepted. That needs
+ * 2^32 messages in one key epoch with the attacker holding the packet
+ * throughout.
+ */
+#define CL_CTR_REPLAY_WIN_BITS   1024
+#define CL_CTR_REPLAY_WIN_WORDS  (CL_CTR_REPLAY_WIN_BITS / 64)
+/* Largest forward step believed to be a real gap rather than a wrapped-around
+ * replay.  Must sit well above any credible burst of loss from one peer and
+ * well below 2^31, where serial arithmetic stops being able to tell the two
+ * apart. */
+#define CL_CTR_REPLAY_MAX_JUMP   (1u << 24)
+
+typedef struct {
+    uint32_t last;                            /* highest seq accepted so far  */
+    uint64_t win[CL_CTR_REPLAY_WIN_WORDS];    /* circular, slot = seq % BITS  */
+} cl_ctr_replay_t;
+
+#define CL_CTR_RP_WORD(s)  ((((uint32_t)(s)) % CL_CTR_REPLAY_WIN_BITS) / 64)
+#define CL_CTR_RP_MASK(s)  (1ULL << ((((uint32_t)(s)) % CL_CTR_REPLAY_WIN_BITS) % 64))
+
+/* Verdicts from cl_ctr_check_and_update_seq().  Three, not two: "seen this
+ * exact packet before" and "too old to have an opinion about" call for
+ * opposite handling on the reliable path - one must be re-ACKed, the other
+ * must not be. */
+#define CL_CTR_SEQ_OK     0   /* fresh: accept and deliver                    */
+#define CL_CTR_SEQ_DUP  (-1)  /* inside the window, bit already set: drop     */
+#define CL_CTR_SEQ_OLD  (-2)  /* below the window: drop, and we cannot know   */
+                              /* whether we ever had it                       */
+#define CL_CTR_SEQ_JUMP (-3)  /* implausibly far ahead: a wrapped-around      */
+                              /* replay, or a peer we have lost far too much  */
+                              /* of - refuse either way                       */
+
+static inline void cl_ctr_replay_reset(cl_ctr_replay_t *r)
+{
+    r->last = 0;
+    memset(r->win, 0, sizeof r->win);
+}
+
+/*
+ * Accept @seq at most once.  Not thread-safe by design: the only caller is the
+ * cluster's single worker reactor, same as the counter it replaces.
+ */
+static inline int cl_ctr_replay_check(cl_ctr_replay_t *r, uint32_t seq)
+{
+    int32_t  fwd = (int32_t)(seq - r->last);   /* serial-number difference */
+    uint32_t d, s;
+
+    if (fwd > 0) {                       /* forward: the common case          */
+        d = (uint32_t)fwd;
+        if (d >= CL_CTR_REPLAY_MAX_JUMP)
+            return CL_CTR_SEQ_JUMP;
+        if (d >= CL_CTR_REPLAY_WIN_BITS) {
+            memset(r->win, 0, sizeof r->win);
+        } else {
+            /* Clear the slots the window has just moved onto.  These hold
+             * bits for seqs a full window older, which must not be mistaken
+             * for the fresh ones now mapping to the same slots. */
+            for (s = r->last + 1; s != seq; s++)
+                r->win[CL_CTR_RP_WORD(s)] &= ~CL_CTR_RP_MASK(s);
+            r->win[CL_CTR_RP_WORD(seq)] &= ~CL_CTR_RP_MASK(seq);
+        }
+        r->last = seq;
+        r->win[CL_CTR_RP_WORD(seq)] |= CL_CTR_RP_MASK(seq);
+        return CL_CTR_SEQ_OK;
+    }
+
+    /* At or below the mark.  Unsigned subtraction gives the exact backward
+     * distance even across a wrap, and avoids negating INT32_MIN.  Note
+     * seq == last == 0 with an empty window is the untouched state and falls
+     * out here as a legitimate first accept - it costs nothing to allow, and
+     * every sender in fact starts at 1 (++my_seq). */
+    d = r->last - seq;
+    if (d >= CL_CTR_REPLAY_WIN_BITS)
+        return CL_CTR_SEQ_OLD;
+    if (r->win[CL_CTR_RP_WORD(seq)] & CL_CTR_RP_MASK(seq))
+        return CL_CTR_SEQ_DUP;
+
+    r->win[CL_CTR_RP_WORD(seq)] |= CL_CTR_RP_MASK(seq);
+    return CL_CTR_SEQ_OK;
+}
 
 typedef struct cl_ctr_peer_ {
     char         ip[CL_CTR_MAX_IP_LEN + 1];
@@ -933,14 +1160,14 @@ typedef struct cl_ctr_peer_ {
     char         bin_sockets[CL_CTR_MAX_BIN_SOCKETS][CL_CTR_MAX_BIN_SOCK_LEN];
     unsigned char pubkey[CL_CTR_PUBKEY_SZ];           /* long-lived X25519 pubkey (from ALIVE);
                                                      zero if unknown; used for KEY_HANDOFF */
-    uint32_t      last_seq;                        /* highest seq accepted from this peer */
+    cl_ctr_replay_t replay;                        /* control-plane anti-replay */
     /* Consumer traffic is counted separately from the control plane.  They
      * share a session key and a socket but not a sequence space: a consumer
      * may send thousands of packets a second where the control plane sends a
      * handful, and one counter for both means a reordered consumer packet can
      * make a MASTER_ALIVE arriving behind it look like a replay - which is a
      * missed liveness beacon, not a dropped cache reply. */
-    uint32_t      last_consumer_seq;
+    cl_ctr_replay_t replay_consumer;
     /* Peer's advertised consistency-critical config (from ALIVE), used to warn
      * on accidental per-node config drift.  cfg_known=0 until first advertised;
      * cfg_warned deduplicates the mismatch warning. */
@@ -966,7 +1193,7 @@ struct cl_ctr_peers_ {
     unsigned char   master_salt[CL_CTR_MASTER_SALT_SZ];
     /* my_seq: monotonic send counter; in shm so mod_destroy can use it for
      * GOODBYE without needing the worker's private state.  Reset to 0 on
-     * every session key rotation so last_seq counters reset cleanly.   */
+     * every session key rotation so peers' replay windows reset cleanly. */
     uint32_t        my_seq;
     uint32_t        my_consumer_seq;   /* the consumer plane's own counter */
     /* Sharing-tag override: 0 = automatic (master-driven) allocation; nonzero =
@@ -2336,8 +2563,8 @@ static int cl_ctr_derive_session_key(cl_ctr_cluster_t *cl)
     cl->peers->my_seq = 0;
     cl->peers->my_consumer_seq = 0;
     for (i = 0; i < cl->peers->count; i++) {
-        cl->peers->entries[i].last_seq = 0;
-        cl->peers->entries[i].last_consumer_seq = 0;
+        cl_ctr_replay_reset(&cl->peers->entries[i].replay);
+        cl_ctr_replay_reset(&cl->peers->entries[i].replay_consumer);
     }
     cl->have_session_key = 1;   /* a valid group key now exists */
     /* The salt (and my_seq) just changed, so any queued retransmit is now stale. */
@@ -2518,44 +2745,52 @@ static int cl_ctr_decrypt_pkt(char *buf, ssize_t n, const char *sender_ip,
 }
 
 /**
- * cl_ctr_check_and_update_seq() - reject replayed or reordered packets.
- * Looks up sender_ip in the peer table; requires pkt_seq > last_seq.
- * Updates last_seq on accept.  Unknown senders (new nodes not yet in
- * the peer table) are accepted so their first packet (ALIVE/JOIN_REQ)
- * can populate the table.
+ * cl_ctr_check_and_update_seq() - accept each sequence number exactly once.
+ * Looks up sender_ip in the peer table and runs @pkt_seq through that peer's
+ * replay window for the requested plane.  Unknown senders (new nodes not yet
+ * in the peer table) are accepted so their first packet (ALIVE/JOIN_REQ) can
+ * populate the table.
  * Only called for CL_CTR_PACKET_MAGIC packets; bootstrap packets use join_nonce.
  * Single-threaded caller (cl_ctr_worker reactor); no lock needed for the check.
- * @return 0 to accept, -1 to drop.
+ * @return CL_CTR_SEQ_OK to accept, CL_CTR_SEQ_DUP / CL_CTR_SEQ_OLD to drop.
  */
 static int cl_ctr_check_and_update_seq(const char *sender_ip, uint32_t pkt_seq,
                                    cl_ctr_cluster_t *cl, int is_consumer)
 {
-    int i;
+    const char *why;
+    int i, rc;
     for (i = 0; i < cl->peers->count; i++) {
         if (strcmp(cl->peers->entries[i].ip, sender_ip) == 0) {
-            uint32_t *last = is_consumer
-                             ? &cl->peers->entries[i].last_consumer_seq
-                             : &cl->peers->entries[i].last_seq;
+            cl_ctr_replay_t *r = is_consumer
+                                 ? &cl->peers->entries[i].replay_consumer
+                                 : &cl->peers->entries[i].replay;
 
-            if (pkt_seq <= *last) {
-                /* Debug for consumer traffic, warning for the control plane.
-                 * A consumer sending at rate will reorder on any network with
-                 * more than one path, and a warning per reordered packet says
-                 * "attack" about something entirely ordinary. */
-                if (is_consumer)
-                    LM_DBG("clusterer_controller: consumer packet from %s out "
-                           "of order seq=%u last=%u, dropping\n",
-                           sender_ip, pkt_seq, *last);
-                else
-                    LM_WARN("clusterer_controller: replay from %s seq=%u "
-                            "last=%u, dropping\n", sender_ip, pkt_seq, *last);
-                return -1;
-            }
-            *last = pkt_seq;
-            return 0;
+            rc = cl_ctr_replay_check(r, pkt_seq);
+            if (rc == CL_CTR_SEQ_OK)
+                return rc;
+
+            /* Debug for consumer traffic, warning for the control plane.  A
+             * consumer sending at rate will duplicate on any path that retries,
+             * and a warning per copy says "attack" about something entirely
+             * ordinary.  Reordering no longer reaches here at all - the window
+             * accepts it - so what is left really is a repeat or something
+             * older than the window can vouch for. */
+            why = rc == CL_CTR_SEQ_DUP  ? "already accepted"
+                : rc == CL_CTR_SEQ_JUMP ? "implausibly far ahead - a wrapped "
+                                          "replay, or this peer's traffic has "
+                                          "been lost wholesale"
+                                        : "older than the replay window";
+            if (is_consumer)
+                LM_DBG("clusterer_controller: consumer packet from %s seq=%u "
+                       "last=%u %s, dropping\n", sender_ip, pkt_seq, r->last,
+                       why);
+            else
+                LM_WARN("clusterer_controller: packet from %s seq=%u last=%u "
+                        "%s, dropping\n", sender_ip, pkt_seq, r->last, why);
+            return rc;
         }
     }
-    return 0;   /* unknown sender: accept, handler will upsert into peer table */
+    return CL_CTR_SEQ_OK;   /* unknown sender: accept, handler will upsert into peer table */
 }
 
 /* =========================================================================
@@ -2816,6 +3051,91 @@ static void cl_ctr_arm_tfd_us(int tfd, uint64_t usec_value, uint64_t usec_interv
 }
 
 /*
+ * Release an entry and give its packet buffer back.  Every path that clears
+ * `used` goes through here - an entry cleared without freeing would leak the
+ * buffer, and the next enqueue into that slot memsets the pointer away.
+ */
+static void cl_ctr_retx_release(cl_ctr_cluster_t *cl, cl_ctr_retx_entry_t *e)
+{
+    if (e->pkt) {
+        pkg_free(e->pkt);
+        e->pkt = NULL;
+    }
+    if (e->used) {
+        e->used = 0;
+        if (cl->retx_count > 0)
+            cl->retx_count--;
+    }
+}
+
+/*
+ * A reliable send too large to cache goes out once and is never repaired.
+ * That is a downgrade of the guarantee the caller asked for, so it is a
+ * warning rather than the debug line it used to be - rate limited per process,
+ * because whatever is oversized will be oversized every time.
+ */
+static void cl_ctr_retx_too_big(cl_ctr_cluster_t *cl, int pkt_len)
+{
+    static unsigned int last_warn;
+    unsigned int now = get_ticks();
+
+    if (last_warn == 0 || now - last_warn >= CL_CTR_RELIABLE_WARN_IVL) {
+        last_warn = now;
+        LM_WARN("clusterer_controller: [cluster %d] a %d-byte packet asked for "
+                "reliable delivery but the retransmit cache holds %d - it was "
+                "sent once, best-effort, and will not be repaired. The bound "
+                "follows this interface's MTU, so a payload within "
+                "cc_max_payload (%d) always fits.\n",
+                cl->cluster_id, pkt_len, cl_ctr_retx_pkt_max, cc_max_payload);
+    }
+}
+
+/*
+ * Arm the shared retransmit timer for the EARLIEST deadline in the queue, or
+ * disarm it when the queue is empty.
+ *
+ * Every arm has to go through here.  Arming it directly to "now + one
+ * interval" on each enqueue - which is what the broadcast path used to do -
+ * makes a steady stream of reliable sends push the deadline forward faster
+ * than it can arrive: at fifty messages a second and a 40 ms retry gap, the
+ * timer was re-armed every 20 ms to fire 40 ms later and therefore never fired
+ * at all while traffic continued.  Measured on the two-node rig: 45 lost
+ * messages produced 2 retransmits.  A reliable send is at its least reliable
+ * exactly when the channel is busy, which is the opposite of what it promises.
+ *
+ * Deadline-driven rather than fixed-interval for the second reason too: with a
+ * flat 250 ms sweep an entry due in 40 ms waited 250, so a consumer budget of
+ * 2 x 40 ms was spent as 2 x 250 ms and every repair landed long after the
+ * consumer had given up on it.
+ */
+static void cl_ctr_retx_rearm(cl_ctr_cluster_t *cl)
+{
+    utime_t now, first = 0;
+    int i;
+
+    if (cl->retx_count == 0) {
+        cl_ctr_arm_tfd_us(cl->retx_tfd, 0, 0);      /* nothing pending */
+        return;
+    }
+
+    for (i = 0; i < CL_CTR_RETX_QUEUE_SZ; i++)
+        if (cl->retx_q[i].used &&
+            (first == 0 || cl->retx_q[i].next_due_us < first))
+            first = cl->retx_q[i].next_due_us;
+
+    if (first == 0) {                                /* count/queue disagree */
+        cl_ctr_arm_tfd_us(cl->retx_tfd, 0, 0);
+        return;
+    }
+
+    now = get_uticks();
+    /* Never 0 microseconds: that is timerfd's disarm, not "fire immediately",
+     * and an already-due entry would then wait for the next enqueue to be
+     * noticed at all. */
+    cl_ctr_arm_tfd_us(cl->retx_tfd, first > now ? (uint64_t)(first - now) : 1, 0);
+}
+
+/*
  * Drop every outstanding retransmit.  Called on loss of mastership and on
  * session-key rotation, so a demoted or re-keyed node never keeps delivering a
  * stale master-keyed KEY_GRANT/NODE_ASSIGN that would push a joiner onto a dead
@@ -2828,6 +3148,12 @@ static void cl_ctr_retx_flush(cl_ctr_cluster_t *cl)
         return;
     LM_DBG("clusterer_controller: [cluster %d] flushing %d pending retransmit(s)\n",
            cl->cluster_id, cl->retx_count);
+    {   /* release each, then clear: a bare memset over the array would drop
+         * every entry's packet pointer on the floor. */
+        int _i;
+        for (_i = 0; _i < CL_CTR_RETX_QUEUE_SZ; _i++)
+            cl_ctr_retx_release(cl, &cl->retx_q[_i]);
+    }
     memset(cl->retx_q, 0, sizeof(cl->retx_q));
     cl->retx_count = 0;
     cl_ctr_arm_tfd_us(cl->retx_tfd, 0, 0);   /* disarm */
@@ -2847,8 +3173,10 @@ static void cl_ctr_retx_enqueue_bcast(cl_ctr_cluster_t *cl, uint32_t seq,
     cl_ctr_retx_entry_t *e = NULL;
     int i, n = 0;
 
-    if (pkt_len <= 0 || pkt_len > (int)sizeof(cl->retx_q[0].pkt))
+    if (pkt_len <= 0 || pkt_len > cl_ctr_retx_pkt_max) {
+        cl_ctr_retx_too_big(cl, pkt_len);
         return;
+    }
 
     lock_start_read(cl->peers->lock);
     for (i = 0; i < cl->peers->count; i++)
@@ -2872,7 +3200,14 @@ static void cl_ctr_retx_enqueue_bcast(cl_ctr_cluster_t *cl, uint32_t seq,
         return;
     }
 
-    memset(e, 0, sizeof(*e));
+    memset(e, 0, sizeof(*e));   /* pkt was NULLed by the release that freed it */
+    e->pkt = pkg_malloc(pkt_len);
+    if (!e->pkt) {
+        LM_ERR("clusterer_controller: [cluster %d] no pkg for a %d-byte "
+               "retransmit cache entry - broadcast sent once, best-effort\n",
+               cl->cluster_id, pkt_len);
+        return;
+    }
     e->used         = 1;
     e->seq          = seq;
     e->type         = CL_CTR_PKT_CONSUMER_REL;
@@ -2880,16 +3215,15 @@ static void cl_ctr_retx_enqueue_bcast(cl_ctr_cluster_t *cl, uint32_t seq,
     e->expect_n     = (uint16_t)n;
     e->retries_left = cl->consumer_retries;
     e->retries_cfg  = (uint8_t)cl->consumer_retries;
-    e->next_due_us  = get_uticks() + (utime_t)cl->consumer_retry_ms * 1000;
+    e->retry_ivl_us = (utime_t)cl->consumer_retry_ms * 1000;
+    e->next_due_us  = get_uticks() + e->retry_ivl_us;
     e->pkt_len      = pkt_len;
     memcpy(e->pkt, pkt, pkt_len);
     cl->retx_count++;
-    /* First argument is the delay, and zero there means disarm - the value
-     * this once passed, which switched the retransmit timer off instead of
-     * on and left every reliable broadcast waiting for a repair that could
-     * never run. */
-    cl_ctr_arm_tfd_us(cl->retx_tfd,
-                      (utime_t)cl->consumer_retry_ms * 1000, 0);
+    /* Through the helper, never straight at the timer: this used to arm it
+     * unconditionally to now + one interval, which under continuous broadcasts
+     * pushed the sweep past every deadline it was meant to serve. */
+    cl_ctr_retx_rearm(cl);
 }
 
 /* The consumer plane retransmits on its own schedule: the join handshake's
@@ -2912,10 +3246,14 @@ static void cl_ctr_retx_enqueue_consumer(cl_ctr_cluster_t *cl, uint32_t seq,
             cl->retx_q[i].type == type) {
             cl->retx_q[i].retries_left = cl->consumer_retries;
             cl->retx_q[i].retries_cfg  = (uint8_t)cl->consumer_retries;
+            cl->retx_q[i].retry_ivl_us = (utime_t)cl->consumer_retry_ms * 1000;
             cl->retx_q[i].next_due_us  = get_uticks()
-                                       + (utime_t)cl->consumer_retry_ms * 1000;
+                                       + cl->retx_q[i].retry_ivl_us;
             break;
         }
+    /* The deadline just moved in (consumer gaps are shorter than the
+     * handshake's), so the timer enqueue armed has to be pulled forward. */
+    cl_ctr_retx_rearm(cl);
 }
 
 static void cl_ctr_retx_enqueue(cl_ctr_cluster_t *cl, uint32_t seq, unsigned char type,
@@ -2923,11 +3261,14 @@ static void cl_ctr_retx_enqueue(cl_ctr_cluster_t *cl, uint32_t seq, unsigned cha
                             const struct sockaddr *dest, socklen_t destlen)
 {
     cl_ctr_retx_entry_t *e;
-    int i, slot = -1, was_empty;
+    int i, slot = -1;
 
-    if (pkt_len <= 0 || pkt_len > (int)sizeof(cl->retx_q[0].pkt) ||
-        destlen == 0 || destlen > (socklen_t)sizeof(cl->retx_q[0].dest))
+    if (pkt_len <= 0 || pkt_len > cl_ctr_retx_pkt_max ||
+        destlen == 0 || destlen > (socklen_t)sizeof(cl->retx_q[0].dest)) {
+        if (pkt_len > cl_ctr_retx_pkt_max)
+            cl_ctr_retx_too_big(cl, pkt_len);
         return;
+    }
 
     for (i = 0; i < CL_CTR_RETX_QUEUE_SZ; i++)
         if (!cl->retx_q[i].used) { slot = i; break; }
@@ -2937,21 +3278,27 @@ static void cl_ctr_retx_enqueue(cl_ctr_cluster_t *cl, uint32_t seq, unsigned cha
         return;
     }
 
-    was_empty = (cl->retx_count == 0);
     e = &cl->retx_q[slot];
-    memset(e, 0, sizeof(*e));
+    memset(e, 0, sizeof(*e));   /* pkt was NULLed by the release that freed it */
+    e->pkt = pkg_malloc(pkt_len);
+    if (!e->pkt) {
+        LM_ERR("clusterer_controller: [cluster %d] no pkg for a %d-byte "
+               "retransmit cache entry - 0x%02x sent once, best-effort\n",
+               cl->cluster_id, pkt_len, type);
+        return;
+    }
     e->used         = 1;
     e->seq          = seq;
     e->type         = type;
     e->retries_left = CL_CTR_RETX_MAX_RETRIES;
-    e->next_due_us  = get_uticks() + CL_CTR_RETX_INTERVAL_US;
+    e->retry_ivl_us = CL_CTR_RETX_INTERVAL_US;
+    e->next_due_us  = get_uticks() + e->retry_ivl_us;
     memcpy(&e->dest, dest, destlen);
     e->destlen      = destlen;
     memcpy(e->pkt, pkt, pkt_len);
     e->pkt_len      = pkt_len;
     cl->retx_count++;
-    if (was_empty)
-        cl_ctr_arm_tfd_us(cl->retx_tfd, CL_CTR_RETX_INTERVAL_US, 0);
+    cl_ctr_retx_rearm(cl);
 }
 
 /* An ACK arrived: drop the queued packet whose seq it echoes. */
@@ -3010,12 +3357,12 @@ static void cl_ctr_handle_ack(const char *payload, int payload_len,
             LM_DBG("clusterer_controller: [cluster %d] ACK for 0x%02x seq %u\n",
                    cl->cluster_id, e->type, acked);
         }
-        e->used = 0;
-        cl->retx_count--;
+        cl_ctr_retx_release(cl, e);
         break;
     }
-    if (cl->retx_count == 0)
-        cl_ctr_arm_tfd_us(cl->retx_tfd, 0, 0);   /* nothing pending - disarm */
+    /* Dropping an entry can make a LATER one the earliest, so re-arm rather
+     * than only disarming on empty. */
+    cl_ctr_retx_rearm(cl);
 }
 
 /*
@@ -3094,15 +3441,14 @@ static int cl_ctr_on_retx_tfd(int fd, void *param, int was_timeout)
                    cl->cluster_id, e->type, e->seq,
                    (unsigned)(e->retries_cfg ? e->retries_cfg
                                              : CL_CTR_RETX_MAX_RETRIES));
-            e->used = 0;
-            cl->retx_count--;
+            cl_ctr_retx_release(cl, e);
         } else {
-            e->next_due_us = now + CL_CTR_RETX_INTERVAL_US;
+            e->next_due_us = now + (e->retry_ivl_us ? e->retry_ivl_us
+                                                    : CL_CTR_RETX_INTERVAL_US);
         }
     }
 
-    if (cl->retx_count > 0)
-        cl_ctr_arm_tfd_us(cl->retx_tfd, CL_CTR_RETX_INTERVAL_US, 0);
+    cl_ctr_retx_rearm(cl);
     return 0;
 }
 
@@ -4140,16 +4486,17 @@ static void cl_ctr_handle_join_req(int sock, const char *payload, int payload_le
                                (const char (*)[CL_CTR_MAX_BIN_SOCK_LEN])bin_socks,
                                cl);
 
-    /* Reset last_seq in the peer table.  Essential: a restarted node begins its
-     * seq counter from 0, and without this reset peers would permanently reject
-     * its new packets (old last_seq > new seq) until the next key rotation.  The
+    /* Reset the replay window in the peer table.  Essential: a restarted node
+     * begins its seq counter from 0, and without this reset peers would
+     * permanently reject its new packets (old high-water mark far above the new
+     * low seq) until the next key rotation.  The
      * joiner's long-lived pubkey (for a future KEY_HANDOFF) is learned from its
      * ALIVE, not here - the JOIN_REQ now carries only an ephemeral Noise key. */
     {
 	cl_ctr_peer_t *e = cl_ctr_peer_by_ip_locked(cl, src_ip);
 	if (e) {
-	    e->last_seq = 0;
-	    e->last_consumer_seq = 0;
+	    cl_ctr_replay_reset(&e->replay);
+	    cl_ctr_replay_reset(&e->replay_consumer);
 	}
     }
 
@@ -4320,11 +4667,11 @@ static void cl_ctr_handle_member_list(const char *payload, int payload_len,
 
     lock_start_write(cl->peers->lock);
 
-    /* Second pass: upsert all peers and reset their last_seq.
-     * Resetting last_seq here covers the case where a peer restarted and
+    /* Second pass: upsert all peers and reset their replay windows.
+     * Resetting them here covers the case where a peer restarted and
      * sent JOIN_REQ: the MEMBER_LIST is the broadcast announcement that a
      * join event occurred.  Without the reset, non-master peers would reject
-     * the restarted node's new packets (old last_seq > new low seq). */
+     * the restarted node's new packets (old mark > new low seq). */
     for (i = 0; i < (int)count; i++, p += CL_CTR_IP_ENTRY_SZ) {
 	char ip_buf[CL_CTR_MAX_IP_LEN + 1];
 	int  _j;
@@ -4344,8 +4691,8 @@ static void cl_ctr_handle_member_list(const char *payload, int payload_len,
 	    cl_ctr_learn_peer_locked(ip_buf, cl);
 	for (_j = 0; _j < cl->peers->count; _j++) {
 	    if (strcmp(cl->peers->entries[_j].ip, ip_buf) == 0) {
-		cl->peers->entries[_j].last_seq = 0;
-		cl->peers->entries[_j].last_consumer_seq = 0;
+		cl_ctr_replay_reset(&cl->peers->entries[_j].replay);
+		cl_ctr_replay_reset(&cl->peers->entries[_j].replay_consumer);
 		break;
 	    }
 	}
@@ -5436,20 +5783,67 @@ static void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	    unsigned char _t = (unsigned char)buf[CL_CTR_WIRE_HDR_SZ];
 	    int is_consumer_pkt = (_t == CL_CTR_PKT_CONSUMER ||
 	                           _t == CL_CTR_PKT_CONSUMER_REL);
+	    int _seq_rc;
 
 	    memcpy(&pkt_seq, buf + CL_CTR_WIRE_HDR_SZ + 1, CL_CTR_SEQ_SZ);
 	    pkt_seq = ntohl(pkt_seq);
-	    if (cl_ctr_check_and_update_seq(sender_ip_buf, pkt_seq, cl,
-	                                    is_consumer_pkt) < 0) {
-		/* A duplicate of a message that asked to be acknowledged means
-		 * our acknowledgement did not arrive: say it again.  Without
-		 * this the sender spends its whole retransmit budget against a
-		 * receiver that has had the message all along and is dropping
-		 * every copy in silence. */
-		if ((unsigned char)buf[CL_CTR_WIRE_HDR_SZ]
-		        == CL_CTR_PKT_CONSUMER_REL)
-		    cl_ctr_send_ack(cl->sock, cl, pkt_seq, 0,
-		                    (const struct sockaddr *)&src_addr, src_len);
+	    _seq_rc = cl_ctr_check_and_update_seq(sender_ip_buf, pkt_seq, cl,
+	                                          is_consumer_pkt);
+	    if (_seq_rc != CL_CTR_SEQ_OK) {
+		if (_t == CL_CTR_PKT_CONSUMER_REL) {
+		    if (_seq_rc == CL_CTR_SEQ_DUP) {
+			/* A duplicate of a message that asked to be
+			 * acknowledged means our acknowledgement did not
+			 * arrive: say it again.  Without this the sender spends
+			 * its whole retransmit budget against a receiver that
+			 * has had the message all along and is dropping every
+			 * copy in silence. */
+			cl_ctr_send_ack(cl->sock, cl, pkt_seq, 0,
+			                (const struct sockaddr *)&src_addr,
+			                src_len);
+		    } else {
+			/* Below the window.  We genuinely do not know whether
+			 * this payload was ever delivered, so we must not claim
+			 * it was - an ACK here is exactly the silent lie that
+			 * made reliable delivery unreliable before the window
+			 * existed.  Withholding it costs the sender the rest of
+			 * its budget and one honest "unacked" line.
+			 *
+			 * Reaching this at all means the window is too small
+			 * for the offered rate, which is a sizing problem the
+			 * operator can act on - hence a warning, not a debug
+			 * line, rate limited per process because a burst that
+			 * outruns the window outruns it for many packets. */
+			static unsigned int last_old_warn;
+			unsigned int now_t = get_ticks();
+
+			if (last_old_warn == 0 ||
+			    now_t - last_old_warn >= CL_CTR_RELIABLE_WARN_IVL) {
+			    last_old_warn = now_t;
+			    if (_seq_rc == CL_CTR_SEQ_JUMP)
+				LM_WARN("clusterer_controller: reliable message "
+				        "from %s seq=%u is implausibly far ahead "
+				        "of that peer's last accepted sequence - "
+				        "refused and NOT acknowledged. Either a "
+				        "replay of a very old packet, or this "
+				        "peer's traffic has been lost wholesale; "
+				        "membership will reset the window when it "
+				        "rejoins.\n", sender_ip_buf, pkt_seq);
+			    else
+				LM_WARN("clusterer_controller: reliable message "
+				        "from %s seq=%u fell more than %d messages "
+				        "behind the replay window and cannot be "
+				        "confirmed - NOT acknowledging. The sender "
+				        "is offering more than the window spans "
+				        "within its retransmit horizon "
+				        "(consumer_retries x consumer_retry_ms = "
+				        "%d ms); lower that horizon or expect "
+				        "losses.\n", sender_ip_buf, pkt_seq,
+				        CL_CTR_REPLAY_WIN_BITS,
+				        cl->consumer_retries * cl->consumer_retry_ms);
+			}
+		    }
+		}
 		return;
 	    }
 	}
@@ -7056,8 +7450,42 @@ static int mod_init(void)
 		int _overhead = 20 + 8 + CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ
 		                + CL_CTR_CONSUMER_HDR_SZ + CLCTR_MAX_CHAN_LEN + CL_CTR_TAG_SZ;
 		cc_max_payload = _mtu - _overhead;
+		/* Do NOT pad this back up to CLCTR_MAX_PAYLOAD when the link is
+		 * smaller than that. It used to, and the effect was that any
+		 * interface under ~1411 MTU - a VPN, a GRE/IPIP tunnel, PPPoE,
+		 * the usual 1400/1420/1436 - reported a bound ABOVE what the
+		 * path carries, which is the exact inverse of why the MTU is
+		 * consulted at all. Every full-size consumer datagram then IP
+		 * fragments, and a fragmented datagram is lost entirely if any
+		 * one fragment is, so the padding manufactured precisely the
+		 * losses the retransmit machinery then has to repair.
+		 *
+		 * Honour the link and say so instead: the compile-time constant
+		 * stays what a consumer sizes a buffer with, but it stops being
+		 * a promise the network cannot keep. */
 		if (cc_max_payload < CLCTR_MAX_PAYLOAD)
-		    cc_max_payload = CLCTR_MAX_PAYLOAD;
+		    LM_WARN("clusterer_controller: interface %s has MTU %d, so a "
+		            "consumer datagram carries at most %d bytes - below "
+		            "the %d that CLCTR_MAX_PAYLOAD leads consumers to "
+		            "expect. Sends above %d will be refused on this "
+		            "link. Raise the MTU, or keep consumer payloads "
+		            "under it; the bound is deliberately NOT padded up "
+		            "to the constant, because that only fragments and a "
+		            "lost fragment loses the whole message.\n",
+		            my_interface_buf, _mtu, cc_max_payload,
+		            (int)CLCTR_MAX_PAYLOAD, cc_max_payload);
+		/* However large the MTU claims to be, one datagram still has
+		 * to fit a UDP payload. Loopback reports 65536, which lands a
+		 * byte past what sendto() accepts. */
+		if (cc_max_payload > CL_CTR_UDP_PAYLOAD_MAX - CL_CTR_PKT_OVERHEAD)
+		    cc_max_payload = CL_CTR_UDP_PAYLOAD_MAX - CL_CTR_PKT_OVERHEAD;
+		if (cc_max_payload <= 0) {
+		    LM_ERR("clusterer_controller: interface %s has MTU %d, which "
+		           "cannot carry even the %d bytes of per-datagram "
+		           "overhead - the cluster plane cannot run on it\n",
+		           my_interface_buf, _mtu, _overhead);
+		    return -1;
+		}
 		LM_INFO("clusterer_controller: interface %s MTU=%d, "
 		        "max consumer payload=%d bytes\n",
 		        my_interface_buf, _mtu, cc_max_payload);
@@ -7068,6 +7496,29 @@ static int mod_init(void)
 	    }
 	    close(_mtu_sock);
 	}
+    }
+
+    /* Size the transmit buffers from the bound that gates them, now that the
+     * MTU probe above has settled cc_max_payload. Doing it here rather than at
+     * compile time is the whole point: a jumbo-frame link raises
+     * cc_max_payload, and a CLCTR_MAX_PAYLOAD-sized buffer could not hold what
+     * that bound then admits. */
+    cl_ctr_script_buf_sz  = cc_max_payload;
+    cl_ctr_consumer_pkt_sz = CL_CTR_PKT_OVERHEAD + cc_max_payload;
+    /* The retransmit cache follows the same bound, for the same reason: a
+     * reliable send that the transmit buffer accepts must also be one the
+     * repair path can hold, or reliability quietly stops at a size the API
+     * never mentions.  Whichever is larger - the control plane's biggest
+     * handshake packet, or a full-MTU consumer message. */
+    cl_ctr_retx_pkt_max = cl_ctr_consumer_pkt_sz > CL_CTR_NODE_ASSIGN_MAX_SZ
+                          ? cl_ctr_consumer_pkt_sz : CL_CTR_NODE_ASSIGN_MAX_SZ;
+    cl_ctr_script_buf  = pkg_malloc(cl_ctr_script_buf_sz);
+    cl_ctr_consumer_pkt = pkg_malloc(cl_ctr_consumer_pkt_sz);
+    if (!cl_ctr_script_buf || !cl_ctr_consumer_pkt) {
+	LM_ERR("clusterer_controller: no pkg memory for the %d/%d byte "
+	       "transmit buffers\n", cl_ctr_script_buf_sz,
+	       cl_ctr_consumer_pkt_sz);
+	return -1;
     }
 
     if (cl_ctr_discover_bin_sockets() < 0)
@@ -7116,6 +7567,33 @@ static int mod_init(void)
 	    cl->consumer_retry_ms = consumer_retry_ms;
 	if (cl->consumer_rate == -1)
 	    cl->consumer_rate = consumer_rate_limit;
+
+	/* The replay window is a fixed number of MESSAGES, but what it has to
+	 * span is a fixed amount of TIME - the retransmit horizon, which is
+	 * configurable and can legally be set as high as 10 x 5000 ms.  Report
+	 * the resulting per-peer rate ceiling rather than leaving an operator
+	 * to meet it as unexplained loss.  Above the ceiling, a repair copy can
+	 * arrive after its slot has been reused and is refused (and, on the
+	 * reliable path, deliberately not acknowledged). */
+	{
+	    int horizon_ms = cl->consumer_retries * cl->consumer_retry_ms;
+	    int ceiling = horizon_ms > 0
+	                  ? (CL_CTR_REPLAY_WIN_BITS * 1000) / horizon_ms : 0;
+
+	    if (horizon_ms > 0 && ceiling < 1000)
+		LM_WARN("clusterer_controller: [cluster %d] consumer retransmit "
+		        "horizon is %d ms (%d retries x %d ms), so the %d-slot "
+		        "replay window only spans ~%d consumer messages/s from "
+		        "any one peer; above that, retransmits arrive too late "
+		        "to be judged and are dropped\n", cl->cluster_id,
+		        horizon_ms, cl->consumer_retries, cl->consumer_retry_ms,
+		        CL_CTR_REPLAY_WIN_BITS, ceiling);
+	    else
+		LM_DBG("clusterer_controller: [cluster %d] replay window spans "
+		       "%d messages, ~%d msg/s per peer at a %d ms retransmit "
+		       "horizon\n", cl->cluster_id, CL_CTR_REPLAY_WIN_BITS,
+		       ceiling, horizon_ms);
+	}
 
 	/* Resolve which BIN socket to use for this cluster.
 	 * Priority: explicit bin_socket= in cluster string >
@@ -7445,11 +7923,27 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param)
 {
     struct cl_ctr_consumer_job *job = (struct cl_ctr_consumer_job *)param;
     cl_ctr_cluster_t *cl = job->cl;
-    char      pkt[CL_CTR_CONSUMER_PKT_MAX];
+    /* the per-process buffer sized from cc_max_payload at mod_init;
+     * a CL_CTR_CONSUMER_PKT_MAX-sized stack array could not hold what
+     * the MTU-derived bound in cl_ctr_consumer_submit() admits */
+    char     *pkt = cl_ctr_consumer_pkt;
     char      dst_ip[CL_CTR_MAX_IP_LEN + 1];
     uint32_t  seq;
     uint16_t  id_be;
     int       plain_len, i, to_self = 0, on_wire = 1, reliable = 0;
+
+    /* Defence in depth against the two bounds drifting apart again. The
+     * admission gate in cl_ctr_consumer_submit() and the buffer allocated in
+     * mod_init are both derived from cc_max_payload, so this cannot fire
+     * today - which is exactly what was true of the old pair right up until
+     * the MTU probe was added and made them disagree. */
+    if (!pkt || CL_CTR_PKT_OVERHEAD + job->payload_len > cl_ctr_consumer_pkt_sz) {
+        LM_ERR("clusterer_controller: consumer packet of %d bytes does not fit "
+               "the %d-byte transmit buffer - dropping\n",
+               CL_CTR_PKT_OVERHEAD + job->payload_len, cl_ctr_consumer_pkt_sz);
+        shm_free(job);
+        return;
+    }
 
     /* unicast to our own id never touches the wire; multicast with
      * CLCTR_SEND_TO_SELF touches it AND dispatches locally */
@@ -7511,8 +8005,18 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param)
                  * bytes - and silences -Wpointer-sign without retyping the
                  * buffer, which would only move the warning to the
                  * seal_and_send() calls that legitimately need char *. */
+                /* The SEALED length.  cl_ctr_seal_and_send() encrypted in
+                 * place, so what is on the wire is the wire header, the
+                 * ciphertext and the AEAD tag - 44 bytes more than plain_len.
+                 * Caching plain_len re-sent a packet truncated by exactly that
+                 * much, which every receiver discarded as "short" before it
+                 * could be decrypted: consumer retransmission had never
+                 * delivered a single byte.  The control plane's own enqueue
+                 * (KEY_GRANT) always passed the sealed length, which is why
+                 * the join handshake's ARQ worked and this did not. */
                 cl_ctr_retx_enqueue_bcast(cl, ntohl(seq),
-                        (const unsigned char *)pkt, plain_len);
+                        (const unsigned char *)pkt,
+                        CL_CTR_WIRE_HDR_SZ + plain_len + CL_CTR_TAG_SZ);
         } else {
             struct sockaddr_in d;
 
@@ -7545,9 +8049,11 @@ static void cl_ctr_rpc_consumer_send(int sender, void *param)
                             (const struct sockaddr *)&d, sizeof d);
                     if (reliable)
                         /* same sign-only cast as the broadcast path above */
+                        /* sealed length, as above */
                         cl_ctr_retx_enqueue_consumer(cl, ntohl(seq),
                                 CL_CTR_PKT_CONSUMER_REL,
-                                (const unsigned char *)pkt, plain_len,
+                                (const unsigned char *)pkt,
+                                CL_CTR_WIRE_HDR_SZ + plain_len + CL_CTR_TAG_SZ,
                                 (const struct sockaddr *)&d, sizeof d);
                 }
             }
@@ -7608,6 +8114,30 @@ static int cl_ctr_consumer_submit(int cluster_id, int dst_node_id,
                "use BIN for bulk data\n", payload_len, cc_max_payload);
         return -1;
     }
+
+    /* Single gate for every sender - the script functions and the consumer API
+     * both funnel through here, so the flag cannot survive by another route.
+     *
+     * enable_reliable_send=0 degrades a reliable send to a plain one rather
+     * than failing it: the payload still goes out, it just is not chased. The
+     * warning is process-local and rate-limited - several workers may each emit
+     * one per interval, the same trade pull_send_failed() makes, because an
+     * occasional duplicate line costs less than a lock on a send path. */
+    if ((flags & CLCTR_SEND_RELIABLE) && !enable_reliable_send) {
+        static unsigned int last_warn;   /* per process, deliberately */
+        unsigned int now = get_ticks();
+
+        flags &= ~CLCTR_SEND_RELIABLE;
+        if (last_warn == 0 || now - last_warn >= CL_CTR_RELIABLE_WARN_IVL) {
+            last_warn = now;
+            LM_WARN("clusterer_controller: reliable delivery was requested on "
+                    "channel '%.*s' but enable_reliable_send is 0 - sending "
+                    "plain, so this message is not acknowledged and not "
+                    "retransmitted if it is lost.\n",
+                    channel->len, channel->s);
+        }
+    }
+
     cl = cl_ctr_cluster_by_id(cluster_id);
     if (!cl) {
         LM_ERR("consumer send to unknown cluster %d\n", cluster_id);
@@ -7754,7 +8284,7 @@ bad:
 static int cl_ctr_script_send(int cluster_id, int node_id, str *gen_msg,
 		str *tag, unsigned char kind, int flags)
 {
-	char buf[CLCTR_MAX_PAYLOAD];
+	char *buf = cl_ctr_script_buf;
 	str pl;
 	int taglen = tag ? tag->len : 0;
 
@@ -7762,9 +8292,18 @@ static int cl_ctr_script_send(int cluster_id, int node_id, str *gen_msg,
 		return -1;
 	if (taglen > 255)
 		taglen = 255;
-	if (2 + taglen + gen_msg->len > cc_max_payload) {
+	/* Bound against the BUFFER, not only against cc_max_payload. They are
+	 * derived from one another at mod_init now, but this function writes
+	 * into buf[] and buf[] is what it must answer to - the gap between the
+	 * two forms is exactly how a 1500-MTU link turned a 1350-byte script
+	 * message into an 89-byte stack overrun. cmd_cl_ctr_send_req_list()
+	 * now shares this buffer and this guard. */
+	if (!buf || 2 + taglen + gen_msg->len > cl_ctr_script_buf_sz ||
+	    2 + taglen + gen_msg->len > cc_max_payload) {
 		LM_ERR("clusterer_controller: message of %d bytes is more than the "
-			"%d a datagram carries\n", gen_msg->len, cc_max_payload);
+			"%d a datagram carries\n", gen_msg->len,
+			cc_max_payload < cl_ctr_script_buf_sz ? cc_max_payload
+			                                      : cl_ctr_script_buf_sz);
 		return -1;
 	}
 	buf[0] = (char)kind;
@@ -7851,15 +8390,25 @@ static int cmd_cl_ctr_send_req_list(struct sip_msg *msg, int *cluster_id,
 			CL_CTR_MAX_PEERS);
 
 	{
-		char  buf[CLCTR_MAX_PAYLOAD];
+		/* The same MTU-derived buffer its two siblings use, not a
+		 * CLCTR_MAX_PAYLOAD stack array.  A compile-time 1300 here meant
+		 * that on a jumbo link a script could broadcast an 8 KB message
+		 * but could not send the same message to a LIST of nodes - the
+		 * list form silently stopped at a seventh of what the other two
+		 * carried, with an error that blamed "the cluster plane" rather
+		 * than the buffer. */
+		char *buf  = cl_ctr_script_buf;
 		str   pl;
 		int   tlen = tag ? tag->len : 0;
 
 		if (tlen > 255)
 			tlen = 255;
-		if (2 + tlen + gen_msg->len > (int)sizeof(buf)) {
-			LM_ERR("clusterer_controller: message too large for the "
-			       "cluster plane (%d bytes)\n", gen_msg->len);
+		if (!buf || 2 + tlen + gen_msg->len > cl_ctr_script_buf_sz ||
+		    2 + tlen + gen_msg->len > cc_max_payload) {
+			LM_ERR("clusterer_controller: message of %d bytes is more "
+			       "than the %d a datagram carries\n", gen_msg->len,
+			       cc_max_payload < cl_ctr_script_buf_sz
+			           ? cc_max_payload : cl_ctr_script_buf_sz);
 			return -1;
 		}
 		buf[0] = (char)CL_CTR_SCRIPT_REQ;
@@ -7930,6 +8479,13 @@ static int cl_ctr_script_init(void)
 	return clctr_register_channel(&cl_ctr_script_chan, cl_ctr_script_recv);
 }
 
+/* Consumers must reach cc_max_payload through the bound API, never as an extern
+ * - see the note in api.h. */
+static int clctr_get_max_payload(void)
+{
+    return cc_max_payload;
+}
+
 int load_clctr(clctr_api_t *api)
 {
     if (!api)
@@ -7940,5 +8496,6 @@ int load_clctr(clctr_api_t *api)
     api->send_list        = clctr_send_list;
     api->get_my_node_id   = clctr_get_my_node_id;
     api->get_my_ip        = cl_ctr_get_my_ip;
+    api->get_max_payload  = clctr_get_max_payload;
     return 0;
 }

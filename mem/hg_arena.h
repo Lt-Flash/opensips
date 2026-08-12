@@ -65,6 +65,31 @@ int hg_arena_init(struct hg_block *hb, unsigned long hdr_size);
  * this SAME underlying arena rather than a separate reservation. */
 void *hg_chunk_backing(struct hg_block *hb, unsigned long size);
 
+/* Flush this THREAD's cached cells back to the shared pool, in every arena it
+ * caches in. Must run on the owning thread - the caches are __thread and are
+ * unreachable from anywhere else, which is the whole reason the sweep is
+ * dispatched rather than executed centrally. */
+void hg_cache_flush_self(void);
+
+/* Flush only if a sweep has been requested since this thread last looked.
+ * For threads IPC cannot reach - TCP main's IO pool waits on a condvar, not
+ * the reactor - called at a job boundary. Cheap: one read of a global. */
+extern volatile unsigned long hg_sweep_gen;
+
+/* Evaluate the reserve floor. Called from the buddy layer on every grid
+ * allocation and free, because that is the one point every consumer passes -
+ * see the definition in hg_arena.c for what went wrong when it lived in
+ * carve_chunk() instead. hb->lock must be held. */
+void hg_reserve_floor_check(struct hg_block *hb);
+
+/* Widen the [lo,hi] extent watermarks over a region just handed out. Called
+ * from the buddy layer so every consumer of grid space is covered - the DBG
+ * free guard aborts on pointers outside this range. hb->lock must be held. */
+void hg_extent_note(struct hg_block *hb, void *base, unsigned long size);
+void hg_cache_flush_if_due(void);
+void *hg_backing_aligned(struct hg_block *hb, unsigned long size,
+                         unsigned long align);
+
 /* a cell of at least @size usable bytes (header excluded), or NULL if
  * size > HG_CELL_MAX or the arena is exhausted. No fallback to another
  * allocator on exhaustion - fail loud, per the HG_MALLOC design decision

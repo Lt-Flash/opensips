@@ -26,6 +26,7 @@
 #include "topology.h"
 #include "clusterer.h"
 #include "sync.h"
+#include "../../timer.h"   /* get_ticks() */
 
 int sync_packet_size = DEFAULT_SYNC_PACKET_SIZE;
 int _sync_from_id = 0;

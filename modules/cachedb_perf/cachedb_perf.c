@@ -2047,8 +2047,17 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 	 * the requester must not conclude the key is absent from a node that
 	 * demonstrably holds it. */
 #ifdef CLUSTERER_CTRL_SUPPORT
+	/* The effective bound, not the compile-time constant: cc_max_payload
+	 * follows the interface MTU and is SMALLER than CLCTR_MAX_PAYLOAD on a
+	 * link under ~1411 (VPN, tunnel, PPPoE).  Budgeting against the constant
+	 * there would build a reply the controller then refuses to send, and the
+	 * requester would wait out its timeout instead of being told the value is
+	 * held-but-unsendable - which is precisely the answer this branch exists
+	 * to give. */
 	budget = via_clctr
-		? CLCTR_MAX_PAYLOAD - (int)(PCACHE_CLCTR_RPL_HDR + key->len)
+		? (cc_max_payload < CLCTR_MAX_PAYLOAD
+		       ? cc_max_payload : CLCTR_MAX_PAYLOAD)
+		  - (int)(PCACHE_CLCTR_RPL_HDR + key->len)
 		: pull_max_value;
 #else
 	budget = pull_max_value;
@@ -2611,12 +2620,16 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 		uint16_t kl = htons((uint16_t)key->len);
 		int n = 0;
 
-		/* the entry checks above bound both lengths, so this can only
-		 * fire if those ever change - which is exactly when it should */
-		if (PCACHE_CLCTR_REQ_HDR + col->col_name.len + key->len >
-		        (int)sizeof buf) {
+		/* Against the smaller of the buffer and the link's effective
+		 * bound: the entry checks above bound both lengths, so this can
+		 * only fire if those ever change - or if the MTU makes
+		 * cc_max_payload smaller than the buffer, which is exactly when
+		 * it should. */
+		int _lim = cc_max_payload < (int)sizeof buf
+		           ? cc_max_payload : (int)sizeof buf;
+		if (PCACHE_CLCTR_REQ_HDR + col->col_name.len + key->len > _lim) {
 			LM_ERR("pull request for a %d byte key does not fit %d\n",
-				key->len, (int)sizeof buf);
+				key->len, _lim);
 			goto fail;
 		}
 		buf[n++] = PCACHE_CLCTR_REQ;

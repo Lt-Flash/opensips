@@ -230,13 +230,6 @@ static inline void cell_set_next(void *cell_start, void *next)
 	*(void **)((char *)cell_start + HG_CELL_HDR) = next;
 }
 
-/* the slot the link LIVES in, so the GC can unlink from a singly-linked free
- * list with a pointer-to-pointer instead of tracking a predecessor */
-static inline void **cell_next_slot(void *cell_start)
-{
-	return (void **)((char *)cell_start + HG_CELL_HDR);
-}
-
 /*
  * Does @cell_start belong to THIS arena?
  *

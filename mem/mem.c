@@ -92,7 +92,7 @@ int init_pkg_mallocs(void)
 	 */
 #ifdef INLINE_ALLOC
 #if defined HG_MALLOC
-	mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0);
+	mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0, NULL);
 #else
 	mem_pool = malloc(pkg_mem_size);
 	if (!mem_pool) {
@@ -170,7 +170,7 @@ int init_pkg_mallocs(void)
 #endif
 #ifdef HG_MALLOC
 	case MM_HG_MALLOC:
-		mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0);
+		mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0, NULL);
 		gen_pkg_malloc     = (osips_block_malloc_f)hg_malloc;
 		gen_pkg_realloc    = (osips_block_realloc_f)hg_realloc;
 		gen_pkg_free       = (osips_block_free_f)hg_free;
@@ -235,7 +235,7 @@ int init_pkg_mallocs(void)
 #endif
 #ifdef HG_MALLOC
 	case MM_HG_MALLOC_DBG:
-		mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0);
+		mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0, NULL);
 		gen_pkg_malloc    = (osips_block_malloc_f)hg_malloc_dbg;
 		gen_pkg_realloc   = (osips_block_realloc_f)hg_realloc_dbg;
 		gen_pkg_free      = (osips_block_free_f)hg_free_dbg;

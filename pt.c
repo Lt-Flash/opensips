@@ -284,8 +284,11 @@ static int pin_pick_cpu(enum process_type ptype, struct socket_info *sock)
 	return best;
 }
 
-/* Apply the choice made above. Runs in the CHILD. */
-static void pin_apply_cpu(int cpu)
+/* Apply the choice made above. Runs in the CHILD - BEFORE process_no is
+ * set for this child (see the call site), so process_no here still reads
+ * as the parent's (always 0), not this child's real slot. Take the
+ * description as a parameter instead of relying on that global. */
+static void pin_apply_cpu(int cpu, const char *proc_desc)
 {
 	cpu_set_t one;
 
@@ -295,17 +298,17 @@ static void pin_apply_cpu(int cpu)
 	CPU_ZERO(&one);
 	CPU_SET(cpu, &one);
 	if (sched_setaffinity(0, sizeof one, &one) != 0) {
-		LM_WARN("failed to pin process %d to CPU %d: %s\n",
-			process_no, cpu, strerror(errno));
+		LM_WARN("failed to pin \"%s\" to CPU %d: %s\n",
+			proc_desc, cpu, strerror(errno));
 		return;
 	}
 
-	LM_INFO("process %d pinned to CPU %d\n", process_no, cpu);
+	LM_INFO("\"%s\" pinned to CPU %d\n", proc_desc, cpu);
 }
 
 /* Confine a multithreaded process to its group's whole CPU list. Runs in
  * the CHILD, before any of its threads exist, so they all inherit it. */
-static void pin_apply_group(enum process_type t)
+static void pin_apply_group(enum process_type t, const char *proc_desc)
 {
 	cpu_set_t set;
 
@@ -318,16 +321,16 @@ static void pin_apply_group(enum process_type t)
 		return;
 	CPU_AND(&set, &set, &pin_type_set[t]);
 	if (CPU_COUNT(&set) == 0) {
-		LM_WARN("pin group for process %d has no CPU in common with the "
-			"allowed set - leaving it unpinned\n", process_no);
+		LM_WARN("pin group for \"%s\" has no CPU in common with the "
+			"allowed set - leaving it unpinned\n", proc_desc);
 		return;
 	}
 	if (sched_setaffinity(0, sizeof set, &set) != 0) {
-		LM_WARN("failed to pin process %d to its CPU group: %s\n",
-			process_no, strerror(errno));
+		LM_WARN("failed to pin \"%s\" to its CPU group: %s\n",
+			proc_desc, strerror(errno));
 		return;
 	}
-	LM_INFO("process %d pinned to a %d-CPU group\n", process_no,
+	LM_INFO("\"%s\" pinned to a %d-CPU group\n", proc_desc,
 		CPU_COUNT(&set));
 }
 
@@ -346,11 +349,11 @@ static int pin_pick_cpu(enum process_type ptype, struct socket_info *sock)
 	return -1;
 }
 
-static void pin_apply_cpu(int cpu)
+static void pin_apply_cpu(int cpu, const char *proc_desc)
 {
 }
 
-static void pin_apply_group(enum process_type t)
+static void pin_apply_group(enum process_type t, const char *proc_desc)
 {
 }
 
@@ -624,9 +627,10 @@ int internal_fork(const struct internal_fork_params *ifpp)
 		 * chosen by the parent (pin_pick_cpu) so the decision could see a
 		 * consistent view of who is running where. */
 		if (ifpp->pin_whole_group)
-			pin_apply_group(ifpp->pin_group ? ifpp->pin_group : ifpp->type);
+			pin_apply_group(ifpp->pin_group ? ifpp->pin_group : ifpp->type,
+				ifpp->proc_desc);
 		else
-			pin_apply_cpu(pt[new_idx].pinned_cpu);
+			pin_apply_cpu(pt[new_idx].pinned_cpu, ifpp->proc_desc);
 
 #ifdef HG_MALLOC
 		/*
@@ -720,7 +724,7 @@ int internal_fork(const struct internal_fork_params *ifpp)
 			 * and this child never touches it again.
 			 */
 			struct hg_block *child_pkg =
-				hg_malloc_init(pkg_mem_size, "pkg", 0);
+				hg_malloc_init(pkg_mem_size, "pkg", 0, ifpp->proc_desc);
 			if (!child_pkg) {
 				LM_CRIT("failed to init this child's own pkg memory "
 					"(%lu bytes)\n", pkg_mem_size);

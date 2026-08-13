@@ -20,9 +20,10 @@ allocator once they drain, so the arena can shrink again rather than only ever
 growing to its high-water mark.
 
 It is worth using when you run large shared pools on many workers and care about
-tail latency and page-table pressure. It is **not** worth using if you cannot
-reserve huge pages, cannot raise the `memlock` limit, or need the pool to grow
-while running.
+tail latency and page-table pressure. A reserved huge-page pool gives the best
+backing but is **not** required — see the tier ladder below. It is not the right
+choice if you cannot raise the `memlock` limit, or if you need the pool sized
+differently without a restart.
 
 ## Compared with the other allocators
 
@@ -77,6 +78,22 @@ while running.
   its high-water mark.
 - **You can see inside it.** 30 exported statistics plus `hg_stats`, rather than
   a used/free pair.
+- **It runs anywhere, and tells you what it got.** Page backing is a four-rung
+  ladder, and a miss degrades to the next rung — it never fails startup:
+
+  | Tier | Mechanism | |
+  |---|---|---|
+  | 1 | `mmap(MAP_HUGETLB)` | huge pages from the reserved hugetlb pool |
+  | 2 | `MADV_HUGEPAGE` | THP, huge at first fault |
+  | 3 | `MADV_COLLAPSE` | THP, retrofitted after filling |
+  | 4 | plain 4 KB pages | always works |
+
+  A reserved pool is therefore an **optimisation, not a prerequisite**. Where you
+  cannot reserve one — a container, a VM you do not control, a laptop — tiers 2
+  and 3 still get huge pages through THP, and even on tier 4 you keep the
+  lock-free fast path, the per-thread caches, the class-dedicated blocks and the
+  reclaim. Only the guaranteed TLB win is given up. The tier reached is logged at
+  startup and reported by `hg_stats`, so it is never a guess.
 
 ### Cons — read these before deploying
 
@@ -98,9 +115,10 @@ while running.
   class whose blocks each retain one live cell holds them. (This is what v2
   changed: in v1 chunks were carved per class and never returned, so a burst
   pinned its peak for the life of the process.)
-- **It needs host configuration.** Huge pages must be reserved and `memlock`
-  raised, or the arena silently drops to a lower tier and you lose the benefit
-  without an obvious error.
+- **Getting the best backing needs host configuration.** A reserved huge-page
+  pool and a raised `memlock` limit are what buy tier 1. Without them it still
+  starts, on a lower rung — correct behaviour, but it does mean reading the
+  startup line rather than assuming you got what you configured for.
 - **Linux only.** It relies on `MAP_HUGETLB` and `mlock`.
 
 ## Enabling it
@@ -136,9 +154,9 @@ grep HugePages_ /proc/meminfo          # confirm the grant, it can come up short
 systemctl edit opensips                # [Service]  LimitMEMLOCK=infinity
 ```
 
-The arena reports which tier it obtained. **`MAP_HUGETLB 2M pages`** is what you
-want; `plain 4K pages` means the pool was too small or `memlock` was still
-capped — it still runs, which is why this is easy to miss.
+The arena logs the tier it obtained at startup, and `hg_stats` reports it. Tier 1
+(`MAP_HUGETLB 2M pages`) is the best case; a lower rung is a deliberate, working
+fallback rather than an error. Read the line instead of assuming.
 
 ## CPU pinning
 
@@ -198,7 +216,7 @@ Three numbers worth watching:
 
 | Field | Meaning |
 |---|---|
-| `tier` | must be `MAP_HUGETLB 2M pages`, or the point is lost |
+| `tier` | which backing it obtained; tiers 1–3 are all huge pages |
 | `blocks_carved` − `blocks_returned` | blocks in use; if returned tracks carved, reclaim is working |
 | `corruption.total` | must stay `0`. Non-zero is a real defect, not tuning |
 

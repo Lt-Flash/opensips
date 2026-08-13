@@ -242,6 +242,76 @@ All 30 counters are also exported as `hg_shm_*` statistics for scraping:
 opensips-cli -x mi statistics:get hg_shm_carved hg_shm_corruption
 ```
 
+### Sizing with `hg_advise`
+
+Because the whole reservation is paid for at startup, an oversized `-m` is not
+free the way it is under the other allocators. `hg_advise` closes that loop: it
+reads the high-water marks the allocator actually reached and says what `-m` and
+`-M` should be. Run it after a busy period, apply, restart, re-read.
+
+A first read on a server started with `-m 512 -M 32`:
+
+```json
+{
+  "uptime_s": 141,
+  "shm": {
+    "configured_mb": 512,
+    "peak_bytes": 6742016,
+    "peak_pct_of_configured": 1,
+    "margin_applied": 2,
+    "recommended_mb": 14,
+    "verdict": "oversized - the surplus is pinned and unusable elsewhere",
+    "live_slab_bytes": 121504,
+    "live_large_bytes": 3564464,
+    "large_share_pct": 96,
+    "caveat": "most of this arena's live bytes are in the large tier, and at least some large consumers size themselves as a fraction of the arena - so this recommendation is an upper bound, not a fixed point. Apply it once, restart, and re-read rather than iterating."
+  },
+  "pkg": {
+    "configured_mb": 32,
+    "peak_bytes": 4363536,
+    "peak_pct_of_configured": 13,
+    "margin_applied": 3,
+    "recommended_mb": 14,
+    "verdict": "oversized - the surplus is pinned and unusable elsewhere",
+    "processes": 6,
+    "pinned_total_mb": 192,
+    "recommended_total_mb": 84
+  },
+  "notes": [
+    "advice is based on the high-water reached SO FAR; a longer or heavier window can only raise it",
+    "uptime is under 2 hours - too short to have seen a busy period, treat the numbers as provisional",
+    "pkg peak is the worst single process, which is the one -M has to cover; every process gets its own arena of that size"
+  ]
+}
+```
+
+498 MB of the shm arena is pinned and doing nothing. Restarting the same server
+with `-m 14` and re-reading gives:
+
+```json
+"shm": {
+  "configured_mb": 14,
+  "peak_bytes": 6742016,
+  "peak_pct_of_configured": 45,
+  "margin_applied": 2,
+  "recommended_mb": 14,
+  "verdict": "reasonable"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `peak_bytes` | high-water of real used bytes, since start — the number everything else derives from |
+| `margin_applied` | headroom multiplier: **×2** for shm, **×3** for pkg (a pkg arena is per process and cannot borrow) |
+| `recommended_mb` | `peak × margin`, floored at 8 MB shm / 2 MB pkg, rounded up to a whole huge page |
+| `verdict` | from peak as a share of configured: >70% `TIGHT`, >50% `watch`, <20% `oversized`, otherwise `reasonable` |
+| `large_share_pct` | how much of the peak is the large tier. High means the advice is an upper bound — some large consumers size themselves *as a fraction of the arena*, so shrinking `-m` shrinks them too |
+| `pinned_total_mb` / `recommended_total_mb` | pkg only: `-M × processes`, what you are actually paying versus what it would cost |
+
+The `notes` array is where it tells you not to trust it yet — short uptime, no
+busy period seen. Both examples above carry that note, which is exactly why the
+advice is "apply once and re-read", not "iterate to a fixed point".
+
 ## Building
 
 ```bash

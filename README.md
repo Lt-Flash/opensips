@@ -47,11 +47,34 @@ while running.
   an allocator lock for ordinary allocations.
 - **Predictable residency.** The arena is pre-faulted and `mlock`ed, so there is
   no page-fault cost during traffic and no swapping.
-- **It gives memory back, across classes.** A block that drains fully returns to
-  the class-agnostic buddy and can be re-carved for a different size class, so
-  the carve shrinks when load drops instead of staying at its peak. Measured on
-  a production gateway over a business day: carve 23.0 MB → 18.6 MB, with blocks
-  returned (+1016) outpacing blocks carved (+848).
+- **It gives memory back, across classes — and does it eagerly.** Reclaim is two
+  mechanisms that are useless apart. *GC un-types*: a block whose cells are all
+  free goes back to the buddy and stops belonging to a size class, so a block of
+  free 96-byte cells — worthless to a class-768 requester — becomes available to
+  anyone. *Defrag re-joins*: a freed block merges with its buddy, that with its
+  buddy, up to a whole page, O(1) per step because a buddy's address is the
+  block's own with one bit flipped. Run only GC and you get correctly-sized but
+  fragmented free space; run only defrag and nothing ever becomes free enough to
+  merge.
+
+  Both are **event-driven rather than periodic**, and that is the part that
+  matters operationally. A free just pushes onto a thread's LIFO; a block's live
+  counter only moves at cache/block transitions — 1–3% of operations, already
+  under the lock — so testing *"did this block hit zero, and can it merge"*
+  there costs almost nothing and returns memory the moment it is genuinely free.
+  A deferred or timer-driven sweep is slowest exactly when the reserve is most
+  needed. Merging is delayed slightly on purpose: eager coalescing thrashes at a
+  size boundary (free, merge to 16 KB, immediately need 8 KB, split back).
+
+  Measured on a production gateway across a business day: carve **23.0 MB →
+  18.6 MB**, with blocks returned (+1016) outpacing blocks carved (+848) — the
+  arena shrinking under sustained load rather than holding its peak. Watch it
+  with `gc_passes`, `blocks_carved` and `blocks_returned` in `hg_stats`.
+
+  Two honest limits: merging is **buddy-only**, so two free neighbours that are
+  not partners never merge; and the large tier (allocations above a page) is
+  returned only when a chunk empties completely, so in practice it settles at
+  its high-water mark.
 - **You can see inside it.** 30 exported statistics plus `hg_stats`, rather than
   a used/free pair.
 

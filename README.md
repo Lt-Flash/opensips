@@ -35,7 +35,7 @@ while running.
 | Resident memory | grows as touched | grows as touched | grows as touched | grows as touched | **pinned in full at start** |
 | Cost of oversizing | low — untouched pages stay unbacked | low | low | low | **high — you pay for it immediately** |
 | Returns memory | within pool | within pool | within pool | within pool | to internal buddy; **carve can shrink** |
-| Cross-class reuse | yes | yes | yes | yes | **no — classes are isolated** |
+| Cross-class reuse | yes | yes | yes | yes | via the buddy, once a block drains |
 | Introspection | basic stats | basic stats | basic stats | basic stats | **30 statistics + 2 MI commands** |
 | Corruption detection | runtime checks | — | — | — | counters + `LM_CRIT` |
 
@@ -47,8 +47,11 @@ while running.
   an allocator lock for ordinary allocations.
 - **Predictable residency.** The arena is pre-faulted and `mlock`ed, so there is
   no page-fault cost during traffic and no swapping.
-- **It gives memory back.** Drained blocks return to the buddy allocator, so the
-  carve shrinks when load drops instead of staying at peak.
+- **It gives memory back, across classes.** A block that drains fully returns to
+  the class-agnostic buddy and can be re-carved for a different size class, so
+  the carve shrinks when load drops instead of staying at its peak. Measured on
+  a production gateway over a business day: carve 23.0 MB → 18.6 MB, with blocks
+  returned (+1016) outpacing blocks carved (+848).
 - **You can see inside it.** 30 exported statistics plus `hg_stats`, rather than
   a used/free pair.
 
@@ -64,9 +67,14 @@ while running.
 - **Sizing mistakes are not recoverable in place.** Since nothing grows at
   runtime, correcting `-m`/`-M` means stop → adjust → start under any allocator;
   with HG_MALLOC the huge-page pool has to be adjusted too.
-- **Classes do not share.** Memory freed in one size class is never handed to
-  another. A workload that shifts its allocation profile can exhaust one class
-  while the arena still has room elsewhere.
+- **Cross-class reuse needs a block to drain fully.** A block is dedicated to one
+  size class while in use, so memory freed inside it is reused by that class
+  first. Only when the block empties completely does it return to the buddy and
+  stop belonging to any class, after which it can be re-carved for another. A
+  workload that shifts its profile therefore recovers, but not instantly — and a
+  class whose blocks each retain one live cell holds them. (This is what v2
+  changed: in v1 chunks were carved per class and never returned, so a burst
+  pinned its peak for the life of the process.)
 - **It needs host configuration.** Huge pages must be reserved and `memlock`
   raised, or the arena silently drops to a lower tier and you lose the benefit
   without an obvious error.

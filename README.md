@@ -312,6 +312,103 @@ The `notes` array is where it tells you not to trust it yet — short uptime, no
 busy period seen. Both examples above carry that note, which is exactly why the
 advice is "apply once and re-read", not "iterate to a fixed point".
 
+## Measured performance
+
+Every figure below comes from **one binary with only the allocator changed**
+(`-a`, chosen at runtime), on the same hosts, same config, same offered load.
+The unit is **CPU cores consumed at matched load — lower is better**. Nothing
+here is a microbenchmark; each is a full SIP call flow.
+
+### Five allocators, one binary — topology hiding + cachedb_perf at 12k CPS
+
+| Allocator | Cores | vs F_MALLOC |
+|---|---|---|
+| **HG_MALLOC** | **5.29** | **−18%** |
+| F_PARALLEL_MALLOC | 5.88 | −8% |
+| HP_MALLOC | 6.03 | −6% |
+| F_MALLOC | 6.42 | baseline |
+| Q_MALLOC | 7.28 | +13% |
+
+```
+CPU cores at 12k CPS (lower is better)
+
+HG_MALLOC      5.29  ███████████████████████                 −18%
+F_PARALLEL     5.88  ██████████████████████████
+HP_MALLOC      6.03  ███████████████████████████
+F_MALLOC       6.42  █████████████████████████████           baseline
+Q_MALLOC       7.28  █████████████████████████████████       +13%
+```
+
+**Each allocator was sized for itself, and that matters.** A first pass gave
+everyone a common `-m 1024` and F_PARALLEL_MALLOC came out *worst* — 18k failed
+calls at 9k CPS — because it splits shm into 32 fixed pools, so 1024/32 = 32 MB
+per pool ran out long before the arena looked full. At its real requirement
+(`-m 4096`) it moved to second place. "Same `-m` for everyone" is not a fair
+comparison.
+
+### The gap widens with load — real dispatcher LB, 20,000 concurrent calls
+
+Across the routing arms and rates in that run, HG_MALLOC took **20–45% less
+CPU**, and the saving grew with load. At the top of the range measured:
+
+```
+TH + dialog at 4000 CPS, cores consumed
+
+  F_MALLOC   ████████████████████████████████  3.20
+  HG_MALLOC  █████████████████                 1.76      −45%
+```
+
+Memory over the same run: HG **flat at ~1.7 GB** regardless of load — the arena
+is pre-faulted at startup, so there is nothing left to grow — against F_MALLOC
+climbing **751 MB → 1126 MB** as the work arrived.
+
+### By routing arm — three nodes, 12k CPS
+
+```
+CPU saving vs F_MALLOC (higher is better)
+
+  simple relay (rr)        ██████████ −10%
+  TH + cachedb_perf        ██████████████ −14%
+  TH + cachedb_local       ████████████████████ −20%
+  TH + dialog              ████████████████████████ −24%
+```
+
+The heavier the per-call state, the more the allocator matters — which is the
+expected shape, and a useful sanity check on the numbers.
+
+### Huge pages are the smaller half of the win
+
+Allocator self-time at 800 CPS, measured per backing tier:
+
+```
+  tier 1  MAP_HUGETLB     2.75%  ███████████
+  tier 4  plain 4 KB      3.38%  ██████████████
+  ── other allocators on the same host and workload ──
+  best of Q/F/HP/F_PAR    9.5%   ██████████████████████████████████████
+  worst                  22.8%   ████████████████████████████████████████████████████████████████████████████████████████
+```
+
+Huge pages buy about **19% of HG_MALLOC's own cost**. The rest is the slab plus
+the per-process free stack — which is why **tier 4, with huge pages fully
+disabled, still beat F_MALLOC by 2.8×**. On a host that cannot give you a
+hugetlb pool, this allocator is still the right choice.
+
+### v1 → v2
+
+A 3-repetition v1/v2/F_MALLOC window put HG at **−15.7% vs F_MALLOC**, with v2
+**−1.8% against v1** — i.e. v2's reclaim costs nothing on the CPU side. v2's
+gain is memory: on a production billing gateway across a business day the carve
+went **23.0 MB → 18.6 MB**, with blocks returned (+1016) outpacing blocks carved
+(+848). v1 structurally could not do that.
+
+**Read these as directional, not as a spec.** All of it is x86-64, 16 cores,
+Linux, with SIP call flows rather than allocation microbenchmarks; the LB run
+was scaled to 20k concurrent calls to fit the rig's RAM. One measurement
+artifact is known and unresolved: the first measured point after a
+cachedb-backed TH backend starts shows a few percent failed calls at *any* rate
+— it follows position in the run, not load. Discard one warm-up point. It
+affects both allocators equally, so the comparison stands.
+
 ## Building
 
 ```bash
@@ -321,6 +418,30 @@ cp Makefile.conf.template Makefile.conf     # -DHG_MALLOC already set
 make -j"$(nproc)" && make install
 opensips -V | grep HG_MALLOC_V2             # confirm it is compiled in
 ```
+
+**Add the modules your config loads to `include_modules` in `Makefile.conf`.**
+The default set is the core plus a small default module list — anything outside
+it (`db_mysql`, `tls_mgm`, `tls_openssl`, `proto_tls`, `proto_wss`, `httpd`,
+`rest_client`, `topology_hiding`, …) is simply **not built**, and the omission
+does not surface until OpenSIPS starts and fails on `loadmodule`. One line, all
+on one row, space separated:
+
+```make
+include_modules?= db_mysql db_sqlite httpd json proto_tls proto_wss rest_client \
+                  sqlops stir_shaken tls_mgm tls_openssl topology_hiding
+```
+
+Two things that bite here:
+
+- **`exclude_modules` is not optional either.** Omitting it does *not* mean "the
+  default set" — it means *build everything*, so a module with an unmet
+  dependency (`db_berkeley` without `db.h`) fails, `make all` exits non-zero,
+  `make install` never runs, and the prefix silently keeps the **previous**
+  build. That then looks like every module failing the revision-stamp check,
+  which reads like a toolchain fault and is not one.
+- **`stir_shaken` needs `export STIR_SHAKEN_OPENSSL=1`** if you want OpenSSL
+  rather than wolfSSL. A bare assignment does not reach the module's recursive
+  sub-make.
 
 Verified: gcc and clang on x86-64, and cross-compiled for arm64 and arm32 —
 zero errors on all four. On arm32 the allocator emits `-Wcast-align` warnings,

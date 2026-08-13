@@ -31,9 +31,10 @@ while running.
 | Design | safety-checked | minimal overhead | fine-grained locking | parallel buckets | hugepage slab + per-thread cache |
 | Page backing | 4 KB | 4 KB | 4 KB | 4 KB | **2 MB huge pages** |
 | Fast path | locked | locked | locked, sharded | locked, sharded | **lock-free** |
-| Memory residency | grows on demand | grows on demand | grows on demand | grows on demand | **reserved and pinned at start** |
-| Returns memory | within pool | within pool | within pool | within pool | to internal buddy; **arena can shrink** |
-| Grows at runtime | yes | yes | yes | yes | **no — fixed at start** |
+| Pool size | fixed at `-m`/`-M` | fixed at `-m`/`-M` | fixed at `-m`/`-M` | fixed at `-m`/`-M` | fixed at `-m`/`-M` |
+| Resident memory | grows as touched | grows as touched | grows as touched | grows as touched | **pinned in full at start** |
+| Cost of oversizing | low — untouched pages stay unbacked | low | low | low | **high — you pay for it immediately** |
+| Returns memory | within pool | within pool | within pool | within pool | to internal buddy; **carve can shrink** |
 | Cross-class reuse | yes | yes | yes | yes | **no — classes are isolated** |
 | Introspection | basic stats | basic stats | basic stats | basic stats | **30 statistics + 2 MI commands** |
 | Corruption detection | runtime checks | — | — | — | counters + `LM_CRIT` |
@@ -53,11 +54,16 @@ while running.
 
 ### Cons — read these before deploying
 
-- **The arena cannot grow at runtime.** It is sized and pinned once. Resizing
-  means stop → adjust → start; a running node cannot be rescued by adding pages.
-- **It reserves what you ask for, immediately.** A generous `-m`/`-M` is not free
-  the way it is under Q_MALLOC — resident memory equals the configured size from
-  the first second.
+- **It reserves what you ask for, immediately.** This is the one that bites. *No*
+  OpenSIPS allocator grows its pool at runtime — `-m`/`-M` are fixed at startup
+  for all of them — but the others obtain the pool with a plain `mmap`, so pages
+  only become resident as they are touched and an over-generous setting costs
+  almost nothing. HG_MALLOC pre-faults and `mlock`s the whole arena, so resident
+  memory equals the configured size from the first second. Oversizing is cheap
+  under Q_MALLOC and expensive here.
+- **Sizing mistakes are not recoverable in place.** Since nothing grows at
+  runtime, correcting `-m`/`-M` means stop → adjust → start under any allocator;
+  with HG_MALLOC the huge-page pool has to be adjusted too.
 - **Classes do not share.** Memory freed in one size class is never handed to
   another. A workload that shifts its allocation profile can exhaust one class
   while the arena still has room elsewhere.

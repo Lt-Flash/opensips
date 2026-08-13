@@ -42,10 +42,12 @@ whole reservation is paid for at startup rather than as it is touched.
 | | Q_MALLOC | F_MALLOC | HP_MALLOC | F_PARALLEL_MALLOC | **HG_MALLOC v2** |
 |---|---|---|---|---|---|
 | Design | safety-checked | minimal overhead | fine-grained locking | parallel buckets | hugepage slab + per-thread cache |
-| Page backing | 4 KB | 4 KB | 4 KB | 4 KB | **2 MB huge pages** — 4-rung ladder, degrades to 4 KB rather than failing |
+| Page backing | 4 KB | 4 KB | 4 KB | 4 KB | **2 MB huge pages** — hugetlb, else THP, else THP-collapse, else 4 KB |
+| Host requirements | none | none | none | none | **none to run** — a hugetlb pool and raised `memlock` buy tier 1 and pinning, and their absence costs only those |
+| If huge pages are unavailable | n/a | n/a | n/a | n/a | starts on the next rung down and says which; **slab, per-thread caches, lock-free path and reclaim all still apply** — only the guaranteed TLB win is given up |
 | Fast path | locked | locked | locked, sharded | locked, sharded | **lock-free** |
 | Pool size | fixed at `-m`/`-M` | fixed at `-m`/`-M` | fixed at `-m`/`-M` | fixed at `-m`/`-M` | fixed at `-m`/`-M` |
-| Resident memory | grows as touched | grows as touched | grows as touched | grows as touched | **pinned in full at start** |
+| Resident memory | grows as touched | grows as touched | grows as touched | grows as touched | **pre-faulted in full at start**, pinned if `memlock` allows |
 | Cost of oversizing | low — untouched pages stay unbacked | low | low | low | **high — you pay for it immediately** |
 | Returns memory | within pool | within pool | within pool | within pool | to internal buddy; **carve can shrink** |
 | Cross-class reuse | yes | yes | yes | yes | via the buddy, once a block drains |

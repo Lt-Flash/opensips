@@ -12,25 +12,37 @@ that every process reaches, and a private pool per process (`-M`). At scale two
 things hurt — TLB pressure from 4 KB pages across a multi-gigabyte shared pool,
 and contention on the allocator lock when dozens of workers allocate at once.
 
-HG_MALLOC addresses both. It reserves one arena up front, backed by **2 MB huge
-pages**, pins it into RAM, and serves fixed size classes from per-thread caches
-so the common allocation path takes no lock at all. Memory freed back to a size
-class stays in that class; whole blocks are returned to an internal buddy
-allocator once they drain, so the arena can shrink again rather than only ever
-growing to its high-water mark.
+HG_MALLOC addresses both. It reserves one arena up front, pins it into RAM, and
+serves fixed size classes from per-thread caches, so the common allocation path
+takes no lock at all. The arena's page backing is chosen by a **four-rung ladder**
+— reserved huge pages first, then THP, then THP retrofitted, then plain 4 KB —
+each rung attempted and then *verified* through `/proc`; a rung that is
+unavailable degrades to the next one and never fails startup. Huge pages are the
+best case, not a prerequisite.
+
+Inside the arena, memory is cut into **class-dedicated blocks**. A freed cell
+returns to its own block, but a block whose cells have *all* been freed loses its
+class entirely: it goes back to an internal buddy allocator, merges with its
+buddy, and can be re-cut for any other size class. So a burst in one class does
+not permanently reserve memory against the others — the in-use footprint falls
+back instead of only ever growing to its high-water mark. What does *not* shrink
+is the reservation itself: it stays mapped and pinned for the life of the
+process, by design.
 
 It is worth using when you run large shared pools on many workers and care about
 tail latency and page-table pressure. A reserved huge-page pool gives the best
-backing but is **not** required — see the tier ladder below. It is not the right
-choice if you cannot raise the `memlock` limit, or if you need the pool sized
-differently without a restart.
+backing but is **not** required — see the tier ladder below; nor is `memlock`,
+which if it cannot be raised costs you the pinning (the arena runs unpinned and
+swappable, with a warning) rather than the allocator. What it genuinely cannot do
+is resize while running: `-m`/`-M` are fixed for the life of the process, and the
+whole reservation is paid for at startup rather than as it is touched.
 
 ## Compared with the other allocators
 
 | | Q_MALLOC | F_MALLOC | HP_MALLOC | F_PARALLEL_MALLOC | **HG_MALLOC v2** |
 |---|---|---|---|---|---|
 | Design | safety-checked | minimal overhead | fine-grained locking | parallel buckets | hugepage slab + per-thread cache |
-| Page backing | 4 KB | 4 KB | 4 KB | 4 KB | **2 MB huge pages** |
+| Page backing | 4 KB | 4 KB | 4 KB | 4 KB | **2 MB huge pages** — 4-rung ladder, degrades to 4 KB rather than failing |
 | Fast path | locked | locked | locked, sharded | locked, sharded | **lock-free** |
 | Pool size | fixed at `-m`/`-M` | fixed at `-m`/`-M` | fixed at `-m`/`-M` | fixed at `-m`/`-M` | fixed at `-m`/`-M` |
 | Resident memory | grows as touched | grows as touched | grows as touched | grows as touched | **pinned in full at start** |
@@ -47,7 +59,9 @@ differently without a restart.
 - **Lock-free common path.** Per-thread caches mean workers do not serialise on
   an allocator lock for ordinary allocations.
 - **Predictable residency.** The arena is pre-faulted and `mlock`ed, so there is
-  no page-fault cost during traffic and no swapping.
+  no page-fault cost during traffic and no swapping. (Tier 1 needs no `mlock` —
+  hugetlb pages are unswappable by construction. On tiers 2–4 a capped `memlock`
+  limit costs the pinning, not the arena: it is still pre-faulted, and says so.)
 - **It gives memory back, across classes — and does it eagerly.** Reclaim is two
   mechanisms that are useless apart. *GC un-types*: a block whose cells are all
   free goes back to the buddy and stops belonging to a size class, so a block of

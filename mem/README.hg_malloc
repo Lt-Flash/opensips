@@ -43,25 +43,34 @@ Note that -m is rounded up to a whole number of huge pages, so on a
 machine with 2 MB huge pages the real granularity is 2 MB.
 
 
-Budget about twice the shm you give F_MALLOC
---------------------------------------------
+Sizing it against the other allocators
+--------------------------------------
 
-An arena that is enough under one of the other allocators is not
-necessarily enough here, and the gap widens with call concurrency rather
-than with call rate. Two properties of the design cause it:
+*The old "budget twice F_MALLOC" rule is RETIRED - see below. It is kept
+here because the reasoning still explains what to watch for, and because
+the number is quoted in older notes.*
+
+An arena that is enough under one of the other allocators may not be
+enough here, and the gap widens with call concurrency rather than with
+call rate. Two properties of the design caused it:
 
   * every allocation is rounded up to its size class, so a request lands
-    in a cell up to one class larger than it asked for;
-  * a freed cell goes back to the class it came from and is never
-    reclassified, so memory the peak of one class took is not available
-    to another afterwards.
+    in a cell up to one class larger than it asked for - this STILL
+    applies, and it is the part you still budget for;
+  * a freed cell went back to the class it came from and was never
+    reclassified, so memory the peak of one class took was not available
+    to another afterwards - this is FIXED in v2. A block whose cells have
+    all been freed is un-typed, returned to the buddy allocator, and can
+    be re-cut for any other class. See README.hg_arena_v2, which names
+    exactly this as the origin of the 2x rule and fixing it as what
+    retires the rule.
 
 Neither is a leak, and neither shows up at low concurrency - both are
 proportional to how many objects are alive at once.
 
-Measured on a topology-hiding proxy (three nodes, four UDP workers each,
-INVITE/200/ACK/BYE held for 500 ms, so roughly 1500 calls in flight per
-node at 3000 CPS):
+Measured on v1, on a topology-hiding proxy (three nodes, four UDP workers
+each, INVITE/200/ACK/BYE held for 500 ms, so roughly 1500 calls in flight
+per node at 3000 CPS):
 
     F_MALLOC    -m 512    clean
     HG_MALLOC   -m 512    carve_chunk failures on the hot class within
@@ -70,11 +79,14 @@ node at 3000 CPS):
     HG_MALLOC   -m 1024   clean - 0 carve_chunk, 0 failed calls, and
                           25% less CPU than F_MALLOC at the same load
 
-So the rule of thumb is to give HG_MALLOC twice the arena that the same
-traffic needs under F_MALLOC, and to confirm it against the log rather
-than by arithmetic. The exact requirement here was somewhere between
-512 and 1024 MB; it was not bracketed more finely, and it will differ
-with the mix of allocation sizes a particular config makes.
+Under v2 the reclaim closes most of that gap. On the production billing
+gateways HG_MALLOC peaks at 14.8 MB of shm while Q_MALLOC in the same
+role peaks at 16.1 MB - lower, while carrying four times the traffic. So
+do not apply a multiplier: size from measurement. Run the workload and
+ask hg_advise, which derives -m and -M from the high-water marks the
+allocator actually saw, and confirm against the log rather than by
+arithmetic. The requirement differs with the mix of allocation sizes a
+particular config makes.
 
 The failure is loud but it is not fatal, which is the trap: the server
 keeps running and keeps answering, while the module that could not get
@@ -318,8 +330,14 @@ Limitations
 -----------
 
   * Allocations are served from fixed size classes up to 64K, and from a
-    coalescing tier above that. There is no defragmentation or garbage
-    collection: memory is never returned to the OS while the server runs.
+    coalescing tier above that. v2 does garbage-collect and defragment -
+    a fully drained block loses its class and merges with its buddy - but
+    reclaim is WITHIN the arena: the reservation is never handed back to
+    the OS while the server runs, by design, because it is pre-faulted
+    and mlock()ed.
+  * Reclaim needs a block to drain COMPLETELY, so a class whose blocks
+    each keep one live cell holds all of them, and merging is buddy-only,
+    so two free neighbours that are not buddies never merge.
   * On exhaustion it fails loudly rather than falling back to another
     allocator. Raise -m / -M.
   * NUMA-aware arena placement is not implemented - see CPU pinning

@@ -54,6 +54,7 @@
 #include <inttypes.h>
 
 #include "../../sr_module.h"
+#include "../../timer.h"
 #include "../../dprint.h"
 #include "../../mem/shm_mem.h"
 #include "../../locking.h"
@@ -84,6 +85,16 @@ static int hgs_hold_mb = 0;       /* 0 = the classic churn-only soak */
  * RAM - a rig concern too: 5 workers x the cap.)
  */
 static int hgs_hold_pkg_mb = 0;
+/*
+ * Second cycle, for the shrink rig: at again_s seconds after startup a
+ * TIMER job re-runs one hold/verify/free cycle of hold_mb - in the timer
+ * process, which is fine for shm (the arena is shared; any process can
+ * drive it). The window between the workers' child_init soak ending
+ * (holds freed) and this cycle is where the shrink gate finds its quiet
+ * ticks; the cycle then proves the punched range recommits and serves
+ * stamped data again. 0 = off.
+ */
+static int hgs_again_s = 0;
 
 struct hgs_shared {
 	gen_lock_t lock;
@@ -334,10 +345,51 @@ static int hgs_run(int rank)
 	return 0;
 }
 
+static void hgs_again(unsigned int ticks, void *param)
+{
+	struct hgs_blk *hold;
+	unsigned long held = 0, torn = 0;
+	int n = 0, i, maxhold = hgs_hold_mb * 8 + 8, pid = getpid();
+	unsigned int seed = (unsigned int)pid ^ 0xa9a1u;
+
+	hold = pkg_malloc(maxhold * sizeof *hold);
+	if (!hold) {
+		LM_ERR("again-cycle: no pkg for the hold table\n");
+		return;
+	}
+	memset(hold, 0, maxhold * sizeof *hold);
+	while (held < (unsigned long)hgs_hold_mb << 20 && n < maxhold) {
+		hold[n].len = (128 << 10) + (rand_r(&seed) % (384 << 10));
+		hold[n].p = shm_malloc(hold[n].len);
+		if (!hold[n].p)
+			break;
+		hgs_fill(&hold[n], pid, 3 * HGS_MAX_SLOTS + n);
+		held += hold[n].len;
+		n++;
+	}
+	for (i = 0; i < n; i++) {
+		torn += hgs_check(&hold[i], pid, 3 * HGS_MAX_SLOTS + i);
+		shm_free(hold[i].p);
+	}
+	pkg_free(hold);
+	LM_NOTICE("hgstress AGAIN-CYCLE (pid %d): held %lu KB in %d blocks, "
+		"%lu torn -> %s\n", pid, held >> 10, n, torn,
+		torn == 0 && held >= (unsigned long)hgs_hold_mb << 20
+		? "PASS" : (torn ? "FAIL" : "SHORT"));
+}
+
 static int mod_init(void)
 {
 	if (hgs_slots > HGS_MAX_SLOTS)
 		hgs_slots = HGS_MAX_SLOTS;
+
+	if (hgs_again_s > 0 &&
+	    register_timer("hgstress-again", hgs_again, NULL,
+	                   (unsigned int)hgs_again_s,
+	                   TIMER_FLAG_DELAY_ON_DELAY) < 0) {
+		LM_ERR("failed to register the again-cycle timer\n");
+		return -1;
+	}
 
 	shared = shm_malloc(sizeof *shared);
 	if (!shared) {
@@ -380,6 +432,7 @@ static const param_export_t params[] = {
 	{ "large",   INT_PARAM, &hgs_large   },
 	{ "hold_mb",     INT_PARAM, &hgs_hold_mb     },
 	{ "hold_pkg_mb", INT_PARAM, &hgs_hold_pkg_mb },
+	{ "again_s",     INT_PARAM, &hgs_again_s     },
 	{ 0, 0, 0 }
 };
 

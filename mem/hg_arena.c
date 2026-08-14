@@ -683,6 +683,13 @@ void hg_cache_flush_self(void)
 		n = cache_flush_locked(hb, &palloc_slots[i]);
 		hb->cache_flushes++;
 		hb->cells_flushed += n;
+		/* v3: a PRIVATE arena's shrink gate ticks here - only its
+		 * owning process can release its memory, and this runs in
+		 * every process once per sweep. The shared arena is ticked
+		 * by the sweep timer alone, or 30 workers would each tick
+		 * the one shared window counter. */
+		if (!hb->shared)
+			hg_shrink_tick(hb);
 		lock_release(&hb->lock);
 		if (n)
 			LM_DBG("%s: idle sweep returned %u cached cells\n", hb->name, n);
@@ -1890,6 +1897,7 @@ enum hg_stat_field {
 	 * demand hit a wall (cap or host), which is exactly the old
 	 * exhaustion condition wearing its new name. */
 	HGS_COMMITTED, HGS_CAP, HGS_GROWS, HGS_GROW_BYTES, HGS_GROW_REFUSED,
+	HGS_SHRINKS, HGS_SHRINK_BYTES,
 	/* the alertable gauge: 1 while a RESOURCE refusal is latched (cap
 	 * refusals never latch - an admin ceiling is policy, not incident) */
 	HGS_GROW_BLOCKED,
@@ -1956,6 +1964,8 @@ static unsigned long hg_shm_stat(void *ctx)
 	case HGS_GROW_BYTES:      return hb->grow_bytes;
 	case HGS_GROW_REFUSED:    return hb->grow_refused;
 	case HGS_GROW_BLOCKED:    return hb->grow_blocked;
+	case HGS_SHRINKS:         return hb->shrinks;
+	case HGS_SHRINK_BYTES:    return hb->shrink_bytes;
 	}
 	return 0;
 }
@@ -2000,6 +2010,8 @@ static const struct {
 	{"hg_shm_grow_bytes",      HGS_GROW_BYTES},
 	{"hg_shm_grow_refused",    HGS_GROW_REFUSED},
 	{"hg_shm_grow_blocked",    HGS_GROW_BLOCKED},
+	{"hg_shm_shrinks",         HGS_SHRINKS},
+	{"hg_shm_shrink_bytes",    HGS_SHRINK_BYTES},
 	{NULL, 0}
 };
 

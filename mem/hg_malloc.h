@@ -454,10 +454,24 @@ struct hg_block {
 	 * default until an admin asks for more.
 	 */
 	unsigned long         hcap;         /* VA reserved, >= hsize */
+	unsigned long         hsize_min;    /* hsize at init - shrink's floor.
+	                                     * The admin asked for -m/-M of
+	                                     * memory; growth above it is
+	                                     * elastic, the base is not. */
 	unsigned long         grow_granule; /* bytes per grow step, hps multiple */
 	unsigned long         grows;        /* successful commits */
 	unsigned long         grow_bytes;   /* their total */
 	unsigned long         grow_refused; /* refusals (cap or resource) */
+	unsigned long         shrinks;      /* successful releases */
+	unsigned long         shrink_bytes; /* their total */
+	/* consecutive quiet sweep ticks - the down-slow gate. Reset by any
+	 * grow and by any tick that fails the abundance test, so a shrink
+	 * needs a full uninterrupted quiet window. */
+	unsigned int          shrink_quiet;
+	/* set once when hg_mem_release() fails structurally (e.g. a kernel
+	 * without hugetlb hole punch): shrink is disabled for this arena's
+	 * lifetime rather than re-attempted and re-logged every window */
+	unsigned int          shrink_unsupported;
 	/*
 	 * One line per refusal EPISODE, not per refusal: a full arena refuses
 	 * on every subsequent allocation (measured: 239k NOTICEs in 4s on the
@@ -712,6 +726,30 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta);
  * hb->lock.
  */
 int hg_grow_ram_refused(struct hg_block *hb, unsigned long delta);
+
+/*
+ * Release the backing of [hbase+off, +len) - the shrink primitive, chosen
+ * and verified by measurement on the fleet's oldest kernel (5.4):
+ *
+ *   shared (shm):  madvise(MADV_REMOVE) - punches the shmem OBJECT, so
+ *                  every mapper is affected; measured to free pages even
+ *                  while another process holds them VM_LOCKED, and the
+ *                  range recommits cleanly afterwards. The one mechanism
+ *                  that is NOT correct here is mmap(PROT_NONE|MAP_FIXED):
+ *                  it rebinds only the caller's mapping and was measured
+ *                  leaving other workers reading the old bytes.
+ *   shared tier 1: same call; hugetlb hole punch works on 5.4 and the
+ *                  pages return to HugePages_Free (measured), which is
+ *                  where a static pool's shrink SHOULD put them.
+ *   private (pkg): madvise(MADV_DONTNEED) - per-process arena, no
+ *                  cross-process question; next touch refaults zero.
+ *
+ * munlock first: it releases only THIS process's VM_LOCKED accounting -
+ * a range mlocked by the worker that grew it keeps its stale VmLck there
+ * until exit, which is cosmetic; the punch frees the memory regardless.
+ * Returns 0, or -1 with shrink_unsupported latched (nothing to retry).
+ */
+int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len);
 
 /* re-sync per-process state after fork(): see hg_arena.c for why the
  * inherited private free-stack/bump state must be discarded, not kept or

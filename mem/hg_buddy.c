@@ -23,6 +23,7 @@
 #ifdef HG_MALLOC
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "hg_version.h"
 #include "hg_malloc.h"
@@ -93,6 +94,39 @@ static inline void bit_clear(unsigned long *bm, unsigned long n)
 static inline void fl_push(struct hg_block *hb, void *p, unsigned int order)
 {
 	struct hg_free_blk *b = (struct hg_free_blk *)p;
+
+	/*
+	 * v3: the TOP-order list is kept in ascending address order, so the
+	 * list head - what hg_buddy_alloc() serves whole pages from - is
+	 * always the LOWEST free page. That is the whole prefer-low policy:
+	 * new carves concentrate at the bottom, the top pages drain, and
+	 * shrink (top-only by design) finds them whole-free. Lower orders
+	 * stay LIFO - their blocks live inside pages already carved, where
+	 * the cell-level concentration policy owns placement, and their
+	 * lists are the long ones where an ordered walk would cost.
+	 *
+	 * The walk is bounded by the whole-free page count and runs on the
+	 * buddy slow path only (a page reaches top order when it drains
+	 * fully - GC and shrink territory, not the cell fast path).
+	 */
+	if (order == hb->buddy_top && hb->bfree[order]) {
+		struct hg_free_blk *cur = hb->bfree[order], *prev = NULL;
+
+		while (cur && (void *)cur < p) {
+			prev = cur;
+			cur = cur->next;
+		}
+		b->prev = prev;
+		b->next = cur;
+		if (cur)
+			cur->prev = b;
+		if (prev)
+			prev->next = b;
+		else
+			hb->bfree[order] = b;
+		hb->nfree[order]++;
+		return;
+	}
 
 	b->prev = NULL;
 	b->next = hb->bfree[order];
@@ -224,6 +258,9 @@ int hg_buddy_init(struct hg_block *hb)
 		pg->bitmap = (unsigned long *)(void *)cur;
 		cur += bmwords * sizeof(long);
 		memset(pg->leaforder, HG_LEAF_NONE, lpp);
+		/* the committed pages carry init's achieved tier; pages beyond
+		 * get theirs stamped by the grow that commits them */
+		pg->tier = (unsigned char)hb->tier;
 		/* starts wholly reserved; pages < npages are published below,
 		 * pages beyond wait for hg_buddy_grow() */
 	}
@@ -441,14 +478,17 @@ int hg_buddy_grow(struct hg_block *hb, unsigned long need)
 	hb->npages = (unsigned long)(hb->hbase + hb->hsize - hb->pbase)
 	             >> hb->hps_shift;
 
-	for (i = old_pages; i < hb->npages; i++)
+	for (i = old_pages; i < hb->npages; i++) {
+		hb->pages[i].tier = (unsigned char)tier;
 		page_publish_whole(hb, &hb->pages[i]);
+	}
 
 	/* keep the floor at 1/16 of the grid it now guards */
 	hb->reserve_floor = (hb->npages * hg_leaves_per_page(hb)) / 16;
 
 	hb->grows++;
 	hb->grow_bytes += delta;
+	hb->shrink_quiet = 0;    /* fresh demand voids any quiet window */
 	hg_grow_unblock(hb, "the arena grew, the resource came back");
 
 	LM_NOTICE("%s arena grew by %lu MB to %lu MB (%lu new pages on %s; "
@@ -457,6 +497,138 @@ int hg_buddy_grow(struct hg_block *hb, unsigned long need)
 		hg_mem_tier_str((enum hg_mem_tier)tier),
 		(hb->hcap - hb->hsize) >> 20);
 	return 0;
+}
+
+/* --- shrink (v3) ------------------------------------------------------ */
+
+/* defined with the run machinery below; shrink shares its eligibility test */
+static inline int page_is_whole_free(const struct hg_block *hb,
+                                     const struct hg_page *pg);
+
+/*
+ * Release up to one granule of whole-free pages from the TOP of the
+ * committed range. Top-only is what keeps every address invariant intact:
+ * hg_owns() stays one contiguous test, the registry entry stays valid, and
+ * a page below the new top is untouched. Whole-free is what makes it SAFE
+ * with no cross-process coordination: eager merging guarantees a
+ * whole-free page is one top-order block on the free list, and a cell
+ * parked in some thread's private cache has NOT decremented its block's
+ * live count - so its page is not whole-free and can never be picked here.
+ *
+ * Never below hsize_min: the admin asked for -m/-M; only growth is
+ * elastic. The release syscall runs BEFORE any bookkeeping, while
+ * hb->lock (held by the caller) keeps every allocator out of the pages
+ * being punched - if the kernel refuses, nothing has changed.
+ */
+static void hg_buddy_shrink(struct hg_block *hb)
+{
+	unsigned long lpp = hg_leaves_per_page(hb);
+	unsigned long limit = hb->grow_granule >> hb->hps_shift;
+	unsigned long n = 0, i, off, len;
+	unsigned int top = hb->buddy_top;
+
+	while (n < limit &&
+	       hb->hsize - ((n + 1UL) << hb->hps_shift) >= hb->hsize_min &&
+	       page_is_whole_free(hb, &hb->pages[hb->npages - 1 - n]))
+		n++;
+	if (!n)
+		return;
+
+	len = n << hb->hps_shift;
+	off = (unsigned long)(hb->pages[hb->npages - n].base - hb->hbase);
+	if (off + len != hb->hsize) {
+		/* a platform where the grid does not end exactly at the
+		 * committed end (unaligned non-Linux base). Shrinking a
+		 * mid-range is correct for the punch but wrong for the
+		 * hsize arithmetic - decline rather than approximate. */
+		return;
+	}
+
+	if (hg_mem_release(hb, off, len) != 0)
+		return;
+
+	for (i = hb->npages - n; i < hb->npages; i++) {
+		struct hg_page *pg = &hb->pages[i];
+
+		fl_unlink(hb, pg->base, top);
+		bit_clear(pg->bitmap, node_id(top, top, 0));
+		memset(pg->leaforder, HG_LEAF_NONE, (size_t)lpp);
+		pg->free_leaves = 0;
+		pg->run_len = 0;
+		hb->buddy_free_leaves -= lpp;
+		if (hb->tier_bytes[pg->tier] >= hb->hps)
+			hb->tier_bytes[pg->tier] -= hb->hps;
+	}
+	hb->npages -= n;
+	hb->hsize -= len;
+	hb->size -= len;
+	hb->shrinks++;
+	hb->shrink_bytes += len;
+	hb->reserve_floor = (hb->npages * lpp) / 16;
+
+	LM_NOTICE("%s arena shrank by %lu MB to %lu MB (%lu pages released "
+		"to the %s; %lu MB of growth still held)\n", hb->name,
+		len >> 20, hb->hsize >> 20, n,
+		hb->tier == HG_MEM_HUGETLB ? "hugetlb pool" : "host",
+		(hb->hsize - hb->hsize_min) >> 20);
+}
+
+/* how many consecutive quiet sweep ticks earn one granule back. At the
+ * 30 s sweep this is a two-minute window - deliberately down-slow against
+ * the up-fast growth, the asymmetry every elastic design here shares.
+ * HG_SHRINK_QUIET_TICKS in the environment overrides it - the same
+ * scaffolding status as the cap variables (the profile's "for N cycles"
+ * replaces it), and what lets a rig drain in minutes instead of hours. */
+#define HG_SHRINK_QUIET_TICKS 4
+
+static unsigned int hg_shrink_quiet_ticks(void)
+{
+	static int ticks = -1;
+
+	if (ticks < 0) {
+		char *e = getenv("HG_SHRINK_QUIET_TICKS");
+
+		ticks = e ? atoi(e) : HG_SHRINK_QUIET_TICKS;
+		if (ticks < 1)
+			ticks = 1;
+	}
+	return (unsigned int)ticks;
+}
+
+/*
+ * The down-slow policy gate, one call per sweep interval, hb->lock held.
+ * Counts a tick as "quiet" only while ALL of it holds: elastic bytes
+ * exist, nothing is starved (not below the floor, not grow-blocked), the
+ * top page is already whole-free, and free space would stay generously
+ * clear of the floor's recovery threshold even after giving a granule
+ * back - so a shrink can never be the thing that re-triggers pressure.
+ * Any failed condition resets the window; so does any grow.
+ *
+ * These thresholds are the hardcoded seed of the scale-down half of the
+ * auto_scaling_profile surface; the profile replaces the constants, not
+ * the shape.
+ */
+void hg_shrink_tick(struct hg_block *hb)
+{
+	unsigned long granule_leaves;
+
+	if (!hb->buddy_ready || hb->shrink_unsupported)
+		return;
+	if (hb->hsize <= hb->hsize_min) {
+		hb->shrink_quiet = 0;
+		return;
+	}
+	granule_leaves = hb->grow_granule >> HG_LEAF_SHIFT;
+	if (hb->below_floor || hb->grow_blocked ||
+	    hb->buddy_free_leaves < granule_leaves + hb->reserve_floor * 4 ||
+	    !page_is_whole_free(hb, &hb->pages[hb->npages - 1])) {
+		hb->shrink_quiet = 0;
+		return;
+	}
+	if (++hb->shrink_quiet < hg_shrink_quiet_ticks())
+		return;
+	hb->shrink_quiet = 0;
+	hg_buddy_shrink(hb);
 }
 
 /* --- allocate --------------------------------------------------------- */

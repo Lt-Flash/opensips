@@ -562,6 +562,39 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta)
 #endif
 }
 
+/* the shrink primitive - contract and measurements on the prototype */
+int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len)
+{
+	char *base = hb->hbase + off;
+	int advice = hb->shared ? MADV_REMOVE : MADV_DONTNEED;
+
+	if (off + len > hb->hsize) {
+		LM_BUG("%s: release of %lu@%lu overruns the %lu committed "
+			"bytes\n", hb->name, len, off, hb->hsize);
+		return -1;
+	}
+
+	munlock(base, len);
+
+	if (madvise(base, len, advice) != 0) {
+		/* structural, not transient: the advice either works on this
+		 * mapping type + kernel or it never will. Say so once and stop
+		 * trying for this arena's lifetime. */
+		hb->shrink_unsupported = 1;
+		LM_WARN("%s: cannot release memory (%s of %lu MB failed: %s) "
+			"- shrink disabled for this arena\n", hb->name,
+			hb->shared ? "MADV_REMOVE" : "MADV_DONTNEED",
+			len >> 20, strerror(errno));
+		return -1;
+	}
+
+	if (hb->locked_mb >= len >> 20)
+		hb->locked_mb -= len >> 20;
+	else
+		hb->locked_mb = 0;
+	return 0;
+}
+
 const char *hg_mem_tier_str(enum hg_mem_tier tier)
 {
 	switch (tier) {
@@ -707,6 +740,7 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 	hb->lo = ~0UL;
 	hb->hbase = base;
 	hb->hsize = HG_HPS_ROUND(size);
+	hb->hsize_min = hb->hsize;
 	hb->hcap = cap;
 	/* one committed-size step per grow: big enough that a growth spurt is
 	 * a handful of commits, small enough that the pre-fault under the

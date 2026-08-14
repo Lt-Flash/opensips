@@ -92,6 +92,12 @@ struct hg_page {
 	/* >0 on the FIRST page of a multi-page run, giving its length; the
 	 * other pages of the run carry HG_RUN_MEMBER. See hg_buddy_alloc_run(). */
 	unsigned int run_len;
+	/* v3: the ACHIEVED backing tier of the commit that brought this page
+	 * in (enum hg_mem_tier). Growth deltas negotiate their own backing,
+	 * and shrink is top-only over pages from arbitrary deltas - without
+	 * this byte the tier_bytes histogram could not be decremented
+	 * truthfully. Fits the existing padding; the descriptor stays 56. */
+	unsigned char tier;
 };
 
 /* run_len marker for a page that belongs to a run but does not head it */
@@ -135,6 +141,14 @@ void hg_grow_unblock(struct hg_block *hb, const char *how);
  * GC-pass route cannot latch on an arena where nothing is reclaimable.
  * hb->lock must be held. Also disarms an episode that went quiet. */
 void hg_grow_blocked_tick(struct hg_block *hb);
+
+/* v3: the down-slow shrink gate, once per sweep interval per arena,
+ * hb->lock held. After HG_SHRINK_QUIET_TICKS consecutive quiet ticks it
+ * releases up to one granule of whole-free TOP pages back to the host
+ * (or, tier 1, the hugetlb pool) - never below the initial -m/-M size.
+ * Called for shm from the sweep timer and for pkg from each process's
+ * own flush path: a pkg arena is private, only its owner can shrink it. */
+void hg_shrink_tick(struct hg_block *hb);
 
 /* Return a block previously handed out by hg_buddy_alloc(), merging it with
  * its buddy as far up as it will go. hb->lock must be held. */

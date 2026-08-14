@@ -688,8 +688,10 @@ void hg_cache_flush_self(void)
 		 * every process once per sweep. The shared arena is ticked
 		 * by the sweep timer alone, or 30 workers would each tick
 		 * the one shared window counter. */
-		if (!hb->shared)
+		if (!hb->shared) {
+			hg_grow_tick(hb);
 			hg_shrink_tick(hb);
+		}
 		lock_release(&hb->lock);
 		if (n)
 			LM_DBG("%s: idle sweep returned %u cached cells\n", hb->name, n);

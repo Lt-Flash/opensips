@@ -36,6 +36,8 @@
 #include "../dprint.h"
 #include "../globals.h"
 #include "../statistics.h"
+#include "../pt_scaling.h"    /* profiles + counted_max_processes via pt.h */
+#include "shm_mem.h"           /* shm_block, for the post-cfg attach */
 
 #ifdef DBG_MALLOC
 #include "mem_dbg_hash.h"
@@ -385,20 +387,11 @@ static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 #endif /* __OS_linux */
 }
 
-/* v3 admin caps - see the declaration comment in hg_malloc.h. 0 = fixed. */
-unsigned long hg_shm_cap_bytes;
-unsigned long hg_pkg_cap_bytes;
-
-/* one extern, not ../pt.h: pulling the process-table header into the
- * allocator for a single counter invites an include cycle for nothing */
-extern unsigned int counted_max_processes;
-
 /*
  * The host-RAM limb of the growth ceiling - see the prototype comment.
  *
  * The floor it defends is max(256 MB, MemTotal/20), overridable via the
- * HG_RAM_FLOOR_MB environment (same scaffolding status as the cap
- * variables: the config surface replaces the env, the semantics stay).
+ * hg_ram_floor_mb config global.
  * MemAvailable is the kernel's own estimate of what can be claimed
  * without swapping - exactly the question here. On a kernel too old to
  * export it the check PASSES: the mlock in hg_mem_commit() still refuses
@@ -424,10 +417,8 @@ int hg_grow_ram_refused(struct hg_block *hb, unsigned long delta)
 		return 0;
 
 	if (floor_mb < 0) {
-		char *e = getenv("HG_RAM_FLOOR_MB");
-
-		if (e) {
-			floor_mb = strtol(e, NULL, 10);
+		if (hg_ram_floor_mb > 0) {
+			floor_mb = hg_ram_floor_mb;      /* hg_ram_floor_mb= config */
 		} else {
 			long total_kb = hg_meminfo_kb("MemTotal");
 
@@ -595,6 +586,146 @@ int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len)
 	return 0;
 }
 
+/* the pkg policy, resolved once post-parse and inherited by fork - every
+ * per-child arena pt.c creates copies it in at hg_malloc_init() time */
+static struct {
+	int valid;
+	unsigned long up_bytes, down_bytes;
+	unsigned int up_pct, up_need, up_window, down_pct, down_cycles;
+	unsigned short cooldown;
+} hg_pkg_pol_resolved;
+
+/*
+ * Copy a profile's numbers onto an arena, translating workers->MB and
+ * validating every edge against the reservation this arena actually has.
+ * @hb may be NULL for the pkg case (arena does not exist yet) - then only
+ * the validation against @cap/@init runs and the result lands in
+ * hg_pkg_pol_resolved.
+ */
+static int hg_autoscale_apply(struct hg_block *hb, const char *which,
+		struct scaling_profile *p, unsigned long init_bytes,
+		unsigned long cap_bytes)
+{
+	unsigned long up_b   = HG_HPS_ROUND((unsigned long)p->max_procs << 20);
+	unsigned long down_b = p->min_procs
+		? HG_HPS_ROUND((unsigned long)p->min_procs << 20) : 0;
+
+	if (cap_bytes <= HG_HPS_ROUND(init_bytes)) {
+		LM_ERR("%s profile '%s': the arena has no growth room - give "
+			"the reservation on the command line (-%s INIT:CAP)\n",
+			which, p->name, hb || !strcmp(which, "shm") ? "m" : "M");
+		return -1;
+	}
+	if (up_b <= HG_HPS_ROUND(init_bytes)) {
+		LM_ERR("%s profile '%s': scale-up target %u MB does not exceed "
+			"the initial %lu MB - the profile could never act\n",
+			which, p->name, p->max_procs, init_bytes >> 20);
+		return -1;
+	}
+	if (up_b > cap_bytes) {
+		LM_ERR("%s profile '%s': scale-up target %u MB exceeds the "
+			"%lu MB reservation - raise the :CAP\n",
+			which, p->name, p->max_procs, cap_bytes >> 20);
+		return -1;
+	}
+	if (down_b) {
+		if (down_b < 2 * HG_HPS) {
+			LM_ERR("%s profile '%s': scale-down target %u MB is below "
+				"the %lu MB minimum viable arena\n",
+				which, p->name, p->min_procs, (2 * HG_HPS) >> 20);
+			return -1;
+		}
+		if (down_b >= up_b) {
+			LM_ERR("%s profile '%s': scale-down target %u MB is not "
+				"below the scale-up target %u MB\n",
+				which, p->name, p->min_procs, p->max_procs);
+			return -1;
+		}
+	}
+
+	if (hb) {
+		lock_get(&hb->lock);
+		hb->pol.active      = 1;
+		hb->pol.up_bytes    = up_b;
+		hb->pol.down_bytes  = down_b ? down_b : hb->hsize_min;
+		hb->pol.up_pct      = p->up_threshold;
+		hb->pol.up_need     = p->up_cycles_needed;
+		hb->pol.up_window   = p->up_cycles_tocheck;
+		hb->pol.down_pct    = p->down_threshold;
+		hb->pol.down_cycles = p->down_cycles_tocheck;
+		hb->pol.cooldown    = p->down_cycles_delay;
+		if (down_b)
+			hb->hsize_min = down_b;   /* the profile IS the ask now */
+		lock_release(&hb->lock);
+	} else {
+		hg_pkg_pol_resolved.valid       = 1;
+		hg_pkg_pol_resolved.up_bytes    = up_b;
+		hg_pkg_pol_resolved.down_bytes  = down_b;
+		hg_pkg_pol_resolved.up_pct      = p->up_threshold;
+		hg_pkg_pol_resolved.up_need     = p->up_cycles_needed;
+		hg_pkg_pol_resolved.up_window   = p->up_cycles_tocheck;
+		hg_pkg_pol_resolved.down_pct    = p->down_threshold;
+		hg_pkg_pol_resolved.down_cycles = p->down_cycles_tocheck;
+		hg_pkg_pol_resolved.cooldown    = p->down_cycles_delay;
+	}
+
+	LM_NOTICE("%s auto-scaling profile '%s'%s: %lu..%lu MB (start %lu), "
+		"up at %u%% for %u/%u cycles, down at %u%% for %u cycles "
+		"(cooldown %u)\n", which, p->name,
+		hg_autoscale_dry_run ? " [DRY RUN - advise only]" : "",
+		(down_b ? down_b : HG_HPS_ROUND(init_bytes)) >> 20, up_b >> 20,
+		init_bytes >> 20, p->up_threshold, p->up_cycles_needed,
+		p->up_cycles_tocheck, p->down_threshold, p->down_cycles_tocheck,
+		p->down_cycles_delay);
+	return 0;
+}
+
+int hg_autoscale_post_cfg(void)
+{
+	struct scaling_profile *p;
+	int hg_shm = (mem_allocator_shm == MM_HG_MALLOC ||
+	              mem_allocator_shm == MM_HG_MALLOC_DBG);
+	int hg_pkg = (mem_allocator_pkg == MM_HG_MALLOC ||
+	              mem_allocator_pkg == MM_HG_MALLOC_DBG);
+
+	if (hg_shm_profile_name) {
+		if (!hg_shm) {
+			LM_WARN("shm_auto_scaling_profile ignored: the shm "
+				"allocator is %s, not " HG_MALLOC_NAME "\n",
+				mm_str(mem_allocator_shm));
+		} else {
+			p = get_scaling_profile(hg_shm_profile_name);
+			if (!p) {
+				LM_ERR("shm_auto_scaling_profile '%s' does not name "
+					"an auto_scaling_profile\n", hg_shm_profile_name);
+				return -1;
+			}
+			if (hg_autoscale_apply((struct hg_block *)shm_block, "shm",
+			        p, shm_mem_size, hg_shm_cap_bytes) < 0)
+				return -1;
+		}
+	}
+
+	if (hg_pkg_profile_name) {
+		if (!hg_pkg) {
+			LM_WARN("pkg_auto_scaling_profile ignored: the pkg "
+				"allocator is %s, not " HG_MALLOC_NAME "\n",
+				mm_str(mem_allocator_pkg));
+		} else {
+			p = get_scaling_profile(hg_pkg_profile_name);
+			if (!p) {
+				LM_ERR("pkg_auto_scaling_profile '%s' does not name "
+					"an auto_scaling_profile\n", hg_pkg_profile_name);
+				return -1;
+			}
+			if (hg_autoscale_apply(NULL, "pkg", p, pkg_mem_size,
+			        hg_pkg_cap_bytes) < 0)
+				return -1;
+		}
+	}
+	return 0;
+}
+
 const char *hg_mem_tier_str(enum hg_mem_tier tier)
 {
 	switch (tier) {
@@ -701,23 +832,16 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 	 * shm cap would reserve gigabytes of VA for a pool that must never
 	 * grow past its formula.
 	 *
-	 * The HG_*_CAP_MB environment fallback is SCAFFOLDING for the v3
-	 * mechanism work: the real config surface (auto_scaling_profile
-	 * grammar) is a later step, and the growth path needs to be provable
-	 * end-to-end before it exists. The globals stay authoritative - the
-	 * env is consulted only while they are unset - so wiring the config
-	 * up later removes the fallback's reach without touching this code. */
-	if (!strcmp(name, "shm")) {
+	 * The caps arrive via -m INIT:CAP / -M INIT:CAP on the command line -
+	 * they cannot come from the config, which is parsed only after this
+	 * arena exists (and, for tier 1, after the pool reservation is
+	 * already taken). */
+	if (!strcmp(name, "shm"))
 		cap = hg_shm_cap_bytes;
-		if (!cap && getenv("HG_SHM_CAP_MB"))
-			cap = strtoul(getenv("HG_SHM_CAP_MB"), NULL, 10) << 20;
-	} else if (!strcmp(name, "pkg")) {
+	else if (!strcmp(name, "pkg"))
 		cap = hg_pkg_cap_bytes;
-		if (!cap && getenv("HG_PKG_CAP_MB"))
-			cap = strtoul(getenv("HG_PKG_CAP_MB"), NULL, 10) << 20;
-	} else {
+	else
 		cap = 0;
-	}
 	base = hg_mem_reserve(size, &cap, &tier, &locked_mb, shared);
 	if (!base) {
 		LM_ERR("failed to reserve %lu bytes for %s HG_MALLOC arena\n",
@@ -753,6 +877,29 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 	hb->locked_mb = locked_mb;
 	hb->tier_bytes[tier] = hb->hsize;
 	hb->shared = shared;
+
+	/*
+	 * A per-child PKG arena created after the config was parsed inherits
+	 * the resolved pkg policy (the fork copied hg_pkg_pol_resolved). The
+	 * pre-fork parent pkg arena and the shm arena take the other path:
+	 * they exist BEFORE the config, so the shm policy is attached to the
+	 * live block by hg_autoscale_post_cfg() and the parent pkg arena
+	 * simply stays fixed.
+	 */
+	if (!shared && hg_pkg_pol_resolved.valid) {
+		hb->pol.active      = 1;
+		hb->pol.up_bytes    = hg_pkg_pol_resolved.up_bytes;
+		hb->pol.down_bytes  = hg_pkg_pol_resolved.down_bytes
+			? hg_pkg_pol_resolved.down_bytes : hb->hsize_min;
+		hb->pol.up_pct      = hg_pkg_pol_resolved.up_pct;
+		hb->pol.up_need     = hg_pkg_pol_resolved.up_need;
+		hb->pol.up_window   = hg_pkg_pol_resolved.up_window;
+		hb->pol.down_pct    = hg_pkg_pol_resolved.down_pct;
+		hb->pol.down_cycles = hg_pkg_pol_resolved.down_cycles;
+		hb->pol.cooldown    = hg_pkg_pol_resolved.cooldown;
+		if (hg_pkg_pol_resolved.down_bytes)
+			hb->hsize_min = hg_pkg_pol_resolved.down_bytes;
+	}
 
 	if (!lock_init(&hb->lock)) {
 		LM_ERR("failed to init the %s arena lock\n", name);

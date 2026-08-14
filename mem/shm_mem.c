@@ -1097,6 +1097,12 @@ mi_response_t *mi_shm_check(const mi_params_t *params,
 
 int init_shm_post_yyparse(void)
 {
+#ifdef HG_MALLOC
+	/* v3: resolve + attach the configured auto-scaling profiles - this is
+	 * the first moment the config is known AND the arena already exists */
+	if (hg_autoscale_post_cfg() < 0)
+		return -1;
+#endif
 #ifdef HP_MALLOC
 	if (mem_allocator_shm == MM_HP_MALLOC ||
 	    mem_allocator_shm == MM_HP_MALLOC_DBG) {

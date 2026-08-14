@@ -293,6 +293,10 @@ DB_DEFAULT_URL "db_default_url"
 DB_MAX_ASYNC_CONNECTIONS "db_max_async_connections"
 DISABLE_503_TRANSLATION "disable_503_translation"
 AUTO_SCALING_PROFILE "auto_scaling_profile"
+SHM_AUTO_SCALING_PROFILE "shm_auto_scaling_profile"
+PKG_AUTO_SCALING_PROFILE "pkg_auto_scaling_profile"
+HG_RAM_FLOOR_MB "hg_ram_floor_mb"
+HG_AUTOSCALE_DRY_RUN "hg_autoscale_dry_run"
 AUTO_SCALING_CYCLE "auto_scaling_cycle"
 TIMER_WORKERS "timer_workers"
 
@@ -551,6 +555,14 @@ SPACE		[ ]
 									return DISABLE_503_TRANSLATION; }
 <INITIAL>{AUTO_SCALING_PROFILE}	{	count(); yylval.strval=yytext;
 									return AUTO_SCALING_PROFILE; }
+<INITIAL>{SHM_AUTO_SCALING_PROFILE}	{	count(); yylval.strval=yytext;
+									return SHM_AUTO_SCALING_PROFILE; }
+<INITIAL>{PKG_AUTO_SCALING_PROFILE}	{	count(); yylval.strval=yytext;
+									return PKG_AUTO_SCALING_PROFILE; }
+<INITIAL>{HG_RAM_FLOOR_MB}	{	count(); yylval.strval=yytext;
+									return HG_RAM_FLOOR_MB; }
+<INITIAL>{HG_AUTOSCALE_DRY_RUN}	{	count(); yylval.strval=yytext;
+									return HG_AUTOSCALE_DRY_RUN; }
 <INITIAL>{AUTO_SCALING_CYCLE}	{	count(); yylval.strval=yytext;
 									return AUTO_SCALING_CYCLE; }
 <INITIAL>{TIMER_WORKERS}	{	count(); yylval.strval=yytext;

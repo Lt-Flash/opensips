@@ -53,6 +53,19 @@ extern int udp_workers_no;
 extern char *udp_auto_scaling_profile;
 extern enum poll_types io_poll_method;
 extern int auto_scaling_enabled;
+
+/* v3 elastic HG_MALLOC arenas. Defined in main.c UNCONDITIONALLY (the -m/-M
+ * parser and cfg.y reference them in every build); consumed only when the
+ * HG allocator is selected - inert otherwise. Caps come from the command
+ * line (-m INIT:CAP) because the reservation precedes config parsing; the
+ * profile names/floor/dry-run come from the config and are applied
+ * post-parse. */
+extern unsigned long hg_shm_cap_bytes;
+extern unsigned long hg_pkg_cap_bytes;
+extern char *hg_shm_profile_name;
+extern char *hg_pkg_profile_name;
+extern int hg_ram_floor_mb;        /* 0 = auto: max(256MB, MemTotal/20) */
+extern int hg_autoscale_dry_run;   /* 1 = ticks log, never act */
 extern int auto_scaling_cycle;
 
 /* TCP network layer related parameters */

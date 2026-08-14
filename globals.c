@@ -63,6 +63,14 @@ int udp_workers_no = UDP_WORKERS_NO;
 char *udp_auto_scaling_profile = NULL;
 /* if the auto-scaling engine is enabled or not - this is autodetected */
 int auto_scaling_enabled = 0;
+
+/* v3 elastic-arena knobs - see globals.h for ownership and timing */
+unsigned long hg_shm_cap_bytes = 0;
+unsigned long hg_pkg_cap_bytes = 0;
+char *hg_shm_profile_name = NULL;
+char *hg_pkg_profile_name = NULL;
+int hg_ram_floor_mb = 0;
+int hg_autoscale_dry_run = 0;
 /* auto-scaling sampling and checking time cycle is 1 sec by default */
 int auto_scaling_cycle = 1;
 /*!< by default choose the best method */

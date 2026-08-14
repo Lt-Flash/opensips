@@ -150,6 +150,10 @@ void hg_grow_blocked_tick(struct hg_block *hb);
  * own flush path: a pkg arena is private, only its owner can shrink it. */
 void hg_shrink_tick(struct hg_block *hb);
 
+/* v3 step 4: the profile's proactive grow gate - same cadence, call sites
+ * and lock contract as hg_shrink_tick(). No-op without a policy. */
+void hg_grow_tick(struct hg_block *hb);
+
 /* Return a block previously handed out by hg_buddy_alloc(), merging it with
  * its buddy as far up as it will go. hb->lock must be held. */
 void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order);

@@ -464,6 +464,38 @@ struct hg_block {
 	unsigned long         grow_refused; /* refusals (cap or resource) */
 	unsigned long         shrinks;      /* successful releases */
 	unsigned long         shrink_bytes; /* their total */
+	/*
+	 * v3 step 4: the attached auto-scaling POLICY - numbers copied out of
+	 * a config auto_scaling_profile at attach time, never a pointer (the
+	 * profile struct lives in process-local memory; this block may be
+	 * shared). active==0 means no profile: growth still works up to hcap
+	 * on exhaustion, shrink keeps its conservative built-in gate - the
+	 * step-1..3 behaviour, unchanged.
+	 *
+	 * The profile's worker-count fields map onto bytes: "scale up to N"
+	 * is N MB, hps-rounded, and becomes the ADMIN CEILING within the
+	 * -m INIT:CAP reservation (it can never raise hcap - the reservation
+	 * happened before the config was even parsed, which is the whole
+	 * reason the cap lives on the command line). "down to M" is the
+	 * shrink floor and MAY sit below the initial size: with a profile
+	 * attached, the profile is what the admin asked for, -m is just the
+	 * starting point.
+	 */
+	struct {
+		unsigned int   active;
+		unsigned long  up_bytes;      /* admin ceiling, <= hcap */
+		unsigned long  down_bytes;    /* shrink floor */
+		unsigned int   up_pct;        /* grow when usage >= this... */
+		unsigned int   up_need;       /* ...for this many ticks... */
+		unsigned int   up_window;     /* ...out of this window */
+		unsigned int   down_pct;      /* shrink when usage <= this... */
+		unsigned int   down_cycles;   /* ...for this many consecutive */
+		unsigned short cooldown;      /* post-grow shrink hold-off */
+	} pol;
+	unsigned int          pol_up_hits;   /* ticks over up_pct in window */
+	unsigned int          pol_up_ticks;  /* window position */
+	unsigned int          pol_cooldown;  /* ticks left before shrink counts */
+	unsigned int          pol_dry_said;  /* one advise line per episode */
 	/* consecutive quiet sweep ticks - the down-slow gate. Reset by any
 	 * grow and by any tick that fails the abundance test, so a shrink
 	 * needs a full uninterrupted quiet window. */
@@ -687,19 +719,12 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 void hg_malloc_destroy(struct hg_block *hb);
 
 /*
- * v3 admin caps, in bytes; 0 (the default) pins the arena at its initial
- * size, which is exactly v2's behaviour. Consulted by hg_malloc_init() -
- * shm arenas read the shm cap, pkg arenas the pkg one - so they must be
- * set before the arenas come up (config parse time). Plain globals rather
- * than parameters because init has five call sites across mem.c/shm_mem.c/
- * pt.c that would all forward a value they do not own.
- *
- * The pkg cap is PER PROCESS: every worker grows its own private arena, so
- * the host-RAM exposure of a pkg cap is cap x nproc. The config layer, not
- * this one, is where that multiplication must be surfaced to the admin.
+ * The v3 admin caps live in globals.h/globals.c (set by -m INIT:CAP /
+ * -M INIT:CAP before any arena exists; 0 = fixed, exactly v2). The pkg
+ * cap is PER PROCESS: every worker grows its own private arena, so the
+ * host-RAM exposure is cap x nproc - hg_grow_ram_refused() applies that
+ * multiplication.
  */
-extern unsigned long hg_shm_cap_bytes;
-extern unsigned long hg_pkg_cap_bytes;
 
 /*
  * Commit @delta more bytes at committed-end offset @off of the reservation
@@ -750,6 +775,18 @@ int hg_grow_ram_refused(struct hg_block *hb, unsigned long delta);
  * Returns 0, or -1 with shrink_unsupported latched (nothing to retry).
  */
 int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len);
+
+/*
+ * Resolve and validate the configured auto-scaling profiles, once, after
+ * the config is parsed (called from init_shm_post_yyparse()). Attaches the
+ * policy to the LIVE shm arena and stashes the pkg policy for the arenas
+ * pt.c creates per child after fork - the pre-fork parent pkg arena
+ * predates the config and stays fixed, which costs nothing (the attendant
+ * barely allocates). Fails LOUDLY on a profile that names nothing, exceeds
+ * the -m/-M reservation, or is attached to an arena with no growth room:
+ * a policy that cannot act is a misconfiguration, not a default.
+ */
+int hg_autoscale_post_cfg(void);
 
 /* re-sync per-process state after fork(): see hg_arena.c for why the
  * inherited private free-stack/bump state must be discarded, not kept or

@@ -30,6 +30,7 @@
 #include "hg_buddy.h"
 #include "hg_arena.h"
 #include "../dprint.h"
+#include "../globals.h"
 
 /*
  * Two records describe the same tree, because they answer different
@@ -419,13 +420,32 @@ void hg_grow_blocked_tick(struct hg_block *hb)
 
 int hg_buddy_grow(struct hg_block *hb, unsigned long need)
 {
-	unsigned long delta, room, old_pages, i;
+	unsigned long delta, room, old_pages, i, limit;
 	int tier;
 
 	if (!hb->buddy_ready)
 		return -1;
 
-	room = hb->hcap - hb->hsize;
+	/* advise-only mode: report what growth WOULD have done, act never -
+	 * the arena behaves exactly like a fixed v2 one, with evidence */
+	if (hg_autoscale_dry_run) {
+		hb->grow_refused++;
+		if (!hb->pol_dry_said) {
+			hb->pol_dry_said = 1;
+			LM_WARN("%s: DRY RUN - would grow for a %lu byte request "
+				"(committed %lu MB); counting further suppressed "
+				"grows in hg_shm_grow_refused\n",
+				hb->name, need, hb->hsize >> 20);
+		}
+		return -1;
+	}
+
+	/* the profile's scale-up target is the admin ceiling WITHIN the
+	 * -m INIT:CAP reservation; without a profile the reservation is the
+	 * ceiling */
+	limit = (hb->pol.active && hb->pol.up_bytes) ? hb->pol.up_bytes
+	                                             : hb->hcap;
+	room = limit > hb->hsize ? limit - hb->hsize : 0;
 	if (room == 0) {
 		hb->grow_refused++;
 		/* an admin-set ceiling doing its job is not an alarm; growth
@@ -439,10 +459,13 @@ int hg_buddy_grow(struct hg_block *hb, unsigned long need)
 		 * carries the magnitude. */
 		if (hb->grows && !hb->grow_refuse_said) {
 			hb->grow_refuse_said = 1;
-			LM_NOTICE("%s: at the %lu MB growth cap (admin limit), "
+			LM_NOTICE("%s: at the %lu MB growth ceiling (%s), "
 				"a %lu byte request must fail - counting further "
 				"refusals in hg_shm_grow_refused\n",
-				hb->name, hb->hcap >> 20, need);
+				hb->name, limit >> 20,
+				limit == hb->hcap ? "the -m/-M reservation"
+				                  : "the profile scale-up target",
+				need);
 		}
 		return -1;
 	}
@@ -489,6 +512,8 @@ int hg_buddy_grow(struct hg_block *hb, unsigned long need)
 	hb->grows++;
 	hb->grow_bytes += delta;
 	hb->shrink_quiet = 0;    /* fresh demand voids any quiet window */
+	hb->pol_cooldown = hb->pol.active ? hb->pol.cooldown : 0;
+	hb->pol_dry_said = 0;
 	hg_grow_unblock(hb, "the arena grew, the resource came back");
 
 	LM_NOTICE("%s arena grew by %lu MB to %lu MB (%lu new pages on %s; "
@@ -573,27 +598,10 @@ static void hg_buddy_shrink(struct hg_block *hb)
 		(hb->hsize - hb->hsize_min) >> 20);
 }
 
-/* how many consecutive quiet sweep ticks earn one granule back. At the
- * 30 s sweep this is a two-minute window - deliberately down-slow against
- * the up-fast growth, the asymmetry every elastic design here shares.
- * HG_SHRINK_QUIET_TICKS in the environment overrides it - the same
- * scaffolding status as the cap variables (the profile's "for N cycles"
- * replaces it), and what lets a rig drain in minutes instead of hours. */
+/* the no-policy default: consecutive quiet sweep ticks per released
+ * granule (two minutes at the 30 s sweep) - deliberately down-slow. A
+ * profile replaces this with its own "for N cycles". */
 #define HG_SHRINK_QUIET_TICKS 4
-
-static unsigned int hg_shrink_quiet_ticks(void)
-{
-	static int ticks = -1;
-
-	if (ticks < 0) {
-		char *e = getenv("HG_SHRINK_QUIET_TICKS");
-
-		ticks = e ? atoi(e) : HG_SHRINK_QUIET_TICKS;
-		if (ticks < 1)
-			ticks = 1;
-	}
-	return (unsigned int)ticks;
-}
 
 /*
  * The down-slow policy gate, one call per sweep interval, hb->lock held.
@@ -611,6 +619,7 @@ static unsigned int hg_shrink_quiet_ticks(void)
 void hg_shrink_tick(struct hg_block *hb)
 {
 	unsigned long granule_leaves;
+	unsigned int need_ticks;
 
 	if (!hb->buddy_ready || hb->shrink_unsupported)
 		return;
@@ -618,17 +627,100 @@ void hg_shrink_tick(struct hg_block *hb)
 		hb->shrink_quiet = 0;
 		return;
 	}
-	granule_leaves = hb->grow_granule >> HG_LEAF_SHIFT;
+	/* post-grow cool-off: the profile grammar's 10x-cycles hold, so an
+	 * arena that just grew cannot immediately give the growth back */
+	if (hb->pol_cooldown) {
+		hb->pol_cooldown--;
+		hb->shrink_quiet = 0;
+		return;
+	}
+	/* the hard SAFETY conditions hold with or without a policy: never
+	 * shrink an arena that is starved, latched, or whose top page is
+	 * still in use */
 	if (hb->below_floor || hb->grow_blocked ||
-	    hb->buddy_free_leaves < granule_leaves + hb->reserve_floor * 4 ||
 	    !page_is_whole_free(hb, &hb->pages[hb->npages - 1])) {
 		hb->shrink_quiet = 0;
 		return;
 	}
-	if (++hb->shrink_quiet < hg_shrink_quiet_ticks())
+	if (hb->pol.active) {
+		/* the profile's own quiet test: usage at or below its
+		 * down-threshold, plus the giving-a-granule-back-stays-safe
+		 * floor guard */
+		if (hb->real_used * 100 > (unsigned long)hb->pol.down_pct *
+		                          hb->hsize ||
+		    hb->buddy_free_leaves <
+		        (hb->grow_granule >> HG_LEAF_SHIFT) +
+		        hb->reserve_floor * 2) {
+			hb->shrink_quiet = 0;
+			return;
+		}
+		need_ticks = hb->pol.down_cycles ? hb->pol.down_cycles : 1;
+	} else {
+		granule_leaves = hb->grow_granule >> HG_LEAF_SHIFT;
+		if (hb->buddy_free_leaves <
+		        granule_leaves + hb->reserve_floor * 4) {
+			hb->shrink_quiet = 0;
+			return;
+		}
+		need_ticks = HG_SHRINK_QUIET_TICKS;
+	}
+	if (++hb->shrink_quiet < need_ticks)
 		return;
 	hb->shrink_quiet = 0;
+	if (hg_autoscale_dry_run) {
+		if (!hb->pol_dry_said) {
+			hb->pol_dry_said = 1;
+			LM_NOTICE("%s: DRY RUN - would shrink (committed %lu MB, "
+				"usage %lu%%)\n", hb->name, hb->hsize >> 20,
+				hb->real_used * 100 / hb->hsize);
+		}
+		return;
+	}
 	hg_buddy_shrink(hb);
+}
+
+/*
+ * The proactive half of the profile: grow BEFORE exhaustion when usage
+ * has crossed the up-threshold often enough. Same call sites and lock
+ * contract as hg_shrink_tick(); a profile-less arena never enters (its
+ * growth remains exhaustion-triggered, the step-1 emergency path, which
+ * also stays armed WITH a profile - a burst between ticks must not fail
+ * allocations while the timer catches up).
+ */
+void hg_grow_tick(struct hg_block *hb)
+{
+	int hit;
+
+	if (!hb->buddy_ready || !hb->pol.active)
+		return;
+	if (hb->hsize >= hb->pol.up_bytes)
+		return;                          /* at the profile ceiling */
+
+	hb->pol_up_ticks++;
+	if (hb->real_used * 100 >= (unsigned long)hb->pol.up_pct * hb->hsize)
+		hb->pol_up_hits++;
+
+	if (hb->pol_up_ticks <
+	    (hb->pol.up_window ? hb->pol.up_window : 1))
+		return;
+	hit = hb->pol_up_hits >= (hb->pol.up_need ? hb->pol.up_need : 1);
+	hb->pol_up_ticks = 0;
+	hb->pol_up_hits = 0;
+	if (!hit)
+		return;
+
+	if (hg_autoscale_dry_run) {
+		if (!hb->pol_dry_said) {
+			hb->pol_dry_said = 1;
+			LM_NOTICE("%s: DRY RUN - would grow (committed %lu MB, "
+				"usage %lu%%, profile ceiling %lu MB)\n",
+				hb->name, hb->hsize >> 20,
+				hb->real_used * 100 / hb->hsize,
+				hb->pol.up_bytes >> 20);
+		}
+		return;
+	}
+	hg_buddy_grow(hb, hb->grow_granule);
 }
 
 /* --- allocate --------------------------------------------------------- */

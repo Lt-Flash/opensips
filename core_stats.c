@@ -309,9 +309,11 @@ static void hg_grow_blocked_event(void)
 	/* promote (or disarm) an armed episode first, so a latch earns its
 	 * event in the same tick that detects it */
 	hg_grow_blocked_tick(hb);
-	/* and the down-slow shrink gate - the shm arena's once-per-interval
-	 * chance to hand quiet growth back (pkg arenas tick themselves from
-	 * each process's flush path; a private arena has one owner) */
+	/* the profile's proactive grow gate, then the down-slow shrink gate -
+	 * the shm arena's once-per-interval policy heartbeat (pkg arenas tick
+	 * themselves from each process's flush path; a private arena has one
+	 * owner) */
+	hg_grow_tick(hb);
 	hg_shrink_tick(hb);
 	due = hb->grow_event_due;
 	hb->grow_event_due = 0;

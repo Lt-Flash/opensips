@@ -55,6 +55,7 @@
 
 #include "../../sr_module.h"
 #include "../../timer.h"
+#include "../../mi/mi.h"
 #include "../../dprint.h"
 #include "../../mem/shm_mem.h"
 #include "../../locking.h"
@@ -378,6 +379,75 @@ static void hgs_again(unsigned int ticks, void *param)
 		? "PASS" : (torn ? "FAIL" : "SHORT"));
 }
 
+/*
+ * MI-driven persistent hold, for the autoscaling rig: the child_init soak
+ * blocks the timer processes (no sweep ticks until every child finishes),
+ * so proving PROACTIVE growth needs load applied from a normal running
+ * process - an MI worker. hgs_hold allocates and parks stamped blocks
+ * until hgs_release; both verify stamps.
+ */
+#define HGS_MI_MAX 4096
+static struct hgs_blk hgs_mi_held[HGS_MI_MAX];
+static int hgs_mi_n;
+
+static mi_response_t *mi_hgs_hold(const mi_params_t *params,
+                                  struct mi_handler *async_hdl)
+{
+	int mb, pid = getpid();
+	unsigned int seed;
+	unsigned long want, held = 0;
+
+	if (get_mi_int_param(params, "mb", &mb) < 0 || mb <= 0)
+		return init_mi_param_error();
+	want = (unsigned long)mb << 20;
+	seed = (unsigned int)pid ^ 0x5eed;
+
+	while (held < want && hgs_mi_n < HGS_MI_MAX) {
+		struct hgs_blk *b = &hgs_mi_held[hgs_mi_n];
+
+		b->len = (128 << 10) + (rand_r(&seed) % (384 << 10));
+		b->p = shm_malloc(b->len);
+		if (!b->p)
+			break;
+		hgs_fill(b, pid, 5 * HGS_MAX_SLOTS + hgs_mi_n);
+		held += b->len;
+		hgs_mi_n++;
+	}
+	LM_NOTICE("hgstress MI-HOLD: +%lu KB (%d blocks total held)\n",
+		held >> 10, hgs_mi_n);
+	return init_mi_result_string(MI_SSTR("OK"));
+}
+
+static mi_response_t *mi_hgs_release(const mi_params_t *params,
+                                     struct mi_handler *async_hdl)
+{
+	unsigned long torn = 0;
+	int i, pid = getpid();
+
+	for (i = 0; i < hgs_mi_n; i++) {
+		torn += hgs_check(&hgs_mi_held[i], pid, 5 * HGS_MAX_SLOTS + i);
+		shm_free(hgs_mi_held[i].p);
+		hgs_mi_held[i].p = NULL;
+	}
+	LM_NOTICE("hgstress MI-RELEASE: %d blocks freed, %lu torn\n",
+		hgs_mi_n, torn);
+	hgs_mi_n = 0;
+	return torn ? init_mi_error(500, MI_SSTR("torn")) :
+	              init_mi_result_string(MI_SSTR("OK"));
+}
+
+static const mi_export_t mi_cmds[] = {
+	{ "hgs_hold", "allocate and park N MB of stamped shm", 0, 0, {
+		{mi_hgs_hold, {"mb", 0}},
+		{EMPTY_MI_RECIPE}}, {0}
+	},
+	{ "hgs_release", "verify and free everything hgs_hold parked", 0, 0, {
+		{mi_hgs_release, {0}},
+		{EMPTY_MI_RECIPE}}, {0}
+	},
+	{EMPTY_MI_EXPORT},
+};
+
 static int mod_init(void)
 {
 	if (hgs_slots > HGS_MAX_SLOTS)
@@ -447,7 +517,7 @@ struct module_exports exports = {
 	NULL,        /* exported async functions */
 	params,
 	NULL,        /* exported statistics */
-	NULL,        /* exported MI functions */
+	mi_cmds,     /* exported MI functions */
 	NULL,        /* exported pseudo-variables */
 	NULL,        /* exported transformations */
 	NULL,        /* extra processes */

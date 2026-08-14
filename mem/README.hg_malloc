@@ -365,3 +365,108 @@ worker at once and detects the failure mode ordinary tests miss - the same
 block being handed to two processes. Each worker stamps its blocks with a
 value derived from its own pid and re-reads them later, so a foreign
 writer is caught and named. See that module's source for the parameters.
+
+
+The v3 elastic arena
+--------------------
+
+From v3 the arena distinguishes COMMITTED memory (pre-faulted, pinned,
+usable) from the RESERVATION around it, and can move the committed size in
+both directions at runtime. With no cap configured, nothing changes: the
+arena is fixed at -m/-M exactly as in v2.
+
+Giving it room - the command line, not the config:
+
+    opensips -m 128:1024 -M 16:64 ...
+
+reserves a 1024 MB shm span (and a 64 MB span per pkg arena) while
+committing only the 128/16 the run starts with. The cap lives on the
+command line for a hard reason: the shm arena is created BEFORE the config
+file is parsed, and on the hugetlb tier the whole cap is reserved from the
+page pool at map time - there is no later moment at which a config value
+could still shape the reservation. On tiers 2-4 the uncommitted remainder
+costs only page-table entries; on tier 1 it is EARMARKED POOL, see sizing
+below.
+
+Growth is exhaustion-triggered by default: an allocation that would have
+failed instead commits one granule (16 MB) more and retries, up to the
+cap. Every delta re-negotiates its backing with the kernel and is
+VERIFIED, never assumed - a THP arena's delta may land on 4K pages, and
+hg_stats then reports the split in tier_bytes rather than pretending one
+tier. Growth is refused, never degraded, when the host cannot back it:
+the mlock that populates the delta reports failure as a clean errno, and
+the host-RAM check before it keeps MemAvailable above a floor of
+max(256 MB, MemTotal/20), overridable with
+
+    hg_ram_floor_mb = 2048
+
+pkg deltas are charged times the process count in that check - every
+worker grows its own private arena under the same workload.
+
+Shrink returns whole-free TOP pages (madvise, so every mapped process
+sees it; on tier 1 the pages go back to HugePages_Free) after a
+sustained quiet period, never below the starting -m/-M unless a profile
+says otherwise. The top-order free list is kept address-ordered so
+carves concentrate low and the top drains.
+
+Policy - the worker autoscaler grammar, reused:
+
+    auto_scaling_profile = MEM_SHM
+        scale up to 1024 on 80% for 3 cycles within 10
+        scale down to 256 on 30% for 120 cycles
+
+    shm_auto_scaling_profile = MEM_SHM
+    pkg_auto_scaling_profile = MEM_PKG
+
+"up to"/"down to" are MB (rounded to whole huge pages); percentages are
+carved-of-committed; a cycle is one sweep interval (30 s). A profile
+adds PROACTIVE growth - the arena grows when usage holds over the
+up-threshold, before any allocation fails (the exhaustion path stays
+armed for bursts between cycles) - and makes the down-threshold and
+cycle count drive the shrink gate. The grammar's implicit 10x delay
+after a scale-down is honoured as a post-grow cooldown. The scale-up
+target becomes the ceiling WITHIN the -m cap; the scale-down target
+becomes the shrink floor and may sit below -m: with a profile attached,
+the profile is the ask and -m is just the starting size. A profile that
+names nothing, exceeds the reservation, could never act, or floors
+below two huge pages FAILS STARTUP - a policy that cannot work is a
+misconfiguration, not a default. The pre-fork parent pkg arena predates
+the config and stays fixed; every per-child pkg arena follows the
+profile.
+
+    hg_autoscale_dry_run = 1
+
+keeps every decision advisory: ticks and even emergency growth log what
+they WOULD have done ("DRY RUN - would grow (committed 64 MB, usage
+97%...)") and act never - the arena behaves exactly like a fixed v2 one
+while you watch what the policy thinks.
+
+Observability: hg_stats (MI) shows committed/cap/grow_headroom, the
+grows/grow_bytes/grow_refused/shrinks/shrink_bytes ledgers, the
+grow_blocked gauge and the per-tier byte split; the same numbers export
+as hgmem: statistics (hg_shm_committed, hg_shm_cap, hg_shm_grows,
+hg_shm_grow_refused, hg_shm_grow_blocked, hg_shm_shrinks, ...). A
+RESOURCE refusal that survives reclaim latches GROW-BLOCKED: one WARN,
+the gauge goes 1, and E_CORE_SHM_GROW_BLOCKED is raised from the sweep
+timer (subscribe with event_route; params arena/committed_mb/cap_mb/
+grow_refused) and re-raised every 5 minutes while latched. An admin
+ceiling refusing is a NOTICE and never latches - a limit doing its job
+is not an incident.
+
+Sizing rules that are not obvious:
+
+  * tier 1 (hugetlb): the pool must fit the CAPS, not the initial
+    sizes - the whole -m cap is reserved from the pool at map time, and
+    every per-child pkg arena reserves its own -M cap the same way. On
+    top of that, leave free pages for the fork window: children briefly
+    COW-touch the parent's pkg arena before they build their own, each
+    touched page drawing a FREE page - a pool with zero free pages at
+    fork time SIGBUSes children (measured; it is the same crash family
+    as the 2026-08 pool-exhaustion incident). If the pool cannot fit a
+    cap, the arena falls back to a cap-less hugetlb reservation: it
+    keeps its huge pages and simply cannot grow, and says so.
+  * a 30-worker gateway with -M 16:64 exposes 30 x 64 MB of potential
+    pinned pkg growth. The RAM-floor check accounts for this, but the
+    admin should too.
+  * shrink on tier 1 returns pages to the POOL, not to general RAM -
+    freeing host memory needs the pool resized down as well.

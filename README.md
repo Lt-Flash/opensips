@@ -20,12 +20,15 @@ work with substantially less CPU.** The allocator is chosen at runtime with
 | **predictable memory** | resident from second one and flat under load — it is exactly the arena you reserved (~1.7 GB in that run), while F_MALLOC climbed 751 MB → 1126 MB into the same work. Flat, not smaller: you pay the reservation up front |
 | **no fragmentation drift** | on a production gateway across a business day the arena *shrank*, 23.0 MB → 18.6 MB |
 
-Two things buy that: **the common allocation path takes no lock at all**, and the
-arena sits on **2 MB huge pages** so a multi-gigabyte pool needs ~512× fewer
-page-table entries. Huge pages are the smaller half — with them disabled
-entirely it still beat F_MALLOC by 2.8× — so a host that cannot reserve a
-hugetlb pool still gets most of the benefit. Full method and caveats in
-[Measured performance](#measured-performance).
+Two things buy that. **The common allocation path takes no lock at all** — that
+is the larger half, and it applies on every host. And the arena takes **the
+largest pages the host will actually give it**: 2 MB huge pages when they are
+available, which cuts the page-table entries for a multi-gigabyte pool by ~512×,
+falling back through THP to plain 4 KB pages when they are not — see the
+[tier ladder](#pros). Page size is the *smaller* half of the win: with huge pages
+disabled entirely, on plain 4 KB, it still beat F_MALLOC by **2.8×**. A host with
+no hugetlb pool is a perfectly good host for this allocator. Full method and
+caveats in [Measured performance](#measured-performance).
 
 It pays off when many workers share a large pool and you care about tail latency:
 SIP proxies under real concurrency, topology hiding, dialog-heavy routing. The
@@ -82,8 +85,10 @@ unpinned and swappable, and says so.
 
 ### Pros
 
-- **Fewer TLB misses.** A multi-GB pool on 2 MB pages needs ~512× fewer page-table
-  entries than on 4 KB pages.
+- **Fewer TLB misses, when the host has huge pages.** A multi-GB pool on 2 MB
+  pages needs ~512× fewer page-table entries than on 4 KB pages. On a host that
+  cannot provide them the arena runs on 4 KB and gives up only this — every
+  other property below still applies.
 - **Lock-free common path.** Per-thread caches mean workers do not serialise on
   an allocator lock for ordinary allocations.
 - **Predictable residency.** The arena is pre-faulted and `mlock`ed, so there is

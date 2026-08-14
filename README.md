@@ -25,6 +25,56 @@ With no cap configured, **nothing changes**: the arena is fixed at
      never below the shrink floor, never above the ceiling
 ```
 
+## 0. Why an elastic arena
+
+Every OpenSIPS deployment ships with two numbers somebody guessed:
+`-m`, the shared-memory arena all calls, dialogs and caches live in,
+and `-M`, the private arena **each worker process** gets. Both are
+fixed at boot. Both are a bet.
+
+**Bet low and you lose at the worst possible moment.** Shared memory
+exhausts in the middle of your best traffic hour: allocations fail,
+calls drop, and the only fix is a restart with a bigger number —
+downtime, during the incident, on every node it touches.
+
+**Bet high and you pay for it every quiet hour.** The arena is pinned
+physical memory; on the hugetlb tier it is carved out of the host at
+boot and nothing else can ever use it. A production load balancer we
+measured peaks at **11.9 MB** of shm over 15 hours of full traffic —
+inside a 128 MB fixed arena. And `-M` multiplies: 16 MB across one
+gateway's 54 workers is **864 MB** of committed RAM backing arenas that
+mostly hold under 3 MB each, because with a fixed `-M` you size *every*
+worker for the *busiest* worker's worst minute.
+
+And the bet cannot be won, because the right number is a moving
+target — it shifts with traffic mix, dialog lifetimes, the module set,
+the season:
+
+```mermaid
+xychart-beta
+    title "One day, one node: fixed arena vs what the traffic needs (MB)"
+    x-axis ["00h","03h","06h","09h","12h","15h","18h","21h","24h"]
+    y-axis "MB" 0 --> 560
+    line [512,512,512,512,512,512,512,512,512]
+    line [64,32,32,96,224,336,368,160,64]
+    line [41,17,15,83,201,318,344,138,49]
+```
+
+*Top, flat: a fixed `-m 512` sized for the storm, paid around the
+clock. Middle, stepped: what v3 keeps committed — granule steps up
+under load, shrink lagging the peak by the quiet window. Bottom: live
+demand. (Illustrative shapes; a measured cycle is charted in
+Section 8.)*
+
+v3 replaces both bets with a **range**: `-m 64:512 -M 16:32`. Start at
+the size you can defend, reserve the ceiling (address space — free),
+commit physical pages only as demand arrives, hand back what goes
+quiet. Growth stops at three independent limits — your policy, the
+backing tier, the host's real free RAM (pkg charged × the worker
+count). Every decision is a counter you can scrape, the one state that
+deserves a page is a latched event, and a dry-run mode narrates what it
+*would* have done before you let it do anything.
+
 Every mechanism below was chosen **by measurement first** — including
 two designs that looked right on paper and were proven memory-corrupting
 before a line of allocator code was written. The log lines, MI output
@@ -33,6 +83,7 @@ mockups.
 
 **Contents**
 
+0. [Why an elastic arena](#0-why-an-elastic-arena)
 1. [Quickstart](#1-quickstart)
 2. [Concepts and architecture](#2-concepts-and-architecture)
 3. [Why the cap is on the command line](#3-why-the-cap-is-on-the-command-line)
@@ -84,6 +135,9 @@ auto_scaling_profile = MEM_SHM
 
 shm_auto_scaling_profile = MEM_SHM
 ```
+
+`pkg_auto_scaling_profile` takes the same grammar and does the same
+for every worker's private arena — Section 11.
 
 Watch it work:
 
@@ -289,6 +343,33 @@ differentially — with one floor, a 16 MB pkg delta was refused while
 WARNING:core:hg_grow_ram_refused: pkg: refusing to grow by 16 MB: 144 MB effective (x9 processes) would leave the host under the 14589 MB floor (MemAvailable 14562 MB). Freeing host memory or lowering the floor lifts this.
 ```
 
+The whole grow path, trigger to publish:
+
+```mermaid
+flowchart TD
+    A["allocation would fail
+    (chunk carve / large tier / region)"] -- "grow-and-retry" --> G
+    P["proactive tick:
+    profile up-window met"] --> G
+    G["grow request, whole 16 MB granules"] --> L1{"admin ceiling:
+    profile up-target, else the cap"}
+    L1 -- "at ceiling: NOTICE, refused++" --> R["refusal counters
+    (hg_shm_grow_refused / pkg twin)"]
+    L1 -- ok --> L2{"tier: does the backing
+    (hugetlb pool) cover the delta?"}
+    L2 -- no --> R
+    L2 -- ok --> L3{"host RAM floor:
+    MemAvailable - delta >= floor
+    (pkg: delta x worker count)"}
+    L3 -- under --> R
+    L3 -- ok --> C["mlock() the new granules:
+    commit, verify tier per delta"]
+    C --> W["publish pages to the buddy grid
+    grows++, headroom NOTICE, cooldown armed"]
+    R -- "resource refusals only" --> B["GROW-BLOCKED machinery
+    (Section 7)"]
+```
+
 ---
 
 ## 7. GROW-BLOCKED — the alertable state
@@ -296,19 +377,20 @@ WARNING:core:hg_grow_ram_refused: pkg: refusing to grow by 16 MB: 144 MB effecti
 A **resource** refusal (host RAM, mlock limit — not an admin ceiling)
 should page someone *only if it means something*. The state machine:
 
-```
-                     resource refusal
-        idle ──────────────────────────► armed
-          ▲                                │
-          │      refusal recurs after a    │ quiet for a full
-          │      GC pass  ─or─  a full     │ sweep interval
-          │      sweep interval with       ▼
-          │      refusals still accruing  disarmed (back to idle)
-          │                │
-   grow succeeds,          ▼
-   or demand falls      LATCHED ── gauge=1, one WARN, event raised
-   below the floor's       │        (re-raised every 5 min while held)
-   recovery mark ◄─────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> idle
+    idle --> armed: resource refusal
+    armed --> idle: quiet for a full sweep interval
+    armed --> LATCHED: refusal recurs after a GC pass
+    armed --> LATCHED: full sweep interval, refusals still accruing
+    LATCHED --> idle: a grow succeeds
+    LATCHED --> idle: demand falls below the floor recovery mark
+    note right of LATCHED
+        gauge hg_shm_grow_blocked = 1
+        one WARN + E_CORE_SHM_GROW_BLOCKED
+        re-raised every 5 min while held
+    end note
 ```
 
 Two latch routes exist because of a measurement: the original
@@ -419,6 +501,21 @@ Floor: never below `-m`/`-M`'s initial size — unless a profile says
 otherwise (Section 9): with a profile attached, the profile is the ask
 and `-m` is just the starting size.
 
+A full cycle, measured on a live process (rig arm K, Section 17): grow
+under MI-driven load, cooldown, the shrink train once the quiet window
+passes, regrowth on the next pulse — committed walking 32→96→16→80 MB
+while the reservation never moves and the hugetlb pool gets every
+released page back:
+
+```mermaid
+xychart-beta
+    title "Measured: committed MB through one load cycle (reservation fixed)"
+    x-axis ["idle", "hold", "cooldown", "quiet + shrink train", "second hold"]
+    y-axis "committed MB" 0 --> 110
+    bar [32, 96, 96, 16, 80]
+    line [32, 96, 96, 16, 80]
+```
+
 ---
 
 ## 9. The profile — configuration reference
@@ -517,6 +614,27 @@ tune thresholds against the advice lines, flip to 0.
   pinned growth — and on tier 1, the same multiplication applies to
   **pool reservations** (each child's arena reserves its own cap at map
   time).
+
+What the multiplier means on a real 54-worker gateway — to survive one
+worker's burst with a fixed `-M` you must hand the burst size to all
+54; with a range, the floor is the norm and the burst is one worker's
+temporary excursion:
+
+```mermaid
+xychart-beta
+    title "pkg, 12 of 54 workers: fixed -M sized for the burst vs v3 (MB)"
+    x-axis ["w1","w2","w3","w4","w5","w6","w7","w8","w9","w10","w11","w12"]
+    y-axis "MB per worker" 0 --> 36
+    bar [32,32,32,32,32,32,32,32,32,32,32,32]
+    bar [16,16,16,32,16,16,16,16,16,16,16,16]
+```
+
+*First bars: fixed `-M 32` because worker 4 once needed 32 —
+1,728 MB across 54 workers, around the clock. Second bars: v3 with
+`-M 16:32` — 53 workers hold the 16 MB floor, the burst worker grows a
+granule and returns it after the quiet window; peak 880 MB. When the
+profile's down-target sits below `-M`, the floor drops further still.
+(Illustrative; the five-worker independence proof is below.)*
 
 Proven: five workers each grew their own arena 8→24→40 MB
 independently, on per-delta-verified THP backing, with every stamped

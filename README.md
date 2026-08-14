@@ -17,7 +17,7 @@ work with substantially less CPU.** The allocator is chosen at runtime with
 | **up to −45% CPU** | and the saving *grows* with load — TH + dialog at 4000 CPS: 3.20 → 1.76 cores |
 | **−10% to −24%** | across every routing arm tested, the heavier the per-call state the bigger the win |
 | **2.8× cheaper allocation** | allocator self-time 2.75–3.38% vs 9.5–22.8% for Q/F/HP/F_PARALLEL on the same host |
-| **flat memory** | ~1.7 GB regardless of load, against F_MALLOC climbing 751 MB → 1126 MB into the same work |
+| **predictable memory** | resident from second one and flat under load — it is exactly the arena you reserved (~1.7 GB in that run), while F_MALLOC climbed 751 MB → 1126 MB into the same work. Flat, not smaller: you pay the reservation up front |
 | **no fragmentation drift** | on a production gateway across a business day the arena *shrank*, 23.0 MB → 18.6 MB |
 
 Two things buy that: **the common allocation path takes no lock at all**, and the

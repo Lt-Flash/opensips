@@ -130,23 +130,30 @@ static unsigned long hg_hps(void)
  * inferred from kernel version or sysfs config alone.
  */
 
-static long hg_read_shmem_huge_kb(void)
+/* read one "Key:  <n> kB" line; -1 if absent (old kernel, no /proc) */
+static long hg_meminfo_kb(const char *key)
 {
 	FILE *f;
 	char line[256];
+	size_t klen = strlen(key);
 	long kb = -1;
 
 	f = fopen("/proc/meminfo", "r");
 	if (!f)
 		return -1;
 	while (fgets(line, sizeof line, f)) {
-		if (!strncmp(line, "ShmemHugePages:", 15)) {
-			kb = strtol(line + 15, NULL, 10);
+		if (!strncmp(line, key, klen) && line[klen] == ':') {
+			kb = strtol(line + klen + 1, NULL, 10);
 			break;
 		}
 	}
 	fclose(f);
 	return kb;
+}
+
+static long hg_read_shmem_huge_kb(void)
+{
+	return hg_meminfo_kb("ShmemHugePages");
 }
 
 /* is the huge-page-sized range starting at @addr PMD-mapped here? */
@@ -381,6 +388,83 @@ static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 /* v3 admin caps - see the declaration comment in hg_malloc.h. 0 = fixed. */
 unsigned long hg_shm_cap_bytes;
 unsigned long hg_pkg_cap_bytes;
+
+/* one extern, not ../pt.h: pulling the process-table header into the
+ * allocator for a single counter invites an include cycle for nothing */
+extern unsigned int counted_max_processes;
+
+/*
+ * The host-RAM limb of the growth ceiling - see the prototype comment.
+ *
+ * The floor it defends is max(256 MB, MemTotal/20), overridable via the
+ * HG_RAM_FLOOR_MB environment (same scaffolding status as the cap
+ * variables: the config surface replaces the env, the semantics stay).
+ * MemAvailable is the kernel's own estimate of what can be claimed
+ * without swapping - exactly the question here. On a kernel too old to
+ * export it the check PASSES: the mlock in hg_mem_commit() still refuses
+ * with a clean errno when the host truly cannot back the delta, so the
+ * failure mode without this limb is a later, harsher refusal, not a
+ * crash.
+ *
+ * Reading /proc under hb->lock is deliberate, same trade as the commit
+ * pre-fault: growth is once per granule of genuine demand, and the
+ * mlock that follows costs orders of magnitude more than one procfs
+ * read.
+ */
+int hg_grow_ram_refused(struct hg_block *hb, unsigned long delta)
+{
+	static long floor_mb = -1;          /* resolved once, per process */
+	unsigned long effective = delta, nproc = 1;
+	long avail_kb;
+
+	/* tier 1 consumes no new host RAM at commit time: the whole cap was
+	 * reserved from the hugetlb pool at map time, and those pages are
+	 * already carved out of MemTotal. Charging them here double-counts. */
+	if (hb->tier == HG_MEM_HUGETLB)
+		return 0;
+
+	if (floor_mb < 0) {
+		char *e = getenv("HG_RAM_FLOOR_MB");
+
+		if (e) {
+			floor_mb = strtol(e, NULL, 10);
+		} else {
+			long total_kb = hg_meminfo_kb("MemTotal");
+
+			floor_mb = 256;
+			if (total_kb > 0 && total_kb / 20 / 1024 > floor_mb)
+				floor_mb = total_kb / 20 / 1024;
+		}
+	}
+
+	avail_kb = hg_meminfo_kb("MemAvailable");
+	if (avail_kb < 0)
+		return 0;                   /* cannot tell - let mlock decide */
+
+	if (!hb->shared) {
+		/* pkg: every worker will grow its own arena under the same
+		 * workload; the single-arena delta understates the real cost
+		 * by the process count */
+		nproc = counted_max_processes ? counted_max_processes : 1;
+		effective = delta * nproc;
+	}
+
+	if ((unsigned long)avail_kb * 1024 <
+	    effective + ((unsigned long)floor_mb << 20)) {
+		/* once per episode - see grow_refuse_said's comment */
+		if (!hb->grow_refuse_said) {
+			hb->grow_refuse_said = 1;
+			LM_WARN("%s: refusing to grow by %lu MB: %lu MB effective"
+				" (x%lu processes) would leave the host under the "
+				"%ld MB floor (MemAvailable %ld MB). Freeing host "
+				"memory or lowering the floor lifts this.\n",
+				hb->name, delta >> 20, effective >> 20, nproc,
+				floor_mb, avail_kb / 1024);
+		}
+		return 1;
+	}
+	return 0;
+}
 
 /*
  * Commit [hbase+off, +delta) of the reservation: populate, pin, verify the
@@ -634,6 +718,7 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 	hb->tier = tier;
 	hb->locked_mb = locked_mb;
 	hb->tier_bytes[tier] = hb->hsize;
+	hb->shared = shared;
 
 	if (!lock_init(&hb->lock)) {
 		LM_ERR("failed to init the %s arena lock\n", name);

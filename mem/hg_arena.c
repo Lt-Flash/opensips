@@ -647,6 +647,13 @@ void hg_reserve_floor_check(struct hg_block *hb)
 		hb->below_floor = 0;
 		LM_NOTICE("%s: free space recovered above the reserve floor "
 			"(%lu leaves free)\n", hb->name, hb->buddy_free_leaves);
+		/* recovery past the same 2x-floor threshold also ends a
+		 * grow-blocked episode: the arena could not grow, but the
+		 * demand that needed it to has gone away. One hysteresis
+		 * mark for both states, deliberately - two thresholds
+		 * drifting apart would let "blocked" outlive the pressure
+		 * that defined it. */
+		hg_grow_unblock(hb, "demand fell back below the floor");
 	}
 }
 
@@ -1883,6 +1890,9 @@ enum hg_stat_field {
 	 * demand hit a wall (cap or host), which is exactly the old
 	 * exhaustion condition wearing its new name. */
 	HGS_COMMITTED, HGS_CAP, HGS_GROWS, HGS_GROW_BYTES, HGS_GROW_REFUSED,
+	/* the alertable gauge: 1 while a RESOURCE refusal is latched (cap
+	 * refusals never latch - an admin ceiling is policy, not incident) */
+	HGS_GROW_BLOCKED,
 };
 
 static unsigned long hg_shm_stat(void *ctx)
@@ -1945,6 +1955,7 @@ static unsigned long hg_shm_stat(void *ctx)
 	case HGS_GROWS:           return hb->grows;
 	case HGS_GROW_BYTES:      return hb->grow_bytes;
 	case HGS_GROW_REFUSED:    return hb->grow_refused;
+	case HGS_GROW_BLOCKED:    return hb->grow_blocked;
 	}
 	return 0;
 }
@@ -1988,6 +1999,7 @@ static const struct {
 	{"hg_shm_grows",           HGS_GROWS},
 	{"hg_shm_grow_bytes",      HGS_GROW_BYTES},
 	{"hg_shm_grow_refused",    HGS_GROW_REFUSED},
+	{"hg_shm_grow_blocked",    HGS_GROW_BLOCKED},
 	{NULL, 0}
 };
 

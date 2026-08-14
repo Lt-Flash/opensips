@@ -1091,6 +1091,8 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("grow_refused"), hb->grow_refused) < 0)
 		return -1;
+	if (add_mi_number(o, MI_SSTR("grow_blocked"), hb->grow_blocked) < 0)
+		return -1;
 
 	/* carved: bytes taken from the arena and cut into size-class chunks.
 	 * Never returned - this is the figure that only ever grows, and the one

@@ -427,6 +427,11 @@ struct hg_block {
 	volatile unsigned long hoff;
 	enum hg_mem_tier      tier;
 	unsigned long         locked_mb;
+	/* MAP_SHARED vs MAP_PRIVATE, as passed to hg_malloc_init(). Stored
+	 * because growth policy depends on it: a pkg delta is per PROCESS,
+	 * so its host-RAM cost is delta x nproc, and the ceiling check must
+	 * know which multiplication to apply. */
+	int                   shared;
 
 	/*
 	 * v3 elastic arena.
@@ -458,10 +463,44 @@ struct hg_block {
 	 * on every subsequent allocation (measured: 239k NOTICEs in 4s on the
 	 * first at-cap soak), and the counter above already carries the
 	 * magnitude. Set when a refusal is logged, cleared by the next
-	 * successful grow. The full two-threshold latch design is a later
-	 * step; this only keeps the log honest until it lands.
+	 * successful grow.
 	 */
 	unsigned int          grow_refuse_said;
+	/*
+	 * The alertable grow-blocked state, RESOURCE refusals only - an admin
+	 * cap doing its job is policy, not an incident, and never latches.
+	 *
+	 * Latching is two-step, modelled on below_floor: the first resource
+	 * refusal only records the GC-pass count it must outlive
+	 * (grow_blocked_mark = gc_passes + 1); the latch arms when a refusal
+	 * recurs at gc_passes >= that mark, i.e. a full GC pass ran in
+	 * between and the arena STILL cannot grow - so a transient spike that
+	 * one reclaim pass absorbs never alerts. Cleared by a successful
+	 * grow (the resource came back) or by free space recovering above
+	 * the reserve floor (the demand went away) - the design's "clear
+	 * when demand falls below a lower mark", reusing the floor's own
+	 * hysteresis threshold rather than inventing a second one.
+	 *
+	 * grow_blocked is the gauge the statistics export; grow_event_due
+	 * hands the E_CORE_SHM_GROW_BLOCKED raise to the sweep timer, which
+	 * runs with no arena lock held - evi_raise_event() allocates shm,
+	 * and raising it here, under hb->lock, inside the allocator that
+	 * just refused, would be re-entry into a full arena at best.
+	 */
+	unsigned int          grow_blocked;
+	unsigned long         grow_blocked_mark;
+	/*
+	 * grow_refused at arming time. The gc_passes route above assumes GC
+	 * RUNS; on the state that matters most - a full arena where nothing
+	 * is reclaimable - gc_passes sits at zero forever and the latch
+	 * would never arm (measured: 5M refusals, gc_passes 0, no latch).
+	 * So the sweep timer is the fallback promoter: if a full sweep
+	 * interval passes with the episode still armed and refusals still
+	 * accumulating, it latches from there. A spike that ends before the
+	 * next sweep still never alerts.
+	 */
+	unsigned long         grow_blocked_refuse0;
+	unsigned int          grow_event_due;
 	/*
 	 * Bytes of the arena per ACHIEVED backing tier, indexed by
 	 * enum hg_mem_tier (slot 0 unused; the enum starts at 1). hb->tier
@@ -659,6 +698,20 @@ extern unsigned long hg_pkg_cap_bytes;
  * hb->lock.
  */
 int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta);
+
+/*
+ * The host-RAM limb of the growth ceiling: would committing @delta more
+ * bytes leave the host with less than the configured floor of available
+ * memory? Returns nonzero to REFUSE. Tier 1 always passes - a hugetlb
+ * mapping reserved its whole cap from the pool at map time (measured), so
+ * its commits consume no new host RAM. For pkg arenas the delta is
+ * multiplied by the process count first: every worker grows its own
+ * private arena under the same workload, so the single-arena delta
+ * understates the real cost ~30x on a gateway. Defined in hg_malloc.c
+ * (it owns /proc/meminfo parsing); called by hg_buddy_grow() under
+ * hb->lock.
+ */
+int hg_grow_ram_refused(struct hg_block *hb, unsigned long delta);
 
 /* re-sync per-process state after fork(): see hg_arena.c for why the
  * inherited private free-stack/bump state must be discarded, not kept or

@@ -124,6 +124,18 @@ void *hg_buddy_alloc(struct hg_block *hb, unsigned int order);
  * allocation), -1 = cannot (at cap / no cap / host refused the commit). */
 int hg_buddy_grow(struct hg_block *hb, unsigned long need);
 
+/* v3: end a grow-blocked episode (say so if one was latched) and re-arm
+ * the once-per-episode reporting. hb->lock must be held. Called by the
+ * grow that succeeds and by the reserve floor's recovery branch - the
+ * "demand fell below the lower mark" clear. @how finishes the sentence
+ * "GROW-BLOCKED cleared - ". */
+void hg_grow_unblock(struct hg_block *hb, const char *how);
+
+/* v3: the sweep timer's promoter for an armed grow-blocked episode - the
+ * GC-pass route cannot latch on an arena where nothing is reclaimable.
+ * hb->lock must be held. Also disarms an episode that went quiet. */
+void hg_grow_blocked_tick(struct hg_block *hb);
+
 /* Return a block previously handed out by hg_buddy_alloc(), merging it with
  * its buddy as far up as it will go. hb->lock must be held. */
 void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order);

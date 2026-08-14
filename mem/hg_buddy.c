@@ -311,6 +311,75 @@ int hg_buddy_init(struct hg_block *hb)
  * refused by the host). The caller's existing failure path then reports
  * exhaustion exactly as a fixed arena would.
  */
+/*
+ * A RESOURCE refusal - the host, not the admin, said no. Counts, and runs
+ * the two-step latch described on grow_blocked's declaration: arm on the
+ * first refusal, latch only if the arena is refused again after a full GC
+ * pass ran - a spike that reclaim absorbs never alerts. The latch WARNs
+ * once and hands the event raise to the sweep timer via grow_event_due;
+ * nothing is raised from here, hb->lock is held.
+ */
+static int grow_resource_refused(struct hg_block *hb)
+{
+	hb->grow_refused++;
+
+	if (hb->grow_blocked)
+		return -1;
+
+	if (!hb->grow_blocked_mark) {
+		/* gc_passes + 1 doubles as the "armed" flag: it can never be
+		 * 0, and it is exactly the count a pass must push gc_passes
+		 * PAST for the refusal to have survived one */
+		hb->grow_blocked_mark = hb->gc_passes + 1;
+		hb->grow_blocked_refuse0 = hb->grow_refused;
+	} else if (hb->gc_passes >= hb->grow_blocked_mark) {
+		hb->grow_blocked = 1;
+		hb->grow_event_due = 1;
+		LM_WARN("%s: GROW-BLOCKED latched - the arena cannot grow and "
+			"a GC pass did not change that (%lu refusals so far). "
+			"Alert on hg_shm_grow_blocked; details precede this "
+			"line.\n", hb->name, hb->grow_refused);
+	}
+	return -1;
+}
+
+/* the blocked state ends two ways; both say so if there is anything to
+ * end, and both re-arm the once-per-episode messages */
+void hg_grow_unblock(struct hg_block *hb, const char *how)
+{
+	if (hb->grow_blocked)
+		LM_NOTICE("%s: GROW-BLOCKED cleared - %s\n", hb->name, how);
+	hb->grow_blocked = 0;
+	hb->grow_blocked_mark = 0;
+	hb->grow_blocked_refuse0 = 0;
+	hb->grow_event_due = 0;
+	hb->grow_refuse_said = 0;
+}
+
+/*
+ * The sweep timer's half of the latch - see grow_blocked_refuse0's
+ * declaration for why the GC route alone cannot be trusted. Called once
+ * per sweep interval with hb->lock HELD; latches if an armed episode is
+ * still accumulating refusals a full interval later.
+ */
+void hg_grow_blocked_tick(struct hg_block *hb)
+{
+	if (hb->grow_blocked || !hb->grow_blocked_mark)
+		return;
+	if (hb->grow_refused > hb->grow_blocked_refuse0) {
+		hb->grow_blocked = 1;
+		hb->grow_event_due = 1;
+		LM_WARN("%s: GROW-BLOCKED latched - the arena cannot grow and "
+			"a full sweep interval did not change that (%lu refusals "
+			"so far). Alert on hg_shm_grow_blocked; details precede "
+			"this line.\n", hb->name, hb->grow_refused);
+	} else {
+		/* armed but quiet for a whole interval: the spike passed */
+		hb->grow_blocked_mark = 0;
+		hb->grow_blocked_refuse0 = 0;
+	}
+}
+
 int hg_buddy_grow(struct hg_block *hb, unsigned long need)
 {
 	unsigned long delta, room, old_pages, i;
@@ -348,12 +417,14 @@ int hg_buddy_grow(struct hg_block *hb, unsigned long need)
 	if (delta > room)
 		delta = room;
 
+	/* the host-RAM limb of the ceiling, before any work is done */
+	if (hg_grow_ram_refused(hb, delta))
+		return grow_resource_refused(hb);
+
 	tier = hg_mem_commit(hb, hb->hsize, delta);
 	if (tier < 0) {
-		/* resource refusal - the host, not the admin, said no. The
-		 * commit rolled itself back; nothing was published. */
-		hb->grow_refused++;
-		return -1;
+		/* the commit rolled itself back; nothing was published */
+		return grow_resource_refused(hb);
 	}
 
 	hb->tier_bytes[tier] += delta;
@@ -378,7 +449,7 @@ int hg_buddy_grow(struct hg_block *hb, unsigned long need)
 
 	hb->grows++;
 	hb->grow_bytes += delta;
-	hb->grow_refuse_said = 0;    /* a new episode may be reported again */
+	hg_grow_unblock(hb, "the arena grew, the resource came back");
 
 	LM_NOTICE("%s arena grew by %lu MB to %lu MB (%lu new pages on %s; "
 		"%lu MB headroom left)\n", hb->name, delta >> 20,

@@ -229,6 +229,10 @@ int hg_pkg_peak_all(unsigned long *peak, unsigned long *sum, int *nproc)
 
 #if defined(HG_MALLOC) && !defined(INLINE_ALLOC)
 #include "mem/hg_arena.h"
+#include "mem/hg_buddy.h"       /* hg_grow_blocked_tick */
+#include "mem/shm_mem.h"        /* shm_block, for the grow-blocked gauge */
+#include "evi/evi_core.h"       /* EVI_SHM_GROW_BLOCKED_ID */
+#include "evi/evi_modules.h"    /* evi_probe/get_params/raise */
 
 /*
  * The HG_MALLOC idle-cache sweep.
@@ -264,9 +268,91 @@ static void rpc_hg_cache_flush(int sender, void *param)
 	hg_cache_flush_self();
 }
 
+/*
+ * The deferred half of GROW-BLOCKED alerting (v3). hg_buddy_grow() latches
+ * the state under hb->lock and may not raise an event there:
+ * evi_raise_event() allocates shm, and the arena that just refused to grow
+ * is the arena it would allocate from. This runs in the timer process with
+ * no arena lock held, once per sweep - which also gives the design's
+ * "re-warn interval exceeds a GC cycle" for free.
+ *
+ * SHM arena only, and honestly so: each worker's PKG arena is
+ * MAP_PRIVATE, its grow_blocked visible only inside that process - a pkg
+ * latch still WARNs in that worker's log and shows in its hg_stats pkg
+ * section, but no single process can gauge them all.
+ *
+ * While the latch holds, the event re-raises every
+ * HG_GROW_REWARN_SWEEPS sweeps so a subscriber that attached late (or an
+ * event pipeline that dropped one) still learns of a persistent block.
+ */
+#define HG_GROW_REWARN_SWEEPS 10   /* x 30s sweep = every 5 minutes */
+
+static str hg_gb_arena_str     = str_init("arena");
+static str hg_gb_committed_str = str_init("committed_mb");
+static str hg_gb_cap_str       = str_init("cap_mb");
+static str hg_gb_refused_str   = str_init("grow_refused");
+
+static void hg_grow_blocked_event(void)
+{
+	struct hg_block *hb = (struct hg_block *)shm_block;
+	static unsigned int blocked_sweeps;
+	evi_params_p list;
+	int due, committed_mb, cap_mb, refused;
+	str arena = str_init("shm");
+
+	if (!hb)
+		return;
+
+	/* consume the due flag and sample the numbers under the lock; the
+	 * raise itself must happen outside it */
+	lock_get(&hb->lock);
+	/* promote (or disarm) an armed episode first, so a latch earns its
+	 * event in the same tick that detects it */
+	hg_grow_blocked_tick(hb);
+	due = hb->grow_event_due;
+	hb->grow_event_due = 0;
+	if (!due && hb->grow_blocked &&
+	    ++blocked_sweeps >= HG_GROW_REWARN_SWEEPS) {
+		due = 1;                     /* still blocked - re-warn */
+	}
+	if (due)
+		blocked_sweeps = 0;
+	if (!hb->grow_blocked)
+		blocked_sweeps = 0;
+	committed_mb = (int)(hb->hsize >> 20);
+	cap_mb       = (int)(hb->hcap >> 20);
+	refused      = (int)hb->grow_refused;
+	lock_release(&hb->lock);
+
+	if (!due)
+		return;
+
+	if (!evi_probe_event(EVI_SHM_GROW_BLOCKED_ID)) {
+		LM_WARN("shm GROW-BLOCKED event due, no subscribers - alert "
+			"on the hg_shm_grow_blocked statistic instead\n");
+		return;
+	}
+
+	list = evi_get_params();
+	if (!list)
+		return;
+	if (evi_param_add_str(list, &hg_gb_arena_str, &arena) ||
+	    evi_param_add_int(list, &hg_gb_committed_str, &committed_mb) ||
+	    evi_param_add_int(list, &hg_gb_cap_str, &cap_mb) ||
+	    evi_param_add_int(list, &hg_gb_refused_str, &refused)) {
+		LM_ERR("unable to build the grow-blocked event parameters\n");
+		evi_free_params(list);
+		return;
+	}
+	if (evi_raise_event(EVI_SHM_GROW_BLOCKED_ID, list))
+		LM_ERR("unable to raise the grow-blocked event\n");
+}
+
 static void hg_cache_sweep(unsigned int ticks, void *param)
 {
 	int i;
+
+	hg_grow_blocked_event();
 
 	/*
 	 * Publish the sweep to threads IPC cannot reach BEFORE dispatching to

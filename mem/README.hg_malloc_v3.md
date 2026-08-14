@@ -683,12 +683,12 @@ All at their exact severities; `%` values are illustrative.
 | `shm auto-scaling profile 'X'...: A..B MB (start C), up at ...` | NOTICE | profile attached; the one line that proves your config took effect |
 | `... [DRY RUN - advise only]: ...` | NOTICE | ditto, advise-only |
 | `shm arena grew by 16 MB to N MB (8 new pages on <tier>; M MB headroom left)` | NOTICE | growth, with the delta's **verified** backing |
-| `shm arena shrank by 16 MB to N MB (8 pages released to the <hugetlb pool|host>; M MB of growth still held)` | NOTICE | shrink, with where the memory went |
-| `at the N MB growth ceiling (the -m/-M reservation | the profile scale-up target), a K byte request must fail - counting further refusals in hg_shm_grow_refused` | NOTICE | admin limb refusing; once per episode; not an incident |
+| `shm arena shrank by 16 MB to N MB (8 pages released to the <hugetlb pool\|host>; M MB of growth still held)` | NOTICE | shrink, with where the memory went |
+| `at the N MB growth ceiling (the -m/-M reservation \| the profile scale-up target), a K byte request must fail - counting further refusals in hg_shm_grow_refused` | NOTICE | admin limb refusing; once per episode; not an incident |
 | `cannot grow by 16 MB: mlock failed (...)` / `refusing to grow by 16 MB: N MB effective (xP processes) would leave the host under the F MB floor` | WARN | resource limb refusing; once per episode |
-| `GROW-BLOCKED latched - the arena cannot grow and a <GC pass|full sweep interval> did not change that (N refusals so far)` | WARN | the latch; gauge is now 1 |
-| `GROW-BLOCKED cleared - <the arena grew...|demand fell back below the floor>` | NOTICE | recovery |
-| `DRY RUN - would <grow|shrink> (...)` | NOTICE/WARN | advise-only decisions |
+| `GROW-BLOCKED latched - the arena cannot grow and a <GC pass\|full sweep interval> did not change that (N refusals so far)` | WARN | the latch; gauge is now 1 |
+| `GROW-BLOCKED cleared - <the arena grew...\|demand fell back below the floor>` | NOTICE | recovery |
+| `DRY RUN - would <grow\|shrink> (...)` | NOTICE/WARN | advise-only decisions |
 | `hugetlb pool cannot back a N MB cap; reserving the M MB in use instead` | NOTICE | pool < cap at startup; arena fixed on huge pages |
 | `mlock of the N MB HG_MALLOC arena failed (...): continuing unpinned` | WARN | init pin failed (RLIMIT); non-fatal, arena swappable |
 | `cannot release memory (MADV_... failed): shrink disabled for this arena` | WARN | kernel refused the primitive; once, permanent for the run |

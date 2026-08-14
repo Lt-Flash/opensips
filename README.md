@@ -16,7 +16,7 @@ work with substantially less CPU.** The allocator is chosen at runtime with
 | **−18% CPU** | five allocators, one binary, topology hiding + cachedb_perf at **12,000 CPS**: 5.29 cores vs 6.42 |
 | **up to −45% CPU** | and the saving *grows* with load — TH + dialog at 4000 CPS: 3.20 → 1.76 cores |
 | **−10% to −24%** | across every routing arm tested, the heavier the per-call state the bigger the win |
-| **2.8× cheaper allocation** | allocator self-time 2.75–3.38% vs 9.5–22.8% for Q/F/HP/F_PARALLEL on the same host |
+| **2.2–2.7× cheaper allocation** | allocator self-time **2.78%** (huge pages) to **3.38%** (plain 4 KB), against F_MALLOC 7.56% — and 11.1% HP_MALLOC, 24.5% Q_MALLOC |
 | **predictable memory** | resident from second one and flat under load — it is exactly the arena you reserved (~1.7 GB in that run), while F_MALLOC climbed 751 MB → 1126 MB into the same work. Flat, not smaller: you pay the reservation up front |
 | **no fragmentation drift** | on a production gateway across a business day the arena *shrank*, 23.0 MB → 18.6 MB |
 
@@ -26,8 +26,9 @@ largest pages the host will actually give it**: 2 MB huge pages when they are
 available, which cuts the page-table entries for a multi-gigabyte pool by ~512×,
 falling back through THP to plain 4 KB pages when they are not — see the
 [tier ladder](#pros). Page size is the *smaller* half of the win: with huge pages
-disabled entirely, on plain 4 KB, it still beat F_MALLOC by **2.8×**. A host with
-no hugetlb pool is a perfectly good host for this allocator. Full method and
+disabled entirely, on plain 4 KB, its own cost rises only from 2.78% to 3.38%
+— still **2.2× cheaper than F_MALLOC**. A host with no hugetlb pool is a
+perfectly good host for this allocator. Full method and
 caveats in [Measured performance](#measured-performance).
 
 It pays off when many workers share a large pool and you care about tail latency:
@@ -409,20 +410,38 @@ expected shape, and a useful sanity check on the numbers.
 
 ### Huge pages are the smaller half of the win
 
-Allocator self-time at 800 CPS, measured per backing tier:
+All four backing tiers were forced and measured — hugetlb pool present, pool
+removed with THP at fault, THP retrofitted by `MADV_COLLAPSE`, and everything
+disabled — with `perf record` over the same workload, summing self time across
+the allocator's symbols:
 
 ```
-  tier 1  MAP_HUGETLB     2.75%  ███████████
-  tier 4  plain 4 KB      3.38%  ██████████████
-  ── other allocators on the same host and workload ──
-  best of Q/F/HP/F_PAR    9.5%   ██████████████████████████████████████
-  worst                  22.8%   ████████████████████████████████████████████████████████████████████████████████████████
+  HG tier 1  MAP_HUGETLB          2.78%  ███████████
+  HG tier 2  THP at fault         2.97%  ████████████
+  HG tier 3  THP via COLLAPSE     3.07%  ████████████
+  HG tier 4  plain 4 KB           3.38%  █████████████
+  ────────────────────────────────────────────────────
+  F_MALLOC                        7.56%  ██████████████████████████████
+  F_PARALLEL_MALLOC               8.96%  ████████████████████████████████████
+  HP_MALLOC                      11.08%  ████████████████████████████████████████████
+  Q_MALLOC                       24.52%  ██████████████████████████████████████████████████████████████████████████████████████████████████
 ```
 
-Huge pages buy about **19% of HG_MALLOC's own cost**. The rest is the slab plus
-the per-process free stack — which is why **tier 4, with huge pages fully
-disabled, still beat F_MALLOC by 2.8×**. On a host that cannot give you a
-hugetlb pool, this allocator is still the right choice.
+So the whole span from best to worst page backing is **0.6 percentage points**,
+while the gap to the next allocator is **4.2**. Huge pages buy ~18% off
+HG_MALLOC's own cost; the rest is the slab plus the per-process free stack. Even
+on plain 4 KB it is **2.2× cheaper than F_MALLOC** and **7.3× cheaper than
+Q_MALLOC**. A host that cannot give you a hugetlb pool is still a good host for
+this allocator.
+
+**Read the tier column and the allocator column as two separate experiments.**
+The four tiers were captured in one sitting (2026-08-05) by forcing the kernel
+knobs between runs; the other allocators were captured on the same rig and
+harness three days later (2026-08-08, 3 passes each, per-allocator `-m` sizing,
+means shown). Run-to-run spread on that harness is tight — ±0.09 for F_MALLOC,
+±0.18 for HG — but a cross-sitting ratio is not the same evidence as a
+head-to-head one, and nobody has yet run all four tiers *against* the other
+allocators in a single sweep.
 
 ### v1 → v2
 

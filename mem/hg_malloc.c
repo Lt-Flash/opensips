@@ -250,10 +250,11 @@ static void hg_exclude_from_core(void *base, unsigned long size)
  *                        and "process-private" pkg cells silently migrated
  *                        between processes through the shared gpool.
  */
-static void *hg_mem_reserve(unsigned long size, enum hg_mem_tier *tier,
-		unsigned long *locked_mb, int shared)
+static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
+		enum hg_mem_tier *tier, unsigned long *locked_mb, int shared)
 {
 	unsigned long asize = HG_HPS_ROUND(size);
+	unsigned long csize = HG_HPS_ROUND(*cap < size ? size : *cap);
 	int vis = shared ? MAP_SHARED : MAP_PRIVATE;
 	char *resv, *base;
 	long shmem_kb;
@@ -261,15 +262,16 @@ static void *hg_mem_reserve(unsigned long size, enum hg_mem_tier *tier,
 
 	*locked_mb = 0;
 	*tier = HG_MEM_4K;
+	*cap = csize;        /* rewritten below if a fallback shrinks it */
 
 #ifndef __OS_linux
 	/* No verified huge-page route outside Linux: take a plain anonymous
 	 * mapping and report the 4K tier honestly rather than claiming one we
 	 * cannot check. Still pinned and pre-faulted. */
-	p = mmap(NULL, asize, PROT_READ|PROT_WRITE, vis|MAP_ANONYMOUS, -1, 0);
+	p = mmap(NULL, csize, PROT_READ|PROT_WRITE, vis|MAP_ANONYMOUS, -1, 0);
 	if (p == MAP_FAILED)
 		return NULL;
-	hg_exclude_from_core(p, asize);
+	hg_exclude_from_core(p, csize);
 	if (mlock(p, asize) == 0)
 		*locked_mb = asize >> 20;
 	else
@@ -277,40 +279,81 @@ static void *hg_mem_reserve(unsigned long size, enum hg_mem_tier *tier,
 	return p;
 #else
 
-	/* tier 1: MAP_HUGETLB - unswappable, exempt from RLIMIT_MEMLOCK */
-	p = mmap(NULL, asize, PROT_READ|PROT_WRITE,
+	/*
+	 * tier 1: MAP_HUGETLB - unswappable, exempt from RLIMIT_MEMLOCK.
+	 *
+	 * Try the whole cap first, then fall back to the committed size alone.
+	 * hugetlb mappings are backed by a fixed pool, so a cap larger than the
+	 * pool can hold makes this mmap fail outright - and silently dropping
+	 * to THP because the admin asked for growth room would be a far worse
+	 * trade than simply not being able to grow. A cap-less tier-1 arena is
+	 * what v2 shipped; losing the tier is a real regression.
+	 */
+	p = mmap(NULL, csize, PROT_READ|PROT_WRITE,
 	         vis|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
+	if (p == MAP_FAILED && csize > asize) {
+		p = mmap(NULL, asize, PROT_READ|PROT_WRITE,
+		         vis|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
+		if (p != MAP_FAILED) {
+			LM_NOTICE("hugetlb pool cannot back a %lu MB cap; "
+				"reserving the %lu MB in use instead - the arena "
+				"keeps huge pages but cannot grow. Raise "
+				"vm.nr_hugepages to allow growth.\n",
+				csize >> 20, asize >> 20);
+			*cap = asize;      /* the arena is fixed after all */
+		}
+		/* on total failure csize stays at the full cap for tiers 2-4:
+		 * THP reservations are plain VA, which CAN hold the cap */
+	}
 	if (p != MAP_FAILED) {
-		hg_exclude_from_core(p, asize);
+		hg_exclude_from_core(p, *cap);
 		memset(p, 0, asize);
 		*tier = HG_MEM_HUGETLB;
 		*locked_mb = asize >> 20;
 		return p;
 	}
 
-	/* tiers 2-4: huge-page-aligned anon mapping. For the shmem
+	/*
+	 * tiers 2-4: huge-page-aligned anon mapping. For the shmem
 	 * (MAP_SHARED) case the VA and shmem *file offset* must be congruent
 	 * modulo the huge page size for THP eligibility, so reserve PROT_NONE
 	 * first, then MAP_FIXED the real mapping at a huge-page boundary
 	 * inside it - an atomic replace, no race with other mappings.
-	 * Harmless (and keeps the alignment) for MAP_PRIVATE. */
-	resv = mmap(NULL, asize + HG_HPS, PROT_NONE,
+	 * Harmless (and keeps the alignment) for MAP_PRIVATE.
+	 *
+	 * The real mapping covers the whole CAP, readable and writable, even
+	 * though only asize of it is committed now. That is the load-bearing
+	 * part of v3 growth, not an accident: this mapping is created before
+	 * fork, so it is the one VMA every worker inherits, all of them backed
+	 * by the same shmem object. Growing later means faulting more of that
+	 * object in - visible to every process by construction. The obvious
+	 * alternative - keep the tail PROT_NONE and mmap/mprotect it live at
+	 * grow time - changes only the GROWER's page tables: measured on the
+	 * 5.4 kernel, the grower reads its new pages fine and a forked worker
+	 * SIGSEGVs on the same addresses (scratchpad rig vatest.c, test A vs
+	 * B). An untouched R/W tail costs a few hundred kB of page-table
+	 * entries, not memory - test B: 64 MB of mapped-untouched span held
+	 * RSS at 576 kB.
+	 */
+	resv = mmap(NULL, csize + HG_HPS, PROT_NONE,
 	            MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	if (resv == MAP_FAILED)
 		return NULL;
 	base = (char *)(((unsigned long)resv + HG_HPS - 1) & ~(HG_HPS - 1));
-	p = mmap(base, asize, PROT_READ|PROT_WRITE,
+	p = mmap(base, csize, PROT_READ|PROT_WRITE,
 	         vis|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
 	if (p == MAP_FAILED) {
-		munmap(resv, asize + HG_HPS);
+		munmap(resv, csize + HG_HPS);
 		return NULL;
 	}
 
-	hg_exclude_from_core(base, asize);
+	hg_exclude_from_core(base, csize);
 
 	/* advise huge before first touch (tier 2), then pin+populate: a cold
-	 * mlock populates to pin, so it doubles as the pre-fault */
-	madvise(base, asize, MADV_HUGEPAGE);
+	 * mlock populates to pin, so it doubles as the pre-fault. The advice
+	 * covers the whole cap so growth deltas inherit it - each delta still
+	 * gets its backing VERIFIED at grow time, never assumed from here. */
+	madvise(base, csize, MADV_HUGEPAGE);
 	shmem_kb = hg_read_shmem_huge_kb();
 	if (mlock(base, asize) == 0) {
 		*locked_mb = asize >> 20;
@@ -333,6 +376,106 @@ static void *hg_mem_reserve(unsigned long size, enum hg_mem_tier *tier,
 	}
 	return base;
 #endif /* __OS_linux */
+}
+
+/* v3 admin caps - see the declaration comment in hg_malloc.h. 0 = fixed. */
+unsigned long hg_shm_cap_bytes;
+unsigned long hg_pkg_cap_bytes;
+
+/*
+ * Commit [hbase+off, +delta) of the reservation: populate, pin, verify the
+ * achieved backing. The range is already mapped R/W (the whole cap is, since
+ * reserve time - that is what makes the commit visible to every forked
+ * worker with no page-table surgery here), so the only work is faulting the
+ * pages in and finding out what the kernel faulted them in AS.
+ *
+ * mlock() is the commit primitive for every tier, chosen for one property:
+ * it populates the exact range and reports failure through errno instead of
+ * raising SIGBUS in whichever worker touches the shortfall later. A grow
+ * that cannot be backed must fail HERE, atomically, while the buddy still
+ * considers the range nonexistent.
+ *   - tiers 2-4: mlock is also the pin, same as init.
+ *   - tier 1: hugetlb pages are unswappable regardless; mlock is used only
+ *     as the populate-with-clean-errno vehicle. The pool-exhaustion path
+ *     (mlock ENOMEM, nothing SIGBUSes, VM_LOCKED rolled back) is PROVEN by
+ *     the hgstress grow harness against a deliberately undersized pool -
+ *     do not take this comment's word for it, run the harness.
+ *
+ * Returns the achieved hg_mem_tier of the delta, or -1 with the range
+ * munlock'd again (refuse, never half-commit). No hg_exclude_from_core()
+ * here: reserve time already excluded the whole cap.
+ */
+int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta)
+{
+	char *base = hb->hbase + off;
+
+	if (off + delta > hb->hcap) {
+		LM_BUG("%s: commit of %lu@%lu overruns the %lu byte cap\n",
+			hb->name, delta, off, hb->hcap);
+		return -1;
+	}
+
+	if (hb->tier == HG_MEM_HUGETLB) {
+		if (mlock(base, delta) != 0) {
+			/* once per episode - see grow_refuse_said's comment */
+			if (!hb->grow_refuse_said) {
+				hb->grow_refuse_said = 1;
+				LM_WARN("%s: cannot grow by %lu MB: the hugetlb "
+					"pool is exhausted (%s). Raise "
+					"vm.nr_hugepages.\n",
+					hb->name, delta >> 20, strerror(errno));
+			}
+			munlock(base, delta);
+			return -1;
+		}
+		hb->locked_mb += delta >> 20;
+		return HG_MEM_HUGETLB;
+	}
+
+#ifdef __OS_linux
+	{
+		long shmem_kb = hg_read_shmem_huge_kb();
+
+		/* re-advise the delta: cheap, and correct even though reserve
+		 * time advised the whole cap - a later madvise elsewhere in the
+		 * VMA may have split it */
+		madvise(base, delta, MADV_HUGEPAGE);
+
+		if (mlock(base, delta) != 0) {
+			/* once per episode - see grow_refuse_said's comment */
+			if (!hb->grow_refuse_said) {
+				hb->grow_refuse_said = 1;
+				LM_WARN("%s: cannot grow by %lu MB: mlock failed "
+					"(%s). If running under systemd, add "
+					"LimitMEMLOCK=infinity to the unit.\n",
+					hb->name, delta >> 20, strerror(errno));
+			}
+			munlock(base, delta);
+			return -1;
+		}
+		hb->locked_mb += delta >> 20;
+
+		/*
+		 * The delta's backing is a fresh negotiation - the arena's init
+		 * tier says NOTHING about what this range just got. Verify it
+		 * the same way init does: read what the kernel actually did.
+		 */
+		if (hg_range_is_huge((unsigned long)base))
+			return HG_MEM_THP_ADVISE;
+		if (shmem_kb >= 0 &&
+		    madvise(base, delta, MADV_COLLAPSE) == 0 &&
+		    hg_read_shmem_huge_kb() - shmem_kb >= (long)(delta / 1024))
+			return HG_MEM_THP_COLLAPSE;
+		return HG_MEM_4K;
+	}
+#else
+	if (mlock(base, delta) != 0) {
+		memset(base, 0, delta);        /* still pre-fault */
+	} else {
+		hb->locked_mb += delta >> 20;
+	}
+	return HG_MEM_4K;
+#endif
 }
 
 const char *hg_mem_tier_str(enum hg_mem_tier tier)
@@ -383,7 +526,13 @@ static void hg_arena_reg_add(struct hg_block *hb)
 	for (i = 0; i < HG_ARENA_REG_MAX; i++) {
 		if (!hg_arena_reg[i].base) {
 			hg_arena_reg[i].base = hb->hbase;
-			hg_arena_reg[i].size = hb->hsize;
+			/* the CAP, not hsize: growth must not invalidate the
+			 * registry entry, or a pointer into grown space would be
+			 * misread as foreign and "routed" to another arena. The
+			 * whole cap's VA belongs to this arena from reserve time;
+			 * uncommitted ranges cannot hold live cells, so the wider
+			 * range cannot misattribute anything that exists. */
+			hg_arena_reg[i].size = hb->hcap;
 			hg_arena_reg[i].hb   = hb;
 			return;
 		}
@@ -423,10 +572,36 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 {
 	enum hg_mem_tier tier;
 	unsigned long locked_mb;
+	unsigned long cap;
 	char *base;
 	struct hg_block *hb;
 
-	base = hg_mem_reserve(size, &tier, &locked_mb, shared);
+	/* v3: the reservation may exceed the committed size, by admin cap.
+	 * cap comes back as what was actually achieved (a hugetlb pool that
+	 * cannot hold the cap degrades to a fixed arena, not to no arena).
+	 * By NAME, not by @shared: shm_dbg is also shared but is a fixed-size
+	 * diagnostic pool computed by hg_get_dbg_pool_size() - handing it the
+	 * shm cap would reserve gigabytes of VA for a pool that must never
+	 * grow past its formula.
+	 *
+	 * The HG_*_CAP_MB environment fallback is SCAFFOLDING for the v3
+	 * mechanism work: the real config surface (auto_scaling_profile
+	 * grammar) is a later step, and the growth path needs to be provable
+	 * end-to-end before it exists. The globals stay authoritative - the
+	 * env is consulted only while they are unset - so wiring the config
+	 * up later removes the fallback's reach without touching this code. */
+	if (!strcmp(name, "shm")) {
+		cap = hg_shm_cap_bytes;
+		if (!cap && getenv("HG_SHM_CAP_MB"))
+			cap = strtoul(getenv("HG_SHM_CAP_MB"), NULL, 10) << 20;
+	} else if (!strcmp(name, "pkg")) {
+		cap = hg_pkg_cap_bytes;
+		if (!cap && getenv("HG_PKG_CAP_MB"))
+			cap = strtoul(getenv("HG_PKG_CAP_MB"), NULL, 10) << 20;
+	} else {
+		cap = 0;
+	}
+	base = hg_mem_reserve(size, &cap, &tier, &locked_mb, shared);
 	if (!base) {
 		LM_ERR("failed to reserve %lu bytes for %s HG_MALLOC arena\n",
 			size, name);
@@ -437,7 +612,7 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 	if (size < ROUNDUP_TO(sizeof(struct hg_block))) {
 		LM_ERR("%s arena of %lu bytes too small for the block header "
 			"(%zu bytes)\n", name, size, sizeof(struct hg_block));
-		munmap(base, HG_HPS_ROUND(size));
+		munmap(base, cap);
 		return NULL;
 	}
 
@@ -448,15 +623,21 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 	hb->lo = ~0UL;
 	hb->hbase = base;
 	hb->hsize = HG_HPS_ROUND(size);
+	hb->hcap = cap;
+	/* one committed-size step per grow: big enough that a growth spurt is
+	 * a handful of commits, small enough that the pre-fault under the
+	 * arena lock stays bounded. Overridable by config later. */
+	hb->grow_granule = HG_HPS_ROUND(16UL << 20);
 	/* hg_hps() is private to this file, and hg_arena_init() needs the probed
 	 * value to lay out the page grid - hand it over rather than re-probing */
 	hb->hps = HG_HPS;
 	hb->tier = tier;
 	hb->locked_mb = locked_mb;
+	hb->tier_bytes[tier] = hb->hsize;
 
 	if (!lock_init(&hb->lock)) {
 		LM_ERR("failed to init the %s arena lock\n", name);
-		munmap(base, hb->hsize);
+		munmap(base, hb->hcap);
 		return NULL;
 	}
 
@@ -467,7 +648,7 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 	if (hg_arena_init(hb, ROUNDUP_TO(sizeof(struct hg_block))) < 0) {
 		LM_ERR("failed to init the %s arena\n", name);
 		lock_destroy(&hb->lock);
-		munmap(base, hb->hsize);
+		munmap(base, hb->hcap);
 		return NULL;
 	}
 
@@ -486,6 +667,10 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 		LM_NOTICE("%s " HG_MALLOC_NAME " arena: %lu MB on %s, %lu MB "
 			"pinned from swapping\n",
 			name, size >> 20, hg_mem_tier_str(tier), locked_mb);
+	if (hb->hcap > hb->hsize)
+		LM_NOTICE("%s arena can grow to %lu MB (%lu MB headroom "
+			"reserved, uncommitted)\n", name, hb->hcap >> 20,
+			(hb->hcap - hb->hsize) >> 20);
 
 	return hb;
 }
@@ -508,8 +693,9 @@ void hg_malloc_destroy(struct hg_block *hb)
 	hg_arena_reg_del(hb);
 	hg_arena_destroy(hb);
 	lock_destroy(&hb->lock);
-	/* munmap last: hb itself lives inside hbase */
-	munmap(hb->hbase, hb->hsize);
+	/* munmap last: hb itself lives inside hbase. The whole cap, not just
+	 * the committed part - the reservation is one mapping */
+	munmap(hb->hbase, hb->hcap);
 }
 
 void hg_malloc_child_init(struct hg_block *hb)

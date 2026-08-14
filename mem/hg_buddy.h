@@ -119,6 +119,11 @@ int hg_buddy_init(struct hg_block *hb);
  * aligned. hb->lock must be held. Returns NULL when no page can serve it. */
 void *hg_buddy_alloc(struct hg_block *hb, unsigned int order);
 
+/* v3: commit up to max(granule, @need) more of the reservation and publish
+ * the new whole pages as free. hb->lock must be held. 0 = grew (retry the
+ * allocation), -1 = cannot (at cap / no cap / host refused the commit). */
+int hg_buddy_grow(struct hg_block *hb, unsigned long need);
+
 /* Return a block previously handed out by hg_buddy_alloc(), merging it with
  * its buddy as far up as it will go. hb->lock must be held. */
 void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order);

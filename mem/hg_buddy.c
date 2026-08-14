@@ -195,20 +195,27 @@ int hg_buddy_init(struct hg_block *hb)
 	 * no decision to make, and costs no extra huge pages. A dedicated page
 	 * would be 25% overhead on an 8 MB pkg arena, and 30 workers each
 	 * wanting one would burn 60 MB to hold 45 KB.
+	 *
+	 * Sized for npages_cap, not npages: descriptors for pages the arena
+	 * could GROW into are laid out now, from committed memory, so a later
+	 * grow only publishes them - it never has to find room for metadata
+	 * in an arena that is, by definition of why it is growing, full. The
+	 * overhead is ~0.05% of each never-committed page, paid up front.
 	 */
-	meta = hb->npages * (sizeof(struct hg_page) + lpp +
-	                     bmwords * sizeof(long));
+	meta = hb->npages_cap * (sizeof(struct hg_page) + lpp +
+	                         bmwords * sizeof(long));
 	meta_base = hg_chunk_backing(hb, meta);
 	if (!meta_base) {
 		LM_ERR("%s: cannot carve %lu bytes of buddy metadata for %lu "
-			"pages\n", hb->name, meta, hb->npages);
+			"pages (%lu committed)\n", hb->name, meta,
+			hb->npages_cap, hb->npages);
 		return -1;
 	}
 	memset(meta_base, 0, meta);
 
 	hb->pages = (struct hg_page *)(void *)meta_base;
-	cur = meta_base + hb->npages * sizeof(struct hg_page);
-	for (i = 0; i < hb->npages; i++) {
+	cur = meta_base + hb->npages_cap * sizeof(struct hg_page);
+	for (i = 0; i < hb->npages_cap; i++) {
 		pg = &hb->pages[i];
 		pg->idx = (unsigned int)i;
 		pg->base = hb->pbase + (i << hb->hps_shift);
@@ -217,7 +224,8 @@ int hg_buddy_init(struct hg_block *hb)
 		pg->bitmap = (unsigned long *)(void *)cur;
 		cur += bmwords * sizeof(long);
 		memset(pg->leaforder, HG_LEAF_NONE, lpp);
-		/* starts wholly reserved; the loop below publishes what is free */
+		/* starts wholly reserved; pages < npages are published below,
+		 * pages beyond wait for hg_buddy_grow() */
 	}
 
 	/*
@@ -280,6 +288,103 @@ int hg_buddy_init(struct hg_block *hb)
 		meta, meta / hb->npages,
 		100.0 * (double)meta / (double)hb->hsize,
 		hb->buddy_free_leaves, hb->npages * lpp, consumed_leaves);
+	return 0;
+}
+
+/* --- grow (v3) -------------------------------------------------------- */
+
+/*
+ * Commit more of the reservation and publish the new whole pages. Called
+ * with hb->lock HELD, from the two places an allocation can die of buddy
+ * exhaustion (carve_chunk and the large tier), which also bounds how often
+ * it runs: once per granule of genuine demand, never on the fast path.
+ *
+ * The pre-fault inside hg_mem_commit() happens under the arena lock - a
+ * deliberate trade. Growth is rare (once per granule, ratcheting), the
+ * granule is sized to keep the stall in the low milliseconds, and the
+ * alternative - dropping the lock to fault, then re-taking it - opens a
+ * publish race for no benefit: every other worker in here is ALSO out of
+ * memory and would only queue on the same growth.
+ *
+ * Returns 0 if new pages were published (caller retries its allocation),
+ * -1 if the arena cannot grow (at cap, cap never set, or the commit was
+ * refused by the host). The caller's existing failure path then reports
+ * exhaustion exactly as a fixed arena would.
+ */
+int hg_buddy_grow(struct hg_block *hb, unsigned long need)
+{
+	unsigned long delta, room, old_pages, i;
+	int tier;
+
+	if (!hb->buddy_ready)
+		return -1;
+
+	room = hb->hcap - hb->hsize;
+	if (room == 0) {
+		hb->grow_refused++;
+		/* an admin-set ceiling doing its job is not an alarm; growth
+		 * being impossible because no cap was ever set is not even
+		 * noteworthy - v2 arenas live their whole lives there. The two
+		 * are told apart by history, not arithmetic: a growable arena
+		 * can only reach room==0 by having grown (hsize starts below
+		 * hcap and moves only in grows), so grows>0 here means "the
+		 * headroom existed and is spent", while grows==0 means the
+		 * arena never had any. Said once per episode - grow_refused
+		 * carries the magnitude. */
+		if (hb->grows && !hb->grow_refuse_said) {
+			hb->grow_refuse_said = 1;
+			LM_NOTICE("%s: at the %lu MB growth cap (admin limit), "
+				"a %lu byte request must fail - counting further "
+				"refusals in hg_shm_grow_refused\n",
+				hb->name, hb->hcap >> 20, need);
+		}
+		return -1;
+	}
+
+	delta = hb->grow_granule;
+	if (need > delta)
+		delta = (need + hb->grow_granule - 1) /
+		        hb->grow_granule * hb->grow_granule;
+	if (delta > room)
+		delta = room;
+
+	tier = hg_mem_commit(hb, hb->hsize, delta);
+	if (tier < 0) {
+		/* resource refusal - the host, not the admin, said no. The
+		 * commit rolled itself back; nothing was published. */
+		hb->grow_refused++;
+		return -1;
+	}
+
+	hb->tier_bytes[tier] += delta;
+	hb->hsize += delta;
+	/* hb->size is the figure every "total/free" surface reports (shmem
+	 * statistics, hg_info, hg_advise's configured_mb) and free_to_carve
+	 * is literally size - real_used: leave it behind and that subtraction
+	 * underflows once carving passes the original size. The per-thread
+	 * cache budget and chunk_max stay on their init-time derivation -
+	 * conservative, and re-deriving them per grow would change cell-cache
+	 * behaviour mid-flight for a marginal win. */
+	hb->size += delta;
+	old_pages = hb->npages;
+	hb->npages = (unsigned long)(hb->hbase + hb->hsize - hb->pbase)
+	             >> hb->hps_shift;
+
+	for (i = old_pages; i < hb->npages; i++)
+		page_publish_whole(hb, &hb->pages[i]);
+
+	/* keep the floor at 1/16 of the grid it now guards */
+	hb->reserve_floor = (hb->npages * hg_leaves_per_page(hb)) / 16;
+
+	hb->grows++;
+	hb->grow_bytes += delta;
+	hb->grow_refuse_said = 0;    /* a new episode may be reported again */
+
+	LM_NOTICE("%s arena grew by %lu MB to %lu MB (%lu new pages on %s; "
+		"%lu MB headroom left)\n", hb->name, delta >> 20,
+		hb->hsize >> 20, hb->npages - old_pages,
+		hg_mem_tier_str((enum hg_mem_tier)tier),
+		(hb->hcap - hb->hsize) >> 20);
 	return 0;
 }
 

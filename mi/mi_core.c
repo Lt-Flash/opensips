@@ -1043,9 +1043,53 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 
 	if (add_mi_string(o, MI_SSTR("tier"), (char *)tier, strlen(tier)) < 0)
 		return -1;
+	/*
+	 * "tier" above is what INIT achieved. Growth deltas negotiate their
+	 * backing separately and may land lower, so a grown arena is described
+	 * by the byte split, not by one label - the label alone would be the
+	 * "outcome reported as an attribute" mistake. Emitted only when a
+	 * second tier actually holds bytes, so the common case stays terse.
+	 */
+	{
+		int nt = 0, t;
+		for (t = HG_MEM_HUGETLB; t <= HG_MEM_4K; t++)
+			if (hb->tier_bytes[t])
+				nt++;
+		if (nt > 1) {
+			mi_item_t *ta = add_mi_object(o, MI_SSTR("tier_bytes"));
+
+			if (!ta)
+				return -1;
+			for (t = HG_MEM_HUGETLB; t <= HG_MEM_4K; t++) {
+				/* add_mi_number() takes a non-const name; the tier
+				 * strings are literals it only reads */
+				char *ts = (char *)hg_mem_tier_str((enum hg_mem_tier)t);
+
+				if (hb->tier_bytes[t] &&
+				    add_mi_number(ta, ts, strlen(ts),
+				                  hb->tier_bytes[t]) < 0)
+					return -1;
+			}
+		}
+	}
 	if (add_mi_number(o, MI_SSTR("total_size"), hb->size) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("pinned_mb"), hb->locked_mb) < 0)
+		return -1;
+	/* v3: committed vs reserved, and whether growth has happened or been
+	 * refused. committed == cap means fixed (v2 semantics, the default). */
+	if (add_mi_number(o, MI_SSTR("committed"), hb->hsize) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("cap"), hb->hcap) < 0)
+		return -1;
+	if (hb->hcap > hb->hsize &&
+	    add_mi_number(o, MI_SSTR("grow_headroom"), hb->hcap - hb->hsize) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("grows"), hb->grows) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("grow_bytes"), hb->grow_bytes) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("grow_refused"), hb->grow_refused) < 0)
 		return -1;
 
 	/* carved: bytes taken from the arena and cut into size-class chunks.

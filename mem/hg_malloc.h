@@ -429,6 +429,50 @@ struct hg_block {
 	unsigned long         locked_mb;
 
 	/*
+	 * v3 elastic arena.
+	 *
+	 * hsize is what is COMMITTED - pre-faulted, pinned, and published to
+	 * the buddy. hcap is what is RESERVED in virtual address space. The
+	 * WHOLE cap is mapped once, before fork; growth only commits more of
+	 * what is already mapped.
+	 *
+	 * That split is forced, not stylistic. mmap() and mprotect() edit ONE
+	 * process's page tables, and the shm arena is shared by ~30 workers
+	 * that forked before any growth happens. A delta mapped into a
+	 * PROT_NONE reservation after fork is invisible to every one of them:
+	 * measured, the grower reads its new page fine and a forked worker
+	 * SIGSEGVs on the same address. Mapping the cap up front gives every
+	 * worker one VMA over one shmem object, so a page the grower commits
+	 * simply faults in wherever it is next touched.
+	 *
+	 * hcap == hsize is a fixed arena - exactly v2's behaviour, and the
+	 * default until an admin asks for more.
+	 */
+	unsigned long         hcap;         /* VA reserved, >= hsize */
+	unsigned long         grow_granule; /* bytes per grow step, hps multiple */
+	unsigned long         grows;        /* successful commits */
+	unsigned long         grow_bytes;   /* their total */
+	unsigned long         grow_refused; /* refusals (cap or resource) */
+	/*
+	 * One line per refusal EPISODE, not per refusal: a full arena refuses
+	 * on every subsequent allocation (measured: 239k NOTICEs in 4s on the
+	 * first at-cap soak), and the counter above already carries the
+	 * magnitude. Set when a refusal is logged, cleared by the next
+	 * successful grow. The full two-threshold latch design is a later
+	 * step; this only keeps the log honest until it lands.
+	 */
+	unsigned int          grow_refuse_said;
+	/*
+	 * Bytes of the arena per ACHIEVED backing tier, indexed by
+	 * enum hg_mem_tier (slot 0 unused; the enum starts at 1). hb->tier
+	 * alone cannot describe a grown arena: every THP delta is a fresh
+	 * negotiation with the kernel and may land on 4K next to an arena
+	 * that got 2M at init. Page backing is an outcome per range, never
+	 * an attribute of the arena - report it as such.
+	 */
+	unsigned long         tier_bytes[HG_MEM_4K + 1];
+
+	/*
 	 * v2 buddy substrate - see mem/README.hg_arena_v2.
 	 *
 	 * The whole design turns "which block owns this address" into two shifts
@@ -448,7 +492,13 @@ struct hg_block {
 	unsigned long hps;         /* huge page size, probed at reserve time */
 	unsigned int  hps_shift;   /* log2(hps), so page-of is a shift */
 	char         *pbase;       /* page 0 - hbase rounded up to hps */
-	unsigned long npages;      /* whole pages from pbase to the reservation end */
+	unsigned long npages;      /* whole pages from pbase to the COMMITTED end
+	                            * (hbase+hsize); grows when the arena does */
+	unsigned long npages_cap;  /* whole pages to the reservation end
+	                            * (hbase+hcap) - the grid's true extent.
+	                            * Descriptors exist for all of these from
+	                            * init, so growth publishes pages instead of
+	                            * relocating metadata */
 
 	/*
 	 * Buddy state (hg_buddy.c). Every field here is written only while
@@ -582,6 +632,33 @@ static inline unsigned long hg_leaf_of(const struct hg_block *hb, const void *p)
 struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 		const char *proc_desc);
 void hg_malloc_destroy(struct hg_block *hb);
+
+/*
+ * v3 admin caps, in bytes; 0 (the default) pins the arena at its initial
+ * size, which is exactly v2's behaviour. Consulted by hg_malloc_init() -
+ * shm arenas read the shm cap, pkg arenas the pkg one - so they must be
+ * set before the arenas come up (config parse time). Plain globals rather
+ * than parameters because init has five call sites across mem.c/shm_mem.c/
+ * pt.c that would all forward a value they do not own.
+ *
+ * The pkg cap is PER PROCESS: every worker grows its own private arena, so
+ * the host-RAM exposure of a pkg cap is cap x nproc. The config layer, not
+ * this one, is where that multiplication must be surfaced to the admin.
+ */
+extern unsigned long hg_shm_cap_bytes;
+extern unsigned long hg_pkg_cap_bytes;
+
+/*
+ * Commit @delta more bytes at committed-end offset @off of the reservation
+ * (both hps-rounded), populating and pinning them, and VERIFYING what
+ * backing the kernel actually provided. Returns the achieved tier of the
+ * delta (>= 1) or -1 with everything rolled back - a refusal, not a
+ * degradation, so a worker never SIGBUSes on memory the allocator
+ * half-committed. Defined in hg_malloc.c because the tier ladder and its
+ * verification probes live there; called by hg_buddy_grow() under
+ * hb->lock.
+ */
+int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta);
 
 /* re-sync per-process state after fork(): see hg_arena.c for why the
  * inherited private free-stack/bump state must be discarded, not kept or

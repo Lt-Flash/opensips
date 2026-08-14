@@ -837,6 +837,12 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 	}
 	size = (unsigned int)(HG_LEAF_SIZE << ord);
 	ch = hg_buddy_alloc(hb, (unsigned int)ord);
+	/* v3: exhaustion is a growth trigger before it is an error. One retry
+	 * only - if the arena grew, the freshly published pages satisfy this
+	 * order by construction (they are whole), so a second miss can only
+	 * mean the grow itself was refused and would be refused again. */
+	if (!ch && hg_buddy_grow(hb, size) == 0)
+		ch = hg_buddy_alloc(hb, (unsigned int)ord);
 
 	/*
 	 * Reserve floor. Checked HERE, at the one point where the arena's free
@@ -996,6 +1002,13 @@ static int pages_init(struct hg_block *hb)
 	hb->pbase = (char *)(((unsigned long)hb->hbase + hps - 1) & ~(hps - 1));
 	end = hb->hbase + hb->hsize;
 	hb->npages = (unsigned long)(end - hb->pbase) >> shift;
+	/* the grid's full extent runs to the CAP - descriptors for every page
+	 * that could ever exist are laid out at init (hg_buddy_init), so a
+	 * grow publishes pages instead of relocating metadata */
+	hb->npages_cap = (unsigned long)(hb->hbase + hb->hcap - hb->pbase)
+	                 >> shift;
+	if (hb->npages_cap < hb->npages)     /* hcap==hsize, or a tiny arena */
+		hb->npages_cap = hb->npages;
 
 	if (hb->pbase != hb->hbase)
 		LM_INFO("%s: reservation base %p is not %lu-aligned, losing %lu "
@@ -1171,6 +1184,13 @@ void *hg_region_alloc(struct hg_block *hb, unsigned long size)
 	if (!rg && ord < 0)
 		rg = hg_buddy_alloc_run(hb,
 			(need + hb->hps - 1) >> hb->hps_shift);
+	/* v3: grow-and-retry, same single-retry contract as carve_chunk() */
+	if (!rg && hg_buddy_grow(hb, need) == 0) {
+		rg = ord < 0
+			? hg_buddy_alloc_run(hb,
+				(need + hb->hps - 1) >> hb->hps_shift)
+			: hg_buddy_alloc(hb, (unsigned int)ord);
+	}
 	lock_release(&hb->lock);
 
 	if (!rg) {
@@ -1858,6 +1878,11 @@ enum hg_stat_field {
 	HGS_RESERVE_FLOOR, HGS_BELOW_FLOOR, HGS_FLOOR_CROSSINGS,
 	/* one number an operator can alert on; the breakdown is in hg_stats */
 	HGS_CORRUPTION,
+	/* v3 elastic arena: committed vs reserved, and the grow ledger.
+	 * grow_refused is the alertable one - a nonzero, rising value means
+	 * demand hit a wall (cap or host), which is exactly the old
+	 * exhaustion condition wearing its new name. */
+	HGS_COMMITTED, HGS_CAP, HGS_GROWS, HGS_GROW_BYTES, HGS_GROW_REFUSED,
 };
 
 static unsigned long hg_shm_stat(void *ctx)
@@ -1915,6 +1940,11 @@ static unsigned long hg_shm_stat(void *ctx)
 	case HGS_BELOW_FLOOR:     return hb->below_floor;
 	case HGS_FLOOR_CROSSINGS: return hb->floor_crossings;
 	case HGS_CORRUPTION:      return hg_corrupt_total(hb);
+	case HGS_COMMITTED:       return hb->hsize;
+	case HGS_CAP:             return hb->hcap;
+	case HGS_GROWS:           return hb->grows;
+	case HGS_GROW_BYTES:      return hb->grow_bytes;
+	case HGS_GROW_REFUSED:    return hb->grow_refused;
 	}
 	return 0;
 }
@@ -1953,6 +1983,11 @@ static const struct {
 	{"hg_shm_below_floor",     HGS_BELOW_FLOOR},
 	{"hg_shm_floor_crossings", HGS_FLOOR_CROSSINGS},
 	{"hg_shm_corruption",      HGS_CORRUPTION},
+	{"hg_shm_committed",       HGS_COMMITTED},
+	{"hg_shm_cap",             HGS_CAP},
+	{"hg_shm_grows",           HGS_GROWS},
+	{"hg_shm_grow_bytes",      HGS_GROW_BYTES},
+	{"hg_shm_grow_refused",    HGS_GROW_REFUSED},
 	{NULL, 0}
 };
 

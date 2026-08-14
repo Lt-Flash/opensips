@@ -396,17 +396,57 @@ climbing **751 MB → 1126 MB** as the work arrived.
 
 ### By routing arm — three nodes, 12k CPS
 
-```
-CPU saving vs F_MALLOC (higher is better)
+Cores consumed across all three nodes, at the same offered load:
 
-  simple relay (rr)        ██████████ −10%
-  TH + cachedb_perf        ██████████████ −14%
-  TH + cachedb_local       ████████████████████ −20%
-  TH + dialog              ████████████████████████ −24%
+```
+                        F_MALLOC   HG_MALLOC   saving
+
+  simple relay (rr)       5.18       4.65       −10%
+  TH + cachedb_perf       6.13       5.28       −14%
+  TH + cachedb_local      6.42       5.13       −20%
+  TH + dialog             7.44       5.65       −24%
 ```
 
 The heavier the per-call state, the more the allocator matters — which is the
 expected shape, and a useful sanity check on the numbers.
+
+#### The saving column is not a ranking of the backends
+
+Each row compares an arm **against itself** on the two allocators, so the saving
+measures *how allocator-bound that arm was* — not how fast the module is. The
+two cache arms show why that distinction matters:
+
+- **`cachedb_local` allocates once per stored entry**, and frees once when the
+  entry is overwritten or expires. One TH state entry per call at 12k CPS is
+  roughly 12,000 allocations and as many frees every second, straight into the
+  general allocator. Making that allocator faster shows up immediately — hence
+  −20%.
+- **`cachedb_perf` allocates once per *chunk*.** Cells of 8 KB and under share
+  256 KB chunks, so a single `shm_malloc` serves hundreds of entries, and freed
+  cells go back to a per-class pool rather than to shm. There is very little
+  allocator traffic left to make faster — hence only −14%.
+
+So the shorter bar is a property of the backend, not a weakness: `cachedb_perf`
+was already avoiding the work HG_MALLOC exists to make cheap. An allocator can
+only give back time you were spending in it.
+
+Both arms were configured identically — `th=16`, which both modules read as a
+power-of-two exponent, giving each 65,536 buckets.
+
+#### What this run does not settle
+
+It does not say which cache backend is cheaper. The two arms land within a few
+percent of each other in absolute cores, in opposite directions on the two
+allocators, and repeat runs of a single *unchanged* arm at this operating point
+spread by 2–3.5% (and about 5% between sessions on different days). That
+ordering is inside the noise, and nothing here should be read as ranking them.
+
+This is an allocator benchmark: it holds the routing arm fixed and swaps the
+allocator underneath. It is also an end-to-end SIP measurement, where the cache
+operation is a small part of a call that also parses messages, keeps transaction
+state and does UDP I/O — so even a large difference in cache cost is diluted
+before it reaches this chart. For the backend comparison, measure the cache
+operation directly.
 
 ### Huge pages are the smaller half of the win
 

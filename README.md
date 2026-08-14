@@ -7,6 +7,35 @@
 
 ## What it is for
 
+**Same OpenSIPS, same config, same hardware — one flag, and the server does the
+work with substantially less CPU.** The allocator is chosen at runtime with
+`-a HG_MALLOC`, so it is a one-line change you can undo just as fast.
+
+| | measured against F_MALLOC, on real SIP call flows |
+|---|---|
+| **−18% CPU** | five allocators, one binary, topology hiding + cachedb_perf at **12,000 CPS**: 5.29 cores vs 6.42 |
+| **up to −45% CPU** | and the saving *grows* with load — TH + dialog at 4000 CPS: 3.20 → 1.76 cores |
+| **−10% to −24%** | across every routing arm tested, the heavier the per-call state the bigger the win |
+| **2.8× cheaper allocation** | allocator self-time 2.75–3.38% vs 9.5–22.8% for Q/F/HP/F_PARALLEL on the same host |
+| **flat memory** | ~1.7 GB regardless of load, against F_MALLOC climbing 751 MB → 1126 MB into the same work |
+| **no fragmentation drift** | on a production gateway across a business day the arena *shrank*, 23.0 MB → 18.6 MB |
+
+Two things buy that: **the common allocation path takes no lock at all**, and the
+arena sits on **2 MB huge pages** so a multi-gigabyte pool needs ~512× fewer
+page-table entries. Huge pages are the smaller half — with them disabled
+entirely it still beat F_MALLOC by 2.8× — so a host that cannot reserve a
+hugetlb pool still gets most of the benefit. Full method and caveats in
+[Measured performance](#measured-performance).
+
+It pays off when many workers share a large pool and you care about tail latency:
+SIP proxies under real concurrency, topology hiding, dialog-heavy routing. The
+cost is honest and worth knowing up front — **the whole arena is reserved and
+pinned at startup**, so an oversized `-m` is paid for immediately rather than
+lazily, and `-m`/`-M` cannot change while the process runs. `hg_advise` exists to
+size it from measurement instead of guesswork.
+
+---
+
 OpenSIPS allocates from its own pools rather than libc: one shared pool (`-m`)
 that every process reaches, and a private pool per process (`-M`). At scale two
 things hurt — TLB pressure from 4 KB pages across a multi-gigabyte shared pool,
@@ -29,13 +58,10 @@ back instead of only ever growing to its high-water mark. What does *not* shrink
 is the reservation itself: it stays mapped and pinned for the life of the
 process, by design.
 
-It is worth using when you run large shared pools on many workers and care about
-tail latency and page-table pressure. A reserved huge-page pool gives the best
-backing but is **not** required — see the tier ladder below; nor is `memlock`,
-which if it cannot be raised costs you the pinning (the arena runs unpinned and
-swappable, with a warning) rather than the allocator. What it genuinely cannot do
-is resize while running: `-m`/`-M` are fixed for the life of the process, and the
-whole reservation is paid for at startup rather than as it is touched.
+Neither host prerequisite is hard: a reserved huge-page pool gives the best
+backing but is not required (see the tier ladder below), and `memlock` — if it
+cannot be raised — costs you the pinning, not the allocator: the arena runs
+unpinned and swappable, and says so.
 
 ## Compared with the other allocators
 

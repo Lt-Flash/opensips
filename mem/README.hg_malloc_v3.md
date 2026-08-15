@@ -127,11 +127,17 @@ auto_scaling_profile = MEM_SHM
     scale up to 1024 on 80% for 3 cycles within 10
     scale down to 256 on 30% for 120 cycles
 
+auto_scaling_profile = MEM_PKG
+    scale up to 64 on 80% for 2 cycles within 5
+    scale down to 8 on 20% for 60 cycles
+
 shm_auto_scaling_profile = MEM_SHM
+pkg_auto_scaling_profile = MEM_PKG
 ```
 
-`pkg_auto_scaling_profile` takes the same grammar and does the same
-for every worker's private arena — Section 11.
+The pkg profile governs **every worker's private arena individually**,
+so its numbers are per-worker scale — an order of magnitude below the
+shared arena's (Section 11).
 
 Watch it work:
 

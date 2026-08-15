@@ -724,6 +724,51 @@ Exhaustion growth + conservative built-in shrink (4 quiet intervals per
 granule, never below `-m 256`). No proactive behaviour, no config
 surface at all.
 
+### 12.5 The first soak, charted
+
+Two nodes, first 14 hours on v3 (2026-08-14/15), every point taken from
+the arena's own grow/shrink NOTICE lines. The LB ran the section 12.2
+recipe untouched; the gateway was deliberately re-cut mid-soak to a
+near-empty start (`-m 8:512 -M 2:32`) to make growth earn everything.
+
+```mermaid
+xychart-beta
+    title "LB .250: committed MB (top line shm, flat line pkg)"
+    x-axis ["23:49 boot", "23:59", "00:09", "08:19", "10:09", "14:00"]
+    y-axis "committed MB" 0 --> 70
+    line [64, 48, 32, 48, 34, 34]
+    line [16, 16, 16, 16, 16, 16]
+```
+
+*The 12.2 config doing its job unattended: idle 64 shrinks to the 32
+floor within 20 minutes of boot, morning traffic grows it back to 48,
+and the after-peak shrink releases only what is genuinely empty —
+committed lands on 34, not 32, because 2 MB of the growth still holds a
+live allocation ("7 pages released; 2 MB of growth still held"). pkg
+never moved on any of the 28 workers. Changes are instantaneous steps;
+the slopes are an artifact of the event-spaced axis.*
+
+```mermaid
+xychart-beta
+    title "GW .244: committed MB (shm; pkg typical; pkg 3 grown workers)"
+    x-axis ["23:50 boot", "00:10", "00:30", "00:57 restart", "01:17 re-cut", "01:19", "14:00"]
+    y-axis "committed MB" 0 --> 70
+    line [64, 48, 32, 64, 8, 24, 24]
+    line [16, 16, 16, 16, 2, 2, 2]
+    line [16, 16, 16, 16, 2, 18, 18]
+```
+
+*The adversarial arm. First boot (`-m 64`) runs the predicted shrink
+train to 32; a restart resets to 64; then the re-cut starts shm at
+**8 MB** and per-worker pkg at **2 MB**. Demand pulls shm to 24 within
+two minutes and exactly three of 54 workers grow their pkg to 18 —
+the other 51 stay at the 2 MB floor. Twelve hours of steady state
+followed.*
+
+Both nodes, the whole window: `grow_refused` 0, `grow_blocked` 0,
+corruption counters 0, tier-1 hugetlb throughout, and the
+`E_CORE_SHM_GROW_BLOCKED` event never fired.
+
 ---
 
 ## 13. Monitoring and alerting

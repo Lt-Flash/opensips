@@ -578,9 +578,24 @@ static inline unsigned long hg_leaf_of(const struct hg_block *hb, const void *p)
 /* @shared: 1 for shm/shm_dbg (MAP_SHARED - one arena for every worker),
  * 0 for pkg (MAP_PRIVATE - each forked worker gets its own copy-on-write
  * arena, lock and free pools). See hg_mem_reserve() in hg_malloc.c for why
- * getting this wrong for pkg is a correctness AND a performance bug. */
+ * getting this wrong for pkg is a correctness AND a performance bug.
+ *
+ * @flags: HG_INIT_INHERITED marks the ONE arena that outlives fork() as a
+ * copy-on-write inheritance: the pre-fork (attendant) pkg arena. Every
+ * child holds a private COW view of it for life - it reads module state
+ * the parent parsed into it, and any write it makes there is a COW fault.
+ * Such an arena must never be hugetlb-backed: a COW fault inside a
+ * hugetlb VMA can only be satisfied by a huge page (no 4K fallback), and
+ * a forked child holds no reservation on its parent's mapping, so with
+ * the pool momentarily empty the fault is a SIGBUS - silent, at fork
+ * time (measured: it is exactly how the last no-script child, TCP main,
+ * died at startup on a short pool). THP has the fallback: a COW fault
+ * splits the huge PMD and copies one 4K page. Per-child arenas are never
+ * inherited (children do not fork) and keep the full ladder. */
+#define HG_INIT_INHERITED  (1U << 0)
+
 struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
-		const char *proc_desc);
+		const char *proc_desc, unsigned int flags);
 void hg_malloc_destroy(struct hg_block *hb);
 
 /* re-sync per-process state after fork(): see hg_arena.c for why the

@@ -251,7 +251,7 @@ static void hg_exclude_from_core(void *base, unsigned long size)
  *                        between processes through the shared gpool.
  */
 static void *hg_mem_reserve(unsigned long size, enum hg_mem_tier *tier,
-		unsigned long *locked_mb, int shared)
+		unsigned long *locked_mb, int shared, int inherited)
 {
 	unsigned long asize = HG_HPS_ROUND(size);
 	int vis = shared ? MAP_SHARED : MAP_PRIVATE;
@@ -277,8 +277,17 @@ static void *hg_mem_reserve(unsigned long size, enum hg_mem_tier *tier,
 	return p;
 #else
 
-	/* tier 1: MAP_HUGETLB - unswappable, exempt from RLIMIT_MEMLOCK */
-	p = mmap(NULL, asize, PROT_READ|PROT_WRITE,
+	/*
+	 * tier 1: MAP_HUGETLB - unswappable, exempt from RLIMIT_MEMLOCK.
+	 *
+	 * ...except for the arena children inherit copy-on-write (the pre-fork
+	 * pkg arena, HG_INIT_INHERITED): a child's write into an inherited
+	 * hugetlb page needs a fresh huge page with no 4K fallback and no
+	 * reservation behind it - an empty pool at that instant is a SIGBUS.
+	 * That arena starts the ladder at THP, whose COW splits to 4K pages
+	 * instead. See the flag's comment in hg_malloc.h.
+	 */
+	p = inherited ? MAP_FAILED : mmap(NULL, asize, PROT_READ|PROT_WRITE,
 	         vis|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
 	if (p != MAP_FAILED) {
 		hg_exclude_from_core(p, asize);
@@ -419,14 +428,15 @@ static void hg_arena_reg_del(struct hg_block *hb)
  * (it cannot: HG_MALLOC IS what those macros dispatch to when selected).
  */
 struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
-		const char *proc_desc)
+		const char *proc_desc, unsigned int flags)
 {
 	enum hg_mem_tier tier;
 	unsigned long locked_mb;
 	char *base;
 	struct hg_block *hb;
 
-	base = hg_mem_reserve(size, &tier, &locked_mb, shared);
+	base = hg_mem_reserve(size, &tier, &locked_mb, shared,
+		(flags & HG_INIT_INHERITED) != 0);
 	if (!base) {
 		LM_ERR("failed to reserve %lu bytes for %s HG_MALLOC arena\n",
 			size, name);
@@ -484,8 +494,11 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 			name, proc_desc, size >> 20, hg_mem_tier_str(tier), locked_mb);
 	else
 		LM_NOTICE("%s " HG_MALLOC_NAME " arena: %lu MB on %s, %lu MB "
-			"pinned from swapping\n",
-			name, size >> 20, hg_mem_tier_str(tier), locked_mb);
+			"pinned from swapping%s\n",
+			name, size >> 20, hg_mem_tier_str(tier), locked_mb,
+			(flags & HG_INIT_INHERITED) ?
+			" (pre-fork arena, inherited copy-on-write by every child: "
+			"hugetlb deliberately skipped, its COW cannot fall back)" : "");
 
 	return hb;
 }

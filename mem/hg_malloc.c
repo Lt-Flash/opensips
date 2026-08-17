@@ -260,7 +260,8 @@ static void hg_exclude_from_core(void *base, unsigned long size)
  *                        between processes through the shared gpool.
  */
 static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
-		enum hg_mem_tier *tier, unsigned long *locked_mb, int shared)
+		enum hg_mem_tier *tier, unsigned long *locked_mb, int shared,
+		int inherited)
 {
 	unsigned long asize = HG_HPS_ROUND(size);
 	unsigned long csize = HG_HPS_ROUND(*cap < size ? size : *cap);
@@ -298,9 +299,17 @@ static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 	 * trade than simply not being able to grow. A cap-less tier-1 arena is
 	 * what v2 shipped; losing the tier is a real regression.
 	 */
-	p = mmap(NULL, csize, PROT_READ|PROT_WRITE,
+	/*
+	 * ...except for the arena children inherit copy-on-write (the pre-fork
+	 * pkg arena, HG_INIT_INHERITED): a child's write into an inherited
+	 * hugetlb page needs a fresh huge page with no 4K fallback and no
+	 * reservation behind it - an empty pool at that instant is a SIGBUS.
+	 * That arena starts the ladder at THP, whose COW splits to 4K pages
+	 * instead. See the flag's comment in hg_malloc.h.
+	 */
+	p = inherited ? MAP_FAILED : mmap(NULL, csize, PROT_READ|PROT_WRITE,
 	         vis|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
-	if (p == MAP_FAILED && csize > asize) {
+	if (p == MAP_FAILED && !inherited && csize > asize) {
 		p = mmap(NULL, asize, PROT_READ|PROT_WRITE,
 		         vis|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
 		if (p != MAP_FAILED) {
@@ -816,7 +825,7 @@ static void hg_arena_reg_del(struct hg_block *hb)
  * (it cannot: HG_MALLOC IS what those macros dispatch to when selected).
  */
 struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
-		const char *proc_desc)
+		const char *proc_desc, unsigned int flags)
 {
 	enum hg_mem_tier tier;
 	unsigned long locked_mb;
@@ -842,7 +851,8 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 		cap = hg_pkg_cap_bytes;
 	else
 		cap = 0;
-	base = hg_mem_reserve(size, &cap, &tier, &locked_mb, shared);
+	base = hg_mem_reserve(size, &cap, &tier, &locked_mb, shared,
+		(flags & HG_INIT_INHERITED) != 0);
 	if (!base) {
 		LM_ERR("failed to reserve %lu bytes for %s HG_MALLOC arena\n",
 			size, name);
@@ -931,8 +941,11 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 			name, proc_desc, size >> 20, hg_mem_tier_str(tier), locked_mb);
 	else
 		LM_NOTICE("%s " HG_MALLOC_NAME " arena: %lu MB on %s, %lu MB "
-			"pinned from swapping\n",
-			name, size >> 20, hg_mem_tier_str(tier), locked_mb);
+			"pinned from swapping%s\n",
+			name, size >> 20, hg_mem_tier_str(tier), locked_mb,
+			(flags & HG_INIT_INHERITED) ?
+			" (pre-fork arena, inherited copy-on-write by every child: "
+			"hugetlb deliberately skipped, its COW cannot fall back)" : "");
 	if (hb->hcap > hb->hsize)
 		LM_NOTICE("%s arena can grow to %lu MB (%lu MB headroom "
 			"reserved, uncommitted)\n", name, hb->hcap >> 20,

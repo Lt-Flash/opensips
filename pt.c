@@ -556,6 +556,29 @@ static int internal_fork_child_setup(const struct internal_fork_params *ifpp)
 
 	/* free the script if not needed */
 	if (!(ifpp->flags & OSS_PROC_NEEDS_SCRIPT) && sroutes) {
+#if defined(PKG_MALLOC) && defined(HG_MALLOC)
+		/*
+		 * Under HG_MALLOC this child is about to abandon the whole pkg
+		 * arena it inherited from the parent (internal_fork() swaps in
+		 * a fresh, private one right after this handler chain), so
+		 * freeing the route AST cell by cell buys nothing - and it was
+		 * the one thing writing into the inherited arena before the
+		 * swap: every such write is a copy-on-write fault against the
+		 * parent's mapping, and while that mapping was hugetlb-backed
+		 * an empty pool turned the very first one into a SIGBUS (how
+		 * TCP main, the last no-script child, died at startup on a
+		 * short pool). The parent's arena no longer sits on hugetlb
+		 * (HG_INIT_INHERITED), so this is not load-bearing for safety
+		 * any more - it just spares every no-script child a private
+		 * 4K copy of each AST page it would otherwise dirty. Dropping
+		 * the pointer is all the child needs.
+		 */
+		if (mem_allocator_pkg == MM_HG_MALLOC ||
+		    mem_allocator_pkg == MM_HG_MALLOC_DBG) {
+			sroutes = NULL;
+			return 0;
+		}
+#endif
 		free_route_lists(sroutes);
 		sroutes = NULL;
 	}
@@ -726,24 +749,24 @@ int internal_fork(const struct internal_fork_params *ifpp)
 			 * specific process - exactly the semantics wanted here, just
 			 * never previously invoked per child.
 			 *
-			 * MUST run after the post-fork handler chain below, not before:
-			 * internal_fork_child_setup() (the default handler) calls
-			 * free_route_lists(), which pkg_frees the route AST this child
-			 * inherited from the parent pre-fork. Those pointers only make
-			 * sense against the ORIGINAL (COW-inherited) arena. Swapping
-			 * mem_block to a fresh arena before that handler runs made it
-			 * free foreign pointers through the new arena's bookkeeping -
-			 * silent cross-arena corruption at best, and a SIGBUS at worst
-			 * (the COW page-fault into the abandoned old arena has nothing
-			 * left to fall back on once the hugetlb pool is tight, which is
-			 * exactly what exposed this). Running the swap here instead
-			 * lets free_route_lists() finish its cleanup against the still-
-			 * correct original arena first; only then is it abandoned - the
-			 * parent's inherited mapping is left unmapped-but-unreferenced,
-			 * and this child never touches it again.
+			 * Runs after the post-fork handler chain, so anything a handler
+			 * frees is still resolved against the arena it was allocated
+			 * from (the inherited one). Two guarantees back this up now,
+			 * neither of which depends on the hugetlb pool having a page
+			 * left at fork time:
+			 *   - internal_fork_child_setup() no longer walks the route AST
+			 *     with pkg_free under HG (see there): core makes NO writes
+			 *     into the inherited arena before the swap;
+			 *   - the inherited arena is not hugetlb-backed
+			 *     (HG_INIT_INHERITED in mem.c): should anything ever write
+			 *     into it - now or later in the child's life - the COW is
+			 *     an ordinary page fault with a 4K fallback, not a SIGBUS.
+			 * The parent's mapping stays in this child, unreferenced; the
+			 * child reads parent-parsed module state through it and never
+			 * allocates from it again.
 			 */
 			struct hg_block *child_pkg =
-				hg_malloc_init(pkg_mem_size, "pkg", 0, ifpp->proc_desc);
+				hg_malloc_init(pkg_mem_size, "pkg", 0, ifpp->proc_desc, 0);
 			if (!child_pkg) {
 				LM_CRIT("failed to init this child's own pkg memory "
 					"(%lu bytes)\n", pkg_mem_size);

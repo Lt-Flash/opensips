@@ -298,7 +298,7 @@ int shm_mem_init_mallocs(void* mempool, unsigned long pool_size,int idx)
 	/* ignores mempool/pool_size as an address - HG_MALLOC does its own
 	 * reservation, pool_size is reused only as the size to request, see
 	 * the shm_mem_init() caller-side skip of shm_getmem() for this case */
-	shm_block = hg_malloc_init(pool_size, "shm", 1, NULL);
+	shm_block = hg_malloc_init(pool_size, "shm", 1, NULL, 0);
 #endif
 #else
 
@@ -528,7 +528,7 @@ int shm_mem_init_mallocs(void* mempool, unsigned long pool_size,int idx)
 	case MM_HG_MALLOC:
 		/* ignores mempool - HG_MALLOC does its own reservation; see the
 		 * shm_mem_init() caller-side skip of shm_getmem() for this case */
-		shm_block = hg_malloc_init(pool_size, "shm", 1, NULL);
+		shm_block = hg_malloc_init(pool_size, "shm", 1, NULL, 0);
 		gen_shm_malloc         = (osips_block_malloc_f)hg_malloc;
 		gen_shm_malloc_unsafe  = (osips_block_malloc_f)hg_malloc;
 		gen_shm_realloc        = (osips_block_realloc_f)hg_realloc;
@@ -605,7 +605,7 @@ int shm_mem_init_mallocs(void* mempool, unsigned long pool_size,int idx)
 #endif
 #ifdef HG_MALLOC
 	case MM_HG_MALLOC_DBG:
-		shm_block = hg_malloc_init(pool_size, "shm", 1, NULL);
+		shm_block = hg_malloc_init(pool_size, "shm", 1, NULL, 0);
 		gen_shm_malloc         = (osips_block_malloc_f)hg_malloc_dbg;
 		gen_shm_malloc_unsafe  = (osips_block_malloc_f)hg_malloc_dbg;
 		gen_shm_realloc        = (osips_block_realloc_f)hg_realloc_dbg;
@@ -811,7 +811,7 @@ int shm_dbg_mem_init_mallocs(void* mempool, unsigned long pool_size)
 	case MM_HG_MALLOC:
 	case MM_HG_MALLOC_DBG:
 		/* ignores mempool, same reasoning as shm_mem_init_mallocs() */
-		shm_dbg_block = hg_malloc_init(pool_size, "shm_dbg", 1, NULL);
+		shm_dbg_block = hg_malloc_init(pool_size, "shm_dbg", 1, NULL, 0);
 		break;
 #endif
 	default:

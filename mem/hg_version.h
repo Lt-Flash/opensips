@@ -39,6 +39,6 @@
 #ifndef HG_VERSION_H
 #define HG_VERSION_H
 
-#define HG_MALLOC_NAME  "HG_MALLOC_V2"
+#define HG_MALLOC_NAME  "HG_MALLOC_V3"
 
 #endif /* HG_VERSION_H */

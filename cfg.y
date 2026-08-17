@@ -410,6 +410,10 @@ extern int cfg_parse_only_routes;
 %token ASYNC_TOKEN
 %token LAUNCH_TOKEN
 %token AUTO_SCALING_PROFILE
+%token SHM_AUTO_SCALING_PROFILE
+%token PKG_AUTO_SCALING_PROFILE
+%token HG_RAM_FLOOR_MB
+%token HG_AUTOSCALE_DRY_RUN
 %token AUTO_SCALING_CYCLE
 %token TIMER_WORKERS
 
@@ -1653,6 +1657,26 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 		| AUTO_SCALING_PROFILE EQUAL auto_scale_profile_def {}
 		| AUTO_SCALING_PROFILE EQUAL error {
 				yyerror("bad auto-scaling profile definition");
+				}
+		| SHM_AUTO_SCALING_PROFILE EQUAL ID { IFOR();
+				hg_shm_profile_name=$3; }
+		| SHM_AUTO_SCALING_PROFILE EQUAL error {
+				yyerror("profile name expected");
+				}
+		| PKG_AUTO_SCALING_PROFILE EQUAL ID { IFOR();
+				hg_pkg_profile_name=$3; }
+		| PKG_AUTO_SCALING_PROFILE EQUAL error {
+				yyerror("profile name expected");
+				}
+		| HG_RAM_FLOOR_MB EQUAL NUMBER { IFOR();
+				hg_ram_floor_mb=$3; }
+		| HG_RAM_FLOOR_MB EQUAL error {
+				yyerror("integer value expected");
+				}
+		| HG_AUTOSCALE_DRY_RUN EQUAL NUMBER { IFOR();
+				hg_autoscale_dry_run=$3; }
+		| HG_AUTOSCALE_DRY_RUN EQUAL error {
+				yyerror("integer value expected");
 				}
 		| AUTO_SCALING_CYCLE EQUAL NUMBER { IFOR();
 				auto_scaling_cycle=$3; }

@@ -89,10 +89,17 @@ int init_pkg_mallocs(void)
 	 * leak that block (never freed, never used) - across dozens of
 	 * worker processes that adds up, so the call is skipped for it
 	 * rather than allocated-and-ignored.
+	 *
+	 * HG_INIT_INHERITED: this is the ONE arena every forked child
+	 * inherits copy-on-write (pt.c hands each child a fresh arena of its
+	 * own, but the parent's stays mapped in the child, holding all the
+	 * module state parsed pre-fork). It must not sit on hugetlb - a
+	 * child's COW fault there has no 4K fallback and no reservation, so
+	 * an empty pool at fork is a silent SIGBUS. It starts on THP instead.
 	 */
 #ifdef INLINE_ALLOC
 #if defined HG_MALLOC
-	mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0, NULL);
+	mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0, NULL, HG_INIT_INHERITED);
 #else
 	mem_pool = malloc(pkg_mem_size);
 	if (!mem_pool) {
@@ -170,7 +177,7 @@ int init_pkg_mallocs(void)
 #endif
 #ifdef HG_MALLOC
 	case MM_HG_MALLOC:
-		mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0, NULL);
+		mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0, NULL, HG_INIT_INHERITED);
 		gen_pkg_malloc     = (osips_block_malloc_f)hg_malloc;
 		gen_pkg_realloc    = (osips_block_realloc_f)hg_realloc;
 		gen_pkg_free       = (osips_block_free_f)hg_free;
@@ -235,7 +242,7 @@ int init_pkg_mallocs(void)
 #endif
 #ifdef HG_MALLOC
 	case MM_HG_MALLOC_DBG:
-		mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0, NULL);
+		mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0, NULL, HG_INIT_INHERITED);
 		gen_pkg_malloc    = (osips_block_malloc_f)hg_malloc_dbg;
 		gen_pkg_realloc   = (osips_block_realloc_f)hg_realloc_dbg;
 		gen_pkg_free      = (osips_block_free_f)hg_free_dbg;

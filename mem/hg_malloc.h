@@ -427,6 +427,135 @@ struct hg_block {
 	volatile unsigned long hoff;
 	enum hg_mem_tier      tier;
 	unsigned long         locked_mb;
+	/* MAP_SHARED vs MAP_PRIVATE, as passed to hg_malloc_init(). Stored
+	 * because growth policy depends on it: a pkg delta is per PROCESS,
+	 * so its host-RAM cost is delta x nproc, and the ceiling check must
+	 * know which multiplication to apply. */
+	int                   shared;
+
+	/*
+	 * v3 elastic arena.
+	 *
+	 * hsize is what is COMMITTED - pre-faulted, pinned, and published to
+	 * the buddy. hcap is what is RESERVED in virtual address space. The
+	 * WHOLE cap is mapped once, before fork; growth only commits more of
+	 * what is already mapped.
+	 *
+	 * That split is forced, not stylistic. mmap() and mprotect() edit ONE
+	 * process's page tables, and the shm arena is shared by ~30 workers
+	 * that forked before any growth happens. A delta mapped into a
+	 * PROT_NONE reservation after fork is invisible to every one of them:
+	 * measured, the grower reads its new page fine and a forked worker
+	 * SIGSEGVs on the same address. Mapping the cap up front gives every
+	 * worker one VMA over one shmem object, so a page the grower commits
+	 * simply faults in wherever it is next touched.
+	 *
+	 * hcap == hsize is a fixed arena - exactly v2's behaviour, and the
+	 * default until an admin asks for more.
+	 */
+	unsigned long         hcap;         /* VA reserved, >= hsize */
+	unsigned long         hsize_min;    /* hsize at init - shrink's floor.
+	                                     * The admin asked for -m/-M of
+	                                     * memory; growth above it is
+	                                     * elastic, the base is not. */
+	unsigned long         grow_granule; /* bytes per grow step, hps multiple */
+	unsigned long         grows;        /* successful commits */
+	unsigned long         grow_bytes;   /* their total */
+	unsigned long         grow_refused; /* refusals (cap or resource) */
+	unsigned long         shrinks;      /* successful releases */
+	unsigned long         shrink_bytes; /* their total */
+	/*
+	 * v3 step 4: the attached auto-scaling POLICY - numbers copied out of
+	 * a config auto_scaling_profile at attach time, never a pointer (the
+	 * profile struct lives in process-local memory; this block may be
+	 * shared). active==0 means no profile: growth still works up to hcap
+	 * on exhaustion, shrink keeps its conservative built-in gate - the
+	 * step-1..3 behaviour, unchanged.
+	 *
+	 * The profile's worker-count fields map onto bytes: "scale up to N"
+	 * is N MB, hps-rounded, and becomes the ADMIN CEILING within the
+	 * -m INIT:CAP reservation (it can never raise hcap - the reservation
+	 * happened before the config was even parsed, which is the whole
+	 * reason the cap lives on the command line). "down to M" is the
+	 * shrink floor and MAY sit below the initial size: with a profile
+	 * attached, the profile is what the admin asked for, -m is just the
+	 * starting point.
+	 */
+	struct {
+		unsigned int   active;
+		unsigned long  up_bytes;      /* admin ceiling, <= hcap */
+		unsigned long  down_bytes;    /* shrink floor */
+		unsigned int   up_pct;        /* grow when usage >= this... */
+		unsigned int   up_need;       /* ...for this many ticks... */
+		unsigned int   up_window;     /* ...out of this window */
+		unsigned int   down_pct;      /* shrink when usage <= this... */
+		unsigned int   down_cycles;   /* ...for this many consecutive */
+		unsigned short cooldown;      /* post-grow shrink hold-off */
+	} pol;
+	unsigned int          pol_up_hits;   /* ticks over up_pct in window */
+	unsigned int          pol_up_ticks;  /* window position */
+	unsigned int          pol_cooldown;  /* ticks left before shrink counts */
+	unsigned int          pol_dry_said;  /* one advise line per episode */
+	/* consecutive quiet sweep ticks - the down-slow gate. Reset by any
+	 * grow and by any tick that fails the abundance test, so a shrink
+	 * needs a full uninterrupted quiet window. */
+	unsigned int          shrink_quiet;
+	/* set once when hg_mem_release() fails structurally (e.g. a kernel
+	 * without hugetlb hole punch): shrink is disabled for this arena's
+	 * lifetime rather than re-attempted and re-logged every window */
+	unsigned int          shrink_unsupported;
+	/*
+	 * One line per refusal EPISODE, not per refusal: a full arena refuses
+	 * on every subsequent allocation (measured: 239k NOTICEs in 4s on the
+	 * first at-cap soak), and the counter above already carries the
+	 * magnitude. Set when a refusal is logged, cleared by the next
+	 * successful grow.
+	 */
+	unsigned int          grow_refuse_said;
+	/*
+	 * The alertable grow-blocked state, RESOURCE refusals only - an admin
+	 * cap doing its job is policy, not an incident, and never latches.
+	 *
+	 * Latching is two-step, modelled on below_floor: the first resource
+	 * refusal only records the GC-pass count it must outlive
+	 * (grow_blocked_mark = gc_passes + 1); the latch arms when a refusal
+	 * recurs at gc_passes >= that mark, i.e. a full GC pass ran in
+	 * between and the arena STILL cannot grow - so a transient spike that
+	 * one reclaim pass absorbs never alerts. Cleared by a successful
+	 * grow (the resource came back) or by free space recovering above
+	 * the reserve floor (the demand went away) - the design's "clear
+	 * when demand falls below a lower mark", reusing the floor's own
+	 * hysteresis threshold rather than inventing a second one.
+	 *
+	 * grow_blocked is the gauge the statistics export; grow_event_due
+	 * hands the E_CORE_SHM_GROW_BLOCKED raise to the sweep timer, which
+	 * runs with no arena lock held - evi_raise_event() allocates shm,
+	 * and raising it here, under hb->lock, inside the allocator that
+	 * just refused, would be re-entry into a full arena at best.
+	 */
+	unsigned int          grow_blocked;
+	unsigned long         grow_blocked_mark;
+	/*
+	 * grow_refused at arming time. The gc_passes route above assumes GC
+	 * RUNS; on the state that matters most - a full arena where nothing
+	 * is reclaimable - gc_passes sits at zero forever and the latch
+	 * would never arm (measured: 5M refusals, gc_passes 0, no latch).
+	 * So the sweep timer is the fallback promoter: if a full sweep
+	 * interval passes with the episode still armed and refusals still
+	 * accumulating, it latches from there. A spike that ends before the
+	 * next sweep still never alerts.
+	 */
+	unsigned long         grow_blocked_refuse0;
+	unsigned int          grow_event_due;
+	/*
+	 * Bytes of the arena per ACHIEVED backing tier, indexed by
+	 * enum hg_mem_tier (slot 0 unused; the enum starts at 1). hb->tier
+	 * alone cannot describe a grown arena: every THP delta is a fresh
+	 * negotiation with the kernel and may land on 4K next to an arena
+	 * that got 2M at init. Page backing is an outcome per range, never
+	 * an attribute of the arena - report it as such.
+	 */
+	unsigned long         tier_bytes[HG_MEM_4K + 1];
 
 	/*
 	 * v2 buddy substrate - see mem/README.hg_arena_v2.
@@ -448,7 +577,13 @@ struct hg_block {
 	unsigned long hps;         /* huge page size, probed at reserve time */
 	unsigned int  hps_shift;   /* log2(hps), so page-of is a shift */
 	char         *pbase;       /* page 0 - hbase rounded up to hps */
-	unsigned long npages;      /* whole pages from pbase to the reservation end */
+	unsigned long npages;      /* whole pages from pbase to the COMMITTED end
+	                            * (hbase+hsize); grows when the arena does */
+	unsigned long npages_cap;  /* whole pages to the reservation end
+	                            * (hbase+hcap) - the grid's true extent.
+	                            * Descriptors exist for all of these from
+	                            * init, so growth publishes pages instead of
+	                            * relocating metadata */
 
 	/*
 	 * Buddy state (hg_buddy.c). Every field here is written only while
@@ -578,10 +713,95 @@ static inline unsigned long hg_leaf_of(const struct hg_block *hb, const void *p)
 /* @shared: 1 for shm/shm_dbg (MAP_SHARED - one arena for every worker),
  * 0 for pkg (MAP_PRIVATE - each forked worker gets its own copy-on-write
  * arena, lock and free pools). See hg_mem_reserve() in hg_malloc.c for why
- * getting this wrong for pkg is a correctness AND a performance bug. */
+ * getting this wrong for pkg is a correctness AND a performance bug.
+ *
+ * @flags: HG_INIT_INHERITED marks the ONE arena that outlives fork() as a
+ * copy-on-write inheritance: the pre-fork (attendant) pkg arena. Every
+ * child holds a private COW view of it for life - it reads module state
+ * the parent parsed into it, and any write it makes there is a COW fault.
+ * Such an arena must never be hugetlb-backed: a COW fault inside a
+ * hugetlb VMA can only be satisfied by a huge page (no 4K fallback), and
+ * a forked child holds no reservation on its parent's mapping, so with
+ * the pool momentarily empty the fault is a SIGBUS - silent, at fork
+ * time (measured: it is exactly how the last no-script child, TCP main,
+ * died at startup on a short pool). THP has the fallback: a COW fault
+ * splits the huge PMD and copies one 4K page. Per-child arenas are never
+ * inherited (children do not fork) and keep the full ladder. */
+#define HG_INIT_INHERITED  (1U << 0)
+
 struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
-		const char *proc_desc);
+		const char *proc_desc, unsigned int flags);
 void hg_malloc_destroy(struct hg_block *hb);
+
+/*
+ * The v3 admin caps live in globals.h/globals.c (set by -m INIT:CAP /
+ * -M INIT:CAP before any arena exists; 0 = fixed, exactly v2). The pkg
+ * cap is PER PROCESS: every worker grows its own private arena, so the
+ * host-RAM exposure is cap x nproc - hg_grow_ram_refused() applies that
+ * multiplication.
+ */
+
+/*
+ * Commit @delta more bytes at committed-end offset @off of the reservation
+ * (both hps-rounded), populating and pinning them, and VERIFYING what
+ * backing the kernel actually provided. Returns the achieved tier of the
+ * delta (>= 1) or -1 with everything rolled back - a refusal, not a
+ * degradation, so a worker never SIGBUSes on memory the allocator
+ * half-committed. Defined in hg_malloc.c because the tier ladder and its
+ * verification probes live there; called by hg_buddy_grow() under
+ * hb->lock.
+ */
+int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta);
+
+/*
+ * The host-RAM limb of the growth ceiling: would committing @delta more
+ * bytes leave the host with less than the configured floor of available
+ * memory? Returns nonzero to REFUSE. Tier 1 always passes - a hugetlb
+ * mapping reserved its whole cap from the pool at map time (measured), so
+ * its commits consume no new host RAM. For pkg arenas the delta is
+ * multiplied by the process count first: every worker grows its own
+ * private arena under the same workload, so the single-arena delta
+ * understates the real cost ~30x on a gateway. Defined in hg_malloc.c
+ * (it owns /proc/meminfo parsing); called by hg_buddy_grow() under
+ * hb->lock.
+ */
+int hg_grow_ram_refused(struct hg_block *hb, unsigned long delta);
+
+/*
+ * Release the backing of [hbase+off, +len) - the shrink primitive, chosen
+ * and verified by measurement on the fleet's oldest kernel (5.4):
+ *
+ *   shared (shm):  madvise(MADV_REMOVE) - punches the shmem OBJECT, so
+ *                  every mapper is affected; measured to free pages even
+ *                  while another process holds them VM_LOCKED, and the
+ *                  range recommits cleanly afterwards. The one mechanism
+ *                  that is NOT correct here is mmap(PROT_NONE|MAP_FIXED):
+ *                  it rebinds only the caller's mapping and was measured
+ *                  leaving other workers reading the old bytes.
+ *   shared tier 1: same call; hugetlb hole punch works on 5.4 and the
+ *                  pages return to HugePages_Free (measured), which is
+ *                  where a static pool's shrink SHOULD put them.
+ *   private (pkg): madvise(MADV_DONTNEED) - per-process arena, no
+ *                  cross-process question; next touch refaults zero.
+ *
+ * munlock first: it releases only THIS process's VM_LOCKED accounting -
+ * a range mlocked by the worker that grew it keeps its stale VmLck there
+ * until exit, which is cosmetic; the punch frees the memory regardless.
+ * Returns 0, or -1 with shrink_unsupported latched (nothing to retry).
+ */
+int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len);
+
+/*
+ * Resolve and validate the configured auto-scaling profiles, once, after
+ * the config is parsed (called from init_shm_post_yyparse()). Attaches the
+ * policy to the LIVE shm arena and stashes the pkg policy for the arenas
+ * pt.c creates per child after fork - the pre-fork parent pkg arena
+ * predates the config and stays fixed, which costs nothing (the attendant
+ * barely allocates). Fails LOUDLY on a profile that names nothing, exceeds
+ * the -m/-M reservation, or is attached to an arena with no growth room:
+ * a policy that cannot act is a misconfiguration, not a default.
+ */
+int hg_autoscale_post_cfg(void);
 
 /* re-sync per-process state after fork(): see hg_arena.c for why the
  * inherited private free-stack/bump state must be discarded, not kept or

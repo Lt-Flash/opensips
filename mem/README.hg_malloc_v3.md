@@ -1,9 +1,3 @@
-> This is the `feature/hg-malloc-v3` branch of the private OpenSIPS
-> mirror. The upstream project README is preserved as
-> [`README.opensips.md`](README.opensips.md); the canonical copy of this
-> guide lives in-tree at
-> [`mem/README.hg_malloc_v3.md`](mem/README.hg_malloc_v3.md).
-
 # HG_MALLOC v3 — the elastic arena
 
 HG_MALLOC v3 lets the shared-memory and per-process arenas **grow and

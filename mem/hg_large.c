@@ -82,7 +82,12 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 	int chunk_ord = -1;
 	struct hg_lfrag *f, *n;
 	struct hg_large_chunk *ch;
-	char *base, *tag;
+	/* base MUST start NULL: the carve below is a grow-and-retry loop whose
+	 * condition reads it before the first attempt assigns it. gcc 9 does
+	 * not flag the uninitialized read this replaced (caught live: the
+	 * garbage "pointer" was &evi_time_str+12, and the lock_init loop it
+	 * was handed to overwrote log_level) */
+	char *base = NULL, *tag;
 
 	/* round to HG_PAYLOAD_ALIGN, not HG_ROUNDTO: a frag's size is what
 	 * places the NEXT frag (HG_LFRAG_NEXT), so rounding to 4 on 32-bit
@@ -138,21 +143,31 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 		{
 			unsigned long total = chunk_size + sizeof(struct hg_large_chunk);
 			int ord = hg_buddy_order_for(hb, total);
+			int attempt;
 
-			if (ord >= 0) {
-				base = hg_buddy_alloc(hb, (unsigned int)ord);
-				if (base) {
-					backing    = HG_LEAF_SIZE << ord;
-					chunk_ord  = ord;
-					chunk_size = backing - sizeof(struct hg_large_chunk);
-				}
-			} else {
-				unsigned long np = (total + hb->hps - 1) >> hb->hps_shift;
+			/* two passes: a miss on the first is a growth trigger
+			 * (v3), and the retry after a successful grow is served
+			 * from whole fresh pages by construction. A second miss
+			 * means the grow was refused - fall through to the
+			 * ordinary exhaustion error. */
+			for (attempt = 0; attempt < 2 && !base; attempt++) {
+				if (attempt && hg_buddy_grow(hb, total) != 0)
+					break;
+				if (ord >= 0) {
+					base = hg_buddy_alloc(hb, (unsigned int)ord);
+					if (base) {
+						backing    = HG_LEAF_SIZE << ord;
+						chunk_ord  = ord;
+						chunk_size = backing - sizeof(struct hg_large_chunk);
+					}
+				} else {
+					unsigned long np = (total + hb->hps - 1) >> hb->hps_shift;
 
-				base = hg_buddy_alloc_run(hb, np);
-				if (base) {
-					backing    = np << hb->hps_shift;
-					chunk_size = backing - sizeof(struct hg_large_chunk);
+					base = hg_buddy_alloc_run(hb, np);
+					if (base) {
+						backing    = np << hb->hps_shift;
+						chunk_size = backing - sizeof(struct hg_large_chunk);
+					}
 				}
 			}
 			chunk_size &= ~63UL;

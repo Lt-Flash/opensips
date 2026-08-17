@@ -675,8 +675,8 @@ shm_auto_scaling_profile = MEM_SHM
 # /etc/sysctl.d/60-opensips.conf — the pool must fit the CAPS:
 #   shm cap:              1024 MB          = 512 pages
 #   pkg cap × 31 workers:   32 MB × 31     = 496 pages
-#   fork-window COW margin (~12%)          ≈ 120 pages
-vm.nr_hugepages=1128
+#   rounding / restart headroom (~5%)      ≈ 50 pages
+vm.nr_hugepages=1060
 ```
 
 ```ini
@@ -685,11 +685,16 @@ vm.nr_hugepages=1128
 LimitMEMLOCK=infinity
 ```
 
-The COW margin is not optional: children briefly copy-on-write-touch
-the parent's pkg arena before building their own, and each touched page
-draws a **free** pool page. A pool with zero free pages at fork time
-SIGBUSes children — measured, and it is the same crash family as a real
-2026-08 production incident. If the pool cannot fit a cap:
+Only the caps draw from the pool. The pre-fork (attendant) pkg arena —
+the one every child inherits copy-on-write — is deliberately **not**
+hugetlb-backed: a child's COW fault inside a hugetlb mapping has no 4K
+fallback and no reservation, so an empty pool at fork time was a silent
+SIGBUS (measured; it is how TCP main, the last no-script child, died at
+startup on a short pool — twice). Its ladder starts at THP instead,
+whose COW splits to 4K pages, and no-script children no longer walk the
+inherited route AST with `pkg_free` before swapping to their own arena.
+Startup therefore cannot SIGBUS on pool state: a short pool only pushes
+late children down the tier ladder. If the pool cannot fit a cap:
 
 ```
 NOTICE: hugetlb pool cannot back a 1024 MB cap; reserving the 128 MB in use instead - the arena keeps huge pages but cannot grow. Raise vm.nr_hugepages to allow growth.
@@ -876,8 +881,11 @@ All at their exact severities; `%` values are illustrative.
    reserved from the hugetlb pool at map time, and every per-child pkg
    arena reserves its own `-M` cap the same way. Budget
    `shm_cap + pkg_cap × workers + ~12% margin` pages.
-2. **Leave free pages for the fork window** (the COW margin, 12.1).
-   Zero free pages at fork time = SIGBUS in children. Measured, twice.
+2. **A short pool degrades, it no longer kills.** The one arena
+   children inherit copy-on-write — the attendant's pkg arena — is kept
+   off hugetlb (12.1), so a pool with zero free pages at fork time
+   pushes late children to THP instead of SIGBUSing them. That SIGBUS
+   was measured, twice, before this rule existed.
 3. **pkg caps multiply** — RAM and, on tier 1, pool reservations.
 4. **Tier-1 shrink returns pages to the pool, not to RAM.** Freeing
    host memory requires shrinking `vm.nr_hugepages` as well.
@@ -915,7 +923,7 @@ All at their exact severities; `%` values are illustrative.
 | never shrinks | top page busy, or inside the post-grow cool-off (10× down-cycles), or usage above the down-threshold, or below-floor/blocked safety hold | check `hg_stats`; prefer-low needs time to drain the top |
 | `DRY RUN - would grow` but nothing happens | `hg_autoscale_dry_run = 1` | that is the point; set 0 to act |
 | `grow_refused` climbing, gauge 0 | isolated refusals; hysteresis holding | by design — the gauge latches on *sustained* refusal |
-| children SIGBUS at startup on tier 1 | pool sized to caps with zero margin | rule 2 |
+| `failed to initialize child process N` / `cannot fork tcp main` at startup, no arena line for that child | a build predating `HG_INIT_INHERITED`: the last no-script child COW-faulted the parent's hugetlb pkg arena on an empty pool | upgrade; meanwhile leave free pages in the pool at fork time |
 | arena runs unpinned (`continuing unpinned`) | `RLIMIT_MEMLOCK` too low for a tier 2–4 arena | `LimitMEMLOCK=infinity` in the unit |
 | testing under `ulimit -l` shows no refusals | you are root — `CAP_IPC_LOCK` bypasses `RLIMIT_MEMLOCK` entirely | test the mlock leg as an unprivileged user (`setpriv`) |
 | pool numbers "prove" shrink is broken | rule 5 | use the exact object-residency formula |

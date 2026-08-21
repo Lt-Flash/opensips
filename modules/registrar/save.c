@@ -934,7 +934,12 @@ int _remove(struct sip_msg *msg, void *udomain, str *aor_uri, str *match_ct,
 
 	ul.lock_udomain((udomain_t *)udomain, &aor_user);
 
-	if (ul.get_urecord((udomain_t *)udomain, &aor_user, &record) != 0) {
+	/* an administrative removal through this node speaks for the whole
+	 * cluster - fetch the record wherever it lives, so the deletion can
+	 * broadcast and hit the shared ledger even when another node owns
+	 * the bindings */
+	if (ul.get_urecord_or_pull((udomain_t *)udomain, &aor_user,
+	        &record) != 0) {
 		LM_DBG("no record '%.*s' found!\n", aor_user.len, aor_user.s);
 		goto out_unlock;
 	}
@@ -1113,7 +1118,7 @@ int _remove_ip_port(struct sip_msg *msg, str *ip, int *port, void *udomain, str*
 
 		ul.lock_udomain(dom, &aor_user);
 
-		if (ul.get_urecord(dom, &aor_user, &record) != 0) {
+		if (ul.get_urecord_or_pull(dom, &aor_user, &record) != 0) {
 			LM_DBG("no record '%.*s' found!\n", aor_user.len, aor_user.s);
 			goto out_unlock;
 		}

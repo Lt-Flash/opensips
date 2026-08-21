@@ -1,65 +1,145 @@
-[![Build Status](https://github.com/OpenSIPS/opensips/actions/workflows/main.yml/badge.svg?branch=master)](https://github.com/OpenSIPS/opensips/actions/workflows/main.yml?query=branch%3Amaster++)
-[![Unit Tests](https://github.com/OpenSIPS/opensips/actions/workflows/unittests.yml/badge.svg?branch=master)](https://github.com/OpenSIPS/opensips/actions/workflows/unittests.yml?query=branch%3Amaster++)
-[![OSS-Fuzz](https://github.com/OpenSIPS/opensips/actions/workflows/cifuzz.yml/badge.svg?branch=master)](https://github.com/OpenSIPS/opensips/actions/workflows/cifuzz.yml?query=branch%3Amaster++)
-[![Cross Platform Builds](https://github.com/OpenSIPS/opensips/actions/workflows/multiarch.yml/badge.svg?branch=master)](https://github.com/OpenSIPS/opensips/actions/workflows/multiarch.yml?query=branch%3Amaster++)
-[![RTP.io](https://github.com/OpenSIPS/opensips/actions/workflows/rtp.io.yml/badge.svg?branch=master)](https://github.com/OpenSIPS/opensips/actions/workflows/rtp.io.yml?query=branch%3Amaster++)
-[![Coverity Scan Build Status](https://scan.coverity.com/projects/7580/badge.svg)](https://scan.coverity.com/projects/opensips-opensips)
+# usrloc pull-sharing cluster
 
-# Welcome to OpenSIPS Project
+A new OpenSIPS user-location cluster mode — `working_mode_preset
+"pull-sharing-cluster"` — built on the flh stack: **cachedb_perf** cross-node
+pulls over the stock **clusterer** bin transport, with an optional SQL ledger.
+This branch (`feature/usrloc-pull-sharing-devel`) stacks on the
+`feature/cachedb-perf-devel` branch (upstream PR #4118) and the devel tree.
 
+**Status:** feature-complete and bench-proven at 1M contacts; 136 rig checks
+green across 7 suites; pending upstream after #4118 merges.
 
-## About
+## The idea
 
-OpenSIPS is a GPL licensed SIP server implementation. It started as a fork of
-Fokus Fraunhofer SIP Express Router (SER) project. OpenSIPS wants to be a more
-open project, not only from license point of view, but more open as project
-management, especially for external contributions.
+Every existing usrloc cluster mode either replicates eagerly (full-sharing:
+every REGISTER broadcast to every node) or centralizes (federation/cachedb:
+one remote store on the SIP path). Pull-sharing does neither:
 
-OpenSIPS wants to overcome the development latency of current SER project,
-to ensure a shorter path into a release for new added features.
-OpenSIPS is a project maintained by OpenSIPS Solutions
-           <http://www.opensips-solutions.com/>
-by a team including core and main developers of SER project.
+* **A REGISTER is a purely local event.** The accepting node stores the
+  contact in its own memory, stamps itself as owner, and tells nobody.
+* **Other nodes learn on lookup.** A miss suspends the SIP transaction
+  (`async(lookup(...))`), asks the cluster, absorbs the answer into local
+  memory as a normal record living to its natural expiry, and resumes.
+  Each node converges toward the full registered set through the traffic it
+  actually serves — the pull rate decays to zero as it gets there.
+* **Responsibility never converges, only data does.** Exactly one node — the
+  owner — pings a contact, maintains its DB row, and (with the HELD protocol
+  below) answers pulls for it with the value. Ownership moves contact-by-
+  contact when a device re-registers elsewhere; deletes and moved bindings
+  are the only broadcasts, because those are the only events remote copies
+  must not outlive.
+* **The cluster keeps every record safe.** No entry is ever dropped because
+  a node died or restarted; survivors serve everything they hold to natural
+  expiry. Repair rides the registration refresh interval — the universal
+  repair clock — and the ledger makes it instant where configured.
 
+## The moving parts
 
-## Info
-For information regarding the OpenSIPS installation, please see the [INSTALL](INSTALL)
-file.
+| Piece | What it does |
+|---|---|
+| `usrloc` mode `CM_PULL_SHARING` | ownership predicate (socket / `_onid` under anycast), blob publish/absorb, invalidation, ledger rules, orphan adoption, shared-tag takeover |
+| `cachedb_perf` CP-15 pull | the cross-node ask: broadcast or owner-hinted, 64k-scale slot pool, negative cache, orphan/late-answer store, `perf_cluster_size` |
+| `registrar` async lookup | `async(lookup("location"), resume)` — a miss suspends on the pull's eventfd; no worker ever blocks |
+| SQL ledger (optional) | natural-key `(username, domain, contact)` upsert table: backup (write-back, eager deletes), restart bootstrap with expired-row sweep, lookup of last resort |
+| HELD protocol (optional) | `pull_authoritative_serve`: only the owner answers a pull with the value; passive holders answer a compact "held" and are asked directly only when the owner is gone |
 
-For current developers/contributors of this project, see the [CREDITS](CREDITS) and
-[AUTHORS](AUTHORS) file. For complete license information, please see the [COPYING](COPYING) file.
-For an overview of OpenSIPS modules, a [modules listing](https://www.opensips.org/Documentation/Modules)
-is available on the opensips.org website.
+## Minimal configuration
 
+```
+loadmodule "clusterer.so"
+modparam("clusterer", "my_node_id", 1)
 
-## Docs
+loadmodule "cachedb_perf.so"
+modparam("cachedb_perf", "cache_collections", "ul=14")
+modparam("cachedb_perf", "sync_cluster_id", 1)
+modparam("cachedb_perf", "pull_on_miss", 1)
+modparam("cachedb_perf", "pull_transport", "bin")
+modparam("cachedb_perf", "pull_max_value", 8192)
+modparam("cachedb_perf", "replicate_collections", "ul")
 
-Documentation about each module can be found in the [README]() file in each
-module directory. For online documentation, please see
-           <https://opensips.org/Resources/Documentation>
+loadmodule "usrloc.so"
+modparam("usrloc", "working_mode_preset", "pull-sharing-cluster")
+modparam("usrloc", "location_cluster", 1)
+modparam("usrloc", "cachedb_url", "perf://ul")
+modparam("usrloc", "db_url", "mysql://opensips:pwd@10.0.0.5/opensips")  # optional
 
-For additional documentation, tutorials and examples please see also
-           <https://opensips.org/Resources/DocsTutorials>
+loadmodule "registrar.so"
 
+route {
+    if ($rm == "REGISTER") { save("location"); exit; }
+    async(lookup("location"), lookup_resume);
+}
+route[lookup_resume] {
+    if ($rc > 0) { t_reply(302, "Moved"); exit; }
+    t_reply(404, "Not Found"); exit;
+}
+```
 
+The preset arbitrates fine-tuning knobs instead of silently ignoring them:
+in-envelope refinements (`sql_write_mode write-through`,
+`restart_persistency none`) are honored, contradictions are startup errors.
+Without `db_url` the mode runs as a pure-pull cluster.
 
-## Questions
+## Tuning for async
 
-For any question related to the OpenSIPS usage, please use the
-           <users@lists.opensips.org>
-public mailing list.
+| Knob | Default | Async guidance |
+|---|---|---|
+| `pull_slots` | 64 | size for the concurrent miss burst (peak miss rate × timeout), not the worker count; each slot costs one pre-fork eventfd **in every process**, so raise `open_files_limit` to match |
+| `pull_timeout_ms` | 50 | 50 is priced for a blocked worker; async holds only a suspended transaction, so 200–500 is nearly free and converts loss into tail latency |
+| `pull_authoritative_serve` | 0 | enable once **every** node runs this build: one value per pull instead of one per holder; degraded case costs one extra LAN round trip |
 
-For questions regarding the development of OpenSIPS - like contributions, bug
-reports, etc - please use the
-           <devel@lists.opensips.org>
-public mailing list.
+## Numbers (3 nodes, one 16-core/16GB host, 1,000,000 contacts)
 
-For questions regarding businesses around OpenSIPS - like products,·
-consultancy, trainings, etc - please use the
-           <business@lists.opensips.org>
-public mailing list.
+* Fill: 1M REGISTERs at 5,000/s aggregate with pulls enabled everywhere —
+  zero loss, zero livelock (REGISTER never touches the pull machinery).
+* Convergence: a cold node absorbed the full 1M set at exactly the offered
+  lookup rate (3,000/s, 337 s), flat from entry 0 to entry 1M.
+* Per-request SIP round-trip: **cold cross-node pull p50 1.4 ms** (p95 9 ms,
+  p99 37 ms), **warm local hit p50 0.46 ms** (p99 0.78 ms), both independent
+  of collection size.
+* Tuned run bookkeeping: pulls requested == received == stored == entries ==
+  1,000,000; timeouts, slot starvation, orphans, misses all zero.
+* Warm re-sweep: 1M lookups, 100% answered locally, zero further pulls.
 
-Also there is a generic news mailing list where you can learn about what is·
-new or important for the OpenSIPS project, about alerts and updates regarding
-relaces and about events around the project.
-           <news@lists.opensips.org>
+## Observability
+
+* Exact fleet contact count: `sum(owned_contacts)` across nodes (ownership
+  is disjoint, so the sum is exact — a Prometheus recording rule away).
+* Per-node convergence: one `perf_cluster_size ul` MI call — live entry
+  counts from every node, unreachable nodes flagged.
+* Inventory: the ledger (`WHERE expires > now`) or the concatenation of
+  every node's `ul_dump owned_only=1`. Do **not** full-`ul_dump` a large
+  table over MI-datagram — the reply can neither be built in pkg nor fit a
+  datagram, and the attempt wedges the node.
+
+## Testing
+
+* `scripts/…` rigs live outside the tree on the dev host: a 2-node netns
+  rig (ledger round, cold start, adoption, shared-tag takeover,
+  observability — drive1–6, 118 checks) and a 3-node DB-less rig for the
+  HELD protocol (drive7, 18 checks: one value per multi-holder pull,
+  owner-dead forced re-ask on the first attempt, clean absence untouched).
+* 1M deployment bench: three `nerdctl` containers on host networking, a
+  Python epoll SIP blaster (sipp's RTPSTREAM fork double-binds its socket
+  at init and is unusable), an MI-datagram CSV monitor.
+
+## Branch anatomy
+
+Stacked on `feature/cachedb-perf-devel` (PR #4118 — cachedb_perf module,
+CP-15 cross-node pull, MTU plumbing). The pull-sharing commits build up:
+config surface and arbitration → ownership/blob/invalidation → ledger →
+keep-everything and cold-start sweep → adoption and shared-tag takeover →
+observability (`perf_cluster_size`, owned/remote stats, dump annotation) →
+async lookup → `pull_slots` sizing → HELD protocol
+(`pull_authoritative_serve`).
+
+## Known limits
+
+* `mid_registrar` is not adapted (its save-side fetches are not
+  pull-aware); plain registrar is.
+* CONTACT_CALLID matching is rejected (the ledger's natural key would need
+  the Call-ID folded in).
+* DB-less operation trades: a crashed node's never-pulled records are lost
+  until re-REGISTER, and `sum(owned_contacts)` counts only living owners.
+* Mixed-version clusters must keep `pull_authoritative_serve` off until
+  every node understands the HELD answer.

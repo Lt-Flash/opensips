@@ -232,6 +232,14 @@ static int  pull_via_clctr;
 #define PCACHE_FOUND_NO       0
 #define PCACHE_FOUND_YES      1
 #define PCACHE_FOUND_OVERSIZE 2
+/* "I hold a copy, but not the authoritative one - ask the writer."  Sent
+ * instead of the value for PCACHE_F_PASSIVE records when
+ * pull_authoritative_serve is on, so a converged cluster answers each pull
+ * with ONE value instead of one per holder.  Not a negative (the key
+ * exists) and not a value; when every peer has spoken and the best on
+ * offer is held copies, the requester re-asks one holder with the force
+ * flag and gets the bytes. */
+#define PCACHE_FOUND_HELD     3
 
 /* One in-flight pull.  The request is issued by whichever process took the
  * miss, but the replies land in whichever process the transport delivers
@@ -258,6 +266,8 @@ struct pcache_pull_slot {
 	unsigned char answered[(CL_MAX_NODE_ID + 7) / 8];
 	int          done;               /* 1 = a value landed                */
 	int          oversize;           /* a peer HAS it but could not send  */
+	int          held;               /* peers holding a passive copy back */
+	int          held_node;          /* first of them - the re-ask target */
 	int          hinted;             /* asked one node, not the cluster   */
 	int          partial;            /* more peers than the snapshot held */
 	/* The waiter left without a value and handed this slot to the protocol
@@ -329,6 +339,13 @@ static struct pcache_neg_slot *neg_slots;
 static gen_lock_t *neg_lock;
 static int pull_negative_ms = 300;     /* modparam; 0 = no negative cache  */
 static int pull_on_miss;               /* modparam; read repair on the get path */
+/* modparam: passive (pulled-in) copies answer pull requests with a compact
+ * "held" instead of the value, so only the node that WROTE a key ships its
+ * bytes.  Off by default: a peer that does not know the HELD code treats it
+ * as silence and degrades to a timeout when no authoritative holder is
+ * left, so enable this only once the whole cluster runs a build that has
+ * it. */
+static int pull_authoritative_serve;
 #define PULL_ST_REQUESTED 0
 #define PULL_ST_SERVED    1
 #define PULL_ST_RECEIVED  2
@@ -395,7 +412,15 @@ static int pull_on_miss;               /* modparam; read repair on the get path 
 #define PULL_ST_SKIP_TOOLONG       18  /* key/collection name cannot be asked */
 #define PULL_ST_SKIP_NOPEERS       19  /* no live cluster member to ask     */
 #define PULL_ST_SKIP_NOSLOT        20  /* slot table full, nothing evictable */
-#define PULL_ST_MAX       21
+/* a peer answered "held": it has a passive copy and is deferring to the
+ * authoritative holder (pull_authoritative_serve) */
+#define PULL_ST_HELD               21
+/* serve side of the same: we withheld a passive copy behind a HELD reply */
+#define PULL_ST_SERVED_HELD        22
+/* every peer answered but only held copies were on offer - the follow-up
+ * targeted ask that carries the force flag */
+#define PULL_ST_FORCED             23
+#define PULL_ST_MAX       24
 /* Two different readinesses, deliberately kept apart:
  *   cluster_ready - the clusterer is bound, the capability is registered and
  *                   membership is being tracked.  Everything cross-node needs
@@ -566,7 +591,7 @@ static mi_response_t *mi_perf_cluster_probe_1(const mi_params_t *params,
 		struct mi_handler *async);
 int load_pcache_pull(pcache_pull_api_t *api);
 static int pcache_pull_start(pcache_col_t *col, const str *key,
-		int hint_node, int *fd, unsigned int *id_out);
+		int hint_node, int force, int *fd, unsigned int *id_out);
 static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 		unsigned int outlen, unsigned int *vlen, unsigned int *expires);
 static int pcache_pull_enabled(pcache_col_t *col);
@@ -623,6 +648,7 @@ static const param_export_t params[] = {
 	{ "pull_transport",      STR_PARAM, &pull_transport_str },
 	{ "pull_timeout_ms",     INT_PARAM, &pull_timeout_ms },
 	{ "pull_slots",          INT_PARAM, &pull_slot_count },
+	{ "pull_authoritative_serve", INT_PARAM, &pull_authoritative_serve },
 	{ "pull_linger_ms",      INT_PARAM, &pull_linger_ms },
 	{ "pull_negative_ms",    INT_PARAM, &pull_negative_ms },
 	{ "pull_on_miss",        INT_PARAM, &pull_on_miss },
@@ -778,6 +804,9 @@ PULLSTATF(smf_pulls_skip_notreplicated, PULL_ST_SKIP_NOTREPLICATED)
 PULLSTATF(smf_pulls_skip_toolong, PULL_ST_SKIP_TOOLONG)
 PULLSTATF(smf_pulls_skip_nopeers, PULL_ST_SKIP_NOPEERS)
 PULLSTATF(smf_pulls_skip_noslot, PULL_ST_SKIP_NOSLOT)
+PULLSTATF(smf_pulls_held,       PULL_ST_HELD)
+PULLSTATF(smf_pulls_served_held, PULL_ST_SERVED_HELD)
+PULLSTATF(smf_pulls_forced,     PULL_ST_FORCED)
 
 /* A GAUGE, unlike every other pull stat: it should read 0 whenever nothing is
  * being asked.  Anything parked here means slots are taken and not released,
@@ -957,6 +986,9 @@ static const stat_export_t mod_stats[] = {
 		(stat_var **)smf_pulls_orphan_expired},
 	{"pulls_negative",   STAT_IS_FUNC, (stat_var **)smf_pulls_negative},
 	{"pulls_oversize",   STAT_IS_FUNC, (stat_var **)smf_pulls_oversize},
+	{"pulls_held",       STAT_IS_FUNC, (stat_var **)smf_pulls_held},
+	{"pulls_served_held", STAT_IS_FUNC, (stat_var **)smf_pulls_served_held},
+	{"pulls_forced",     STAT_IS_FUNC, (stat_var **)smf_pulls_forced},
 	{"pulls_in_flight",  STAT_IS_FUNC, (stat_var **)smf_pulls_in_flight},
 	{"pulls_foreign_cluster", STAT_IS_FUNC,
 		(stat_var **)smf_pulls_foreign_cluster},
@@ -1245,6 +1277,12 @@ static mi_response_t *mi_perf_stats(str *col_s)
 		        pull_stats[PULL_ST_NEGATIVE]) < 0 ||
 		     add_mi_number(clobj, MI_SSTR("pulls_oversize"),
 		        pull_stats[PULL_ST_OVERSIZE]) < 0 ||
+	     add_mi_number(clobj, MI_SSTR("pulls_held"),
+		        pull_stats[PULL_ST_HELD]) < 0 ||
+	     add_mi_number(clobj, MI_SSTR("pulls_served_held"),
+		        pull_stats[PULL_ST_SERVED_HELD]) < 0 ||
+	     add_mi_number(clobj, MI_SSTR("pulls_forced"),
+		        pull_stats[PULL_ST_FORCED]) < 0 ||
 		     add_mi_number(clobj, MI_SSTR("pulls_skip_notreplicated"),
 		                   pull_stat(PULL_ST_SKIP_NOTREPLICATED)) < 0 ||
 		     add_mi_number(clobj, MI_SSTR("pulls_skip_toolong"),
@@ -1754,7 +1792,7 @@ static mi_response_t *do_perf_get(str *key, str *col_s)
 	if (!col)
 		return init_mi_error(404, MI_SSTR("no such collection"));
 
-	rc = pcache_ht_fetch_ex(col->htable, key, &val, &exp);
+	rc = pcache_ht_fetch_ex(col->htable, key, &val, &exp, NULL);
 	if (rc == -2)
 		return init_mi_error(404, MI_SSTR("key not found"));
 	if (rc < 0)
@@ -2161,11 +2199,12 @@ static void pcache_pull_send_rpl(int dst_node, unsigned int id, const str *key,
  * and the controller-plane receivers decode their own framing and land
  * here, so the two can never disagree about what is served. */
 static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
-		str *key, int via_clctr)
+		str *key, int via_clctr, int force)
 {
 	pcache_col_t *col;
 	str val = {NULL, 0};
 	unsigned int exp = 0;
+	unsigned char rfl = 0;
 	int found = PCACHE_FOUND_NO, ttl_left = 0, budget;
 
 	/* The key arrives from a peer and is echoed back in the reply, so it
@@ -2202,8 +2241,9 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 		}
 	}
 
-	if (pcache_ht_fetch_ex(col->htable, key, &val, &exp) != 0)
+	if (pcache_ht_fetch_ex(col->htable, key, &val, &exp, &rfl) != 0)
 		goto reply;
+
 
 	/* Hand over the ORIGINAL lifetime, never a fresh TTL: a copy that
 	 * outlives the owner's entry would serve state the owner already
@@ -2217,6 +2257,19 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 			goto reply;
 		}
 		ttl_left = (int)(exp - now);
+	}
+
+	/* A passive copy defers to whoever WROTE the key: answer "held" and
+	 * let the authority ship the bytes, unless the requester already
+	 * concluded no authority is left and is forcing this very copy out.
+	 * Gated: a peer of the previous format reads HELD as silence, so the
+	 * cluster must uniformly understand it before anyone sends it. */
+	if (pull_authoritative_serve && !force && (rfl & PCACHE_F_PASSIVE)) {
+		pkg_free(val.s);
+		val.s = NULL; val.len = 0;
+		found = PCACHE_FOUND_HELD;
+		__sync_fetch_and_add(&pull_stats[PULL_ST_SERVED_HELD], 1);
+		goto reply;
 	}
 
 	/* The controller plane is one datagram, so a large value cannot ride
@@ -2276,15 +2329,20 @@ static void pcache_pull_serve(bin_packet_t *in)
 {
 	str coll, key;
 	unsigned int id;
+	int force = 0;
 
 	if (bin_pop_int(in, (int *)&id) < 0 || bin_pop_str(in, &coll) < 0 ||
 	        bin_pop_str(in, &key) < 0) {
 		LM_ERR("malformed pull request from node %d\n", in->src_id);
 		return;
 	}
+	/* trailing field: a requester of the previous wire format does not
+	 * send it, and not sending it means not forcing anything */
+	if (bin_pop_int(in, &force) < 0)
+		force = 0;
 	/* arrived over BIN, so it is answered over BIN - even on a node whose
 	 * own pull_transport is the controller plane */
-	pcache_pull_do_serve(in->src_id, id, &coll, &key, 0);
+	pcache_pull_do_serve(in->src_id, id, &coll, &key, 0, force);
 }
 
 /* A peer answered.  Fill the waiting slot; first positive answer wins and
@@ -2348,7 +2406,17 @@ static void pcache_pull_do_reply(int src_node, unsigned int id, str *key,
 		/* someone HAS it - so the key is not absent, whatever the rest of
 		 * the cluster says.  Not a negative, and not a value either. */
 		sl->oversize = 1;
-	} else if (!sl->done && val->len <= pull_max_value) {
+	} else if (found == PCACHE_FOUND_HELD) {
+		/* a passive holder deferring to the authority
+		 * (pull_authoritative_serve on the serve side).  Like OVERSIZE it
+		 * proves the key exists; unlike OVERSIZE the copy is one targeted
+		 * force-ask away, so remember who to ask. */
+		if (!sl->held_node)
+			sl->held_node = src_node;
+		sl->held++;
+		__sync_fetch_and_add(&pull_stats[PULL_ST_HELD], 1);
+	} else if (found == PCACHE_FOUND_YES &&
+	        !sl->done && val->len <= pull_max_value) {
 		memcpy(pull_slot_val(sl), val->s, val->len);
 		sl->vlen = val->len;
 		/* back to an absolute deadline on our own clock */
@@ -2383,7 +2451,8 @@ static void pcache_pull_do_reply(int src_node, unsigned int id, str *key,
 		sl->orphan = 0;
 		store_late = 1;
 	} else if (sl->efd >= 0 &&
-	        (sl->done || sl->oversize || sl->negative >= sl->expect)) {
+	        (sl->done || sl->oversize || sl->negative >= sl->expect ||
+	         (sl->held && sl->negative + sl->held >= sl->expect))) {
 		/* Wake whoever is waiting on this slot.  The reply almost never
 		 * lands in the process that asked, so this is the only way back
 		 * to it: the fd was created before the fork, which is what lets
@@ -2424,7 +2493,8 @@ static void pcache_pull_do_reply(int src_node, unsigned int id, str *key,
 			__sync_fetch_and_add(&pull_stats[PULL_ST_LATE_SUPERSEDED], 1);
 			LM_DBG("late pull answer for <%.*s> superseded by a local "
 				"write - not stored\n", lk.len, lk.s);
-		} else if (pcache_ht_store(lcol->htable, &lk, &lv, late_exp) < 0) {
+		} else if (pcache_ht_store_ex(lcol->htable, &lk, &lv, late_exp,
+		        PCACHE_F_PASSIVE) < 0) {
 			LM_ERR("could not store the late pulled value for <%.*s>\n",
 				lk.len, lk.s);
 		} else {
@@ -2651,7 +2721,9 @@ static void pcache_clctr_recv(int cluster_id, int src_node_id, str *channel,
 		if (left < key.len)
 			goto bad;
 		key.s = (char *)p;
-		pcache_pull_do_serve(src_node_id, ntohl(id_be), &coll, &key, 1);
+		/* optional trailing flags byte - absent on the previous format */
+		pcache_pull_do_serve(src_node_id, ntohl(id_be), &coll, &key, 1,
+			left > key.len ? (p[key.len] & 1) : 0);
 		return;
 	}
 	if (type == PCACHE_CLCTR_RPL) {
@@ -2702,8 +2774,10 @@ bad:
  * somebody else - so an unhelpful answer must leave the caller able to
  * ask the rest, which is why a hinted request that comes back empty is
  * reported as "no answer" rather than as absence. */
+/* @force rides the request to the peers: answer with the value even for a
+ * passive copy.  Set only on the follow-up leg of a held-only exchange. */
 static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
-		int *fd, unsigned int *id_out)
+		int force, int *fd, unsigned int *id_out)
 {
 	struct pcache_pull_slot *sl = NULL;
 	bin_packet_t packet;
@@ -2718,7 +2792,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 		__sync_fetch_and_add(&pull_stats[PULL_ST_SKIP_TOOLONG], 1);
 		return -1;
 	}
-	if (pcache_neg_check(col, key)) {
+	if (!force && pcache_neg_check(col, key)) {
 		__sync_fetch_and_add(&pull_stats[PULL_ST_SUPPRESSED], 1);
 		return 0;
 	}
@@ -2836,6 +2910,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 		n += col->col_name.len;
 		memcpy(buf + n, &kl, 2); n += 2;
 		memcpy(buf + n, key->s, key->len); n += key->len;
+		buf[n++] = (char)(force ? 1 : 0);   /* trailing flags byte */
 		pl.s = buf;
 		pl.len = n;
 		/* one packet, whatever the cluster size - and encrypted, which
@@ -2854,7 +2929,10 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 			goto fail;
 		if (bin_push_int(&packet, (int)id) < 0 ||
 		    bin_push_str(&packet, &col->col_name) < 0 ||
-		    bin_push_str(&packet, (str *)key) < 0) {
+		    bin_push_str(&packet, (str *)key) < 0 ||
+		    /* trailing, so a peer of the previous wire format simply does
+		     * not pop it - absent means 0 on the parse side too */
+		    bin_push_int(&packet, force) < 0) {
 			bin_free_packet(&packet);
 			goto fail;
 		}
@@ -2880,15 +2958,23 @@ fail:
 
 /* Collect a started pull.  Safe to call on a timeout as well - it releases
  * the slot either way, so a caller that gives up leaks nothing.
+ *
+ * When every peer answered but the best on offer was held (passive) copies,
+ * this performs ONE follow-up: a targeted, force-flagged ask to a node that
+ * answered "held", bounded by pull_timeout_ms like the first leg.  That
+ * node proved alive an instant ago, so the leg is one LAN round trip - and
+ * it only ever runs when the authoritative holder is gone, the case where
+ * correctness outranks the extra millisecond.  For an async consumer it
+ * runs in whatever context calls finish(); @allow_forced caps it at one.
  * @return 1 = value in @out, 0 = definitively absent, -1 = no answer. */
-static int pcache_pull_finish(pcache_col_t *col, const str *key,
+static int pcache_pull_finish_ex(pcache_col_t *col, const str *key,
 		unsigned int id, char *out, unsigned int outlen, unsigned int *vlen,
-		unsigned int *expires)
+		unsigned int *expires, int allow_forced)
 {
 	struct pcache_pull_slot *sl;
 	unsigned int exp = 0;
 	uint64_t drain;
-	int rc = -1;
+	int rc = -1, held_node = 0, held_complete = 0;
 
 	lock_get(pull_lock);
 	sl = pull_slot_get(id);
@@ -2917,8 +3003,27 @@ static int pcache_pull_finish(pcache_col_t *col, const str *key,
 		 * partly account for - silence from peers we never counted is
 		 * not evidence of absence. */
 		rc = (sl->hinted || sl->partial) ? -1 : 0;
+	} else if (sl->held && sl->negative + sl->held >= sl->expect) {
+		/* Every peer has spoken and at least one is holding a passive
+		 * copy back - the authority they defer to never answered (dead,
+		 * or restarted empty).  Not absence, not a timeout: the value is
+		 * one force-flagged ask away, made below once the lock is off. */
+		held_node = sl->held_node;
+		held_complete = 1;
 	} else {
 		__sync_fetch_and_add(&pull_stats[PULL_ST_TIMEOUT], 1);
+		/* Timed out - but if somebody DID answer "held", the key provably
+		 * exists and the holder is one ask away.  The silent peer may be
+		 * dead without membership knowing yet (a bin peer that refuses
+		 * connects can take a full detection cycle to be dropped), and
+		 * waiting for that would fail lookups for up to a minute while a
+		 * holder sits there deferring.  Serving the passive copy is
+		 * exactly what the pre-held protocol did whenever a passive
+		 * holder answered first, so the forced leg is never worse - and
+		 * the slot still lingers as an orphan, so an authoritative answer
+		 * that limps in late is stored all the same. */
+		if (sl->held)
+			held_node = sl->held_node;
 	}
 	if (rc == 0 && pc_view && pc_view->generation != sl->gen) {
 		LM_DBG("membership changed during the pull - not concluding "
@@ -2930,7 +3035,10 @@ static int pcache_pull_finish(pcache_col_t *col, const str *key,
 	 * only copy of the collection and key it belongs to.  rc == 1 is already
 	 * stored below; an oversize holder and a settled absence are final
 	 * answers - none of those wants a late reply. */
-	if (rc == 1 || sl->oversize || sl->negative >= sl->expect) {
+	if (rc == 1 || sl->oversize || sl->negative >= sl->expect ||
+	        held_node > 0) {
+		/* held-only is concluded too: the holders withheld deliberately,
+		 * so no late value is coming to an orphan */
 		sl->id = 0;                  /* the slot is reusable from here */
 	} else {
 		sl->orphan = 1;
@@ -2951,7 +3059,8 @@ static int pcache_pull_finish(pcache_col_t *col, const str *key,
 		if (exp && exp <= get_ticks()) {
 			LM_DBG("pulled <%.*s> had already expired in flight - not "
 				"stored\n", key->len, key->s);
-		} else if (pcache_ht_store(col->htable, key, &v, exp) < 0) {
+		} else if (pcache_ht_store_ex(col->htable, key, &v, exp,
+		        PCACHE_F_PASSIVE) < 0) {
 			LM_ERR("could not store the pulled value for <%.*s>\n",
 				key->len, key->s);
 		} else {
@@ -2964,7 +3073,39 @@ static int pcache_pull_finish(pcache_col_t *col, const str *key,
 	} else if (rc == 0) {
 		pcache_neg_add(col, key);
 	}
+
+	if (rc == -1 && held_node > 0 && allow_forced) {
+		struct pollfd pfd;
+		unsigned int fid = 0;
+		int ffd = -1, left = pull_timeout_ms;
+
+		__sync_fetch_and_add(&pull_stats[PULL_ST_FORCED], 1);
+		if (pcache_pull_start(col, key, held_node, 1, &ffd, &fid) != 1)
+			return -1;
+		pfd.fd = ffd;
+		pfd.events = POLLIN;
+		while (left > 0) {
+			int n = poll(&pfd, 1, left);
+
+			if (n > 0)
+				break;
+			if (n < 0 && errno == EINTR) {
+				left -= 1;
+				continue;
+			}
+			break;
+		}
+		return pcache_pull_finish_ex(col, key, fid, out, outlen, vlen,
+			expires, 0);
+	}
 	return rc;
+}
+
+static int pcache_pull_finish(pcache_col_t *col, const str *key,
+		unsigned int id, char *out, unsigned int outlen, unsigned int *vlen,
+		unsigned int *expires)
+{
+	return pcache_pull_finish_ex(col, key, id, out, outlen, vlen, expires, 1);
 }
 
 /* Ask the cluster for one key and wait for the answer.
@@ -2983,7 +3124,7 @@ static int pcache_pull_key(pcache_col_t *col, const str *key, char *out,
 	unsigned int id = 0;
 	int fd = -1, rc, left = pull_timeout_ms;
 
-	rc = pcache_pull_start(col, key, 0, &fd, &id);
+	rc = pcache_pull_start(col, key, 0, 0, &fd, &id);
 	if (rc <= 0)
 		return rc == 0 ? 0 : -1;        /* cached negative, or cannot ask */
 
@@ -3042,7 +3183,7 @@ static int pcache_cluster_probe(pcache_col_t *col, unsigned char *seen,
 	 * anyone, which is the one thing this must not do */
 	pcache_neg_clear(col, &probe_key);
 
-	rc = pcache_pull_start(col, &probe_key, 0, &fd, &id);
+	rc = pcache_pull_start(col, &probe_key, 0, 0, &fd, &id);
 	if (rc <= 0)
 		return -1;
 
@@ -4703,7 +4844,7 @@ static int pcache_api_pull_start(cachedb_con *con, str *key, int *fd,
 
 	if (!col || !key || !fd || !handle)
 		return -1;
-	return pcache_pull_start(col, key, 0, fd, handle);
+	return pcache_pull_start(col, key, 0, 0, fd, handle);
 }
 
 static int pcache_api_pull_start_at(cachedb_con *con, str *key, int node_id,
@@ -4713,7 +4854,7 @@ static int pcache_api_pull_start_at(cachedb_con *con, str *key, int node_id,
 
 	if (!col || !key || !fd || !handle)
 		return -1;
-	return pcache_pull_start(col, key, node_id, fd, handle);
+	return pcache_pull_start(col, key, node_id, 0, fd, handle);
 }
 
 static int pcache_api_my_node_id(cachedb_con *con)

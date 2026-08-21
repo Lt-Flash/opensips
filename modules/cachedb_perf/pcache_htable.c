@@ -305,7 +305,8 @@ static int ovf_fetch(pcache_htable_t *ht, const str *key, unsigned int hash,
  */
 static int _pcache_ht_fetch_buf(pcache_htable_t *ht, const str *key,
 		char *dst, unsigned int dstlen, unsigned int *vlen_out,
-		unsigned int now, unsigned int *exp_out, long long *ll_out)
+		unsigned int now, unsigned int *exp_out, long long *ll_out,
+		unsigned char *fl_out)
 {
 	pcache_bucket_t *b;
 	uint64_t route;
@@ -381,6 +382,8 @@ settled:
 	HT_ST(ht, hits);
 	if (exp_out)
 		*exp_out = exp;                  /* absolute ticks, 0 = never */
+	if (fl_out)
+		*fl_out = fl;                    /* record flags, e.g. F_PASSIVE */
 	*vlen_out = vlen;
 
 	/* the value did not fit: the length above tells the caller what it
@@ -411,7 +414,7 @@ settled:
  * be reached from here - it is handled defensively all the same.
  */
 static int _pcache_ht_fetch(pcache_htable_t *ht, const str *key, str *val,
-		unsigned int now, unsigned int *exp_out)
+		unsigned int now, unsigned int *exp_out, unsigned char *fl_out)
 {
 	unsigned int vlen = 0;
 	long long ll = 0;
@@ -423,7 +426,7 @@ static int _pcache_ht_fetch(pcache_htable_t *ht, const str *key, str *val,
 		return -1;
 
 	rc = _pcache_ht_fetch_buf(ht, key, scratch, PCACHE_CELL_MAX, &vlen,
-		now, exp_out, &ll);
+		now, exp_out, &ll, fl_out);
 	if (rc < 0)
 		return rc == PCACHE_E_TOOSMALL ? -1 : rc;
 
@@ -449,15 +452,17 @@ static int _pcache_ht_fetch(pcache_htable_t *ht, const str *key, str *val,
 
 int pcache_ht_fetch(pcache_htable_t *ht, const str *key, str *val)
 {
-	return _pcache_ht_fetch(ht, key, val, get_ticks(), NULL);
+	return _pcache_ht_fetch(ht, key, val, get_ticks(), NULL, NULL);
 }
 
 /* like pcache_ht_fetch, but also returns the record's absolute expiry
  * (0 = never) - the MI perf_get needs the TTL alongside the value */
 int pcache_ht_fetch_ex(pcache_htable_t *ht, const str *key, str *val,
-		unsigned int *expires)
+		unsigned int *expires, unsigned char *rflags)
 {
-	return _pcache_ht_fetch(ht, key, val, get_ticks(), expires);
+	if (rflags)
+		*rflags = 0;
+	return _pcache_ht_fetch(ht, key, val, get_ticks(), expires, rflags);
 }
 
 /* existence probe - see the contract in pcache_htable.h.  Shares the whole
@@ -478,7 +483,7 @@ int pcache_ht_probe(pcache_htable_t *ht, const str *key, unsigned int *vlen,
 		*is_counter = 0;
 
 	rc = _pcache_ht_fetch_buf(ht, key, NULL, 0, &len, get_ticks(),
-		&exp, NULL);
+		&exp, NULL, NULL);
 	if (rc < 0)
 		return rc;                 /* -2 = absent or expired */
 	if (vlen)
@@ -511,7 +516,7 @@ int pcache_ht_fetch_buf(pcache_htable_t *ht, const str *key, char *buf,
 	}
 
 	rc = _pcache_ht_fetch_buf(ht, key, buf, buflen, vlen, get_ticks(),
-		NULL, &ll);
+		NULL, &ll, NULL);
 
 	if (rc == PCACHE_E_TOOSMALL) {
 		/* *vlen must never exceed the caller's buffer: {buf,*vlen} has to
@@ -565,6 +570,17 @@ static struct povf *ovf_find(pcache_htable_t *ht, const str *key,
 int pcache_ht_store(pcache_htable_t *ht, const str *key, const str *val,
 		unsigned int expires)
 {
+	return pcache_ht_store_ex(ht, key, val, expires, 0);
+}
+
+/* @rflags is stamped on the stored record: 0 for a local consumer write
+ * (the authoritative kind), PCACHE_F_PASSIVE for a value that arrived
+ * through a cluster pull.  The identical-bytes TTL-bump path keeps the
+ * record's existing flags - re-pulling bytes the owner wrote must not
+ * demote the owner's copy. */
+int pcache_ht_store_ex(pcache_htable_t *ht, const str *key, const str *val,
+		unsigned int expires, unsigned char rflags)
+{
 	pcache_bucket_t *b;
 	pcache_rec_t *nr, *old = NULL;
 	struct povf *node = NULL, *on;
@@ -587,7 +603,7 @@ int pcache_ht_store(pcache_htable_t *ht, const str *key, const str *val,
 	nr = pcache_cell_alloc(PCACHE_REC_SIZE(key->len, val->len));
 	if (!nr)
 		return -2;                        /* arena full - write dropped */
-	nr->rflags = 0;
+	nr->rflags = rflags;
 	nr->klen = (unsigned short)key->len;
 	nr->vlen = (unsigned int)val->len;
 	nr->expires = expires;
@@ -645,7 +661,7 @@ again:
 			 * from a previous life.  Without it, storing an 8-byte
 			 * string over a native counter left PCACHE_F_INT set and
 			 * the read path re-interpreted the ASCII as an int64 */
-			old->rflags = 0;
+			old->rflags = rflags;
 			old->vlen = (unsigned int)val->len;
 			memcpy(old->data + key->len, val->s, val->len);
 			old->expires = expires;
@@ -1733,9 +1749,9 @@ int pcache_htable_selftest(void)
 	 * wrapper here) */
 	v.s = "temp"; v.len = 4;
 	HCHK(pcache_ht_store(ht, &k, &v, 500) == 0, "expired store failed\n");
-	HCHK(_pcache_ht_fetch(ht, &k, &out, 1000, NULL) == -2,
+	HCHK(_pcache_ht_fetch(ht, &k, &out, 1000, NULL, NULL) == -2,
 		"expired key still hits\n");
-	rc = _pcache_ht_fetch(ht, &k, &out, 400, NULL);
+	rc = _pcache_ht_fetch(ht, &k, &out, 400, NULL, NULL);
 	HCHK(rc == 0, "live key missed\n");
 	pkg_free(out.s);
 	pcache_ht_remove(ht, &k);

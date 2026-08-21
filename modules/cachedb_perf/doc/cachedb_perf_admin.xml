@@ -525,6 +525,45 @@ modparam("cachedb_perf", "replicate_collections", "th")
 		</emphasis>
 		</para>
 	</section>
+	<section id="param_pull_authoritative_serve" xreflabel="pull_authoritative_serve">
+		<title><varname>pull_authoritative_serve</varname> (integer)</title>
+		<para>
+		In a converged cluster several nodes hold most keys, and a
+		broadcast pull is answered by every one of them - with the full
+		value each, of which the requester uses exactly one.  With this
+		set, a node answers with the value only for keys it
+		<emphasis>wrote</emphasis> (its own <emphasis>set()</emphasis>s -
+		the authoritative copies); for a copy that arrived through a
+		pull it answers a compact <quote>held</quote> instead, so each
+		pull moves one value however many nodes hold the key.
+		</para>
+		<para>
+		A <quote>held</quote> answer still proves the key exists.  When
+		every peer has answered and only held copies were on offer - the
+		writer is dead, or restarted empty - the requester re-asks one of
+		the holders directly with a force flag and receives the value:
+		one extra LAN round trip, paid only in the degraded case.
+		Counters: <emphasis>pulls_served_held</emphasis> (this node
+		withheld a passive copy), <emphasis>pulls_held</emphasis> (held
+		answers received), <emphasis>pulls_forced</emphasis> (follow-up
+		targeted asks).
+		</para>
+		<para>
+		Off by default, and it must stay off until <emphasis>every</emphasis>
+		cluster member runs a build that understands the held answer: an
+		older peer treats it as silence and degrades to a pull timeout
+		whenever no authoritative holder is left.  Entries restored from
+		DB persistence lose the passive mark and are served as
+		authoritative again - harmless, it merely restores the old
+		every-holder-answers behavior for those keys.
+		</para>
+		<para>
+		<emphasis>
+			Default value is <quote>0</quote> (every holder answers with
+			the value).
+		</emphasis>
+		</para>
+	</section>
 	<section id="param_pull_linger_ms" xreflabel="pull_linger_ms">
 		<title><varname>pull_linger_ms</varname> (integer)</title>
 		<para>
@@ -892,7 +931,7 @@ WARNING:cachedb_perf:mod_init: replicate_collections is set but
 		<listitem><para><emphasis>pulls_requested</emphasis> - misses that turned into a request on the wire. <emphasis>pulls_served</emphasis> - requests from peers this node answered.</para></listitem>
 		<listitem><para><emphasis>pulls_suppressed</emphasis> - asks absorbed by an already-cached negative (<varname>pull_negative_ms</varname>); the second and later asker for a key a peer has already denied.</para></listitem>
 		<listitem><para><emphasis>pulls_skip_notreplicated</emphasis>, <emphasis>pulls_skip_toolong</emphasis>, <emphasis>pulls_skip_nopeers</emphasis>, <emphasis>pulls_skip_noslot</emphasis> - misses refused at the gate before anything was sent. They are kept apart because each calls for a different action: pull is off for that collection; the key or collection name is too long to ask for at all; no live cluster member to ask; or the slot table is full and nothing was evictable.</para></listitem>
-		<listitem><para><emphasis>pulls_received</emphasis> - a value came back. <emphasis>pulls_negative</emphasis> - a peer answered that it does not have the key. <emphasis>pulls_oversize</emphasis> - a peer has it but it exceeds the cluster transport limit. <emphasis>pulls_timed_out</emphasis> - nothing came back in <varname>pull_timeout_ms</varname>. <emphasis>pulls_send_failed</emphasis> - the transport refused the datagram, so no peer was ever asked.</para></listitem>
+		<listitem><para><emphasis>pulls_received</emphasis> - a value came back. <emphasis>pulls_negative</emphasis> - a peer answered that it does not have the key. <emphasis>pulls_oversize</emphasis> - a peer has it but it exceeds the cluster transport limit. <emphasis>pulls_timed_out</emphasis> - nothing came back in <varname>pull_timeout_ms</varname>. <emphasis>pulls_send_failed</emphasis> - the transport refused the datagram, so no peer was ever asked. <emphasis>pulls_held</emphasis> - a peer answered that it holds a passive copy but defers to the authoritative holder (<varname>pull_authoritative_serve</varname>); its serve-side twin is <emphasis>pulls_served_held</emphasis>. <emphasis>pulls_forced</emphasis> - every peer answered yet only held copies were on offer, so one holder was re-asked directly with the force flag.</para></listitem>
 		<listitem><para><emphasis>pulls_stored</emphasis> - answers written into the cache. <emphasis>pulls_in_flight</emphasis> - requests outstanding right now (a gauge, not a total).</para></listitem>
 		<listitem><para><emphasis>pulls_orphaned</emphasis> - a waiter gave up but the slot was kept in case the answer still arrives, for <varname>pull_linger_ms</varname>. Its outcomes: <emphasis>pulls_late_stored</emphasis> (arrived and was stored - convergence that would otherwise be lost), <emphasis>pulls_late_superseded</emphasis> (a local write had already filled the key), <emphasis>pulls_late_expired</emphasis> (arrived past the linger and was refused as stale), <emphasis>pulls_orphan_expired</emphasis> (no late answer ever came - the ordinary end of a timeout), <emphasis>pulls_orphan_evicted</emphasis> (the slot was reclaimed early because the pool ran dry).</para></listitem>
 		<listitem><para><emphasis>pulls_abandoned</emphasis> - slots the reaper released because the caller never collected them. Distinct from a timeout, which the caller DID collect: a non-zero value here is a defect signal, not tuning.</para></listitem>

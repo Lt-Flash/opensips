@@ -66,6 +66,14 @@ typedef struct pcache_rec {
  * bytes, arithmetic is fixed-width under the bucket lock, and every
  * user-facing read (fetch, walker) formats it as a decimal string */
 #define PCACHE_F_INT                0x01
+/* The record arrived through a cluster pull, not through a local consumer
+ * write - a passive copy.  Provenance doubles as authority: the serve side
+ * can answer "held, not authoritative" for these instead of shipping the
+ * value, so in a converged cluster only the writer answers with bytes.
+ * A later local write over the key clears it (the writer IS the authority);
+ * a pull landing on identical bytes keeps whatever the record had, which
+ * keeps an owner's copy authoritative. */
+#define PCACHE_F_PASSIVE            0x02
 
 /* strict bounded decimal parse; no overflow guard - counter territory */
 static inline int pcache_str2ll(const char *p, int len, long long *out)
@@ -204,6 +212,12 @@ pcache_htable_t *pcache_htable_new(unsigned int size_log2);
 int pcache_ht_store(pcache_htable_t *ht, const str *key, const str *val,
 		unsigned int expires);
 
+/* as pcache_ht_store, stamping @rflags on the record (PCACHE_F_PASSIVE for
+ * a value that arrived through a cluster pull).  pcache_ht_store() is this
+ * with rflags 0 - a local consumer write, the authoritative kind. */
+int pcache_ht_store_ex(pcache_htable_t *ht, const str *key, const str *val,
+		unsigned int expires, unsigned char rflags);
+
 /* get_buf(): @buf was too small.  *vlen stays 0 and *needed carries the
  * size the value would have needed - never a length the caller could
  * mistake for "bytes written into buf". */
@@ -256,9 +270,10 @@ int pcache_ht_fetch_buf(pcache_htable_t *ht, const str *key, char *buf,
 int pcache_ht_fetch(pcache_htable_t *ht, const str *key, str *val);
 
 /* as pcache_ht_fetch, plus *@expires = the record's absolute expiry (0 =
- * never) on a hit - the MI perf_get reports the TTL with the value */
+ * never) on a hit - the MI perf_get reports the TTL with the value - and
+ * *@rflags = the record's flags (either out pointer may be NULL) */
 int pcache_ht_fetch_ex(pcache_htable_t *ht, const str *key, str *val,
-		unsigned int *expires);
+		unsigned int *expires, unsigned char *rflags);
 
 /* 1 = removed; 0 = was absent; -1 = error */
 int pcache_ht_remove(pcache_htable_t *ht, const str *key);

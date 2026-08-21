@@ -1415,6 +1415,7 @@ int get_urecord(udomain_t* _d, str* _aor, struct urecord** _r)
 	case CM_NONE:
 	case CM_FULL_SHARING:
 	case CM_FEDERATION_CACHEDB:
+	case CM_PULL_SHARING:
 		r = find_mem_urecord(_d, _aor);
 		if (!r)
 			goto out;

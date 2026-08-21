@@ -43,6 +43,7 @@ typedef enum ul_cluster_mode {
 	CM_FULL_SHARING,
 	CM_FULL_SHARING_CACHEDB,
 	CM_SQL_ONLY,
+	CM_PULL_SHARING,
 } ul_cluster_mode_t;
 
 typedef struct usrloc_api {

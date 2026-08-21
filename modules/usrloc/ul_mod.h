@@ -66,21 +66,27 @@ typedef enum ul_pinging_mode {
 } ul_pinging_mode_t;
 #define bad_pinging_mode(pm) ((pm) < PMD_OWNERSHIP || (pm) > PMD_COOPERATION)
 
-#define bad_cluster_mode(mode) ((mode) < CM_NONE || (mode) > CM_SQL_ONLY)
+#define bad_cluster_mode(mode) ((mode) < CM_NONE || (mode) > CM_PULL_SHARING)
 
 /* TODO: rewrite/optimize these 4 checks at mod init */
+/* the pull-sharing arm covers its expert override "restart_persistency
+ * none" + write-through: the ledger is still written, only the restart
+ * bootstrap is waived - so the SQL connection must exist regardless */
 #define have_sql_con() \
-	(cluster_mode == CM_SQL_ONLY || rr_persist == RRP_LOAD_FROM_SQL)
+	(cluster_mode == CM_SQL_ONLY || rr_persist == RRP_LOAD_FROM_SQL || \
+	 (cluster_mode == CM_PULL_SHARING && sql_wmode != SQL_NO_WRITE))
 
 #define have_cdb_con() \
 	(cluster_mode == CM_FEDERATION_CACHEDB || \
-	 cluster_mode == CM_FULL_SHARING_CACHEDB)
+	 cluster_mode == CM_FULL_SHARING_CACHEDB || \
+	 cluster_mode == CM_PULL_SHARING)
 
 static inline int have_mem_storage(void)
 {
 	return cluster_mode == CM_NONE ||
 	       cluster_mode == CM_FEDERATION_CACHEDB ||
-	       cluster_mode == CM_FULL_SHARING;
+	       cluster_mode == CM_FULL_SHARING ||
+	       cluster_mode == CM_PULL_SHARING;
 }
 
 static inline int tags_in_use(void)

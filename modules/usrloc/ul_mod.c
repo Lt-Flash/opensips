@@ -325,6 +325,11 @@ static module_dependency_t *get_deps_wmode_preset(const param_export_t *param)
 	if (l_memmem(haystack, "cachedb", strlen(haystack), strlen("cachedb")))
 		return alloc_module_dep(MOD_TYPE_CACHEDB, NULL, DEP_ABORT);
 
+	/* pull-sharing rides a cachedb_perf collection */
+	if (l_memmem(haystack, "pull-sharing", strlen(haystack),
+	        strlen("pull-sharing")))
+		return alloc_module_dep(MOD_TYPE_CACHEDB, NULL, DEP_ABORT);
+
 	return NULL;
 }
 
@@ -579,6 +584,11 @@ int ul_check_config(void)
 			cluster_mode = CM_SQL_ONLY;
 			rr_persist = RRP_NONE;
 			sql_wmode = SQL_NO_WRITE;
+		} else if (!strcasecmp(runtime_preset, "pull-sharing-cluster")) {
+			/* only the mode is fixed here; restart_persistency and
+			 * sql_write_mode are arbitrated in the mode's switch case
+			 * below, from the knob strings + the presence of a db_url */
+			cluster_mode = CM_PULL_SHARING;
 		} else {
 			LM_ERR("invalid working_mode_preset: '%s'\n", runtime_preset);
 			return -1;
@@ -597,6 +607,8 @@ int ul_check_config(void)
 				cluster_mode = CM_FULL_SHARING_CACHEDB;
 			} else if (!strcasecmp(cluster_mode_str, "sql-only")) {
 				cluster_mode = CM_SQL_ONLY;
+			} else if (!strcasecmp(cluster_mode_str, "pull-sharing")) {
+				cluster_mode = CM_PULL_SHARING;
 			} else {
 				LM_ERR("invalid cluster_mode: '%s'\n", cluster_mode_str);
 				return -1;
@@ -648,14 +660,20 @@ int ul_check_config(void)
 		return -1;
 	}
 
-	if (rr_persist != RRP_LOAD_FROM_SQL && sql_wmode != SQL_NO_WRITE) {
-		LM_WARN("the 'sql_write_mode' only makes sense with an "
-		        "SQL-based restart persistency -- ignoring...\n");
-		sql_wmode = SQL_NO_WRITE;
-	} else if (rr_persist == RRP_LOAD_FROM_SQL && sql_wmode == SQL_NO_WRITE) {
-		LM_WARN("using SQL restart persistency without an 'sql_write_mode' "
-		        "- defaulting to 'write-back'...\n");
-		sql_wmode = SQL_WRITE_BACK;
+	/* pull-sharing arbitrates its SQL knobs in its own switch case below,
+	 * from the knob STRINGS - by this point the enums may not reflect what
+	 * the user wrote, so rewriting them here would corrupt that input */
+	if (cluster_mode != CM_PULL_SHARING) {
+		if (rr_persist != RRP_LOAD_FROM_SQL && sql_wmode != SQL_NO_WRITE) {
+			LM_WARN("the 'sql_write_mode' only makes sense with an "
+			        "SQL-based restart persistency -- ignoring...\n");
+			sql_wmode = SQL_NO_WRITE;
+		} else if (rr_persist == RRP_LOAD_FROM_SQL
+		        && sql_wmode == SQL_NO_WRITE) {
+			LM_WARN("using SQL restart persistency without an "
+			        "'sql_write_mode' - defaulting to 'write-back'...\n");
+			sql_wmode = SQL_WRITE_BACK;
+		}
 	}
 
 	switch (cluster_mode) {
@@ -774,6 +792,120 @@ int ul_check_config(void)
 		}
 		pinging_mode = PMD_COOPERATION;
 		break;
+
+	case CM_PULL_SHARING:
+		/* Unlike the older presets, this mode arbitrates the fine-tuning
+		 * knobs instead of ignoring them: an in-envelope refinement is
+		 * honored, a contradiction is a startup error, and nothing is
+		 * discarded silently.  The knob STRINGS are read here (not the
+		 * enums): they are the record of what the user actually set, and
+		 * they distinguish "unset" from "explicitly the default". */
+		if (runtime_preset && cluster_mode_str
+		        && strcasecmp(cluster_mode_str, "pull-sharing")) {
+			LM_ERR("'cluster_mode %s' contradicts 'working_mode_preset "
+			       "%s'\n", cluster_mode_str, runtime_preset);
+			return -1;
+		}
+
+		if (!location_cluster) {
+			LM_ERR("'location_cluster' is not set!\n");
+			return -1;
+		}
+
+		if (!cdb_url.s || !cdb_url.s[0]) {
+			LM_ERR("pull-sharing serves lookup misses through a "
+			       "cachedb_perf collection - set 'cachedb_url' to a "
+			       "perf:// URL\n");
+			return -1;
+		}
+		if (strncasecmp(cdb_url.s, "perf:", 5)) {
+			LM_ERR("pull-sharing relies on cachedb_perf's pull-on-miss; "
+			       "'cachedb_url' must be a perf:// URL, not <%s>\n",
+			       cdb_url.s);
+			return -1;
+		}
+
+		if (ZSTR(db_url)) {
+			if (sql_wmode_str || rr_persist_str) {
+				LM_ERR("'%s' is set, but there is no 'db_url' to apply it "
+				       "to\n", sql_wmode_str ? "sql_write_mode"
+				                             : "restart_persistency");
+				return -1;
+			}
+			rr_persist = RRP_NONE;
+			sql_wmode = SQL_NO_WRITE;
+			LM_WARN("pull-sharing without a 'db_url': pure-pull operation "
+			        "- no shared ownership ledger and no restart "
+			        "bootstrap; a restarted node re-learns only what "
+			        "traffic asks of it\n");
+		} else {
+			if (!rr_persist_str
+			        || !strcasecmp(rr_persist_str, "load-from-sql")) {
+				rr_persist = RRP_LOAD_FROM_SQL;
+			} else if (!strcasecmp(rr_persist_str, "none")) {
+				rr_persist = RRP_NONE;
+				LM_WARN("explicit 'restart_persistency none': the shared "
+				        "DB is still written through, but this node will "
+				        "NOT bootstrap from it after a restart\n");
+			} else if (!strcasecmp(rr_persist_str, "sync-from-cluster")) {
+				LM_ERR("pull-sharing has no full-sync capability to sync "
+				       "from - 'restart_persistency sync-from-cluster' "
+				       "cannot work here\n");
+				return -1;
+			} else {
+				LM_ERR("invalid restart_persistency: '%s'\n",
+				       rr_persist_str);
+				return -1;
+			}
+
+			if (!sql_wmode_str
+			        || !strcasecmp(sql_wmode_str, "write-through")) {
+				sql_wmode = SQL_WRITE_THROUGH;
+			} else if (!strcasecmp(sql_wmode_str, "write-back")) {
+				sql_wmode = SQL_WRITE_BACK;
+				LM_WARN("'sql_write_mode write-back': the ownership ledger "
+				        "lags by the flush interval, so failover and "
+				        "adoption decisions read a delayed picture\n");
+			} else if (!strcasecmp(sql_wmode_str, "none")) {
+				LM_ERR("'sql_write_mode none' with a 'db_url' would leave "
+				       "a never-written ledger that poisons failover "
+				       "decisions - drop 'db_url' instead for pure-pull "
+				       "operation\n");
+				return -1;
+			} else {
+				LM_ERR("invalid sql_write_mode: '%s'\n", sql_wmode_str);
+				return -1;
+			}
+		}
+
+		if (pinging_mode_str
+		        && !strcasecmp(pinging_mode_str, "cooperation")) {
+			LM_ERR("pull-sharing cannot use 'pinging_mode cooperation': "
+			       "nodes hold only their own and pulled contacts, so "
+			       "hash shares would land on nodes that never saw the "
+			       "contact and NAT bindings would rot unpinged\n");
+			return -1;
+		} else if (pinging_mode_str
+		        && strcasecmp(pinging_mode_str, "ownership")) {
+			LM_ERR("invalid pinging_mode: '%s'\n", pinging_mode_str);
+			return -1;
+		}
+		pinging_mode = PMD_OWNERSHIP;
+
+		if (matching_mode == CT_MATCH_CONTACT_CALLID) {
+			LM_ERR("pull-sharing keys shared-DB rows by (domain, aor, "
+			       "contact); 'matching_mode' CONTACT_CALLID would need "
+			       "the callid folded into that key and is not supported "
+			       "yet\n");
+			return -1;
+		}
+
+		if (!!ul_ha_cluster != !!(ul_ha_shtag.s && ul_ha_shtag.s[0])) {
+			LM_ERR("'ha_cluster' and 'ha_shtag' only work as a pair - "
+			       "set both or neither\n");
+			return -1;
+		}
+		break;
 	}
 
 	LM_DBG("ul config: cluster_mode=%d, rrp=%d, sql_wm=%d\n",
@@ -864,7 +996,12 @@ int ul_check_db(void)
 			return -1;
 		}
 
-		if (!CACHEDB_CAPABILITY(&cdbf, CACHEDB_CAP_COL_ORIENTED)) {
+		/* pull-sharing stores opaque record blobs under plain keys, so it
+		 * only needs the KV surface; the cachedb modes need a
+		 * column-oriented backend */
+		if (!CACHEDB_CAPABILITY(&cdbf, cluster_mode == CM_PULL_SHARING ?
+		        (CACHEDB_CAP_GET|CACHEDB_CAP_SET|CACHEDB_CAP_REMOVE) :
+		        CACHEDB_CAP_COL_ORIENTED)) {
 			LM_ERR("not enough capabilities for cachedb_url %s\n",
 			       db_url_escape(&cdb_url));
 			return -1;

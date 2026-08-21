@@ -247,7 +247,14 @@ async lookup → `pull_slots` sizing → HELD protocol
   pull-aware); plain registrar is.
 * CONTACT_CALLID matching is rejected (the ledger's natural key would need
   the Call-ID folded in).
-* DB-less operation trades: a crashed node's never-pulled records are lost
-  until re-REGISTER, and `sum(owned_contacts)` counts only living owners.
+* DB-less operation trades: any record that was ever pulled survives a
+  crash — holders keep serving it, and a restarted owner pulls its own
+  records back from them on lookup. What cannot be recovered is a record
+  that existed *only* on the crashed node (never looked up from another
+  node, and no ledger holding a second copy): it stays unreachable until
+  its device re-registers, at most one refresh interval. Similarly
+  `sum(owned_contacts)` undercounts briefly after a crash — orphaned
+  records are served but ownerless — healing as the owner re-pulls or
+  refreshes land on survivors. A ledger closes both gaps.
 * Mixed-version clusters must keep `pull_authoritative_serve` off until
   every node understands the HELD answer.

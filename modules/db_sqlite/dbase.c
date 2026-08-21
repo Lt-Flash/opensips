@@ -663,6 +663,12 @@ int db_last_inserted_id(const db_con_t* _h)
 	db_ps_t ps;
 
 	CON_SET_CURR_PS(_h, &ps);
+#else
+	/* without value binding, a caller-set PS context would make
+	 * db_print_values() emit '?' placeholders nothing ever binds -
+	 * every column then arrives NULL (exactly as db_sqlite_insert()
+	 * already guards against) */
+	CON_RESET_CURR_PS(_h);
 #endif
 	ret = snprintf(sql_buf, SQL_BUF_LEN, "insert or replace into %.*s (",
 		CON_TABLE(_h)->len, CON_TABLE(_h)->s);

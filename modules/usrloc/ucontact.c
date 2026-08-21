@@ -963,11 +963,34 @@ static inline void update_contact_pos(struct urecord* _r, ucontact_t* _c)
 /*! \brief
  * Update ucontact with new values
  */
+/* did this update MOVE the binding (re-registration through a different
+ * node or connection), as opposed to refreshing it in place?  Only moves
+ * are broadcast in pull-sharing - refreshes stay quiet. */
+static int ul_binding_moved(ucontact_t *_c, ucontact_info_t *_ci)
+{
+	static const str empty = STR_NULL;
+	const str *nrecv, *npath;
+
+	if (!str_match(&_c->callid, _ci->callid))
+		return 1;
+	nrecv = _ci->received.s ? &_ci->received : &empty;
+	if (!str_match(&_c->received, nrecv))
+		return 1;
+	npath = (_ci->path && _ci->path->s) ? _ci->path : &empty;
+	if (!str_match(&_c->path, npath))
+		return 1;
+	return _c->sock != _ci->sock;
+}
+
 int update_ucontact(struct urecord* _r, ucontact_t* _c, ucontact_info_t* _ci,
                     const struct ct_match *match, char skip_replication)
 {
-	int ret, persist_kv_store = 1;
+	int ret, persist_kv_store = 1, moved = 0;
 	ul_cb_extra extra;
+
+	/* evaluated before mem_update_ucontact() overwrites the old state */
+	if (cluster_mode == CM_PULL_SHARING && !skip_replication)
+		moved = ul_binding_moved(_c, _ci);
 
 	memset(&extra, 0, sizeof extra);
 
@@ -992,8 +1015,18 @@ int update_ucontact(struct urecord* _r, ucontact_t* _c, ucontact_info_t* _ci,
 	/* pull-sharing: handling the refresh here makes (or keeps) us the
 	 * owner - on a previously pulled contact this IS the takeover
 	 * re-stamp (the fresh _ci also cleared FL_PULLED/FL_MEM above) */
-	if (cluster_mode == CM_PULL_SHARING && !skip_replication)
+	if (cluster_mode == CM_PULL_SHARING && !skip_replication) {
 		ul_ct_stamp_owner(_c);
+
+		/* a moved binding is broadcast so stale holders (the previous
+		 * owner first among them) re-point or drop their copies now
+		 * instead of serving a dead path until natural expiry */
+		if (moved) {
+			struct ct_match m = match ? *match
+				: (struct ct_match){CT_MATCH_NONE, NULL};
+			replicate_ucontact_update(_r, _c, &m);
+		}
+	}
 
 	if (!skip_replication && have_data_replication()) {
 		if (persist_urecord_kv_store(_r) != 0)

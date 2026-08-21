@@ -921,6 +921,32 @@ static int receive_urecord_delete(bin_packet_t *packet)
 		goto out_err;
 	}
 
+	/* pull-sharing: the sender can only speak for the contacts it saw -
+	 * drop our convergence copies, but never contacts we own (a binding
+	 * accepted here after the sender's snapshot outlives its wipe) */
+	if (cluster_mode == CM_PULL_SHARING) {
+		urecord_t *r;
+		ucontact_t *c, *t;
+
+		lock_udomain(domain, &aor);
+		if (get_urecord(domain, &aor, &r) != 0) {
+			unlock_udomain(domain, &aor);
+			return 0;
+		}
+		c = r->contacts;
+		while (c) {
+			t = c;
+			c = c->next;
+			if (t->flags & FL_PULLED)
+				delete_ucontact(r, t, NULL, 1);
+		}
+		ul_pull_unpublish(r);
+		if (!r->contacts)
+			release_urecord(r, 1);
+		unlock_udomain(domain, &aor);
+		return 0;
+	}
+
 	lock_udomain(domain, &aor);
 
 	if (delete_urecord(domain, &aor, NULL, 1) != 0) {
@@ -1029,9 +1055,19 @@ static int receive_ucontact_insert(bin_packet_t *packet)
 
 	unpack_indexes(ci.contact_id, &_, &rlabel, &clabel);
 
+	/* pull-sharing receives these only as invalidations: apply onto what
+	 * exists (as a convergence copy), never materialize what does not */
+	if (cluster_mode == CM_PULL_SHARING)
+		ci.flags |= FL_PULLED | FL_MEM;
+
 	lock_udomain(domain, &aor);
 
 	if (get_urecord(domain, &aor, &record) != 0) {
+		if (cluster_mode == CM_PULL_SHARING) {
+			unlock_udomain(domain, &aor);
+			goto out_free;
+		}
+
 		LM_INFO("failed to fetch local urecord - creating new one "
 			"(ci: '%.*s') \n", callid.len, callid.s);
 
@@ -1067,9 +1103,15 @@ static int receive_ucontact_insert(bin_packet_t *packet)
 			unlock_udomain(domain, &aor);
 			goto error;
 		}
+		/* our cached blob (if any) just went stale - drop it, the next
+		 * pull re-fetches from the contact's new owner */
+		if (cluster_mode == CM_PULL_SHARING)
+			ul_pull_unpublish(record);
 		break;
 
 	case 1:
+		if (cluster_mode == CM_PULL_SHARING)
+			break;
 		if (clabel >= record->next_clabel) {
 			record->next_clabel = CLABEL_NEXT(clabel);
 		} else {
@@ -1090,6 +1132,7 @@ static int receive_ucontact_insert(bin_packet_t *packet)
 
 	unlock_udomain(domain, &aor);
 
+out_free:
 	free_pkg_str_list(cmatch.match_params);
 	return 0;
 
@@ -1191,11 +1234,22 @@ static int receive_ucontact_update(bin_packet_t *packet)
 	else
 		bin_pop_ctmatch(packet, &cmatch);
 
+	/* pull-sharing: this is the moved-binding invalidation - the sender
+	 * took over the contact, so an existing copy here is re-pointed and
+	 * demoted to a convergence copy; what we do not hold we ignore */
+	if (cluster_mode == CM_PULL_SHARING)
+		ci.flags |= FL_PULLED | FL_MEM;
+
 	lock_udomain(domain, &aor);
 
 	/* failure in retrieving a urecord may be ok, because packet order in UDP
 	 * is not guaranteed, so update commands may arrive before inserts */
 	if (get_urecord(domain, &aor, &record) != 0) {
+		if (cluster_mode == CM_PULL_SHARING) {
+			unlock_udomain(domain, &aor);
+			goto out_free;
+		}
+
 		LM_INFO("failed to fetch local urecord - create new record and contact"
 			" (ci: '%.*s')\n", callid.len, callid.s);
 
@@ -1222,6 +1276,9 @@ static int receive_ucontact_update(bin_packet_t *packet)
 		rc = get_ucontact(record, &contact_str, &callid, ci.cseq + 1, &cmatch,
 			&contact);
 		if (rc == 1) {
+			if (cluster_mode == CM_PULL_SHARING)
+				goto out_unlock;
+
 			LM_INFO("contact '%.*s' not found, inserting new (ci: '%.*s')\n",
 				contact_str.len, contact_str.s, callid.len, callid.s);
 
@@ -1242,12 +1299,16 @@ static int receive_ucontact_update(bin_packet_t *packet)
 				unlock_udomain(domain, &aor);
 				goto error;
 			}
+			if (cluster_mode == CM_PULL_SHARING)
+				ul_pull_unpublish(record);
 		} /* XXX: for -2 and -1, the master should have already handled
 			 these errors - so we can skip them - razvanc */
 	}
 
+out_unlock:
 	unlock_udomain(domain, &aor);
 
+out_free:
 	free_pkg_str_list(cmatch.match_params);
 	return 0;
 
@@ -1329,6 +1390,10 @@ static int receive_ucontact_delete(bin_packet_t *packet)
 		unlock_udomain(domain, &aor);
 		goto error;
 	}
+
+	/* pull-sharing: our cached blob just went stale - withdraw it */
+	if (cluster_mode == CM_PULL_SHARING)
+		ul_pull_unpublish(record);
 
 out:
 	unlock_udomain(domain, &aor);

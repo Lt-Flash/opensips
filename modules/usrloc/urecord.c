@@ -939,7 +939,10 @@ int insert_ucontact(urecord_t* _r, str* _contact, ucontact_info_t* _ci,
 int delete_ucontact(urecord_t* _r, struct ucontact* _c,
         const struct ct_match *match, char skip_replication)
 {
-	if (!skip_replication && have_data_replication())
+	/* pull-sharing broadcasts deletes eagerly: they are the only events
+	 * whose staleness cannot wait for natural expiry on remote holders */
+	if (!skip_replication && (have_data_replication()
+	        || cluster_mode == CM_PULL_SHARING))
 		replicate_ucontact_delete(_r, _c, match);
 
 	if (exists_ulcb_type(UL_CONTACT_DELETE))

@@ -91,6 +91,12 @@ int get_domain_ucontacts(udomain_t *d,void *buf, int len, unsigned int flags,
 /* Sums up the total number of users in memory, over all domains. */
 unsigned long get_number_of_users(void *);
 
+/* pull-sharing observability (exact by ownership disjointness) */
+void ul_count_contacts_by_ownership(unsigned long *owned,
+		unsigned long *remote);
+unsigned long get_owned_contacts(void *foo);
+unsigned long get_remote_contacts(void *foo);
+
 
 /*! \brief
  * Find a particular domain

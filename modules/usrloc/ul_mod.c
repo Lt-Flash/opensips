@@ -274,6 +274,11 @@ static const param_export_t params[] = {
 
 static const stat_export_t mod_stats[] = {
 	{"registered_users" ,  STAT_IS_FUNC, (stat_var**)get_number_of_users  },
+	/* pull-sharing: owned is the summable fleet truth (ownership is
+	 * disjoint across nodes), remote gauges convergence copies; both
+	 * count live contacts only and read 0 outside the mode */
+	{"owned_contacts"  ,   STAT_IS_FUNC, (stat_var**)get_owned_contacts  },
+	{"remote_contacts" ,   STAT_IS_FUNC, (stat_var**)get_remote_contacts },
 	{0,0,0}
 };
 static const mi_export_t mi_cmds[] = {
@@ -288,6 +293,8 @@ static const mi_export_t mi_cmds[] = {
 	{ MI_USRLOC_DUMP, 0, 0, 0, {
 		{w_mi_usrloc_dump, {0}},
 		{w_mi_usrloc_dump_1, {"brief", 0}},
+		{w_mi_usrloc_dump, {"owned_only", 0}},
+		{w_mi_usrloc_dump_1, {"brief", "owned_only", 0}},
 		{EMPTY_MI_RECIPE}}, {"ul_dump", 0}
 	},
 	{ MI_USRLOC_FLUSH, 0, 0, mi_child_init, {

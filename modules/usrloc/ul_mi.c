@@ -89,7 +89,7 @@ static inline int mi_fix_aor(str *aor)
 
 
 static inline int mi_add_aor_node(mi_item_t *aor_item, urecord_t* r,
-													time_t t, int short_dump)
+									time_t t, int short_dump, int owned_only)
 {
 	mi_item_t *cts_arr, *ct_item;
 	ucontact_t* c;
@@ -108,6 +108,10 @@ static inline int mi_add_aor_node(mi_item_t *aor_item, urecord_t* r,
 		return -1;
 
 	for( c=r->contacts ; c ; c=c->next) {
+		if (owned_only && cluster_mode == CM_PULL_SHARING
+		        && !ul_ct_is_mine(c))
+			continue;
+
 		/* contact */
 		ct_item = add_mi_object(cts_arr, NULL, 0);
 		if (!ct_item)
@@ -118,6 +122,19 @@ static inline int mi_add_aor_node(mi_item_t *aor_item, urecord_t* r,
 
 		if (add_mi_string_fmt(ct_item, MI_SSTR("ContactID"), "%" PRIu64, c->contact_id) < 0)
 			return -1;
+
+		/* pull-sharing: who answers for this contact - the summable
+		 * fleet view is the concatenation of every node's owned set */
+		if (cluster_mode == CM_PULL_SHARING) {
+			if (ul_ct_is_mine(c)) {
+				if (add_mi_string(ct_item, MI_SSTR("Ownership"),
+				        MI_SSTR("owned")) < 0)
+					return -1;
+			} else if (add_mi_string_fmt(ct_item, MI_SSTR("Ownership"),
+			        "remote(owner=%d)", ul_ct_owner_nid(c)) < 0) {
+				return -1;
+			}
+		}
 
 		if (c->expires == 0) {
 			if (add_mi_string(ct_item, MI_SSTR("Expires"), MI_SSTR("permanent")) < 0)
@@ -303,7 +320,7 @@ mi_response_t *mi_usrloc_rm_contact(const mi_params_t *params,
 
 	lock_udomain( dom, &aor);
 
-	ret = get_urecord( dom, &aor, &rec);
+	ret = get_urecord_or_pull( dom, &aor, &rec);
 	if (ret == 1) {
 		unlock_udomain( dom, &aor);
 		return init_mi_error(404, MI_SSTR("AOR not found"));
@@ -334,6 +351,7 @@ mi_response_t *mi_usrloc_rm_contact(const mi_params_t *params,
 
 mi_response_t *mi_usrloc_dump(const mi_params_t *params, int short_dump)
 {
+	int owned_only = 0;
 	struct urecord* r;
 	dlist_t* dl;
 	udomain_t* dom;
@@ -344,6 +362,9 @@ mi_response_t *mi_usrloc_dump(const mi_params_t *params, int short_dump)
 	mi_response_t *resp;
 	mi_item_t *resp_obj;
 	mi_item_t *domains_arr, *domain_item, *aors_arr, *aor_item;
+
+	/* optional; absent leaves the default */
+	try_get_mi_int_param(params, "owned_only", &owned_only);
 
 	resp = init_mi_result_object(&resp_obj);
 	if (!resp) {
@@ -401,6 +422,19 @@ mi_response_t *mi_usrloc_dump(const mi_params_t *params, int short_dump)
 				}
 				r =( urecord_t * ) *dest;
 
+				/* an AoR contributing nothing to the owned view is
+				 * dropped whole - the fleet-wide dump is the clean
+				 * concatenation of every node's owned_only output */
+				if (owned_only && cluster_mode == CM_PULL_SHARING) {
+					ucontact_t *ct;
+
+					for (ct = r->contacts; ct; ct = ct->next)
+						if (ul_ct_is_mine(ct))
+							break;
+					if (!ct)
+						continue;
+				}
+
 				aor_item = add_mi_object(aors_arr, NULL, 0);
 				if (!aor_item) {
 					LM_ERR("Failed to add mi item\n");
@@ -408,7 +442,8 @@ mi_response_t *mi_usrloc_dump(const mi_params_t *params, int short_dump)
 				}
 
 				/* add entry */
-				if (mi_add_aor_node(aor_item, r, t, short_dump)!=0) {
+				if (mi_add_aor_node(aor_item, r, t, short_dump,
+				        owned_only)!=0) {
 					LM_ERR("Failed to add AOR info\n");
 					goto error_unlock;
 				}
@@ -519,7 +554,7 @@ mi_response_t *mi_usrloc_add(const mi_params_t *params,
 
 	lock_udomain( dom, &aor);
 
-	n = get_urecord( dom, &aor, &r);
+	n = get_urecord_or_pull( dom, &aor, &r);
 	if ( n==1) {
 		if (insert_urecord( dom, &aor, &r, 0, NULL, NULL) < 0)
 			goto lock_error;
@@ -598,7 +633,7 @@ mi_response_t *mi_usrloc_show_contact(const mi_params_t *params,
 
 	lock_udomain( dom, &aor);
 
-	ret = get_urecord( dom, &aor, &rec);
+	ret = get_urecord_or_pull( dom, &aor, &rec);
 	if (ret == 1) {
 		unlock_udomain( dom, &aor);
 		return init_mi_error(404, MI_SSTR("AOR not found"));
@@ -610,7 +645,7 @@ mi_response_t *mi_usrloc_show_contact(const mi_params_t *params,
 	if (!resp)
 		goto error;
 
-	if (mi_add_aor_node(resp_obj, rec, t, 0)!=0)
+	if (mi_add_aor_node(resp_obj, rec, t, 0, 0)!=0)
 		goto error;
 
 	unlock_udomain( dom, &aor);

@@ -122,6 +122,10 @@ static int  pc_shtag_cid;              /* parsed tag cluster                 */
 /* CP-15.5 cross-node pull, on the same capability as the sync packets */
 #define PCACHE_PULL_REQ     2
 #define PCACHE_PULL_RPL     3
+/* cluster collection-size query: live per-node entry counts for one
+ * collection, riding the same capability the pulls do */
+#define PCACHE_STAT_REQ     4
+#define PCACHE_STAT_RPL     5
 
 #define PCACHE_PULL_SLOTS      64     /* concurrent in-flight pulls        */
 /* Defaults for the pull_max_value / pull_max_key modparams below. Sized from
@@ -428,6 +432,25 @@ struct pcache_peer_stat {
 	unsigned int last_reply;     /* ticks of its last answer, 0 = never  */
 };
 static struct pcache_peer_stat *peer_stats;   /* [CL_MAX_NODE_ID + 1] */
+
+/* one outstanding cluster-size query at a time (an ops path): the MI
+ * process broadcasts, replies land in whichever workers the transport
+ * picks, and the MI process polls this shm gather until everyone
+ * answered or the wait runs out */
+#define PCACHE_STAT_MAX_NODES 32
+#define PCACHE_STAT_WAIT_MS   300
+struct pcache_stat_gather {
+	unsigned int id;                          /* 0 = idle */
+	unsigned int seq;
+	int replies;
+	struct {
+		int node;
+		int found;
+		int entries;
+	} r[PCACHE_STAT_MAX_NODES];
+};
+static struct pcache_stat_gather *stat_gather;
+static gen_lock_t *stat_lock;
 
 static inline void peer_note_reply(int node_id, int carried_value)
 {
@@ -3133,6 +3156,222 @@ static mi_response_t *mi_perf_cluster_probe_1(const mi_params_t *params,
 	return do_perf_cluster_probe(&col);
 }
 
+/* perf_cluster_size <collection>: one broadcast question, one LIVE
+ * entry count per node.  For a replicated collection this is the
+ * convergence gauge: each node's count climbs toward the full set as
+ * its pulls decay toward zero, and a node that does not answer within
+ * the wait is exactly as unreachable as it would be for a pull. */
+static mi_response_t *do_perf_cluster_size(str *col_s)
+{
+	mi_response_t *resp;
+	mi_item_t *obj, *arr, *it;
+	pcache_col_t *col;
+	pcache_ht_totals_t t;
+	bin_packet_t req;
+	int ids[PCACHE_STAT_MAX_NODES];
+	unsigned int gen, qid;
+	long long total;
+	int i, k, n, waited, answered, my_id;
+
+	col = col_by_name(col_s);
+	if (!col || !col->htable)
+		return init_mi_error(404, MI_SSTR("no such collection"));
+
+	pcache_ht_totals(col->htable, &t);
+	my_id = clusterer_api.get_my_id ? clusterer_api.get_my_id() : 0;
+
+	resp = init_mi_result_object(&obj);
+	if (!resp)
+		return 0;
+	if (add_mi_string(obj, MI_SSTR("collection"),
+	        col->col_name.s, col->col_name.len) < 0)
+		goto err;
+
+	arr = add_mi_array(obj, MI_SSTR("nodes"));
+	if (!arr)
+		goto err;
+
+	it = add_mi_object(arr, NULL, 0);
+	if (!it || add_mi_number(it, MI_SSTR("node_id"), my_id) < 0 ||
+	        add_mi_number(it, MI_SSTR("entries"), t.entries) < 0 ||
+	        add_mi_string(it, MI_SSTR("source"), MI_SSTR("local")) < 0)
+		goto err;
+	total = t.entries;
+	answered = 0;
+
+	if (!cluster_ready) {
+		if (add_mi_string(obj, MI_SSTR("cluster"),
+		        MI_SSTR("not formed - local view only")) < 0)
+			goto err;
+		return resp;
+	}
+
+	n = pcache_cluster_members(ids, PCACHE_STAT_MAX_NODES, &gen, NULL);
+	if (n <= 0) {
+		if (add_mi_string(obj, MI_SSTR("cluster"),
+		        MI_SSTR("no peers up - local view only")) < 0)
+			goto err;
+		return resp;
+	}
+
+	lock_get(stat_lock);
+	if (stat_gather->id) {
+		lock_release(stat_lock);
+		free_mi_response(resp);
+		return init_mi_error(503,
+			MI_SSTR("another cluster-size query is in flight"));
+	}
+	qid = ++stat_gather->seq;
+	if (!qid)
+		qid = ++stat_gather->seq;
+	stat_gather->id = qid;
+	stat_gather->replies = 0;
+	lock_release(stat_lock);
+
+	if (bin_init(&req, &pcache_sync_cap, PCACHE_STAT_REQ,
+	        PCACHE_SYNC_VERSION, 0) < 0 ||
+	        bin_push_int(&req, (int)qid) < 0 ||
+	        bin_push_str(&req, &col->col_name) < 0 ||
+	        clusterer_api.send_all(&req, sync_cluster_id)
+	                != CLUSTERER_SEND_SUCCESS) {
+		bin_free_packet(&req);
+		lock_get(stat_lock);
+		stat_gather->id = 0;
+		lock_release(stat_lock);
+		free_mi_response(resp);
+		return init_mi_error(500, MI_SSTR("failed to ask the cluster"));
+	}
+	bin_free_packet(&req);
+
+	for (waited = 0; waited < PCACHE_STAT_WAIT_MS; waited += 10) {
+		usleep(10000);
+		lock_get(stat_lock);
+		i = stat_gather->replies;
+		lock_release(stat_lock);
+		if (i >= n)
+			break;
+	}
+
+	lock_get(stat_lock);
+	for (k = 0; k < stat_gather->replies; k++) {
+		it = add_mi_object(arr, NULL, 0);
+		if (!it || add_mi_number(it, MI_SSTR("node_id"),
+		        stat_gather->r[k].node) < 0)
+			goto err_unlock;
+		if (stat_gather->r[k].found) {
+			if (add_mi_number(it, MI_SSTR("entries"),
+			        stat_gather->r[k].entries) < 0)
+				goto err_unlock;
+			total += stat_gather->r[k].entries;
+		} else if (add_mi_string(it, MI_SSTR("status"),
+		        MI_SSTR("no such collection there")) < 0) {
+			goto err_unlock;
+		}
+		answered++;
+
+		for (i = 0; i < n; i++)
+			if (ids[i] == stat_gather->r[k].node)
+				ids[i] = 0;
+	}
+	stat_gather->id = 0;
+	lock_release(stat_lock);
+
+	for (i = 0; i < n; i++) {
+		if (!ids[i])
+			continue;
+		it = add_mi_object(arr, NULL, 0);
+		if (!it || add_mi_number(it, MI_SSTR("node_id"), ids[i]) < 0 ||
+		        add_mi_string(it, MI_SSTR("status"),
+		                MI_SSTR("no reply")) < 0)
+			goto err;
+	}
+
+	if (add_mi_number(obj, MI_SSTR("peers_answered"), answered) < 0 ||
+	        add_mi_number(obj, MI_SSTR("peers_asked"), n) < 0 ||
+	        add_mi_number(obj, MI_SSTR("total_entries"), total) < 0)
+		goto err;
+	if (answered < n && add_mi_string(obj, MI_SSTR("note"),
+	        MI_SSTR("total covers answering nodes only")) < 0)
+		goto err;
+
+	return resp;
+
+err_unlock:
+	stat_gather->id = 0;
+	lock_release(stat_lock);
+err:
+	free_mi_response(resp);
+	return 0;
+}
+
+static mi_response_t *w_perf_cluster_size(const mi_params_t *params,
+		struct mi_handler *async_hdl)
+{
+	str col;
+
+	if (get_mi_string_param(params, "collection", &col.s, &col.len) < 0)
+		return init_mi_param_error();
+	return do_perf_cluster_size(&col);
+}
+
+/* answer a cluster-size question: our live entry count for @collection */
+static void pcache_stat_serve(bin_packet_t *in)
+{
+	bin_packet_t out;
+	pcache_col_t *col;
+	pcache_ht_totals_t t;
+	str coll;
+	int id, found = 0, entries = 0;
+
+	if (bin_pop_int(in, &id) < 0 || bin_pop_str(in, &coll) < 0) {
+		LM_ERR("malformed stat request from node %d\n", in->src_id);
+		return;
+	}
+
+	col = col_by_name(&coll);
+	if (col && col->htable) {
+		pcache_ht_totals(col->htable, &t);
+		found = 1;
+		entries = (int)t.entries;
+	}
+
+	if (bin_init(&out, &pcache_sync_cap, PCACHE_STAT_RPL,
+	        PCACHE_SYNC_VERSION, 0) < 0)
+		return;
+	if (bin_push_int(&out, id) < 0 || bin_push_str(&out, &coll) < 0 ||
+	        bin_push_int(&out, found) < 0 ||
+	        bin_push_int(&out, entries) < 0) {
+		bin_free_packet(&out);
+		return;
+	}
+	if (clusterer_api.send_to(&out, sync_cluster_id, in->src_id)
+	        != CLUSTERER_SEND_SUCCESS)
+		LM_ERR("failed to answer node %d's size query\n", in->src_id);
+	bin_free_packet(&out);
+}
+
+static void pcache_stat_reply(bin_packet_t *in)
+{
+	str coll;
+	int id, found, entries;
+
+	if (bin_pop_int(in, &id) < 0 || bin_pop_str(in, &coll) < 0 ||
+	        bin_pop_int(in, &found) < 0 || bin_pop_int(in, &entries) < 0) {
+		LM_ERR("malformed stat reply from node %d\n", in->src_id);
+		return;
+	}
+
+	lock_get(stat_lock);
+	if (stat_gather->id == (unsigned int)id
+	        && stat_gather->replies < PCACHE_STAT_MAX_NODES) {
+		stat_gather->r[stat_gather->replies].node = in->src_id;
+		stat_gather->r[stat_gather->replies].found = found;
+		stat_gather->r[stat_gather->replies].entries = entries;
+		stat_gather->replies++;
+	}
+	lock_release(stat_lock);
+}
+
 static void pcache_sync_recv(bin_packet_t *packet)
 {
 	pcache_col_t *col;
@@ -3144,6 +3383,14 @@ static void pcache_sync_recv(bin_packet_t *packet)
 	}
 	if (packet->type == PCACHE_PULL_RPL) {
 		pcache_pull_reply(packet);
+		return;
+	}
+	if (packet->type == PCACHE_STAT_REQ) {
+		pcache_stat_serve(packet);
+		return;
+	}
+	if (packet->type == PCACHE_STAT_RPL) {
+		pcache_stat_reply(packet);
 		return;
 	}
 	if (packet->type != PCACHE_SYNC_RELOAD) {
@@ -3469,6 +3716,12 @@ static const mi_export_t mi_cmds[] = {
 		"see which ones actually answer a pull", 0, 0, {
 		{mi_perf_cluster_probe_0, {0}},
 		{mi_perf_cluster_probe_1, {"collection", 0}},
+		{EMPTY_MI_RECIPE}},
+		{0}
+	},
+	{ "perf_cluster_size", "live per-node entry counts for one collection "
+		"across the cluster (the convergence gauge)", 0, 0, {
+		{w_perf_cluster_size, {"collection", 0}},
 		{EMPTY_MI_RECIPE}},
 		{0}
 	},
@@ -4766,12 +5019,16 @@ static int mod_init(void)
 			pull_xcluster_warn = shm_malloc(sizeof *pull_xcluster_warn);
 			peer_stats = shm_malloc((CL_MAX_NODE_ID + 1) * sizeof *peer_stats);
 			pull_lock = lock_alloc();
+			stat_gather = shm_malloc(sizeof *stat_gather);
+			stat_lock = lock_alloc();
 			if (!pull_slots || !pull_next_id || !pull_stats || !peer_stats ||
 			        !pull_send_warn || !pull_xcluster_warn ||
-			        !pull_lock || !lock_init(pull_lock)) {
+			        !pull_lock || !lock_init(pull_lock) ||
+			        !stat_gather || !stat_lock || !lock_init(stat_lock)) {
 				LM_ERR("no shm for the cross-node pull state\n");
 				return -1;
 			}
+			memset(stat_gather, 0, sizeof *stat_gather);
 			memset(pull_slots, 0, (size_t)PCACHE_PULL_SLOTS * pull_slot_sz);
 			memset(peer_stats, 0,
 				(CL_MAX_NODE_ID + 1) * sizeof *peer_stats);

@@ -209,6 +209,61 @@ Without `db_url` the mode runs as a pure-pull cluster.
   <img alt="Pulls absorbed per second versus entries already held: flat at the offered 3,000/s from zero to one million entries" src="doc/pull-sharing/throughput-light.svg">
 </picture>
 
+## Memory: HG_MALLOC v3 vs F_MALLOC
+
+Same binary, same 1M protocol (fill 2×500k at 2,500 reg/s, cold sweep of
+the third node at 3,000 lookups/s, warm re-sweep, then every record
+allowed to expire), run once with `-a F_MALLOC -m 3072` and once with the
+elastic `-a HG_MALLOC -m 512:3072` (v3, no auto-scaling profile). Numbers
+are `shmem` real-used unless stated; "puller" is the cold node after it
+absorbed all 1M records plus their cached blobs.
+
+| | F_MALLOC | HG_MALLOC v3 |
+|---|---|---|
+| owner at 500k contacts (real used) | 914 MB | 893 MB |
+| puller at 1M pulled (real used) | 1,953 MB | 1,761 MB (−10%) |
+| of which allocator overhead (real − used) | 643 MB | 396 MB |
+| mapped / committed to hold that | 3,072 MB fixed | 2,336 MB, grown in 114 × 16 MB steps |
+| still used after all 1M expired (owner / puller) | 236 / 448 MB | 238 / 450 MB |
+| commit after expiry | 3,072 MB | 1,110 / 2,334 MB, shrinking in granules |
+| REGISTER p50 / p99 | 0.64 / 1.2 ms | 0.50 / 5.4 ms |
+| cold pull p50 / p95 / p99 | 1.5 / 8.9 / 34 ms | 1.35 / 16 / 60 ms |
+| warm hit p50 / p99 | 0.44 / 0.78 ms | 0.42 / 15 ms |
+| requests lost during the sweeps | 0 | 210 (one stall overflowed the SIP socket) |
+
+Read across: HG_MALLOC v3 holds the same data in ~10% less memory — most
+of the difference is allocator overhead (F_MALLOC's split fragments cost
+643 MB on the puller against 396 MB) — and commits only what the load
+needs, about 1.3× of use, instead of a 3 GB pool mapped up front; after
+the mass expiry it starts handing granules back even without an
+auto-scaling profile. Both allocators return the freed records
+themselves: a quarter of the peak remains in use on each (the grown hash
+tables and the blob arena's chunks, which never shrink by design). The
+price, on this branch of v3, is the latency tail: growth commits and
+garbage-collection passes run inside the allocating worker's critical
+section, so p99 is 20× F_MALLOC's on warm hits and one late-sweep stall
+of ~0.5 s dropped 212 datagrams at n3's receive queue. Two operational
+findings came with it: growth silently refuses when the arena could not
+be pinned at start (run with `LimitMEMLOCK=infinity`, or the container
+with `--ulimit memlock=-1`), and GC cadence is not a knob. Ideas for
+closing the tail are filed with the allocator work; the footprint and
+elasticity advantages stand today.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/pull-sharing/mem-used-dark.svg">
+  <img alt="Shared memory really used versus contacts held, owner and pulling node, HG_MALLOC v3 against F_MALLOC" src="doc/pull-sharing/mem-used-light.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/pull-sharing/mem-elastic-dark.svg">
+  <img alt="HG_MALLOC v3 elastic arena: committed size growing in 16 MB granules just ahead of use, against F_MALLOC's fixed 3 GB pool" src="doc/pull-sharing/mem-elastic-light.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/pull-sharing/mem-retention-dark.svg">
+  <img alt="Peak shared memory versus what is still used after every record expired, per allocator and node role" src="doc/pull-sharing/mem-retention-light.svg">
+</picture>
+
 ## Observability
 
 * Exact fleet contact count: `sum(owned_contacts)` across nodes (ownership

@@ -48,8 +48,9 @@ cachedb_perf Module
                       perf_dump / perf_get / perf_probe /
                       perf_pull / perf_set / perf_ttl / perf_del
 
-              1.8.4. perf_save / perf_load
-              1.8.5. perf_sync
+              1.8.4. perf_cluster_size
+              1.8.5. perf_save / perf_load
+              1.8.6. perf_sync
 
         1.9. Exported Events
 
@@ -894,7 +895,31 @@ opensips-cli -x mi cachedb_perf:perf_set greeting hello 300
 opensips-cli -x mi cachedb_perf:perf_ttl "session-*" 1800
 opensips-cli -x mi cachedb_perf:perf_del "session-abc*"
 
-1.8.4. perf_save / perf_load
+1.8.4. perf_cluster_size
+
+   perf_cluster_size <collection> asks every cluster member for its
+   LIVE entry count in one collection and reports them side by
+   side, the local count included. For a replicated collection this
+   is the convergence gauge: each node's count climbs toward the
+   full set as its pulls decay toward zero. Because the answers are
+   live there is nothing to age or interpret - a node that does not
+   answer within the wait is exactly as unreachable as it would be
+   for a pull, and is listed with "no reply" (the reported total
+   then says it covers the answering nodes only). One query runs at
+   a time; it is an operator path.
+
+   Example. perf_cluster_size usage
+opensips-cli -x mi cachedb_perf:perf_cluster_size ul
+{ "collection": "ul",
+  "nodes": [
+    { "node_id": 2, "entries": 25350, "source": "local" },
+    { "node_id": 1, "entries": 25350 },
+    { "node_id": 3, "status": "no reply" } ],
+  "peers_answered": 1, "peers_asked": 2,
+  "total_entries": 50700,
+  "note": "total covers answering nodes only" }
+
+1.8.5. perf_save / perf_load
 
    Persist a collection to, or restore it from, the db_url backend
    (see DB persistence). With no argument they operate on every
@@ -907,7 +932,7 @@ opensips-cli -x mi cachedb_perf:perf_save
 opensips-cli -x mi cachedb_perf:perf_save sessions
 opensips-cli -x mi cachedb_perf:perf_load sessions
 
-1.8.5. perf_sync
+1.8.6. perf_sync
 
    Save a collection to the DB and signal the cluster to reload it
    (see Cluster sync); all declared collections if none is named.

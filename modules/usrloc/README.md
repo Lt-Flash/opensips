@@ -244,6 +244,16 @@ targeted at the last known owner first - so a refresh this node never
 saw is recovered instead of answered with a 404.
 
 
+Fleet-wide observability recipes: the exact cluster contact count is
+`sum(owned_contacts)` across your per-node stat scrapes (Prometheus
+recording rule or a Grafana query); each node's convergence progress
+is one `cachedb_perf` **perf_cluster_size** call on the shared
+collection (live per-node entry counts, unreachable nodes flagged);
+the full record inventory is either one ledger query
+(`SELECT ... WHERE expires > now`) or the concatenation of every
+node's `ul_dump owned_only=1`.
+
+
 Unlike the older presets, "pull-sharing-cluster" arbitrates the
 fine-tuning knobs instead of silently ignoring them: refinements
 within the mode's envelope are honored (an explicit
@@ -1502,6 +1512,16 @@ equals to string "brief", a brief dump will be
 done (only AOR and contacts, with no other details)
 
 
+Under the "pull-sharing" [cluster mode](#param_cluster_mode) every
+contact is annotated with its *Ownership* ("owned" or
+"remote(owner=N)"), and the optional **owned_only** parameter renders
+exactly this node's owned set (AoRs contributing nothing are dropped
+whole).  Concatenating every node's `owned_only` dump yields the exact
+fleet view, with no overlap and no noise.  The bulk dump never pulls;
+the point queries (`show_contact`, `add`, `rm_contact`) do - any node
+can inspect, modify or remove any registered user.
+
+
 #### usrloc:flush
 
 
@@ -1645,6 +1665,24 @@ this statistic will be register for each used domain
 Total number of AOR existing in the USRLOC memory cache for all
 domains - can not be reset.
 
+
+
+#### owned_contacts
+
+
+Live contacts this node OWNS (pull-sharing mode only; 0 otherwise).
+Ownership is disjoint across the cluster, so **summing this statistic
+over all nodes gives the exact cluster-wide number of registered
+contacts** - the fleet's source of truth, with zero protocol.
+Computed by walking at read time, so it cannot drift.
+
+
+#### remote_contacts
+
+
+Live convergence copies this node holds of other nodes' contacts
+(pull-sharing mode only).  A gauge of memory overhead and pull
+activity: it climbs as the node converges toward the full set.
 
 ### Exported Events
 

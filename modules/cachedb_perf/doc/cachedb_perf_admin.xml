@@ -1037,6 +1037,38 @@ opensips-cli -x mi cachedb_perf:perf_del "session-abc*"
 		</example>
 	</section>
 
+	<section id="mi_perf_cluster_size" xreflabel="perf_cluster_size">
+		<title><emphasis>perf_cluster_size</emphasis> - live per-node entry
+		counts</title>
+		<para>
+		<emphasis>perf_cluster_size &lt;collection&gt;</emphasis> asks every
+		cluster member for its LIVE entry count in one collection and
+		reports them side by side, the local count included.  For a
+		replicated collection this is the convergence gauge: each node's
+		count climbs toward the full set as its pulls decay toward zero.
+		Because the answers are live there is nothing to age or interpret -
+		a node that does not answer within the wait is exactly as
+		unreachable as it would be for a pull, and is listed with
+		<emphasis>no reply</emphasis> (the reported total then says it
+		covers the answering nodes only).  One query runs at a time; it is
+		an operator path.
+		</para>
+		<example>
+		<title>perf_cluster_size usage</title>
+		<programlisting format="linespecific">
+opensips-cli -x mi cachedb_perf:perf_cluster_size ul
+{ "collection": "ul",
+  "nodes": [
+    { "node_id": 2, "entries": 25350, "source": "local" },
+    { "node_id": 1, "entries": 25350 },
+    { "node_id": 3, "status": "no reply" } ],
+  "peers_answered": 1, "peers_asked": 2,
+  "total_entries": 50700,
+  "note": "total covers answering nodes only" }
+</programlisting>
+		</example>
+	</section>
+
 	<section id="mi_perf_save" xreflabel="perf_save / perf_load">
 		<title><function moreinfo="none">perf_save / perf_load</function></title>
 		<para>

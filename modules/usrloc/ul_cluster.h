@@ -53,7 +53,27 @@ extern str ul_ha_shtag;
 
 extern str contact_repl_cap;
 
+/* pull-sharing: this node's clusterer id, learned at init (0 = unknown) */
+extern int ul_my_nid;
+/* pull-sharing: contact K/V key holding the owner's clusterer id.  Riding
+ * the K/V store means it persists through the kv_store DB column, the bin
+ * packets and the pull blob without any schema or wire-format change. */
+extern str ul_onid_key;
+
 int ul_init_cluster(void);
+
+/* the owner node id recorded on a contact, 0 if none */
+int ul_ct_owner_nid(ucontact_t *c);
+
+/* record this node as the contact's owner (local registration events) */
+void ul_ct_stamp_owner(ucontact_t *c);
+
+/* pull-sharing ownership: is this node responsible for the contact
+ * (pinging, DB maintenance)?  Unicast: accepted on a local socket means
+ * ours - a pulled or foreign-row contact carries a non-local socket that
+ * resolved to NULL.  Anycast: the socket is local on every node, so the
+ * recorded owner id decides. */
+int ul_ct_is_mine(ucontact_t *c);
 
 #define _is_my_ucontact(__ct) \
 	(!__ct->shtag.s || \

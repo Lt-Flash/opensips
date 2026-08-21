@@ -871,6 +871,11 @@ int insert_ucontact(urecord_t* _r, str* _contact, ucontact_info_t* _ci,
 		return -1;
 	}
 
+	/* pull-sharing: a locally handled registration makes us the owner;
+	 * stamped before the DB/blob writes below so it rides both */
+	if (cluster_mode == CM_PULL_SHARING && !skip_replication)
+		ul_ct_stamp_owner(*_c);
+
 	if (_ci->pre_replicate_cb
 	        && _ci->pre_replicate_cb(*_c, _ci->pre_replicate_info) != 0)
 		LM_ERR("pre-replication callback returned non-zero\n");

@@ -32,6 +32,43 @@ str contact_repl_cap = str_init("usrloc-contact-repl");
 struct clusterer_binds clusterer_api;
 str ul_shtag_key = str_init("_st");
 
+int ul_my_nid;
+str ul_onid_key = str_init("_onid");
+
+int ul_ct_owner_nid(ucontact_t *c)
+{
+	int_str_t *v;
+
+	if (!c->kv_storage)
+		return 0;
+	v = kv_get(c->kv_storage, &ul_onid_key);
+	if (!v || v->is_str)
+		return 0;
+	return v->i;
+}
+
+int ul_ct_is_mine(ucontact_t *c)
+{
+	if (!c->sock)
+		return 0;
+	if (is_anycast(c->sock))
+		return ul_my_nid && ul_ct_owner_nid(c) == ul_my_nid;
+	return 1;
+}
+
+/* record this node as the contact's owner (local registration events) */
+void ul_ct_stamp_owner(ucontact_t *c)
+{
+	int_str_t v;
+
+	if (!c->kv_storage)
+		return;
+	v.is_str = 0;
+	v.i = ul_my_nid;
+	if (!kv_put(c->kv_storage, &ul_onid_key, &v))
+		LM_ERR("oom stamping owner id on <%.*s>\n", c->c.len, c->c.s);
+}
+
 int ul_init_cluster(void)
 {
 	if (location_cluster == 0)
@@ -45,6 +82,13 @@ int ul_init_cluster(void)
 	if (load_clusterer_api(&clusterer_api) != 0) {
 		LM_ERR("failed to load clusterer API\n");
 		return -1;
+	}
+
+	if (cluster_mode == CM_PULL_SHARING) {
+		ul_my_nid = clusterer_api.get_my_id();
+		if (ul_my_nid <= 0)
+			LM_WARN("no clusterer node id yet - anycast ownership will "
+			        "not resolve until the cluster forms\n");
 	}
 
 	/* register handler for processing usrloc packets to the clusterer module */

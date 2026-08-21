@@ -73,6 +73,11 @@ typedef enum flags {
 	/* Handle RFC 8599 Push Notifications when routing to this contact */
 	FL_PN_ON       = 1 << 2,
 
+	/* pull-sharing: a convergence copy merged from a cluster pull, an
+	 * invalidation broadcast or a shared-DB row of another node.  Never
+	 * pinged, never written anywhere; it lives to its natural expiry. */
+	FL_PULLED      = 1 << 3,
+
 	FL_ALL         = (int)0xFFFFFFFF  /*!< All flags set */
 } ucontact_flags_t;
 

@@ -989,6 +989,12 @@ int update_ucontact(struct urecord* _r, ucontact_t* _c, ucontact_info_t* _ci,
 	if (skip_replication && _c->kv_storage)
 		restore_urecord_kv_store(_r, _c);
 
+	/* pull-sharing: handling the refresh here makes (or keeps) us the
+	 * owner - on a previously pulled contact this IS the takeover
+	 * re-stamp (the fresh _ci also cleared FL_PULLED/FL_MEM above) */
+	if (cluster_mode == CM_PULL_SHARING && !skip_replication)
+		ul_ct_stamp_owner(_c);
+
 	if (!skip_replication && have_data_replication()) {
 		if (persist_urecord_kv_store(_r) != 0)
 			LM_ERR("failed to persist latest urecord K/V storage\n");

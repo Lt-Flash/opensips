@@ -739,6 +739,12 @@ get_domain_mem_ucontacts(udomain_t *d,void *buf, int *len, unsigned int flags,
 				if ((c->cflags & flags) != flags)
 					continue;
 
+				/* pull-sharing: only the owner may ping - a ping from
+				 * any other node's socket cannot traverse the NAT
+				 * pinhole the UA holds open toward the accepting one */
+				if (cluster_mode == CM_PULL_SHARING && !ul_ct_is_mine(c))
+					continue;
+
 				/* a lot slower than fetching all tags before the outermost
 				 * loop, but at least we have proper responsiveness to tag
 				 * switches! */

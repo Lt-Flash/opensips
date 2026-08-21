@@ -442,13 +442,6 @@ int preload_udomain(db_con_t* _c, udomain_t* _d)
 
 	char suggest_regen=0;
 
-	/* pull-sharing: connection-oriented rows this node accepted must not
-	 * be resurrected - the restart severed those connections.  They are
-	 * collected during the (cursor-driven) load and reaped afterwards. */
-#define UL_REAP_MAX 1024
-	static uint64_t reap_cids[UL_REAP_MAX];
-	int reap_n = 0, reap_lost = 0;
-
 	urecord_t* r;
 	ucontact_t* c;
 
@@ -549,19 +542,6 @@ int preload_udomain(db_con_t* _c, udomain_t* _d)
 							domain,	MAX_URI_SIZE);
 					continue;
 				}
-			}
-
-			if (cluster_mode == CM_PULL_SHARING && ci->sock
-			        && !is_anycast(ci->sock)
-			        && (ci->sock->proto == PROTO_TCP
-			         || ci->sock->proto == PROTO_TLS
-			         || ci->sock->proto == PROTO_WS
-			         || ci->sock->proto == PROTO_WSS)) {
-				if (reap_n < UL_REAP_MAX)
-					reap_cids[reap_n++] = ci->contact_id;
-				else
-					reap_lost++;
-				continue;
 			}
 
 			unpack_indexes(ci->contact_id, &aorhash, &rlabel, &clabel);
@@ -724,25 +704,6 @@ int preload_udomain(db_con_t* _c, udomain_t* _d)
 	} while(RES_ROW_N(res)>0);
 
 	ul_dbf.free_result(_c, res);
-
-	if (reap_n) {
-		db_key_t dk = &contactid_col;
-		db_val_t dv;
-
-		LM_INFO("reaping %d of our connection-oriented rows (their "
-			"connections died with the restart)\n", reap_n);
-		memset(&dv, 0, sizeof dv);
-		VAL_TYPE(&dv) = DB_BIGINT;
-		for (i = 0; i < reap_n; i++) {
-			VAL_BIGINT(&dv) = reap_cids[i];
-			if (ul_dbf.delete(_c, &dk, 0, &dv, 1) < 0)
-				LM_ERR("failed to reap row %" PRIu64 "\n", reap_cids[i]);
-		}
-	}
-	if (reap_lost)
-		LM_WARN("%d further connection-oriented rows could not be "
-			"reaped this pass - they stay until natural expiry\n",
-			reap_lost);
 
 	if ( suggest_regen ) {
 		LM_NOTICE("At least 1 contact(s) from the database has invalid contact_id!\n"

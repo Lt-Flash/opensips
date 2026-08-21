@@ -953,16 +953,21 @@ int delete_ucontact(urecord_t* _r, struct ucontact* _c,
 
 	LM_DBG("deleting contact '%.*s'\n", _c->c.len, _c->c.s);
 
+	/* pull-sharing: event-handled deletes kill the row by natural key
+	 * IMMEDIATELY, no matter who wrote it and no matter the write mode
+	 * (only additions and refreshes batch under write-back - a deferred
+	 * delete would let a restarting node bootstrap a dead binding).
+	 * Replication-applied deletes do not touch the ledger: the handling
+	 * node already did. */
+	if (cluster_mode == CM_PULL_SHARING && !skip_replication
+	        && sql_wmode != SQL_NO_WRITE
+	        && db_delete_ucontact_natkey(_c) < 0)
+		LM_ERR("failed to remove contact from database\n");
+
 	if (st_delete_ucontact(_c) > 0) {
-		if (sql_wmode == SQL_WRITE_THROUGH) {
-			if (cluster_mode == CM_PULL_SHARING) {
-				/* event-handled deletes kill the row by natural key, no
-				 * matter who wrote it; replication-applied ones do not
-				 * touch the ledger - the handling node already did */
-				if (!skip_replication
-				        && db_delete_ucontact_natkey(_c) < 0)
-					LM_ERR("failed to remove contact from database\n");
-			} else if (db_delete_ucontact(_c) < 0) {
+		if (sql_wmode == SQL_WRITE_THROUGH
+		        && cluster_mode != CM_PULL_SHARING) {
+			if (db_delete_ucontact(_c) < 0) {
 				LM_ERR("failed to remove contact from database\n");
 			}
 		}

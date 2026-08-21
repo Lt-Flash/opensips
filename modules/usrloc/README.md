@@ -165,16 +165,25 @@ The cluster keeps every record safe: no usrloc entry is ever dropped
 because a node died or restarted - survivors keep everything they
 hold to natural expiry or an explicit de-registration, whatever the
 contact's transport.  With a [db url](#param_db_url) configured, the
-mode writes every registration event through to SQL immediately, and
-that table doubles as three things: crash-proof backup (a record
-exists there from the moment it is accepted), restart bootstrap (a
-starting node preloads it and begins nearly converged), and the last
-resort of the lookup chain (a record whose owner crashed before any
-peer pulled it is still served, by any node, from the database).
+mode batches registrations and refreshes to SQL on the flush timer
+(write-back - the mode default, keeping the SIP path free of blocking
+SQL) while **deletions are always written through immediately**, and
+that table doubles as three things: backup (at most one flush
+interval behind, and flushed in full on graceful shutdown), restart
+bootstrap (a starting node preloads it and begins nearly converged -
+anything newer than the last flush is simply re-pulled on demand),
+and the last resort of the lookup chain (a record whose owner crashed
+before any peer pulled it is still served, by any node, from the
+database).
 Rows are keyed by *(username, domain, contact)* - deployments must
 add a unique index over these columns - and written with
-insert-on-duplicate-update semantics, so a re-registration through a
-different node atomically re-stamps the very same row.  Without a
+insert-on-duplicate-update semantics, so N nodes writing the same
+binding always collapse onto the very same row (a re-registration
+through a different node atomically re-stamps it).  Make that natural
+key the table's unique constraint and keep *contact\_id* as a plain
+indexed column: this mode mints contact ids per node and re-stamps
+them on takeover, so their cluster-wide uniqueness is no longer
+guaranteed by construction.  Without a
 database the mode still works as a pure-pull cluster: a restarted
 node starts empty and re-learns through traffic, but records held
 only by a crashed node are lost until their devices re-register.
@@ -211,10 +220,10 @@ modparam("usrloc", "db_url", "mysql://opensips:pwd@10.0.0.5/opensips")
 Unlike the older presets, "pull-sharing-cluster" arbitrates the
 fine-tuning knobs instead of silently ignoring them: refinements
 within the mode's envelope are honored (an explicit
-"[sql write mode](#param_sql_write_mode) write-back", trading ledger
-freshness for latency, or
+"[sql write mode](#param_sql_write_mode) write-through", trading
+SIP-path latency for a zero-lag ledger, or
 "[restart persistency](#param_restart_persistency) none", waiving
-the bootstrap while keeping the write-through), while contradictions
+the bootstrap while keeping the writes), while contradictions
 - a different [cluster mode](#param_cluster_mode), SQL knobs without
 a [db url](#param_db_url), "sql\_write\_mode none" WITH a db url,
 "sync-from-cluster" persistency, "cooperation"
@@ -778,9 +787,10 @@ persistency.
 OpenSIPS will run with a "pull-sharing"
 [cluster mode](#param_cluster_mode); with a
 [db url](#param_db_url) configured it derives "load-from-sql"
-[restart persistency](#param_restart_persistency) and "write-through"
+[restart persistency](#param_restart_persistency) and "write-back"
 [sql write mode](#param_sql_write_mode) (the table is the cluster's
-backup and bootstrap store), without one it runs as a pure-pull
+backup and bootstrap store; deletions are nevertheless always
+written through immediately), without one it runs as a pure-pull
 cluster.  See the
 ["Pull Sharing" topology](#pull_sharing_topology) section.
 

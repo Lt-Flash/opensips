@@ -862,14 +862,18 @@ int ul_check_config(void)
 				return -1;
 			}
 
+			/* write-back is the mode default: the DB is backup and
+			 * restart bootstrap, not the primary - a picture at most one
+			 * flush interval old costs nothing the pulls do not repair,
+			 * and the SIP path stays free of blocking SQL.  Deletions
+			 * are written through eagerly REGARDLESS of this setting
+			 * (see delete_ucontact) - only additions and refreshes
+			 * batch. */
 			if (!sql_wmode_str
-			        || !strcasecmp(sql_wmode_str, "write-through")) {
-				sql_wmode = SQL_WRITE_THROUGH;
-			} else if (!strcasecmp(sql_wmode_str, "write-back")) {
+			        || !strcasecmp(sql_wmode_str, "write-back")) {
 				sql_wmode = SQL_WRITE_BACK;
-				LM_WARN("'sql_write_mode write-back': the ownership ledger "
-				        "lags by the flush interval, so failover and "
-				        "adoption decisions read a delayed picture\n");
+			} else if (!strcasecmp(sql_wmode_str, "write-through")) {
+				sql_wmode = SQL_WRITE_THROUGH;
 			} else if (!strcasecmp(sql_wmode_str, "none")) {
 				LM_ERR("'sql_write_mode none' with a 'db_url' would leave "
 				       "a never-written ledger that poisons failover "

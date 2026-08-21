@@ -104,6 +104,17 @@ typedef struct usrloc_api {
 	int (*get_urecord_or_pull) (udomain_t *d, str *aor, struct urecord **r);
 
 	/**
+	 * Async pull pair (pull-sharing mode), for callers that suspend the
+	 * transaction instead of blocking the worker.  @pull_start: 1 =
+	 * started, wait on @fd then call @pull_finish; 0 = definitively
+	 * absent; -1 = cannot ask (use the blocking lookup).  @pull_finish:
+	 * 1 = record absorbed into local memory / 0 absent / -1 no answer.
+	 */
+	int (*pull_start) (udomain_t *d, str *aor, int *fd,
+	        unsigned int *handle);
+	int (*pull_finish) (udomain_t *d, str *aor, unsigned int handle);
+
+	/**
 	 * Fetch a given AoR from an usrloc domain, across multiple locations.
 	 * Thus, this function is only relevant when using
 	 * cluster_mode == CM_FEDERATION_CACHEDB.  The function will return success

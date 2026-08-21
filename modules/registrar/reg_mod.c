@@ -193,6 +193,10 @@ static const cmd_export_t cmds[] = {
 
 static const acmd_export_t acmds[] = {
 	pn_async_cmds,
+	{"lookup", (acmd_function)w_async_reg_lookup, {
+		{CMD_PARAM_STR|CMD_PARAM_STATIC, domain_fixup, 0},
+		{CMD_PARAM_STR|CMD_PARAM_OPT, lookup_flags_fixup, lookup_flags_fixup_free},
+		{CMD_PARAM_STR|CMD_PARAM_OPT,0,0}, {0,0,0}}},
 	{0,0,{{0,0,0}}}
 };
 

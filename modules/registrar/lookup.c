@@ -52,6 +52,109 @@ int reg_lookup(struct sip_msg* _m, void* _t, void *flags, str* uri)
 	return lookup(_m, _t, flags, uri, reg_use_domain, NULL);
 }
 
+/* ------ async lookup: suspend the transaction on a pull, never block ------
+ *
+ * The plain path only: a local record with a live contact (or any
+ * non-pull-sharing mode) completes inline with no IO; a genuine miss
+ * starts the cluster pull and parks the transaction on the pull's fd.
+ * The resume collects + absorbs the answer and simply re-runs the
+ * blocking lookup - which is then a local hit, or falls through to the
+ * ledger / a clean miss.  Branch-mode lookups keep the blocking path. */
+
+struct alookup_param {
+	udomain_t *d;
+	struct lookup_flags *flags;     /* fixup product: pre-fork memory */
+	unsigned int handle;
+	int has_uri;
+	str aor;
+	str uri;
+	char buf[0];
+};
+
+static int resume_async_lookup(int fd, struct sip_msg *msg, void *param)
+{
+	struct alookup_param *p = (struct alookup_param *)param;
+	int rc;
+
+	ul.pull_finish(p->d, &p->aor, p->handle);
+
+	rc = lookup(msg, p->d, p->flags, p->has_uri ? &p->uri : NULL,
+			reg_use_domain, NULL);
+	shm_free(p);
+	return rc;
+}
+
+int w_async_reg_lookup(struct sip_msg *_m, async_ctx *ctx, void *_t,
+		void *flags, str *uri)
+{
+	udomain_t *dom = (udomain_t *)_t;
+	struct lookup_flags *lf = (struct lookup_flags *)flags;
+	unsigned int fl = lf ? lf->flags : 0;
+	struct alookup_param *p;
+	urecord_t *r;
+	ucontact_t *c;
+	str aor, sip_instance = STR_NULL, call_id = STR_NULL, *aor_uri;
+	unsigned int handle;
+	int rc, fd, alive = 0;
+
+	if (ul.cluster_mode != CM_PULL_SHARING
+	        || (fl & REG_BRANCH_AOR_LOOKUP_FLAG))
+		goto no_io;
+
+	/* mirror lookup()'s AoR derivation for the plain path */
+	aor_uri = uri ? uri : GET_RURI(_m);
+	if (extract_aor(aor_uri, &aor, &sip_instance, &call_id,
+	        reg_use_domain) < 0)
+		goto no_io;                 /* the blocking path reports it */
+
+	ul.lock_udomain(dom, &aor);
+	if (ul.get_urecord(dom, &aor, &r) == 0)
+		for (c = r->contacts; c; c = c->next)
+			if (VALID_CONTACT(c, get_act_time())) {
+				alive = 1;
+				break;
+			}
+	ul.unlock_udomain(dom, &aor);
+	if (alive)
+		goto no_io;                 /* local hit: no pull, no suspend */
+
+	rc = ul.pull_start(dom, &aor, &fd, &handle);
+	if (rc != 1)
+		goto no_io;   /* known absent / cannot ask: blocking path decides */
+
+	p = shm_malloc(sizeof *p + aor.len + (uri ? uri->len : 0));
+	if (!p) {
+		LM_ERR("oom - collecting the pull inline\n");
+		ul.pull_finish(dom, &aor, handle);
+		goto no_io;
+	}
+	p->d = dom;
+	p->flags = lf;
+	p->handle = handle;
+	p->aor.s = p->buf;
+	p->aor.len = aor.len;
+	memcpy(p->buf, aor.s, aor.len);
+	if (uri) {
+		p->uri.s = p->buf + aor.len;
+		p->uri.len = uri->len;
+		memcpy(p->uri.s, uri->s, uri->len);
+		p->has_uri = 1;
+	} else {
+		p->has_uri = 0;
+	}
+
+	ctx->resume_param = p;
+	ASYNC_SET_RESUME_F(ctx, resume_async_lookup);
+	async_status = fd;
+	return 1;
+
+no_io:
+	ctx->resume_param = NULL;
+	ASYNC_CLEAR_RESUME_F(ctx);
+	async_status = ASYNC_NO_IO;
+	return reg_lookup(_m, _t, flags, uri);
+}
+
 
 struct to_body* select_uri(struct sip_msg* _m)
 {

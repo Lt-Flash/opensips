@@ -707,6 +707,69 @@ int ul_pull_fetch(struct udomain *domain, str *aor, urecord_t **r,
 	return get_urecord(domain, aor, r);
 }
 
+/* Async pull, for a caller that suspends its transaction instead of
+ * occupying a worker: begin the cluster ask for @aor.
+ * 1 = started (@fd becomes readable when settled, @handle for finish),
+ * 0 = a cached negative IS the cluster's answer, -1 = cannot ask
+ * (no API, no peers, no slot - the blocking path is the fallback). */
+int ul_pull_start(struct udomain *domain, str *aor, int *fd,
+		unsigned int *handle)
+{
+	str key;
+	urecord_t *r;
+	ucontact_t *c;
+	time_t newest = 0;
+	int hint = 0;
+
+	if (cluster_mode != CM_PULL_SHARING || !ul_pull_api_ok || !cdbc)
+		return -1;
+
+	key = ul_blob_key(domain->name, aor);
+	if (!key.len)
+		return -1;
+
+	/* a husk's freshest copy names the owner - ask it directly */
+	lock_udomain(domain, aor);
+	if (get_urecord(domain, aor, &r) == 0)
+		for (c = r->contacts; c; c = c->next)
+			if (c->expires > newest) {
+				newest = c->expires;
+				hint = ul_ct_owner_nid(c);
+			}
+	unlock_udomain(domain, aor);
+	if (hint == ul_my_nid)
+		hint = 0;
+
+	return ul_pull_api.start_at(cdbc, &key, hint, fd, handle);
+}
+
+/* Async pull: collect the answer and absorb it.  Takes its own lock.
+ * 1 = absorbed, 0 = definitively absent, -1 = no answer / not usable
+ * (a follow-up blocking lookup still gets the ledger fallback). */
+int ul_pull_finish(struct udomain *domain, str *aor, unsigned int handle)
+{
+	str key, val = STR_NULL;
+	int rc;
+
+	if (!cdbc)
+		return -1;
+
+	key = ul_blob_key(domain->name, aor);
+	if (!key.len)
+		return -1;
+
+	rc = ul_pull_api.finish(cdbc, &key, handle, &val);
+	if (rc != 1)
+		return rc;
+
+	lock_udomain(domain, aor);
+	rc = ul_pull_absorb_blob(domain, aor, &val) > 0 ? 1 : -1;
+	unlock_udomain(domain, aor);
+	pkg_free(val.s);
+
+	return rc;
+}
+
 /* Restart bootstrap: after the ledger load, publish the blobs of every
  * record this node owns at least one contact of.  Only owners publish -
  * a foreign row is already in our memory for local lookups, and pulls

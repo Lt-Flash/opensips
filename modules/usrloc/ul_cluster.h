@@ -85,6 +85,13 @@ void ul_pull_publish_all_owned(void);
  * absorbed, or -1 for a blob this build refuses (foreign format). */
 int ul_pull_absorb_blob(struct udomain *domain, str *aor, str *blob);
 
+/* pull-sharing: async pull pair for transaction-suspending callers.
+ * start: 1 = suspended on @fd, 0 = known absent, -1 = cannot (fall back
+ * to the blocking path).  finish: 1 absorbed / 0 absent / -1 no answer. */
+int ul_pull_start(struct udomain *domain, str *aor, int *fd,
+		unsigned int *handle);
+int ul_pull_finish(struct udomain *domain, str *aor, unsigned int handle);
+
 /* pull-sharing: the shared-cache half of get_urecord_or_pull().  The
  * caller MUST hold the domain lock for @aor.  @hint_nid > 0 asks that
  * node first (falling back to the broadcast); 0 asks everyone.

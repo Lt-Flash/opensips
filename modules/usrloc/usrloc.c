@@ -34,6 +34,7 @@
 #include "usrloc.h"
 #include "../../sr_module.h"
 #include "ul_mod.h"
+#include "ul_cluster.h"
 #include "ul_evi.h"
 
 extern unsigned int nat_bflag;
@@ -61,6 +62,8 @@ int bind_usrloc(usrloc_api_t* api)
 	/* record manipulation */
 	api->get_urecord         = get_urecord;
 	api->get_urecord_or_pull = get_urecord_or_pull;
+	api->pull_start          = ul_pull_start;
+	api->pull_finish         = ul_pull_finish;
 	api->get_global_urecord  = get_global_urecord;
 	api->release_urecord     = release_urecord;
 	api->insert_urecord      = insert_urecord;

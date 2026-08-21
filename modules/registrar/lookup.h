@@ -41,6 +41,11 @@
  */
 int reg_lookup(struct sip_msg* _m, void* _t, void *flags, str* uri);
 
+/* async lookup: suspends the transaction on a pull-sharing cluster pull
+ * instead of blocking the worker; identical to lookup() otherwise */
+int w_async_reg_lookup(struct sip_msg *_m, async_ctx *ctx, void *_t,
+		void *flags, str *uri);
+
 /*! \brief the is_registered() function
  * Return 1 if the AOR is registered, -1 otherwise
  * AOR comes from:

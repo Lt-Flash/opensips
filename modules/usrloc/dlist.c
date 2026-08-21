@@ -1248,6 +1248,9 @@ int delete_ucontact_from_coords(udomain_t *d, ucontact_coords ct_coords,
 		}
 
 		mem_delete_ucontact(r, c);
+
+		if (cluster_mode == CM_PULL_SHARING)
+			ul_pull_publish(r);
 	}
 
 	_unlock_ulslot(d, contact_id);

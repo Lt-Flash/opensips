@@ -37,6 +37,9 @@
 #define REPL_UCONTACT_INSERT 3
 #define REPL_UCONTACT_UPDATE 4
 #define REPL_UCONTACT_DELETE 5
+/* pull-sharing: never sent as a packet - it is the self-describing
+ * format of the record blob stored in the shared cache collection */
+#define REPL_UREC_BLOB       6
 
 #define UL_BIN_V2      2
 #define UL_BIN_V3      3 // added "cmatch" (default: CT_MATCH_CONTACT_CALLID)
@@ -67,6 +70,20 @@ int ul_ct_owner_nid(ucontact_t *c);
 
 /* record this node as the contact's owner (local registration events) */
 void ul_ct_stamp_owner(ucontact_t *c);
+
+/* pull-sharing: (re)publish the record's blob into the shared cache
+ * collection, or withdraw it.  No-ops outside CM_PULL_SHARING. */
+void ul_pull_publish(urecord_t *r);
+void ul_pull_unpublish(urecord_t *r);
+
+/* pull-sharing: restart bootstrap - publish every record this node owns
+ * at least one contact of (call once, after the ledger preload) */
+void ul_pull_publish_all_owned(void);
+
+/* pull-sharing: merge a pulled blob into local memory.  The caller MUST
+ * hold the domain lock for @aor.  Returns the number of live contacts
+ * absorbed, or -1 for a blob this build refuses (foreign format). */
+int ul_pull_absorb_blob(struct udomain *domain, str *aor, str *blob);
 
 /* pull-sharing ownership: is this node responsible for the contact
  * (pinging, DB maintenance)?  Unicast: accepted on a local socket means

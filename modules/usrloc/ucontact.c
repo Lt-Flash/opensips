@@ -1022,13 +1022,24 @@ int update_ucontact(struct urecord* _r, ucontact_t* _c, ucontact_info_t* _ci,
 		if (persist_kv_store && persist_urecord_kv_store(_r) != 0)
 			LM_ERR("failed to persist latest urecord K/V storage\n");
 
-		ret = db_update_ucontact(_c) ;
+		/* pull-sharing: rows are keyed naturally and a takeover means the
+		 * ledger row was last written by another node with its own
+		 * contact_id, which a contact_id-keyed UPDATE would miss - upsert
+		 * on the natural key instead */
+		if (cluster_mode == CM_PULL_SHARING)
+			ret = db_insert_ucontact(_c, 0, 1);
+		else
+			ret = db_update_ucontact(_c);
 		if (ret < 0) {
 			LM_ERR("failed to update database\n");
 		} else {
 			_c->state = CS_SYNC;
 		}
 	}
+
+	if (cluster_mode == CM_PULL_SHARING && !skip_replication)
+		ul_pull_publish(_r);
+
 	return 0;
 }
 

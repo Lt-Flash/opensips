@@ -26,6 +26,7 @@
 #include "ul_mod.h"
 #include "dlist.h"
 #include "kv_store.h"
+#include "utime.h"
 
 str contact_repl_cap = str_init("usrloc-contact-repl");
 
@@ -461,6 +462,352 @@ void replicate_ucontact_delete(urecord_t *r, ucontact_t *c,
 error:
 	LM_ERR("replicate ucontact delete failed\n");
 	bin_free_packet(&packet);
+}
+
+/* pull-sharing: the record blob
+ *
+ * The value stored under ul$<domain>$<aor> is a self-describing bin
+ * packet (capability + type + version header included), so the absorb
+ * side can refuse a format it does not speak and treat the pull as a
+ * miss - rolling upgrades degrade to not-shared instead of misparsing.
+ * Payload: publisher node id, the urecord fields, then a counted list
+ * of contacts in the exact bin_push_contact() layout.  EVERY valid
+ * contact the node knows is included, owned and pulled alike: blobs
+ * converge the way memory does, so any single pull answer tends toward
+ * the full contact set of the AoR even when its contacts are owned by
+ * different nodes (per-contact ownership rides each contact's "_onid"
+ * K/V entry, inside the serialized kv_storage). */
+
+static str ul_blob_key(const str *domain, const str *aor)
+{
+	static char kbuf[512];
+	str k = {kbuf, 0};
+
+	if (3 + domain->len + 1 + aor->len > (int)sizeof(kbuf))
+		return k;                              /* .len == 0: unusable */
+	memcpy(kbuf, "ul$", 3);
+	k.len = 3;
+	memcpy(kbuf + k.len, domain->s, domain->len);
+	k.len += domain->len;
+	kbuf[k.len++] = '$';
+	memcpy(kbuf + k.len, aor->s, aor->len);
+	k.len += aor->len;
+	return k;
+}
+
+static int ul_pull_serialize_urecord(urecord_t *r, bin_packet_t *pkt)
+{
+	struct ct_match cmatch = { CT_MATCH_CONTACT_ONLY, NULL };
+	ucontact_t *c;
+	int n = 0;
+
+	if (bin_init(pkt, &contact_repl_cap, REPL_UREC_BLOB,
+	             UL_BIN_VERSION, 0) != 0) {
+		LM_ERR("failed to build the record blob\n");
+		return -1;
+	}
+
+	bin_push_int(pkt, ul_my_nid);
+	bin_push_urecord(pkt, r);
+
+	for (c = r->contacts; c; c = c->next)
+		if (VALID_CONTACT(c, act_time))
+			n++;
+	bin_push_int(pkt, n);
+
+	for (c = r->contacts; c; c = c->next)
+		if (VALID_CONTACT(c, act_time))
+			bin_push_contact(pkt, r, c, &cmatch);
+
+	return n;
+}
+
+void ul_pull_publish(urecord_t *r)
+{
+	bin_packet_t pkt;
+	str key, blob;
+	time_t max_exp = 0;
+	ucontact_t *c;
+	int n;
+
+	if (cluster_mode != CM_PULL_SHARING || !cdbc)
+		return;
+
+	key = ul_blob_key(r->domain, &r->aor);
+	if (!key.len) {
+		LM_ERR("AoR too long to share: <%.*s>\n", r->aor.len, r->aor.s);
+		return;
+	}
+
+	get_act_time();
+	n = ul_pull_serialize_urecord(r, &pkt);
+	if (n < 0)
+		return;
+	if (n == 0) {
+		bin_free_packet(&pkt);
+		if (cdbf.remove(cdbc, &key) < 0)
+			LM_ERR("failed to withdraw <%.*s>\n", key.len, key.s);
+		return;
+	}
+
+	for (c = r->contacts; c; c = c->next)
+		if (VALID_CONTACT(c, act_time) && c->expires > max_exp)
+			max_exp = c->expires;
+
+	bin_get_buffer(&pkt, &blob);
+	/* +30 s so a refresh landing at the expiry edge still overwrites an
+	 * existing blob rather than racing a hole */
+	if (cdbf.set(cdbc, &key, &blob, (int)(max_exp - act_time) + 30) < 0)
+		LM_ERR("failed to publish <%.*s>\n", key.len, key.s);
+	bin_free_packet(&pkt);
+}
+
+void ul_pull_unpublish(urecord_t *r)
+{
+	str key;
+
+	if (cluster_mode != CM_PULL_SHARING || !cdbc)
+		return;
+
+	key = ul_blob_key(r->domain, &r->aor);
+	if (!key.len)
+		return;
+	if (cdbf.remove(cdbc, &key) < 0)
+		LM_ERR("failed to withdraw <%.*s>\n", key.len, key.s);
+}
+
+/* Restart bootstrap: after the ledger load, publish the blobs of every
+ * record this node owns at least one contact of.  Only owners publish -
+ * a foreign row is already in our memory for local lookups, and pulls
+ * for it should resolve from its owner's fresher store. */
+void ul_pull_publish_all_owned(void)
+{
+	dlist_t *dl;
+	udomain_t *dom;
+	map_iterator_t it;
+	urecord_t *r;
+	ucontact_t *c;
+	void **p;
+	int i, mine, n = 0;
+
+	if (cluster_mode != CM_PULL_SHARING || !cdbc)
+		return;
+
+	for (dl = root; dl; dl = dl->next) {
+		dom = dl->d;
+		for (i = 0; i < dom->size; i++) {
+			lock_ulslot(dom, i);
+			for (map_first(dom->table[i].records, &it);
+			        iterator_is_valid(&it); iterator_next(&it)) {
+				p = iterator_val(&it);
+				if (!p)
+					continue;
+				r = (urecord_t *)*p;
+
+				mine = 0;
+				for (c = r->contacts; c; c = c->next)
+					if (ul_ct_is_mine(c)) {
+						mine = 1;
+						break;
+					}
+				if (mine) {
+					ul_pull_publish(r);
+					n++;
+				}
+			}
+			unlock_ulslot(dom, i);
+		}
+	}
+
+	LM_INFO("re-published %d owned records into the shared cache\n", n);
+}
+
+/* Merge one pulled blob into local memory; the caller holds the domain
+ * lock for @aor.  Contacts run through the same get->update-or-insert
+ * machinery the live replication uses, so per-contact callid/cseq rules
+ * settle every conflict - including a blob that echoes contacts this
+ * node owns: an equal cseq is a no-op, and genuinely newer state means
+ * a takeover we missed, which FL_PULLED then correctly reflects. */
+int ul_pull_absorb_blob(struct udomain *domain, str *aor, str *blob)
+{
+	static ucontact_info_t ci;
+	static str d, r_aor, contact_str, callid,
+		user_agent, path, attr, st, sock, kv_str, cflags_str;
+	bin_packet_t pkt;
+	urecord_t *record;
+	ucontact_t *contact;
+	map_t kv_storage;
+	struct ct_match cmatch;
+	unsigned int rlabel;
+	unsigned short _, clabel;
+	int rc, sl, n, tmp, publisher, absorbed = 0, fresh = 0;
+	short pkg_ver;
+
+	if (!blob->s || blob->len < 32) {
+		LM_ERR("pulled a runt blob (%d bytes) for <%.*s>\n",
+		       blob->len, aor->len, aor->s);
+		return -1;
+	}
+
+	bin_init_buffer(&pkt, blob->s, blob->len);
+	if (pkt.type != REPL_UREC_BLOB) {
+		LM_ERR("pulled value for <%.*s> is not a record blob (type %d)\n",
+		       aor->len, aor->s, pkt.type);
+		return -1;
+	}
+	pkg_ver = get_bin_pkg_version(&pkt);
+	if (pkg_ver != UL_BIN_VERSION) {
+		LM_INFO("record blob format %d differs from ours (%d) - treating "
+			"the pull as a miss until the fleet converges\n",
+			pkg_ver, UL_BIN_VERSION);
+		return -1;
+	}
+
+	bin_pop_int(&pkt, &publisher);
+	bin_pop_str(&pkt, &d);
+	bin_pop_str(&pkt, &r_aor);
+	if (!str_match(&r_aor, aor) || !str_match(&d, domain->name)) {
+		LM_ERR("blob echoes <%.*s|%.*s>, expected <%.*s|%.*s> - "
+		       "refusing\n", d.len, d.s, r_aor.len, r_aor.s,
+		       domain->name->len, domain->name->s, aor->len, aor->s);
+		return -1;
+	}
+
+	if (get_urecord(domain, aor, &record) != 0) {
+		if (insert_urecord(domain, aor, &record, 1, NULL, NULL) != 0) {
+			LM_ERR("failed to create the record for <%.*s>\n",
+			       aor->len, aor->s);
+			return -1;
+		}
+		fresh = 1;
+	}
+
+	bin_pop_int(&pkt, &tmp);
+	if (fresh) {
+		record->label = tmp;
+		sl = record->aorhash & (domain->size - 1);
+		if (domain->table[sl].next_label <= record->label)
+			domain->table[sl].next_label = record->label + 1;
+	}
+	bin_pop_int(&pkt, &tmp);
+	if (fresh)
+		record->next_clabel = tmp;
+
+	bin_pop_str(&pkt, &kv_str);
+	if (fresh && kv_str.len) {
+		kv_storage = store_deserialize(&kv_str);
+		if (kv_storage) {
+			store_destroy(record->kv_storage);
+			record->kv_storage = kv_storage;
+		}
+	}
+
+	bin_pop_int(&pkt, &n);
+	get_act_time();
+
+	for (; n > 0; n--) {
+		memset(&ci, 0, sizeof ci);
+		cmatch = (struct ct_match){CT_MATCH_NONE, NULL};
+
+		bin_pop_str(&pkt, &d);              /* per-contact domain copy */
+		bin_pop_str(&pkt, &r_aor);          /* per-contact aor copy */
+		bin_pop_str(&pkt, &contact_str);
+
+		bin_pop_str(&pkt, &st);
+		memcpy(&ci.contact_id, st.s, sizeof ci.contact_id);
+
+		bin_pop_str(&pkt, &callid);
+		ci.callid = &callid;
+		bin_pop_str(&pkt, &user_agent);
+		ci.user_agent = &user_agent;
+		bin_pop_str(&pkt, &path);
+		ci.path = &path;
+		bin_pop_str(&pkt, &attr);
+		ci.attr = &attr;
+		bin_pop_str(&pkt, &ci.received);
+		bin_pop_str(&pkt, &ci.instance);
+
+		bin_pop_str(&pkt, &st);
+		memcpy(&ci.expires, st.s, sizeof ci.expires);
+		bin_pop_str(&pkt, &st);
+		memcpy(&ci.q, st.s, sizeof ci.q);
+
+		bin_pop_str(&pkt, &sock);
+		if (sock.s && sock.s[0]) {
+			ci.sock = parse_sock_info(&sock);
+			if (!ci.sock)
+				LM_DBG("non-local socket <%.*s>\n", sock.len, sock.s);
+		} else {
+			ci.sock = NULL;
+		}
+
+		bin_pop_int(&pkt, &ci.cseq);
+		bin_pop_int(&pkt, &ci.flags);
+		bin_pop_str(&pkt, &cflags_str);
+		ci.cflags = flag_list_to_bitmask(
+		        (str_const *)&cflags_str, FLAG_TYPE_BRANCH, FLAG_DELIM, 0);
+		bin_pop_int(&pkt, &ci.methods);
+
+		bin_pop_str(&pkt, &st);
+		memcpy(&ci.last_modified, st.s, sizeof ci.last_modified);
+
+		bin_pop_str(&pkt, &kv_str);
+		ci.packed_kv_storage = &kv_str;
+
+		bin_pop_ctmatch(&pkt, &cmatch);
+
+		/* a convergence copy: never pinged, never written to any store */
+		ci.flags |= FL_PULLED | FL_MEM;
+
+		if (ci.expires <= act_time)
+			goto next_contact;              /* already dead in flight */
+
+		unpack_indexes(ci.contact_id, &_, &rlabel, &clabel);
+
+		rc = get_ucontact(record, &contact_str, &callid, ci.cseq, &cmatch,
+			&contact);
+		switch (rc) {
+		case -2:
+		case -1:
+			/* what we hold is as new or newer */
+			break;
+
+		case 0:
+			ci.contact_id = pack_indexes((unsigned short)record->aorhash,
+						record->label, (unsigned short)contact->label);
+
+			if (update_ucontact(record, contact, &ci, NULL, 1) != 0)
+				LM_ERR("failed to absorb update of <%.*s>\n",
+				       contact_str.len, contact_str.s);
+			else
+				absorbed++;
+			break;
+
+		case 1:
+			if (clabel >= record->next_clabel) {
+				record->next_clabel = CLABEL_NEXT(clabel);
+			} else {
+				clabel = record->next_clabel;
+				record->next_clabel = CLABEL_NEXT(record->next_clabel);
+			}
+
+			ci.contact_id = pack_indexes((unsigned short)record->aorhash,
+						record->label, (unsigned short)clabel);
+
+			if (insert_ucontact(record, &contact_str, &ci, NULL, 1,
+			        &contact) != 0)
+				LM_ERR("failed to absorb <%.*s>\n",
+				       contact_str.len, contact_str.s);
+			else
+				absorbed++;
+			break;
+		}
+
+next_contact:
+		free_pkg_str_list(cmatch.match_params);
+	}
+
+	return absorbed;
 }
 
 /* packet receiving */

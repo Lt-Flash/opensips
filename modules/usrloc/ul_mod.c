@@ -436,6 +436,10 @@ static void ul_rpc_data_load(int sender_id, void *_)
 			/* continue with the other ul domains */;
 		}
 	}
+
+	/* pull-sharing: the shared cache is empty after a restart - re-offer
+	 * what this node owns, so peers' pulls resolve again immediately */
+	ul_pull_publish_all_owned();
 }
 
 int init_cachedb(void)
@@ -1023,6 +1027,10 @@ int ul_check_db(void)
 		db_caps = DB_CAP_ALL;
 		if (cluster_mode == CM_SQL_ONLY)
 			db_caps |= DB_CAP_RAW_QUERY;
+		/* the ledger's last-writer-wins row merge is the backend's
+		 * insert-on-duplicate-update, not a convention */
+		if (cluster_mode == CM_PULL_SHARING)
+			db_caps |= DB_CAP_INSERT_UPDATE;
 
 		if (!DB_CAPABILITY(ul_dbf, db_caps)) {
 			LM_ERR("database module does not implement all functions"

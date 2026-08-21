@@ -243,6 +243,7 @@ void mem_delete_ucontact(urecord_t* _r, ucontact_t* _c)
 static inline int nodb_timer(urecord_t* _r)
 {
 	ucontact_t* ptr, *t;
+	int gone = 0;
 
 	ptr = _r->contacts;
 
@@ -260,11 +261,17 @@ static inline int nodb_timer(urecord_t* _r)
 			ptr = ptr->next;
 
 			mem_delete_ucontact(_r, t);
+			gone++;
 			update_stat( _r->slot->d->expires, 1);
 		} else {
 			ptr = ptr->next;
 		}
 	}
+
+	/* pull-sharing: the shared-cache blob must shrink with the record
+	 * (publishing an empty set withdraws the key) */
+	if (gone && cluster_mode == CM_PULL_SHARING)
+		ul_pull_publish(_r);
 
 	return 0;
 }
@@ -315,7 +322,7 @@ static inline int wb_timer(urecord_t* _r,query_list_t **ins_list)
 {
 	ucontact_t* ptr, *t;
 	cstate_t old_state;
-	int op,ins_done=0;
+	int op,ins_done=0,gone=0;
 
 	ptr = _r->contacts;
 
@@ -360,6 +367,7 @@ static inline int wb_timer(urecord_t* _r,query_list_t **ins_list)
 			}
 
 			mem_delete_ucontact(_r, t);
+			gone++;
 		} else {
 			/* Determine the operation we have to do */
 			old_state = ptr->state;
@@ -370,7 +378,11 @@ static inline int wb_timer(urecord_t* _r,query_list_t **ins_list)
 				break;
 
 			case 1: /* insert */
-				if (db_insert_ucontact(ptr,ins_list,0) < 0) {
+				/* pull-sharing writes are natural-key upserts (and skip
+				 * the insert list - insert_update cannot be batched) */
+				if (cluster_mode == CM_PULL_SHARING ?
+				        db_insert_ucontact(ptr, 0, 1) < 0 :
+				        db_insert_ucontact(ptr, ins_list, 0) < 0) {
 					LM_ERR("inserting contact into database failed\n");
 					ptr->state = old_state;
 				}
@@ -379,7 +391,9 @@ static inline int wb_timer(urecord_t* _r,query_list_t **ins_list)
 				break;
 
 			case 2: /* update */
-				if (db_update_ucontact(ptr) < 0) {
+				if (cluster_mode == CM_PULL_SHARING ?
+				        db_insert_ucontact(ptr, 0, 1) < 0 :
+				        db_update_ucontact(ptr) < 0) {
 					LM_ERR("updating contact in db failed\n");
 					ptr->state = old_state;
 				}
@@ -390,6 +404,9 @@ static inline int wb_timer(urecord_t* _r,query_list_t **ins_list)
 		}
 	}
 
+	/* pull-sharing: the shared-cache blob must shrink with the record */
+	if (gone && cluster_mode == CM_PULL_SHARING)
+		ul_pull_publish(_r);
 
 	return ins_done;
 }
@@ -827,6 +844,12 @@ void release_urecord(urecord_t* _r, char skip_replication)
 		if (exists_ulcb_type(UL_AOR_DELETE))
 			run_ul_callbacks(UL_AOR_DELETE, _r, NULL);
 
+		/* pull-sharing: withdraw this node's copy of the blob - on the
+		 * owner that is the authoritative one, on a holder it drops a
+		 * cached copy that would otherwise answer pulls with stale data */
+		if (cluster_mode == CM_PULL_SHARING)
+			ul_pull_unpublish(_r);
+
 		if (!skip_replication && location_cluster) {
 			if (cluster_mode == CM_FEDERATION_CACHEDB &&
 			    cdb_update_urecord_metadata(&_r->aor, 1) != 0)
@@ -893,12 +916,18 @@ int insert_ucontact(urecord_t* _r, str* _contact, ucontact_info_t* _ci,
 		if (persist_urecord_kv_store(_r) != 0)
 			LM_DBG("failed to persist latest urecord K/V storage\n");
 
-		if (db_insert_ucontact(*_c,0,0) < 0) {
+		/* pull-sharing rows are keyed by (user, domain, contact), and a
+		 * takeover legitimately re-stamps a row another node wrote - so
+		 * the write must be an upsert, never a bare insert */
+		if (db_insert_ucontact(*_c, 0, cluster_mode == CM_PULL_SHARING) < 0) {
 			LM_ERR("failed to insert in database\n");
 		} else {
 			(*_c)->state = CS_SYNC;
 		}
 	}
+
+	if (cluster_mode == CM_PULL_SHARING && !skip_replication)
+		ul_pull_publish(_r);
 
 	return 0;
 }
@@ -936,6 +965,9 @@ int delete_ucontact(urecord_t* _r, struct ucontact* _c,
 				LM_ERR("failed to sync with db\n");
 		}
 	}
+
+	if (cluster_mode == CM_PULL_SHARING && !skip_replication)
+		ul_pull_publish(_r);
 
 	return 0;
 }

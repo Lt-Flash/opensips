@@ -1379,7 +1379,9 @@ int insert_urecord(udomain_t* _d, str* _aor, struct urecord** _r,
 			        && pre_replicate_cb(*_r, pre_replicate_info) != 0)
 				LM_ERR("urecord pre-replication callback returned non-zero\n");
 
-			if (location_cluster)
+			/* pull-sharing never announces inserts - peers would only
+			 * materialize empty AoR shells they may never be asked about */
+			if (location_cluster && cluster_mode != CM_PULL_SHARING)
 				replicate_urecord_insert(*_r);
 		}
 	} else {

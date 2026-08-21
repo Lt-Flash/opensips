@@ -2012,12 +2012,11 @@ int delete_urecord(udomain_t* _d, str* _aor, struct urecord* _r,
 	}
 
 	if (!_r) {
-		/* pull-sharing: an explicit deletion event must find the record
-		 * wherever it lives - a REGISTER un-binding through this node is
-		 * authoritative even when another node accepted the binding */
-		if (cluster_mode == CM_PULL_SHARING && !skip_replication ?
-		        get_urecord_or_pull(_d, _aor, &_r) > 0 :
-		        get_urecord(_d, _aor, &_r) > 0) {
+		/* plain local fetch: REGISTER processing (un-binding included)
+		 * never pulls - it acts on what this node holds.  Administrative
+		 * removals that must reach the whole cluster (registrar
+		 * remove(), MI rm/rm_contact) pull explicitly and pass @_r. */
+		if (get_urecord(_d, _aor, &_r) > 0) {
 			return 0;
 		}
 	}

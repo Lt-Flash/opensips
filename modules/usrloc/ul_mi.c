@@ -281,9 +281,20 @@ mi_response_t *mi_usrloc_rm_aor(const mi_params_t *params,
 		return init_mi_error(400, MI_SSTR("Domain missing in AOR"));
 
 	lock_udomain( dom, &aor);
-	if (delete_urecord( dom, &aor, NULL, 0) < 0) {
-		unlock_udomain( dom, &aor);
-		return init_mi_error(500, MI_SSTR("Failed to delete AOR"));
+	{
+		/* an administrative removal speaks for the whole cluster - fetch
+		 * the record wherever it lives (REGISTER processing, by
+		 * contrast, never pulls: it only stores locally) */
+		urecord_t *rec;
+
+		if (get_urecord_or_pull( dom, &aor, &rec) == 1) {
+			unlock_udomain( dom, &aor);
+			return init_mi_error(404, MI_SSTR("AOR not found"));
+		}
+		if (delete_urecord( dom, &aor, rec, 0) < 0) {
+			unlock_udomain( dom, &aor);
+			return init_mi_error(500, MI_SSTR("Failed to delete AOR"));
+		}
 	}
 
 	unlock_udomain( dom, &aor);

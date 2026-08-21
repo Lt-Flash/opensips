@@ -33,6 +33,7 @@
 #include "../../cachedb/cachedb.h"
 
 #include "ul_mod.h"            /* usrloc module parameters */
+#include "kv_store.h"
 #include "ul_evi.h"
 #include "utime.h"
 #include "ul_cluster.h"
@@ -1511,6 +1512,227 @@ int get_urecord(udomain_t* _d, str* _aor, struct urecord** _r)
 out:
 	*_r = NULL;
 	return 1;   /* Nothing found */
+}
+
+/* pull-sharing: bulk merge from the ledger into local memory.
+ *
+ * Two callers, two shapes:
+ *  - orphan adoption (@adopt_nid > 0): import ONLY the dead node's rows
+ *    that fall in this node's deterministic share AND are adoptable -
+ *    anycast (our matching anycast socket makes pings valid) or Path'd
+ *    (pings and requests ride the Path through the live edge proxy).
+ *    Each such contact is re-stamped as ours: pinging and row
+ *    maintenance resume here instead of pausing until re-REGISTER.
+ *  - shared-tag activation (@adopt_nid == 0): import everything; the
+ *    ownership predicate sorts rows naturally (the VIP just moved here,
+ *    so the active peer's rows re-derive as OURS via the socket and are
+ *    re-stamped; the rest become convergence copies).
+ * Runs from the timer job (worker context, DB handle present); locks
+ * each AoR as it goes.  Returns the number of contacts taken over. */
+int ul_pull_ledger_import(udomain_t* _d, int adopt_nid, int my_idx,
+		int nr_nodes)
+{
+	static const struct ct_match cmatch = {CT_MATCH_CONTACT_ONLY, NULL};
+	ucontact_info_t *ci;
+	db_key_t columns[UL_COLS];
+	db_res_t* res = NULL;
+	db_row_t *row;
+	char uri[MAX_URI_SIZE];
+	str user, contact;
+	char *domain;
+	map_t kv;
+	int_str_t *v;
+	urecord_t *r;
+	ucontact_t *c;
+	unsigned short aorhash, clabel;
+	unsigned int rlabel;
+	int i, n, rc, taken = 0, no_rows = 10;
+
+	if (!ul_dbh)
+		return 0;
+
+	columns[0] = &user_col;
+	columns[1] = &contactid_col;
+	columns[2] = &contact_col;
+	columns[3] = &expires_col;
+	columns[4] = &q_col;
+	columns[5] = &callid_col;
+	columns[6] = &cseq_col;
+	columns[7] = &flags_col;
+	columns[8] = &cflags_col;
+	columns[9] = &user_agent_col;
+	columns[10] = &received_col;
+	columns[11] = &path_col;
+	columns[12] = &sock_col;
+	columns[13] = &methods_col;
+	columns[14] = &last_mod_col;
+	columns[15] = &sip_instance_col;
+	columns[16] = &kv_store_col;
+	columns[17] = &attr_col;
+	columns[UL_COLS - 1] = &domain_col;
+
+	if (ul_dbf.use_table(ul_dbh, _d->name) < 0) {
+		LM_ERR("sql use_table failed\n");
+		return 0;
+	}
+
+	if (DB_CAPABILITY(ul_dbf, DB_CAP_FETCH)) {
+		if (ul_dbf.query(ul_dbh, 0, 0, 0, columns, 0,
+		                 use_domain ? UL_COLS : UL_COLS - 1, 0, 0) < 0) {
+			LM_ERR("import query failed\n");
+			return 0;
+		}
+		no_rows = estimate_available_rows(8+32+64+4+8+128+8+4+4+64
+			+32+128+16+8+8+255+255+32+255, UL_COLS);
+		if (no_rows == 0)
+			no_rows = 10;
+		if (ul_dbf.fetch_result(ul_dbh, &res, no_rows) < 0) {
+			LM_ERR("fetching rows failed\n");
+			return 0;
+		}
+	} else if (ul_dbf.query(ul_dbh, 0, 0, 0, columns, 0,
+	                 use_domain ? UL_COLS : UL_COLS - 1, 0, &res) < 0) {
+		LM_ERR("import query failed\n");
+		return 0;
+	}
+
+	get_act_time();
+
+	do {
+		for (i = 0; i < RES_ROW_N(res); i++) {
+			row = RES_ROWS(res) + i;
+
+			user.s = (char*)VAL_STRING(ROW_VALUES(row));
+			if (VAL_NULL(ROW_VALUES(row)) || !user.s || !user.s[0])
+				continue;
+			user.len = strlen(user.s);
+
+			ci = dbrow2info(ROW_VALUES(row) + 1, &contact);
+			if (!ci)
+				continue;
+			if (ci->expires <= act_time)
+				continue;
+
+			if (use_domain) {
+				domain = (char*)VAL_STRING(ROW_VALUES(row) + UL_COLS - 1);
+				if (VAL_NULL(ROW_VALUES(row) + UL_COLS - 1) || !domain
+				        || domain[0] == '\0')
+					continue;
+				user.len = snprintf(uri, MAX_URI_SIZE, "%.*s@%s",
+					user.len, user.s, domain);
+				user.s = uri;
+				if (user.len <= 0 || user.len >= MAX_URI_SIZE)
+					continue;
+			}
+
+			if (adopt_nid > 0) {
+				/* only the dead node's rows, only our share, only
+				 * classes whose pings survive an owner change */
+				if (core_hash(&user, NULL, 0) % nr_nodes
+				        != (unsigned int)my_idx)
+					continue;
+
+				if (!((ci->sock && is_anycast(ci->sock))
+				        || (ci->path && ci->path->len)))
+					continue;
+
+				if (ZSTRP(ci->packed_kv_storage))
+					continue;
+				kv = store_deserialize(ci->packed_kv_storage);
+				if (!kv)
+					continue;
+				v = kv_get(kv, &ul_onid_key);
+				rc = (v && !v->is_str) ? v->i : 0;
+				store_destroy(kv);
+				if (rc != adopt_nid)
+					continue;
+			}
+
+			lock_udomain(_d, &user);
+
+			if (get_urecord(_d, &user, &r) != 0
+			        && insert_urecord(_d, &user, &r, 1, NULL, NULL) != 0) {
+				LM_ERR("failed to create record for <%.*s>\n",
+				       user.len, user.s);
+				unlock_udomain(_d, &user);
+				continue;
+			}
+
+			unpack_indexes(ci->contact_id, &aorhash, &rlabel, &clabel);
+
+			rc = get_ucontact(r, &contact, ci->callid, ci->cseq, &cmatch,
+				&c);
+			switch (rc) {
+			case -2:
+			case -1:
+				/* memory is as new or newer - an already-adopted copy
+				 * lands here and keeps its stamp */
+				c = NULL;
+				break;
+
+			case 0:
+				ci->contact_id = pack_indexes((unsigned short)r->aorhash,
+							r->label, (unsigned short)c->label);
+				if (update_ucontact(r, c, ci, NULL, 1) != 0) {
+					LM_ERR("failed to import update of <%.*s>\n",
+					       contact.len, contact.s);
+					c = NULL;
+				}
+				break;
+
+			case 1:
+				if (clabel >= r->next_clabel) {
+					r->next_clabel = CLABEL_NEXT(clabel);
+				} else {
+					clabel = r->next_clabel;
+					r->next_clabel = CLABEL_NEXT(r->next_clabel);
+				}
+				ci->contact_id = pack_indexes((unsigned short)r->aorhash,
+							r->label, (unsigned short)clabel);
+
+				if (insert_ucontact(r, &contact, ci, NULL, 1, &c) != 0) {
+					LM_ERR("failed to import <%.*s>\n",
+					       contact.len, contact.s);
+					c = NULL;
+				}
+				break;
+
+			default:
+				c = NULL;
+			}
+
+			if (c) {
+				if (adopt_nid > 0 || ul_ct_is_mine(c)) {
+					/* ours now: stamp, shed the convergence marks, let
+					 * the write-back flush re-stamp the row */
+					ul_ct_stamp_owner(c);
+					c->flags &= ~(FL_PULLED | FL_MEM);
+					if (c->state == CS_SYNC)
+						c->state = CS_DIRTY;
+					taken++;
+				} else {
+					c->flags |= FL_PULLED | FL_MEM;
+				}
+				ul_pull_publish(r);
+			}
+
+			unlock_udomain(_d, &user);
+		}
+
+		if (DB_CAPABILITY(ul_dbf, DB_CAP_FETCH)) {
+			if (ul_dbf.fetch_result(ul_dbh, &res, no_rows) < 0) {
+				LM_ERR("fetching rows (1) failed\n");
+				break;
+			}
+		} else {
+			break;
+		}
+	} while (RES_ROW_N(res) > 0);
+
+	ul_dbf.free_result(ul_dbh, res);
+
+	n = taken; (void)n;
+	return taken;
 }
 
 /* pull-sharing: the last resort of the lookup chain - read the AoR

@@ -45,6 +45,21 @@ str ul_onid_key = str_init("_onid");
 static pcache_pull_api_t ul_pull_api;
 static int ul_pull_api_ok;
 
+/* orphan adoption: node-down events are queued here and processed from
+ * the usrloc timer once the settle delay has passed AND the node is
+ * still absent from the membership - a flap costs nothing.  Shared-tag
+ * activation queues a full ledger import the same way (the callback may
+ * fire in a process without a DB handle; the timer job has one). */
+#define UL_ADOPT_DELAY   10          /* seconds */
+#define UL_ADOPT_PENDING 8
+struct ul_adopt_slot {
+	int nid;                         /* 0 = free */
+	unsigned int due;
+};
+static struct ul_adopt_slot *adopt_pending;
+static int *ha_import_pending;
+static gen_lock_t *adopt_lock;
+
 int ul_ct_owner_nid(ucontact_t *c)
 {
 	int_str_t *v;
@@ -79,6 +94,17 @@ void ul_ct_stamp_owner(ucontact_t *c)
 		LM_ERR("oom stamping owner id on <%.*s>\n", c->c.len, c->c.s);
 }
 
+static void ul_ha_shtag_cb(str *tag, int state, int c_id, void *param)
+{
+	if (cluster_mode != CM_PULL_SHARING || state != SHTAG_STATE_ACTIVE)
+		return;
+
+	if (ha_import_pending)
+		*ha_import_pending = 1;
+	LM_INFO("shared tag <%.*s> went ACTIVE - a full ledger takeover is "
+		"scheduled\n", tag->len, tag->s);
+}
+
 int ul_init_cluster(void)
 {
 	if (location_cluster == 0)
@@ -105,6 +131,23 @@ int ul_init_cluster(void)
 		else
 			LM_INFO("cachedb_perf pull API not exported - owner hints "
 			        "disabled, pulls stay broadcast-only\n");
+
+		adopt_pending = shm_malloc(UL_ADOPT_PENDING
+				* sizeof *adopt_pending + sizeof *ha_import_pending);
+		adopt_lock = lock_alloc();
+		if (!adopt_pending || !adopt_lock || !lock_init(adopt_lock)) {
+			LM_ERR("no more shm memory for the adoption queue\n");
+			return -1;
+		}
+		memset(adopt_pending, 0, UL_ADOPT_PENDING * sizeof *adopt_pending
+				+ sizeof *ha_import_pending);
+		ha_import_pending = (int *)(adopt_pending + UL_ADOPT_PENDING);
+
+		if (ul_ha_cluster && ul_ha_shtag.s
+		        && clusterer_api.shtag_register_callback(&ul_ha_shtag,
+		                ul_ha_cluster, NULL, ul_ha_shtag_cb) < 0)
+			LM_ERR("failed to register the shared-tag callback - "
+			       "activation will not trigger a ledger takeover\n");
 	}
 
 	/* register handler for processing usrloc packets to the clusterer module */
@@ -1589,10 +1632,154 @@ void receive_cluster_event(enum clusterer_event ev, int node_id)
 	if (ev == SYNC_REQ_RCV && receive_sync_request(node_id) < 0)
 		LM_ERR("Failed to send sync data to node: %d\n", node_id);
 
-	/* pull-sharing deliberately does NOTHING on CLUSTER_NODE_DOWN: every
-	 * record a survivor holds stays to natural expiry or an explicit
-	 * un-REGISTER - the cluster keeps the whole set alive, and whether a
-	 * given contact is still routable is the routing layer's business.
-	 * (This event is where orphan adoption will hook in later.) */
+	/* pull-sharing drops NOTHING on CLUSTER_NODE_DOWN - every record a
+	 * survivor holds stays to natural expiry or an explicit
+	 * un-REGISTER.  The event only QUEUES orphan adoption: after the
+	 * settle delay, this node takes ownership of its deterministic
+	 * share of the dead node's adoptable contacts, so their pinging
+	 * and row maintenance resume instead of pausing until each UA
+	 * re-registers. */
+	if (cluster_mode != CM_PULL_SHARING || !adopt_pending)
+		return;
+
+	if (ev == CLUSTER_NODE_DOWN) {
+		int i, slot = -1;
+
+		lock_get(adopt_lock);
+		for (i = 0; i < UL_ADOPT_PENDING; i++) {
+			if (adopt_pending[i].nid == node_id) {
+				slot = -2;
+				break;
+			}
+			if (slot == -1 && !adopt_pending[i].nid)
+				slot = i;
+		}
+		if (slot >= 0) {
+			adopt_pending[slot].nid = node_id;
+			adopt_pending[slot].due = get_ticks() + UL_ADOPT_DELAY;
+		}
+		lock_release(adopt_lock);
+
+		if (slot == -1)
+			LM_WARN("adoption queue full - node %d's orphans wait for "
+				"their UAs' re-REGISTERs\n", node_id);
+	} else if (ev == CLUSTER_NODE_UP) {
+		int i;
+
+		lock_get(adopt_lock);
+		for (i = 0; i < UL_ADOPT_PENDING; i++)
+			if (adopt_pending[i].nid == node_id)
+				adopt_pending[i].nid = 0;
+		lock_release(adopt_lock);
+	}
+}
+
+/* take ownership of the dead node's adoptable contacts already held in
+ * local memory (our deterministic share of them) */
+static int ul_pull_adopt_memory(int dead_nid, int my_idx, int nr_nodes)
+{
+	dlist_t *dl;
+	udomain_t *dom;
+	map_iterator_t it;
+	void **dest;
+	urecord_t *r;
+	ucontact_t *c;
+	int i, touched, taken = 0;
+
+	for (dl = root; dl; dl = dl->next) {
+		dom = dl->d;
+		for (i = 0; i < dom->size; i++) {
+			lock_ulslot(dom, i);
+			for (map_first(dom->table[i].records, &it);
+			        iterator_is_valid(&it); iterator_next(&it)) {
+				dest = iterator_val(&it);
+				if (!dest)
+					break;
+				r = (urecord_t *)*dest;
+
+				if (r->aorhash % nr_nodes != (unsigned int)my_idx)
+					continue;
+
+				touched = 0;
+				for (c = r->contacts; c; c = c->next) {
+					if (ul_ct_is_mine(c)
+					        || ul_ct_owner_nid(c) != dead_nid)
+						continue;
+					if (!((c->sock && is_anycast(c->sock))
+					        || c->path.len))
+						continue;
+
+					ul_ct_stamp_owner(c);
+					c->flags &= ~(FL_PULLED | FL_MEM);
+					if (c->state == CS_SYNC)
+						c->state = CS_DIRTY;
+					taken++;
+					touched = 1;
+				}
+				if (touched)
+					ul_pull_publish(r);
+			}
+			unlock_ulslot(dom, i);
+		}
+	}
+
+	return taken;
+}
+
+/* called from the usrloc timer: run any due orphan adoptions and a
+ * queued shared-tag takeover */
+void ul_pull_process_failover(void)
+{
+	clusterer_node_t *nodes, *n;
+	dlist_t *dl;
+	int i, nid, my_idx, nr_nodes, taken;
+
+	if (cluster_mode != CM_PULL_SHARING || !adopt_pending)
+		return;
+
+	if (*ha_import_pending) {
+		*ha_import_pending = 0;
+		taken = 0;
+		for (dl = root; dl; dl = dl->next)
+			taken += ul_pull_ledger_import(dl->d, 0, 0, 0);
+		LM_INFO("shared-tag takeover: %d contacts are now maintained "
+			"here\n", taken);
+	}
+
+	for (i = 0; i < UL_ADOPT_PENDING; i++) {
+		lock_get(adopt_lock);
+		if (!adopt_pending[i].nid
+		        || (int)(get_ticks() - adopt_pending[i].due) < 0) {
+			lock_release(adopt_lock);
+			continue;
+		}
+		nid = adopt_pending[i].nid;
+		adopt_pending[i].nid = 0;
+		lock_release(adopt_lock);
+
+		/* a node that came back meanwhile keeps its registrations -
+		 * and re-acquires organically what it may have lost */
+		nodes = clusterer_api.get_nodes(location_cluster);
+		for (n = nodes; n; n = n->next)
+			if (n->node_id == nid)
+				break;
+		if (nodes)
+			clusterer_api.free_nodes(nodes);
+		if (n)
+			continue;
+
+		my_idx = clusterer_api.get_my_index(location_cluster,
+				&contact_repl_cap, &nr_nodes);
+		if (my_idx < 0 || nr_nodes <= 0)
+			continue;
+
+		taken = ul_pull_adopt_memory(nid, my_idx, nr_nodes);
+		for (dl = root; dl; dl = dl->next)
+			taken += ul_pull_ledger_import(dl->d, nid, my_idx, nr_nodes);
+
+		LM_INFO("node %d down: adopted %d of its contacts (share %d/%d) "
+			"- pinging and row maintenance resume here\n",
+			nid, taken, my_idx, nr_nodes);
+	}
 }
 

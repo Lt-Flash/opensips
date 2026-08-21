@@ -1091,6 +1091,10 @@ int _synchronize_all_udomains(void)
 		if (cluster_mode == CM_PULL_SHARING && sql_wmode != SQL_NO_WRITE)
 			for( ptr=root ; ptr ; ptr=ptr->next)
 				res |= db_grace_sweep_udomain(ptr->d);
+
+		/* pull-sharing: due orphan adoptions / shared-tag takeovers */
+		if (cluster_mode == CM_PULL_SHARING)
+			ul_pull_process_failover();
 	} /* TODO: add a form of cleanup here, or implement cache API TTLs */
 
 	return res;

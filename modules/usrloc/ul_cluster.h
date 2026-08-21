@@ -122,4 +122,8 @@ void replicate_ucontact_delete(urecord_t *r, ucontact_t *c,
 void receive_binary_packets(bin_packet_t *packet);
 void receive_cluster_event(enum clusterer_event ev, int node_id);
 
+/* pull-sharing: process queued orphan adoptions and shared-tag
+ * takeovers (runs off the usrloc timer, in a worker with a DB handle) */
+void ul_pull_process_failover(void);
+
 #endif /* _USRLOC_CLUSTER_H_ */

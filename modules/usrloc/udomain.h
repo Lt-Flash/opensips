@@ -179,6 +179,13 @@ int db_grace_sweep_udomain(udomain_t* _d);
  * caller holds the domain lock.  0 found / 1 not found. */
 int ul_pull_ledger_fetch(udomain_t* _d, str* _aor, struct urecord** _r);
 
+/* pull-sharing: bulk ledger import - orphan adoption (@adopt_nid > 0,
+ * dead node's share only) or shared-tag takeover (@adopt_nid == 0,
+ * everything; the ownership predicate sorts rows).  Locks per AoR.
+ * Returns the number of contacts taken over. */
+int ul_pull_ledger_import(udomain_t* _d, int adopt_nid, int my_idx,
+		int nr_nodes);
+
 /*! \brief
  * Only relevant in a federation @cluster_mode.
  * Obtain urecord pointer if AoR exists in at least one location.

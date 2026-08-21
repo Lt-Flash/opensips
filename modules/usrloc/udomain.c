@@ -442,6 +442,13 @@ int preload_udomain(db_con_t* _c, udomain_t* _d)
 
 	char suggest_regen=0;
 
+	/* pull-sharing: connection-oriented rows this node accepted must not
+	 * be resurrected - the restart severed those connections.  They are
+	 * collected during the (cursor-driven) load and reaped afterwards. */
+#define UL_REAP_MAX 1024
+	static uint64_t reap_cids[UL_REAP_MAX];
+	int reap_n = 0, reap_lost = 0;
+
 	urecord_t* r;
 	ucontact_t* c;
 
@@ -542,6 +549,19 @@ int preload_udomain(db_con_t* _c, udomain_t* _d)
 							domain,	MAX_URI_SIZE);
 					continue;
 				}
+			}
+
+			if (cluster_mode == CM_PULL_SHARING && ci->sock
+			        && !is_anycast(ci->sock)
+			        && (ci->sock->proto == PROTO_TCP
+			         || ci->sock->proto == PROTO_TLS
+			         || ci->sock->proto == PROTO_WS
+			         || ci->sock->proto == PROTO_WSS)) {
+				if (reap_n < UL_REAP_MAX)
+					reap_cids[reap_n++] = ci->contact_id;
+				else
+					reap_lost++;
+				continue;
 			}
 
 			unpack_indexes(ci->contact_id, &aorhash, &rlabel, &clabel);
@@ -682,6 +702,13 @@ int preload_udomain(db_con_t* _c, udomain_t* _d)
 				LM_DBG("regenerated contact id to %"PRIu64"\n", ci->contact_id);
 			}
 
+			/* pull-sharing: rows this node does not own load as
+			 * convergence copies - they expire in memory while the owner
+			 * maintains the row; without this, our expiry would reap a
+			 * row the owner may have refreshed since */
+			if (cluster_mode == CM_PULL_SHARING && !ul_ct_is_mine(c))
+				c->flags |= FL_PULLED | FL_MEM;
+
 			unlock_udomain(_d, &user);
 		}
 
@@ -697,6 +724,25 @@ int preload_udomain(db_con_t* _c, udomain_t* _d)
 	} while(RES_ROW_N(res)>0);
 
 	ul_dbf.free_result(_c, res);
+
+	if (reap_n) {
+		db_key_t dk = &contactid_col;
+		db_val_t dv;
+
+		LM_INFO("reaping %d of our connection-oriented rows (their "
+			"connections died with the restart)\n", reap_n);
+		memset(&dv, 0, sizeof dv);
+		VAL_TYPE(&dv) = DB_BIGINT;
+		for (i = 0; i < reap_n; i++) {
+			VAL_BIGINT(&dv) = reap_cids[i];
+			if (ul_dbf.delete(_c, &dk, 0, &dv, 1) < 0)
+				LM_ERR("failed to reap row %" PRIu64 "\n", reap_cids[i]);
+		}
+	}
+	if (reap_lost)
+		LM_WARN("%d further connection-oriented rows could not be "
+			"reaped this pass - they stay until natural expiry\n",
+			reap_lost);
 
 	if ( suggest_regen ) {
 		LM_NOTICE("At least 1 contact(s) from the database has invalid contact_id!\n"
@@ -1067,6 +1113,44 @@ int db_timer_udomain(udomain_t* _d)
 	return 0;
 }
 
+
+/* pull-sharing: any node may reap ledger rows whose expiry lies more
+ * than a grace period in the past.  The accepting node deletes its rows
+ * eagerly, so this only catches rows orphaned by a crashed owner; the
+ * grace absorbs refresh races and modest clock skew across the fleet. */
+#define UL_PULL_GRACE 60
+int db_grace_sweep_udomain(udomain_t* _d)
+{
+	static db_ps_t my_ps = NULL;
+	db_key_t keys[2];
+	db_op_t  ops[2];
+	db_val_t vals[2];
+
+	if (ul_dbf.use_table(ul_dbh, _d->name) < 0) {
+		LM_ERR("failed to change table\n");
+		return -1;
+	}
+
+	memset(vals, 0, sizeof vals);
+
+	keys[0] = &expires_col;
+	ops[0] = "<";
+	vals[0].type = DB_INT;
+	vals[0].val.int_val = act_time - UL_PULL_GRACE;
+
+	keys[1] = &expires_col;
+	ops[1] = "!=";
+	vals[1].type = DB_INT;
+	vals[1].val.int_val = 0;
+
+	CON_SET_CURR_PS(ul_dbh, &my_ps);
+	if (ul_dbf.delete(ul_dbh, keys, ops, vals, 2) < 0) {
+		LM_ERR("failed to sweep table %s\n", _d->name->s);
+		return -1;
+	}
+
+	return 0;
+}
 
 /*! \brief performs a dummy query just to see if DB is ok */
 int testdb_udomain(db_con_t* con, udomain_t* d)

@@ -1086,6 +1086,11 @@ int _synchronize_all_udomains(void)
 	} else if (have_mem_storage()) {
 		for( ptr=root ; ptr ; ptr=ptr->next)
 			res |= mem_timer_udomain(ptr->d);
+
+		/* pull-sharing: reap ledger rows orphaned by a crashed owner */
+		if (cluster_mode == CM_PULL_SHARING && sql_wmode != SQL_NO_WRITE)
+			for( ptr=root ; ptr ; ptr=ptr->next)
+				res |= db_grace_sweep_udomain(ptr->d);
 	} /* TODO: add a form of cleanup here, or implement cache API TTLs */
 
 	return res;

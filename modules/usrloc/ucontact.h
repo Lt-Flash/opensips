@@ -294,6 +294,13 @@ int db_update_ucontact(ucontact_t* _c);
  */
 int db_delete_ucontact(ucontact_t* _c);
 
+/* pull-sharing: delete the ledger row by its natural key (user, domain,
+ * contact).  Event-path only - deliberately no FL_MEM shortcut: an
+ * un-REGISTER through this node speaks for the UA and must kill the row
+ * even when another node owns it (rows are contact_id-stamped by their
+ * last writer, so a contact_id-keyed delete could not find them). */
+int db_delete_ucontact_natkey(ucontact_t* _c);
+
 /*! \brief
  * Delete multiple contacts from the database
  * having the cids

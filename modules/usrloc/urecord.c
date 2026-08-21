@@ -955,7 +955,14 @@ int delete_ucontact(urecord_t* _r, struct ucontact* _c,
 
 	if (st_delete_ucontact(_c) > 0) {
 		if (sql_wmode == SQL_WRITE_THROUGH) {
-			if (db_delete_ucontact(_c) < 0) {
+			if (cluster_mode == CM_PULL_SHARING) {
+				/* event-handled deletes kill the row by natural key, no
+				 * matter who wrote it; replication-applied ones do not
+				 * touch the ledger - the handling node already did */
+				if (!skip_replication
+				        && db_delete_ucontact_natkey(_c) < 0)
+					LM_ERR("failed to remove contact from database\n");
+			} else if (db_delete_ucontact(_c) < 0) {
 				LM_ERR("failed to remove contact from database\n");
 			}
 		}

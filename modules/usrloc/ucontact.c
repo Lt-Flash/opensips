@@ -871,6 +871,52 @@ int db_delete_ucontact(ucontact_t* _c)
 	return 0;
 }
 
+int db_delete_ucontact_natkey(ucontact_t* _c)
+{
+	static db_ps_t my_ps = NULL;
+	db_key_t keys[3];
+	db_val_t vals[3];
+	char *dom;
+	int n = 0;
+
+	keys[n] = &user_col;
+	memset(vals, 0, sizeof vals);
+	vals[n].type = DB_STR;
+	vals[n].val.str_val = *_c->aor;
+	n++;
+
+	keys[n] = &contact_col;
+	vals[n].type = DB_STR;
+	vals[n].val.str_val = _c->c;
+	n++;
+
+	if (use_domain) {
+		dom = q_memchr(_c->aor->s, '@', _c->aor->len);
+		if (dom) {
+			vals[0].val.str_val.len = dom - _c->aor->s;
+
+			keys[n] = &domain_col;
+			vals[n].type = DB_STR;
+			vals[n].val.str_val.s = dom + 1;
+			vals[n].val.str_val.len = _c->aor->s + _c->aor->len - dom - 1;
+			n++;
+		}
+	}
+
+	if (ul_dbf.use_table(ul_dbh, _c->domain) < 0) {
+		LM_ERR("sql use_table failed\n");
+		return -1;
+	}
+
+	CON_SET_CURR_PS(ul_dbh, &my_ps);
+	if (ul_dbf.delete(ul_dbh, keys, 0, vals, n) < 0) {
+		LM_ERR("deleting from database failed\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 /*
  * Delete multiple contacts from the database
  * having the cids; cids are stored in vals param

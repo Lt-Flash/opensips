@@ -172,6 +172,9 @@ int get_urecord(udomain_t* _d, str* _aor, struct urecord** _r);
 /* as get_urecord(), but a pull-sharing local miss asks the cluster */
 int get_urecord_or_pull(udomain_t* _d, str* _aor, struct urecord** _r);
 
+/* pull-sharing: reap long-expired ledger rows (crashed-owner orphans) */
+int db_grace_sweep_udomain(udomain_t* _d);
+
 /*! \brief
  * Only relevant in a federation @cluster_mode.
  * Obtain urecord pointer if AoR exists in at least one location.

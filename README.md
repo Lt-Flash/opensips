@@ -220,6 +220,47 @@ Without `db_url` the mode runs as a pure-pull cluster.
   table over MI-datagram — the reply can neither be built in pkg nor fit a
   datagram, and the attempt wedges the node.
 
+## Build
+
+Everything the mode needs is in this tree: the four touched modules
+(`usrloc`, `registrar`, `cachedb_perf`, `db_sqlite`), two cachedb core
+headers and one line in `lib/reg` — 46 commits over upstream `master`, no
+new external libraries. A plain checkout builds the bin-transport variant;
+the encrypted `clctr` transport compiles in only when the separate
+`clusterer_controller` module is present, and is not required.
+
+Prerequisites (Debian/Ubuntu names): `build-essential bison flex` for the
+core; `libsqlite3-dev` for an SQLite ledger or
+`default-libmysqlclient-dev` for MySQL; `libncurses-dev` only if you want
+`make menuconfig`. Nothing else for the module set below.
+
+```sh
+git clone -b feature/usrloc-pull-sharing-devel https://github.com/Lt-Flash/opensips.git
+cd opensips
+make -j"$(nproc)" all include_modules="cachedb_perf db_sqlite"   # db_mysql instead, or both
+make install prefix=/opt/opensips-pullshare
+```
+
+`cachedb_perf`, `usrloc`, `registrar`, `clusterer` and `proto_bin` are
+part of the default module set; the `db_*` ledger backends are excluded
+by default upstream, hence `include_modules`. Installing into its own
+prefix keeps the build side by side with a stock OpenSIPS — point `mpath`
+at `<prefix>/lib64/opensips/modules/` (or `lib/` on 32-bit).
+
+Verify:
+
+```sh
+/opt/opensips-pullshare/sbin/opensips -V | head -1          # opensips 4.1.0-dev
+ls /opt/opensips-pullshare/lib64/opensips/modules/ | grep -E 'cachedb_perf|usrloc|registrar|clusterer|proto_bin'
+```
+
+Runtime module set for the mode: `proto_udp`, `proto_bin`, `tm`, `sl`,
+`signaling`, `clusterer`, `cachedb_perf`, `usrloc`, `registrar`, plus a
+`db_*` driver if a ledger is configured and `mi_datagram`/`mi_http` for
+the MI surface. Verified 2026-08-22: a fresh shallow clone of this branch
+from the public URL builds the whole tree with the command above on
+Ubuntu 20.04 (gcc 9) with zero errors.
+
 ## Testing
 
 * `scripts/…` rigs live outside the tree on the dev host: a 2-node netns

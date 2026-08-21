@@ -496,6 +496,31 @@ modparam("cachedb_perf", "replicate_collections", "th")
 		</emphasis>
 		</para>
 	</section>
+	<section id="param_pull_slots" xreflabel="pull_slots">
+		<title><varname>pull_slots</varname> (integer)</title>
+		<para>
+		How many pulls may be in flight at once (8..65536).  A miss that
+		finds the pool dry is not queued - it is answered as a miss, and
+		counted in <emphasis>pulls_skip_noslot</emphasis>.
+		</para>
+		<para>
+		The default suits the blocking mode, where concurrency is capped
+		by the worker count anyway.  Asynchronous users
+		(<emphasis>async()</emphasis> script wrappers over this module's
+		pull API) suspend transactions instead of workers, so hundreds of
+		pulls can be in flight at once: size this for the expected
+		concurrent miss burst - the peak miss rate times
+		<varname>pull_timeout_ms</varname> - not for the worker count.
+		Each slot costs roughly <varname>pull_max_key</varname> +
+		<varname>pull_max_value</varname> bytes of shared memory, so even
+		generous pools are cheap.
+		</para>
+		<para>
+		<emphasis>
+			Default value is <quote>64</quote>.
+		</emphasis>
+		</para>
+	</section>
 	<section id="param_pull_linger_ms" xreflabel="pull_linger_ms">
 		<title><varname>pull_linger_ms</varname> (integer)</title>
 		<para>

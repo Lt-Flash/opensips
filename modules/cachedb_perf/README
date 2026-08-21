@@ -31,8 +31,9 @@ cachedb_perf Module
               1.3.16. replicate_collections (string)
               1.3.17. pull_transport (string)
               1.3.18. pull_timeout_ms (integer)
-              1.3.19. pull_negative_ms (integer)
-              1.3.20. pull_on_miss (integer)
+              1.3.19. pull_slots (integer)
+              1.3.20. pull_negative_ms (integer)
+              1.3.21. pull_on_miss (integer)
 
         1.4. DB persistence
         1.5. Cluster sync
@@ -444,7 +445,25 @@ modparam("cachedb_perf", "replicate_collections", "th")
 
    Default value is “50”.
 
-1.3.19. pull_negative_ms (integer)
+1.3.19. pull_slots (integer)
+
+   How many pulls may be in flight at once (8..65536). A miss that
+   finds the pool dry is not queued - it is answered as a miss,
+   and counted in pulls_skip_noslot.
+
+   The default suits the blocking mode, where concurrency is
+   capped by the worker count anyway. Asynchronous users (async()
+   script wrappers over this module's pull API) suspend
+   transactions instead of workers, so hundreds of pulls can be in
+   flight at once: size this for the expected concurrent miss
+   burst - the peak miss rate times pull_timeout_ms - not for the
+   worker count. Each slot costs roughly pull_max_key +
+   pull_max_value bytes of shared memory, so even generous pools
+   are cheap.
+
+   Default value is “64”.
+
+1.3.20. pull_negative_ms (integer)
 
    How long to remember that the whole cluster answered “not here”
    for a key, in milliseconds (0..2000; 0 disables it). A SIP
@@ -465,7 +484,7 @@ modparam("cachedb_perf", "replicate_collections", "th")
 
    Default value is “300”.
 
-1.3.20. pull_on_miss (integer)
+1.3.21. pull_on_miss (integer)
 
    Repair a miss on the ordinary read path: when a lookup finds
    nothing locally, ask the cluster and return whatever comes back

@@ -127,7 +127,13 @@ static int  pc_shtag_cid;              /* parsed tag cluster                 */
 #define PCACHE_STAT_REQ     4
 #define PCACHE_STAT_RPL     5
 
-#define PCACHE_PULL_SLOTS      64     /* concurrent in-flight pulls        */
+/* Concurrent in-flight pulls (the "pull_slots" modparam).  64 matches the
+ * blocking mode, where the UDP worker count caps concurrency anyway.  Async
+ * users suspend transactions instead of workers, so hundreds can be in
+ * flight at once - size this for the expected concurrent miss burst, not
+ * for the worker count.  A pull that finds the pool dry is not queued, it
+ * is a miss. */
+static int pull_slot_count = 64;
 /* Defaults for the pull_max_value / pull_max_key modparams below. Sized from
  * measurement rather than round numbers: the live cachedb_perf collections on
  * the billing gateways hold values of 1-20 bytes under keys of at most 33, and
@@ -615,6 +621,7 @@ static const param_export_t params[] = {
 	{ "sync_shtag",          STR_PARAM, &sync_shtag_str },
 	{ "pull_transport",      STR_PARAM, &pull_transport_str },
 	{ "pull_timeout_ms",     INT_PARAM, &pull_timeout_ms },
+	{ "pull_slots",          INT_PARAM, &pull_slot_count },
 	{ "pull_linger_ms",      INT_PARAM, &pull_linger_ms },
 	{ "pull_negative_ms",    INT_PARAM, &pull_negative_ms },
 	{ "pull_on_miss",        INT_PARAM, &pull_on_miss },
@@ -783,7 +790,7 @@ static unsigned long smf_pulls_in_flight(void *ctx)
 	if (!pull_slots || !pull_lock)
 		return 0;
 	lock_get(pull_lock);
-	for (k = 0; k < PCACHE_PULL_SLOTS; k++)
+	for (k = 0; k < pull_slot_count; k++)
 		/* an orphan is not a pull in flight - nobody is waiting on it.
 		 * This gauge is documented as the one that should sit at 0, so
 		 * counting orphans would fire the leak alarm on the ordinary
@@ -1256,13 +1263,13 @@ static mi_response_t *mi_perf_stats(str *col_s)
 			int busy = 0, k;
 
 			lock_get(pull_lock);
-			for (k = 0; k < PCACHE_PULL_SLOTS; k++)
+			for (k = 0; k < pull_slot_count; k++)
 				if (pull_slot_at(k)->id)
 					busy++;
 			lock_release(pull_lock);
 			if (add_mi_number(clobj, MI_SSTR("pulls_in_flight"), busy) < 0 ||
 			    add_mi_number(clobj, MI_SSTR("pull_slots"),
-			        PCACHE_PULL_SLOTS) < 0)
+			        pull_slot_count) < 0)
 				goto err;
 		}
 
@@ -2065,7 +2072,7 @@ static struct pcache_pull_slot *pull_slot_get(unsigned int id)
 {
 	int i;
 
-	for (i = 0; i < PCACHE_PULL_SLOTS; i++)
+	for (i = 0; i < pull_slot_count; i++)
 		if (pull_slot_at(i)->id == id)
 			return pull_slot_at(i);
 	return NULL;
@@ -2466,7 +2473,7 @@ static void pcache_pull_reap(utime_t ticks, void *param)
 		return;
 
 	lock_get(pull_lock);
-	for (i = 0; i < PCACHE_PULL_SLOTS; i++) {
+	for (i = 0; i < pull_slot_count; i++) {
 		struct pcache_pull_slot *sl = pull_slot_at(i);
 
 		if (!sl->id || now <= sl->deadline)
@@ -2739,7 +2746,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 	}
 
 	lock_get(pull_lock);
-	for (i = 0; i < PCACHE_PULL_SLOTS; i++)
+	for (i = 0; i < pull_slot_count; i++)
 		if (!pull_slot_at(i)->id) {
 			sl = pull_slot_at(i);
 			break;
@@ -2752,7 +2759,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 		struct pcache_pull_slot *victim = NULL;
 		int v;
 
-		for (v = 0; v < PCACHE_PULL_SLOTS; v++) {
+		for (v = 0; v < pull_slot_count; v++) {
 			struct pcache_pull_slot *c = pull_slot_at(v);
 
 			if (c->id && c->orphan &&
@@ -2768,7 +2775,7 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 		lock_release(pull_lock);
 		__sync_fetch_and_add(&pull_stats[PULL_ST_SKIP_NOSLOT], 1);
 		LM_WARN("all %d pull slots busy - dropping the request\n",
-			PCACHE_PULL_SLOTS);
+			pull_slot_count);
 		return -1;
 	}
 	id = ++(*pull_next_id);
@@ -5005,14 +5012,19 @@ static int mod_init(void)
 				pull_max_key = pull_max_key < 1
 					? PCACHE_PULL_MAX_KEY_DEF : PCACHE_PULL_MAX_KEY;
 			}
+			if (pull_slot_count < 8 || pull_slot_count > 65536) {
+				LM_WARN("pull_slots %d out of range 8..65536 - clamping\n",
+					pull_slot_count);
+				pull_slot_count = pull_slot_count < 8 ? 64 : 65536;
+			}
 			pull_slot_sz = (int)sizeof(struct pcache_pull_slot)
 				+ pull_max_key + pull_max_value;
 			LM_INFO("cross-node pull: %d slots x %d bytes "
 				"(key %d, value %d) = %d KB of shm\n",
-				PCACHE_PULL_SLOTS, pull_slot_sz, pull_max_key,
+				pull_slot_count, pull_slot_sz, pull_max_key,
 				pull_max_value,
-				(PCACHE_PULL_SLOTS * pull_slot_sz + 1023) / 1024);
-			pull_slots = shm_malloc((size_t)PCACHE_PULL_SLOTS * pull_slot_sz);
+				(pull_slot_count * pull_slot_sz + 1023) / 1024);
+			pull_slots = shm_malloc((size_t)pull_slot_count * pull_slot_sz);
 			pull_next_id = shm_malloc(sizeof *pull_next_id);
 			pull_stats = shm_malloc(PULL_ST_MAX * sizeof *pull_stats);
 			pull_send_warn = shm_malloc(sizeof *pull_send_warn);
@@ -5029,7 +5041,7 @@ static int mod_init(void)
 				return -1;
 			}
 			memset(stat_gather, 0, sizeof *stat_gather);
-			memset(pull_slots, 0, (size_t)PCACHE_PULL_SLOTS * pull_slot_sz);
+			memset(pull_slots, 0, (size_t)pull_slot_count * pull_slot_sz);
 			memset(peer_stats, 0,
 				(CL_MAX_NODE_ID + 1) * sizeof *peer_stats);
 			/* One eventfd per slot, created HERE - before the fork - so
@@ -5038,7 +5050,7 @@ static int mod_init(void)
 			 * in whichever process the transport chose, and it has to be
 			 * able to wake the process that asked.  An fd created after
 			 * the fork exists only in its own process and could not. */
-			for (i = 0; i < PCACHE_PULL_SLOTS; i++) {
+			for (i = 0; i < pull_slot_count; i++) {
 				pull_slot_at(i)->efd = eventfd(0, EFD_NONBLOCK);
 				if (pull_slot_at(i)->efd < 0) {
 					LM_ERR("cannot create the pull wakeup fds: %s\n",
@@ -5282,7 +5294,7 @@ static void mod_destroy(void)
 	if (pull_slots) {
 		int i;
 
-		for (i = 0; i < PCACHE_PULL_SLOTS; i++)
+		for (i = 0; i < pull_slot_count; i++)
 			if (pull_slot_at(i)->efd >= 0)
 				close(pull_slot_at(i)->efd);
 		shm_free(pull_slots);

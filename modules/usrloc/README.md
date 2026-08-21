@@ -244,6 +244,17 @@ targeted at the last known owner first - so a refresh this node never
 saw is recovered instead of answered with a 404.
 
 
+Once every node runs a build that has it, setting **cachedb\_perf**'s
+`pull_authoritative_serve` is recommended for this mode: a pull is then
+answered with the value only by the contact's owner - the node that
+published the record - while other holders answer a compact "held", so
+a converged cluster moves one registration blob per pull instead of
+one per holder.  When only held copies answer (the owner crashed, or
+restarted empty), the requester re-asks one holder directly and still
+gets the record - one extra LAN round trip, paid only in the degraded
+case, keeping the keep-everything guarantee intact.
+
+
 Fleet-wide observability recipes: the exact cluster contact count is
 `sum(owned_contacts)` across your per-node stat scrapes (Prometheus
 recording rule or a Grafana query); each node's convergence progress

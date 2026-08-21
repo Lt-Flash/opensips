@@ -221,6 +221,29 @@ modparam("usrloc", "db_url", "mysql://opensips:pwd@10.0.0.5/opensips")
 ```
 
 
+Failover is completed by **orphan adoption**: when a node dies, its
+registrations survive everywhere (nothing is ever dropped), and after
+a short settle delay each survivor takes ownership of its
+deterministic share (*aorhash %% survivors*) of the dead node's
+*adoptable* contacts - anycast ones (any node's matching anycast
+socket traverses the NAT pinhole) and Path'd ones (pings ride the
+Path through the live edge proxy) - first re-stamping the copies it
+already holds, then importing from the database the ones it never
+pulled.  Pinging and row maintenance resume within seconds instead of
+pausing until each device re-registers; a flapping node costs
+nothing (its return dequeues the adoption), and a returning node
+re-acquires its registrations organically through refreshes.
+Directly-connected contacts are deliberately not adopted - no other
+node's socket can reach them, so their repair remains the device's
+own re-REGISTER.  For VIP active/backup pairs the same machinery
+hooks the shared-tag transition: on BACKUP->ACTIVE the node imports
+the full table, the failed peer's rows re-derive as its own through
+the (VIP) socket column, and pinging takes over wholesale.  A lookup
+that finds only expired copies of a record also re-asks the cluster -
+targeted at the last known owner first - so a refresh this node never
+saw is recovered instead of answered with a 404.
+
+
 Unlike the older presets, "pull-sharing-cluster" arbitrates the
 fine-tuning knobs instead of silently ignoring them: refinements
 within the mode's envelope are honored (an explicit

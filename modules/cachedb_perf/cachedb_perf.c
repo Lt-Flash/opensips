@@ -3036,9 +3036,12 @@ static int pcache_pull_finish_ex(pcache_col_t *col, const str *key,
 	 * stored below; an oversize holder and a settled absence are final
 	 * answers - none of those wants a late reply. */
 	if (rc == 1 || sl->oversize || sl->negative >= sl->expect ||
-	        held_node > 0) {
-		/* held-only is concluded too: the holders withheld deliberately,
-		 * so no late value is coming to an orphan */
+	        held_complete) {
+		/* a held-COMPLETE exchange is concluded too: every peer spoke and
+		 * the holders withheld deliberately, so no late value is coming to
+		 * an orphan.  A timeout-with-held is NOT concluded - the silent
+		 * peer may still answer - so that one orphans as usual below, and
+		 * the forced leg runs off the held_node copy taken above. */
 		sl->id = 0;                  /* the slot is reusable from here */
 	} else {
 		sl->orphan = 1;

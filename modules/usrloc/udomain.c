@@ -1682,13 +1682,34 @@ int ul_pull_ledger_fetch(udomain_t* _d, str* _aor, struct urecord** _r)
  */
 int get_urecord_or_pull(udomain_t* _d, str* _aor, struct urecord** _r)
 {
-	if (get_urecord(_d, _aor, _r) == 0)
-		return 0;
+	ucontact_t *c;
+	time_t newest = 0;
+	int hint = 0;
 
-	if (cluster_mode != CM_PULL_SHARING)
+	if (get_urecord(_d, _aor, _r) == 0) {
+		if (cluster_mode != CM_PULL_SHARING)
+			return 0;
+
+		get_act_time();
+		for (c = (*_r)->contacts; c; c = c->next)
+			if (VALID_CONTACT(c, act_time))
+				return 0;
+
+		/* the record is a husk - every contact expired, the timer has
+		 * not swept it yet.  Treat it as a miss and ask the cluster,
+		 * hinting at the freshest copy's owner: if the registration
+		 * lives on anywhere (a refresh we never saw), it is there */
+		for (c = (*_r)->contacts; c; c = c->next)
+			if (c->expires > newest) {
+				newest = c->expires;
+				hint = ul_ct_owner_nid(c);
+			}
+		*_r = NULL;
+	} else if (cluster_mode != CM_PULL_SHARING) {
 		return 1;
+	}
 
-	return ul_pull_fetch(_d, _aor, _r);
+	return ul_pull_fetch(_d, _aor, _r, hint);
 }
 
 /*! \brief

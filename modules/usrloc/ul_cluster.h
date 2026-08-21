@@ -86,9 +86,11 @@ void ul_pull_publish_all_owned(void);
 int ul_pull_absorb_blob(struct udomain *domain, str *aor, str *blob);
 
 /* pull-sharing: the shared-cache half of get_urecord_or_pull().  The
- * caller MUST hold the domain lock for @aor.  Returns like get_urecord:
- * 0 found (@r set), 1 not found. */
-int ul_pull_fetch(struct udomain *domain, str *aor, urecord_t **r);
+ * caller MUST hold the domain lock for @aor.  @hint_nid > 0 asks that
+ * node first (falling back to the broadcast); 0 asks everyone.
+ * Returns like get_urecord: 0 found (@r set), 1 not found. */
+int ul_pull_fetch(struct udomain *domain, str *aor, urecord_t **r,
+		int hint_nid);
 
 /* pull-sharing ownership: is this node responsible for the contact
  * (pinging, DB maintenance)?  Unicast: accepted on a local socket means

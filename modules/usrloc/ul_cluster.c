@@ -20,7 +20,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <poll.h>
+#include <errno.h>
+
 #include "../../forward.h"
+#include "../cachedb_perf/pull_api.h"
 
 #include "ul_cluster.h"
 #include "ul_mod.h"
@@ -35,6 +39,11 @@ str ul_shtag_key = str_init("_st");
 
 int ul_my_nid;
 str ul_onid_key = str_init("_onid");
+
+/* the async pull API, for owner-hinted (targeted) pulls; optional -
+ * without it every pull is simply the broadcast ask */
+static pcache_pull_api_t ul_pull_api;
+static int ul_pull_api_ok;
 
 int ul_ct_owner_nid(ucontact_t *c)
 {
@@ -90,6 +99,12 @@ int ul_init_cluster(void)
 		if (ul_my_nid <= 0)
 			LM_WARN("no clusterer node id yet - anycast ownership will "
 			        "not resolve until the cluster forms\n");
+
+		if (load_pcache_pull_api(&ul_pull_api) == 0)
+			ul_pull_api_ok = 1;
+		else
+			LM_INFO("cachedb_perf pull API not exported - owner hints "
+			        "disabled, pulls stay broadcast-only\n");
 	}
 
 	/* register handler for processing usrloc packets to the clusterer module */
@@ -582,18 +597,58 @@ void ul_pull_unpublish(urecord_t *r)
  * holds the domain lock for @aor - which also means the bounded pull
  * wait (pull_timeout_ms) runs under that slot lock; only genuine remote
  * misses pay it, and those are negative-cached. */
-int ul_pull_fetch(struct udomain *domain, str *aor, urecord_t **r)
+int ul_pull_fetch(struct udomain *domain, str *aor, urecord_t **r,
+		int hint_nid)
 {
 	str key, val = STR_NULL;
 	int rc;
 
 	*r = NULL;
 	if (!cdbc)
-		return 1;
+		return ul_pull_ledger_fetch(domain, aor, r);
 
 	key = ul_blob_key(domain->name, aor);
 	if (!key.len)
 		return 1;
+
+	/* a fresh owner hint turns the broadcast ask into a targeted one -
+	 * typically when re-fetching a record whose local copy just expired:
+	 * if it lives on anywhere, it lives on (extended) at its owner */
+	if (hint_nid > 0 && hint_nid != ul_my_nid && ul_pull_api_ok) {
+		unsigned int handle;
+		int fd;
+
+		rc = ul_pull_api.start_at(cdbc, &key, hint_nid, &fd, &handle);
+		if (rc == 1) {
+			struct pollfd pfd = { .fd = fd, .events = POLLIN };
+			int left = 100;                     /* ms */
+
+			while (left > 0) {
+				int n = poll(&pfd, 1, left);
+
+				if (n > 0)
+					break;
+				if (n < 0 && errno == EINTR) {
+					left -= 1;
+					continue;
+				}
+				break;
+			}
+
+			rc = ul_pull_api.finish(cdbc, &key, handle, &val);
+			if (rc == 1) {
+				rc = ul_pull_absorb_blob(domain, aor, &val);
+				pkg_free(val.s);
+				if (rc > 0)
+					return get_urecord(domain, aor, r);
+			}
+			/* the hinted node had nothing (or nothing usable) - a lone
+			 * negative is not the cluster's answer, so ask everyone */
+		} else if (rc == 0) {
+			/* a cached negative IS the cluster's answer */
+			return ul_pull_ledger_fetch(domain, aor, r);
+		}
+	}
 
 	rc = cdbf.get(cdbc, &key, &val);
 	if (rc < 0)

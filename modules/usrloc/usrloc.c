@@ -60,6 +60,7 @@ int bind_usrloc(usrloc_api_t* api)
 
 	/* record manipulation */
 	api->get_urecord         = get_urecord;
+	api->get_urecord_or_pull = get_urecord_or_pull;
 	api->get_global_urecord  = get_global_urecord;
 	api->release_urecord     = release_urecord;
 	api->insert_urecord      = insert_urecord;

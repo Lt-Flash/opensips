@@ -155,7 +155,7 @@ int is_registered(struct sip_msg* _m, void *_d, str* _a)
 
 	LM_DBG("checking aor <%.*s>\n",aor.len,aor.s);
 	ul.lock_udomain(ud, &aor);
-	if (ul.get_urecord(ud, &aor, &r) == 0) {
+	if (ul.get_urecord_or_pull(ud, &aor, &r) == 0) {
 		for ( c=r->contacts; c && (ret==NOT_FOUND); c=c->next ) {
 			if (VALID_CONTACT(c,get_act_time())) {
 				/* populate the 'attributes' avp */
@@ -238,7 +238,7 @@ int is_contact_registered(struct sip_msg* _m, void *_d, str* _a,
 	}
 
 	ul.lock_udomain(ud, &aor);
-	if (ul.get_urecord(ud, &aor, &r) == 1) {
+	if (ul.get_urecord_or_pull(ud, &aor, &r) == 1) {
 		LM_DBG("AoR '%.*s' not found in usrloc!\n", aor.len, aor.s);
 		ul.unlock_udomain(ud, &aor);
 		return NOT_FOUND;
@@ -350,7 +350,7 @@ int is_ip_registered(struct sip_msg* _m, void* _d, str* _a, pv_spec_t *ip_spec,p
 	}
 
 	ul.lock_udomain(ud, &aor);
-	if (ul.get_urecord(ud, &aor, &r) == 1) {
+	if (ul.get_urecord_or_pull(ud, &aor, &r) == 1) {
 		LM_DBG("no contact found for aor=<%.*s>\n", aor.len, aor.s);
 		goto out_unlock_notfound;
 	}

@@ -576,6 +576,37 @@ void ul_pull_unpublish(urecord_t *r)
 		LM_ERR("failed to withdraw <%.*s>\n", key.len, key.s);
 }
 
+/* The miss half of get_urecord_or_pull(): ask the shared cache, whose
+ * vtable get() hides whether the answer was local state or a completed
+ * cluster pull (CP-15), and absorb a hit into local memory.  The caller
+ * holds the domain lock for @aor - which also means the bounded pull
+ * wait (pull_timeout_ms) runs under that slot lock; only genuine remote
+ * misses pay it, and those are negative-cached. */
+int ul_pull_fetch(struct udomain *domain, str *aor, urecord_t **r)
+{
+	str key, val = STR_NULL;
+	int rc;
+
+	*r = NULL;
+	if (!cdbc)
+		return 1;
+
+	key = ul_blob_key(domain->name, aor);
+	if (!key.len)
+		return 1;
+
+	rc = cdbf.get(cdbc, &key, &val);
+	if (rc < 0)
+		return 1;               /* absent, negative-cached, or no answer */
+
+	rc = ul_pull_absorb_blob(domain, aor, &val);
+	pkg_free(val.s);
+	if (rc <= 0)
+		return 1;
+
+	return get_urecord(domain, aor, r);
+}
+
 /* Restart bootstrap: after the ledger load, publish the blobs of every
  * record this node owns at least one contact of.  Only owners publish -
  * a foreign row is already in our memory for local lookups, and pulls

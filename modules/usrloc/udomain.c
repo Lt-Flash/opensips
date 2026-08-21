@@ -1449,6 +1449,22 @@ out:
 }
 
 /*! \brief
+ * As get_urecord(), except a local miss under pull-sharing asks the
+ * cluster before giving up (bounded, negative-cached).  Same locking
+ * contract as get_urecord(); identical to it in every other mode.
+ */
+int get_urecord_or_pull(udomain_t* _d, str* _aor, struct urecord** _r)
+{
+	if (get_urecord(_d, _aor, _r) == 0)
+		return 0;
+
+	if (cluster_mode != CM_PULL_SHARING)
+		return 1;
+
+	return ul_pull_fetch(_d, _aor, _r);
+}
+
+/*! \brief
  * Only relevant in a federation @cluster_mode.
  * Obtain urecord pointer if AoR exists in at least one location.
  *
@@ -1526,7 +1542,12 @@ int delete_urecord(udomain_t* _d, str* _aor, struct urecord* _r,
 	}
 
 	if (!_r) {
-		if (get_urecord(_d, _aor, &_r) > 0) {
+		/* pull-sharing: an explicit deletion event must find the record
+		 * wherever it lives - a REGISTER un-binding through this node is
+		 * authoritative even when another node accepted the binding */
+		if (cluster_mode == CM_PULL_SHARING && !skip_replication ?
+		        get_urecord_or_pull(_d, _aor, &_r) > 0 :
+		        get_urecord(_d, _aor, &_r) > 0) {
 			return 0;
 		}
 	}

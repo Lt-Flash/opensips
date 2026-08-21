@@ -128,7 +128,7 @@ fetch_urecord:
 	        && (flags & REG_LOOKUP_GLOBAL_FLAG))
 		rc = ul.get_global_urecord(d, &aor, &r);
 	else
-		rc = ul.get_urecord(d, &aor, &r);
+		rc = ul.get_urecord_or_pull(d, &aor, &r);
 
 	if (rc > 0) {
 		LM_DBG("'%.*s' Not found in usrloc\n", aor.len, ZSW(aor.s));

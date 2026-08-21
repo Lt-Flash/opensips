@@ -130,7 +130,7 @@ static inline int no_contacts(udomain_t* _d, struct save_ctx *_sctx,
 	int res;
 
 	ul.lock_udomain(_d, &_sctx->aor);
-	res = ul.get_urecord(_d, &_sctx->aor, &r);
+	res = ul.get_urecord_or_pull(_d, &_sctx->aor, &r);
 	if (res < 0) {
 		rerrno = R_UL_GET_R;
 		LM_ERR("failed to retrieve record from usrloc\n");
@@ -567,7 +567,7 @@ static inline int add_contacts(struct sip_msg* _m, contact_t* _c,
 	urecord_t* r;
 
 	ul.lock_udomain(_d, &_sctx->aor);
-	res = ul.get_urecord(_d, &_sctx->aor, &r);
+	res = ul.get_urecord_or_pull(_d, &_sctx->aor, &r);
 	if (res < 0) {
 		rerrno = R_UL_GET_R;
 		LM_ERR("failed to retrieve record from usrloc\n");

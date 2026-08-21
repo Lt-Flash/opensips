@@ -85,6 +85,11 @@ void ul_pull_publish_all_owned(void);
  * absorbed, or -1 for a blob this build refuses (foreign format). */
 int ul_pull_absorb_blob(struct udomain *domain, str *aor, str *blob);
 
+/* pull-sharing: the shared-cache half of get_urecord_or_pull().  The
+ * caller MUST hold the domain lock for @aor.  Returns like get_urecord:
+ * 0 found (@r set), 1 not found. */
+int ul_pull_fetch(struct udomain *domain, str *aor, urecord_t **r);
+
 /* pull-sharing ownership: is this node responsible for the contact
  * (pinging, DB maintenance)?  Unicast: accepted on a local socket means
  * ours - a pulled or foreign-row contact carries a non-local socket that

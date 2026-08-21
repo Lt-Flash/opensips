@@ -96,6 +96,14 @@ typedef struct usrloc_api {
 	int (*get_urecord) (udomain_t *d, str *aor, struct urecord **r);
 
 	/**
+	 * As @get_urecord, except a local miss under the pull-sharing
+	 * cluster mode asks the cluster before giving up (blocking, bounded
+	 * by the cache's pull timeout; misses are negative-cached).  In
+	 * every other mode it behaves exactly like @get_urecord.
+	 */
+	int (*get_urecord_or_pull) (udomain_t *d, str *aor, struct urecord **r);
+
+	/**
 	 * Fetch a given AoR from an usrloc domain, across multiple locations.
 	 * Thus, this function is only relevant when using
 	 * cluster_mode == CM_FEDERATION_CACHEDB.  The function will return success

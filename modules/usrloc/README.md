@@ -135,6 +135,93 @@ contains precise details on how to achieve this setup (including full
 NoSQL storage support).
 
 
+#### "Pull Sharing" Topology
+
+
+In a pull-sharing cluster, each node fully owns the registrations it
+accepts and lazily learns everyone else's: a lookup that misses local
+memory asks the cluster for the record - through a
+[cachedb\_perf](../cachedb_perf/README.md) collection with pull-on-miss
+enabled - and merges the answer into local memory, where it lives to
+its natural expiry like any other registration.  Each node thereby
+converges toward the full registered set through the traffic it
+actually serves, and its pull rate decays toward zero as it gets
+there.  There is no eager replication: a contact refresh is a purely
+local event (plus a database write, see below), and only deletions
+and moved bindings (a device re-registering through a different node)
+are broadcast, because those are the only events remote copies must
+not outlive.
+
+
+Responsibility does not converge, only data does: every contact has
+exactly one owner - the node that accepted it (re-derived from the
+socket after a restart; under anycast, from the owner node id each
+contact carries) - and only the owner pings it and maintains its
+database row.  A registration landing on another node simply moves
+the ownership there, contact by contact.
+
+
+The cluster keeps every record safe: no usrloc entry is ever dropped
+because a node died or restarted - survivors keep everything they
+hold to natural expiry or an explicit de-registration, whatever the
+contact's transport.  With a [db url](#param_db_url) configured, the
+mode writes every registration event through to SQL immediately, and
+that table doubles as three things: crash-proof backup (a record
+exists there from the moment it is accepted), restart bootstrap (a
+starting node preloads it and begins nearly converged), and the last
+resort of the lookup chain (a record whose owner crashed before any
+peer pulled it is still served, by any node, from the database).
+Rows are keyed by *(username, domain, contact)* - deployments must
+add a unique index over these columns - and written with
+insert-on-duplicate-update semantics, so a re-registration through a
+different node atomically re-stamps the very same row.  Without a
+database the mode still works as a pure-pull cluster: a restarted
+node starts empty and re-learns through traffic, but records held
+only by a crashed node are lost until their devices re-register.
+
+
+Requirements: a [location cluster](#param_location_cluster), and a
+[cachedb url](#param_cachedb_url) pointing to a **cachedb\_perf**
+collection that has pull-on-miss enabled and is listed in its
+`replicate_collections` (use the `bin` pull transport - registration
+records exceed the datagram-bound `clctr` budget).  A working
+two-node setup:
+
+
+```opensips title="Pull-sharing cluster node"
+loadmodule "clusterer.so"
+modparam("clusterer", "my_node_id", 1)
+
+loadmodule "cachedb_perf.so"
+modparam("cachedb_perf", "cache_collections", "ul=14")
+modparam("cachedb_perf", "sync_cluster_id", 1)
+modparam("cachedb_perf", "pull_on_miss", 1)
+modparam("cachedb_perf", "pull_transport", "bin")
+modparam("cachedb_perf", "pull_max_value", 8192)
+modparam("cachedb_perf", "replicate_collections", "ul")
+
+loadmodule "usrloc.so"
+modparam("usrloc", "working_mode_preset", "pull-sharing-cluster")
+modparam("usrloc", "location_cluster", 1)
+modparam("usrloc", "cachedb_url", "perf://ul")
+modparam("usrloc", "db_url", "mysql://opensips:pwd@10.0.0.5/opensips")
+```
+
+
+Unlike the older presets, "pull-sharing-cluster" arbitrates the
+fine-tuning knobs instead of silently ignoring them: refinements
+within the mode's envelope are honored (an explicit
+"[sql write mode](#param_sql_write_mode) write-back", trading ledger
+freshness for latency, or
+"[restart persistency](#param_restart_persistency) none", waiving
+the bootstrap while keeping the write-through), while contradictions
+- a different [cluster mode](#param_cluster_mode), SQL knobs without
+a [db url](#param_db_url), "sql\_write\_mode none" WITH a db url,
+"sync-from-cluster" persistency, "cooperation"
+[pinging](#param_pinging_mode), or a CONTACT\_CALLID
+[matching mode](#param_matching_mode) - are startup errors.
+
+
 #### "N Contact Pings" Problem
 
 
@@ -611,7 +698,8 @@ modparam("usrloc", "db_url", "dbdriver://username:password@dbhost/dbname")
 
 URL of a NoSQL database to be used. Only required in a
 cachedb-enabled
-**[cluster mode](#param_cluster_mode)**.
+**[cluster mode](#param_cluster_mode)**.  The "pull-sharing" mode
+requires a **perf://** URL here (a cachedb\_perf collection).
 
 
 *Default value is "none".*
@@ -630,7 +718,10 @@ modparam("usrloc", "cachedb_url", "mongodb://10.0.0.4:27017/opensipsDB.userlocat
 A pre-defined working mode for the usrloc module.  Setting this
 parameter will override any [cluster mode](#param_cluster_mode),
 [restart persistency](#param_restart_persistency) and
-[sql write mode](#param_sql_write_mode) settings.
+[sql write mode](#param_sql_write_mode) settings - except under
+"pull-sharing-cluster", which arbitrates explicitly-set knobs
+instead of ignoring them (refinements are honored, contradictions
+are startup errors).
 
 
 - **"single-instance-no-db"** - This
@@ -683,6 +774,15 @@ OpenSIPS will run with a "full-sharing-cachedb"
 [cluster mode](#param_cluster_mode), where all location data strictly
 resides in a NoSQL database, thus it will have natural restart
 persistency.
+- **"pull-sharing-cluster"** -
+OpenSIPS will run with a "pull-sharing"
+[cluster mode](#param_cluster_mode); with a
+[db url](#param_db_url) configured it derives "load-from-sql"
+[restart persistency](#param_restart_persistency) and "write-through"
+[sql write mode](#param_sql_write_mode) (the table is the cluster's
+backup and bootstrap store), without one it runs as a pure-pull
+cluster.  See the
+["Pull Sharing" topology](#pull_sharing_topology) section.
 
 
 Refer to section
@@ -739,6 +839,14 @@ among participating OpenSIPS nodes. Consequently, the
 Multiple OpenSIPS boxes using a common
 [db url](#param_db_url) without necessarily being aware
 of each other.
+- *"pull-sharing"* -
+each node owns what it accepts and lazily pulls the rest from the
+cluster on lookup misses, through a cachedb\_perf collection.  The
+[location cluster](#param_location_cluster) and
+[cachedb url](#param_cachedb_url) (a perf:// URL) parameters are
+mandatory; a [db url](#param_db_url) is optional but strongly
+recommended (backup, restart bootstrap and crash coverage).  See
+the ["Pull Sharing" topology](#pull_sharing_topology) section.
 
 
 *Default value is *"none" (single instance mode)*.*
@@ -1150,6 +1258,12 @@ for those modes will be silently discarded.
 modparam("usrloc", "pinging_mode", "ownership")
 ...
 ```
+
+
+Under the "pull-sharing" [cluster mode](#param_cluster_mode),
+pinging is always "ownership" (each node pings exactly the contacts
+it accepted); "cooperation" is rejected at startup, since its
+hash-based split assumes every node holds every contact.
 
 
 #### mi_dump_kv_store (integer)

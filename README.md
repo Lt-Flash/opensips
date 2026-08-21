@@ -43,6 +43,54 @@ one remote store on the SIP path). Pull-sharing does neither:
 | SQL ledger (optional) | natural-key `(username, domain, contact)` upsert table: backup (write-back, eager deletes), restart bootstrap with expired-row sweep, lookup of last resort |
 | HELD protocol (optional) | `pull_authoritative_serve`: only the owner answers a pull with the value; passive holders answer a compact "held" and are asked directly only when the owner is gone |
 
+```mermaid
+flowchart LR
+    subgraph node1["every cluster node"]
+        REG["registrar<br/>async lookup"] --> UL["usrloc<br/>pull-sharing mode"]
+        UL --> CP["cachedb_perf<br/>ul collection + pull"]
+    end
+    CP <-- "pulls over bin (clusterer)" --> PEERS[("peer nodes")]
+    UL -- "write-back upserts, eager deletes" --> DB[("SQL ledger<br/>optional")]
+```
+
+## How a pull works
+
+A cold lookup suspends its transaction and asks the cluster; with
+`pull_authoritative_serve` on, only the owner ships the bytes:
+
+```mermaid
+sequenceDiagram
+    participant UA as caller
+    participant N3 as node 3 (cold)
+    participant N1 as node 1 (owner)
+    participant N2 as node 2 (passive holder)
+    UA->>N3: OPTIONS / INVITE alice
+    Note over N3: miss - transaction suspends,<br/>no worker blocked
+    N3->>N1: PULL alice
+    N3->>N2: PULL alice
+    N1-->>N3: value (authoritative)
+    N2-->>N3: held
+    Note over N3: absorb into local memory -<br/>the next lookup is a 0.46 ms local hit
+    N3->>UA: 302 / routed
+```
+
+A held answer proves the record exists, so a dead or restarted-empty
+owner costs one extra LAN round trip instead of a failure - even before
+the clusterer notices the node is gone:
+
+```mermaid
+sequenceDiagram
+    participant N3 as node 3
+    participant N1 as node 1 (owner, crashed)
+    participant N2 as node 2 (passive holder)
+    N3--xN1: PULL bob
+    N3->>N2: PULL bob
+    N2-->>N3: held
+    Note over N3: no value on offer, but a holder exists:<br/>one forced targeted ask
+    N3->>N2: PULL bob (force)
+    N2-->>N3: value (passive copy)
+```
+
 ## Minimal configuration
 
 ```
@@ -93,13 +141,31 @@ Without `db_url` the mode runs as a pure-pull cluster.
 * Fill: 1M REGISTERs at 5,000/s aggregate with pulls enabled everywhere —
   zero loss, zero livelock (REGISTER never touches the pull machinery).
 * Convergence: a cold node absorbed the full 1M set at exactly the offered
-  lookup rate (3,000/s, 337 s), flat from entry 0 to entry 1M.
+  lookup rate (3,000/s, 337 s).
 * Per-request SIP round-trip: **cold cross-node pull p50 1.4 ms** (p95 9 ms,
-  p99 37 ms), **warm local hit p50 0.46 ms** (p99 0.78 ms), both independent
-  of collection size.
+  p99 37 ms); **warm local hit p50 0.46 ms** (p99 0.78 ms), flat at every
+  table size — the steady-state cost is size-independent.  The cold *mean*
+  sits near 2 ms for the first ~600k pulls and drifts to ~6 ms late in the
+  sweep: queueing under the sustained bulk pull, not record-get cost, and
+  absorption never dropped below the offered rate.
 * Tuned run bookkeeping: pulls requested == received == stored == entries ==
   1,000,000; timeouts, slot starvation, orphans, misses all zero.
 * Warm re-sweep: 1M lookups, 100% answered locally, zero further pulls.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/pull-sharing/convergence-dark.svg">
+  <img alt="Entries held on the cold node versus time: a straight climb to 1,000,000 at 337 seconds, tracking the offered 3,000/s" src="doc/pull-sharing/convergence-light.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/pull-sharing/latency-dark.svg">
+  <img alt="Per-request round-trip across the sweep: cold pull mean ~2 ms with p95 band, drifting up late in the sweep; warm local hits flat at 0.46 ms" src="doc/pull-sharing/latency-light.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/pull-sharing/throughput-dark.svg">
+  <img alt="Pulls absorbed per second versus entries already held: flat at the offered 3,000/s from zero to one million entries" src="doc/pull-sharing/throughput-light.svg">
+</picture>
 
 ## Observability
 

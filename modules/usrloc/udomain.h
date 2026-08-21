@@ -175,6 +175,10 @@ int get_urecord_or_pull(udomain_t* _d, str* _aor, struct urecord** _r);
 /* pull-sharing: reap long-expired ledger rows (crashed-owner orphans) */
 int db_grace_sweep_udomain(udomain_t* _d);
 
+/* pull-sharing: last-resort lookup straight from the shared ledger;
+ * caller holds the domain lock.  0 found / 1 not found. */
+int ul_pull_ledger_fetch(udomain_t* _d, str* _aor, struct urecord** _r);
+
 /*! \brief
  * Only relevant in a federation @cluster_mode.
  * Obtain urecord pointer if AoR exists in at least one location.

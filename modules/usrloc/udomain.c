@@ -1532,6 +1532,168 @@ out:
 	return 1;   /* Nothing found */
 }
 
+/* pull-sharing: the last resort of the lookup chain - read the AoR
+ * straight from the shared ledger.  This is what keeps every record
+ * servable by every node through an owner crash: the write-through
+ * ledger holds each record from the moment it exists, so a lookup that
+ * misses both local memory and the cluster's stores still finds it
+ * here, with no event coordination at all.  Rows merge through the
+ * same per-contact machinery a pulled blob uses; rows this node owns
+ * come back clean (a restarted owner re-acquires on first lookup even
+ * without a bootstrap), everything else becomes a convergence copy.
+ * The caller holds the domain lock for @aor. */
+int ul_pull_ledger_fetch(udomain_t* _d, str* _aor, struct urecord** _r)
+{
+	static const struct ct_match cmatch = {CT_MATCH_CONTACT_ONLY, NULL};
+	ucontact_info_t *ci;
+	db_key_t columns[UL_COLS - 2];
+	db_key_t keys[2];
+	db_val_t vals[2];
+	db_res_t* res = NULL;
+	str contact;
+	char *domain;
+	unsigned short aorhash, clabel;
+	unsigned int rlabel;
+	int i, rc, absorbed = 0;
+	urecord_t* r = NULL;
+	ucontact_t* c;
+
+	*_r = NULL;
+	if (!ul_dbh)
+		return 1;
+
+	keys[0] = &user_col;
+	keys[1] = &domain_col;
+
+	columns[0] = &contactid_col;
+	columns[1] = &contact_col;
+	columns[2] = &expires_col;
+	columns[3] = &q_col;
+	columns[4] = &callid_col;
+	columns[5] = &cseq_col;
+	columns[6] = &flags_col;
+	columns[7] = &cflags_col;
+	columns[8] = &user_agent_col;
+	columns[9] = &received_col;
+	columns[10] = &path_col;
+	columns[11] = &sock_col;
+	columns[12] = &methods_col;
+	columns[13] = &last_mod_col;
+	columns[14] = &sip_instance_col;
+	columns[15] = &kv_store_col;
+	columns[16] = &attr_col;
+
+	memset(vals, 0, sizeof vals);
+
+	vals[0].type = DB_STR;
+	if (use_domain) {
+		vals[1].type = DB_STR;
+		domain = q_memchr(_aor->s, '@', _aor->len);
+		vals[0].val.str_val.s = _aor->s;
+		if (domain==0) {
+			vals[0].val.str_val.len = 0;
+			vals[1].val.str_val = *_aor;
+		} else {
+			vals[0].val.str_val.len = domain - _aor->s;
+			vals[1].val.str_val.s = domain+1;
+			vals[1].val.str_val.len = _aor->s + _aor->len - domain - 1;
+		}
+	} else {
+		vals[0].val.str_val = *_aor;
+	}
+
+	if (ul_dbf.use_table(ul_dbh, _d->name) < 0) {
+		LM_ERR("failed to use table %.*s\n", _d->name->len, _d->name->s);
+		return 1;
+	}
+
+	if (ul_dbf.query(ul_dbh, keys, 0, vals, columns, use_domain ? 2:1,
+	                 UL_COLS - 2, 0, &res) < 0) {
+		LM_ERR("ledger query failed\n");
+		return 1;
+	}
+
+	get_act_time();
+
+	for (i = 0; i < RES_ROW_N(res); i++) {
+		ci = dbrow2info(ROW_VALUES(RES_ROWS(res) + i), &contact);
+		if (!ci)
+			continue;
+		if (ci->expires <= act_time)
+			continue;                       /* awaiting the grace sweep */
+
+		if (!r && get_urecord(_d, _aor, &r) != 0) {
+			if (insert_urecord(_d, _aor, &r, 1, NULL, NULL) != 0) {
+				LM_ERR("failed to create the record for <%.*s>\n",
+				       _aor->len, _aor->s);
+				break;
+			}
+		}
+
+		/* contacts get LOCAL ids, exactly like a pulled blob's do; a
+		 * re-owned row's original id thereby retires - harmless, since
+		 * every ledger write in this mode is a natural-key upsert */
+		unpack_indexes(ci->contact_id, &aorhash, &rlabel, &clabel);
+
+		rc = get_ucontact(r, &contact, ci->callid, ci->cseq, &cmatch, &c);
+		switch (rc) {
+		case -2:
+		case -1:
+			break;                          /* ours is as new or newer */
+
+		case 0:
+			ci->contact_id = pack_indexes((unsigned short)r->aorhash,
+						r->label, (unsigned short)c->label);
+			if (update_ucontact(r, c, ci, NULL, 1) != 0) {
+				LM_ERR("failed to absorb ledger update of <%.*s>\n",
+				       contact.len, contact.s);
+				break;
+			}
+			absorbed++;
+
+			if (ul_ct_is_mine(c))
+				c->state = CS_SYNC;
+			else
+				c->flags |= FL_PULLED | FL_MEM;
+			break;
+
+		case 1:
+			if (clabel >= r->next_clabel) {
+				r->next_clabel = CLABEL_NEXT(clabel);
+			} else {
+				clabel = r->next_clabel;
+				r->next_clabel = CLABEL_NEXT(r->next_clabel);
+			}
+			ci->contact_id = pack_indexes((unsigned short)r->aorhash,
+						r->label, (unsigned short)clabel);
+
+			if (insert_ucontact(r, &contact, ci, NULL, 1, &c) != 0) {
+				LM_ERR("failed to absorb ledger row <%.*s>\n",
+				       contact.len, contact.s);
+				break;
+			}
+			absorbed++;
+
+			if (ul_ct_is_mine(c)) {
+				/* our own row (restart without bootstrap): re-owned,
+				 * and already in the ledger */
+				c->state = CS_SYNC;
+			} else {
+				c->flags |= FL_PULLED | FL_MEM;
+			}
+			break;
+		}
+	}
+
+	ul_dbf.free_result(ul_dbh, res);
+
+	if (absorbed)
+		LM_DBG("served <%.*s> from the ledger (%d contacts)\n",
+		       _aor->len, _aor->s, absorbed);
+
+	return get_urecord(_d, _aor, _r);
+}
+
 /*! \brief
  * As get_urecord(), except a local miss under pull-sharing asks the
  * cluster before giving up (bounded, negative-cached).  Same locking

@@ -599,12 +599,14 @@ int ul_pull_fetch(struct udomain *domain, str *aor, urecord_t **r)
 
 	rc = cdbf.get(cdbc, &key, &val);
 	if (rc < 0)
-		return 1;               /* absent, negative-cached, or no answer */
+		/* no peer holds it (or none answered) - the shared ledger is
+		 * the last resort, and the one that survives an owner crash */
+		return ul_pull_ledger_fetch(domain, aor, r);
 
 	rc = ul_pull_absorb_blob(domain, aor, &val);
 	pkg_free(val.s);
 	if (rc <= 0)
-		return 1;
+		return ul_pull_ledger_fetch(domain, aor, r);
 
 	return get_urecord(domain, aor, r);
 }

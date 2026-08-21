@@ -91,6 +91,48 @@ sequenceDiagram
     N2-->>N3: value (passive copy)
 ```
 
+## The async lookup
+
+The registrar exports `lookup()` as an asynchronous command, so the script
+form is just:
+
+```
+async(lookup("location"), lookup_resume);
+```
+
+What happens underneath:
+
+* If a live local record answers the request — the common case once a node
+  has converged — the lookup completes inline: no suspension, no extra
+  cost over the plain synchronous `lookup()`.
+* On a miss, usrloc starts a cluster pull (owner-hinted when an expired
+  local copy names the last owner) and hands the async framework the
+  pull's **eventfd**. The SIP transaction suspends; **no worker is held**.
+  The eventfd exists per pull slot and is created before the fork, which
+  is what lets the reply land in whichever process the transport picked
+  and still wake the one that asked.
+* When the answer (or the `pull_timeout_ms` deadline) fires, a worker
+  resumes the transaction: it collects the pull, absorbs the record into
+  local memory, and runs the normal lookup. The resume route replies —
+  guard with `t_check_trans()` as in the example above.
+* Everything that cannot suspend falls back to the synchronous path
+  transparently — other cluster modes, branch-AoR lookups, a pull that
+  cannot start — so the script never needs a second code path.
+
+Why it matters: a *blocking* pull occupies a worker for up to
+`pull_timeout_ms`, and pull replies themselves need a worker to be
+processed. Under a miss storm every worker can end up blocked in a wait
+whose answer is stuck behind it in the queue — the classic reply-starvation
+collapse. The async form removes that coupling entirely; combined with the
+rule that **REGISTER never pulls** (a registration is stored locally and
+never consults the cluster), the bench filled 1M contacts at 5,000
+REGISTER/s with pulls enabled everywhere and lost nothing.
+
+One deliberate exception: the held-only *forced re-ask* (previous section)
+runs inside the resuming worker, blocking it for at most one more
+`pull_timeout_ms` — a bounded price paid only when a record's owner is
+gone, against a holder that proved alive milliseconds earlier.
+
 ## Minimal configuration
 
 ```

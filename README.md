@@ -264,6 +264,53 @@ elasticity advantages stand today.
   <img alt="Peak shared memory versus what is still used after every record expired, per allocator and node role" src="doc/pull-sharing/mem-retention-light.svg">
 </picture>
 
+### With a separate cache arena
+
+`arena_hugepage_mb` gives cachedb_perf its own reservation outside
+OpenSIPS shared memory: the whole size is mapped and pinned at start-up,
+walking a tier ladder — `MAP_HUGETLB` 2M pages, THP via `MADV_HUGEPAGE`,
+THP via `MADV_COLLAPSE`, plain 4K — to whatever the host can deliver at
+that moment (reported per node as `cachedb_perf:memory_tier_active`).
+The cache's chunks are bump-allocated from it and never handed back;
+once it is full, further chunks fall back to `shm_malloc`, so an
+undersized arena degrades into the no-arena behaviour rather than
+failing. The same 1M protocol was re-run with a 1,024 MB arena on every
+node (`arena_hugepage_mb=1024`, hugetlb overcommit off, so the
+reservations landed on THP-collapse or plain 4K pages); latency figures
+below quote the worse of the two load generators.
+
+| at the 1M-pulled point | F_MALLOC | HG_MALLOC v3 | F_MALLOC + arena | HG_MALLOC v3 + arena |
+|---|---|---|---|---|
+| puller, shm real-used | 1,953 MB | 1,761 MB | 1,522 MB | 1,390 MB |
+| cache arena used (of 1,024 MB reserved) | — | — | 426 MB | 426 MB |
+| shm + arena | 1,953 MB | 1,761 MB | 1,948 MB | 1,816 MB |
+| committed / mapped to hold that | 3,072 MB fixed | 2,336 MB (114 × 16 MB) | 3,072 MB fixed + 1,024 MB arena | 1,488 MB (61 × 16 MB) + 1,024 MB arena |
+| cold pull p50 / p95 / p99 | 1.5 / 8.9 / 34 ms | 1.35 / 16 / 60 ms | 1.4 / 5.6 / 31 ms | 1.2 / 12 / 54 ms |
+| warm hit p99 | 0.78 ms | 15 ms | 0.75 ms | 0.77 ms |
+| requests lost during the sweeps | 0 | 210 | 0 | 0 (8 pulls timed out in one 2.7 s stall and were answered 404) |
+| shm still used after all 1M expired (owner / puller) | 236 / 448 MB | 238 / 450 MB | 23 / 23 MB | 23 / 23 MB |
+
+Measured: the arena does not make the data smaller — shm plus arena lands
+within 3% of the no-arena total in every configuration, because it is
+the same cache relocated — but it changes what is left behind and the
+tail. With the cache's hash tables and chunks outside shm, both
+allocators return to their 23 MB start-up baseline after the mass expiry
+instead of retaining a quarter of the peak (the arena's own high-water
+mark, 426 MB on the puller, stays put by design), and HG_MALLOC v3's
+warm-hit p99 drops from 15 ms to 0.77 ms — F_MALLOC's figure — with
+zero lost requests, while it commits 1,488 MB instead of 2,336 MB for
+the puller because the cache no longer flows through its growth path.
+What remains on HG v3 is the cold-sweep tail (p99 54 ms against
+F_MALLOC's 31 ms, including one ~2.7 s stall at the very end of the
+sweep; 946 datagrams were dropped at the SIP socket over the sweep, all
+recovered by the client's retransmit) and the arena's price: 1 GB pinned per node up
+front, of which this workload used 426 MB.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/pull-sharing/mem-used-arena-dark.svg">
+  <img alt="Shared memory really used versus contacts held, owner and pulling node: HG_MALLOC v3 and F_MALLOC as before, with the same allocators plus cachedb_perf's separate cache arena as dotted lines running about 400 MB lower at one million contacts" src="doc/pull-sharing/mem-used-arena-light.svg">
+</picture>
+
 ## Observability
 
 * Exact fleet contact count: `sum(owned_contacts)` across nodes (ownership

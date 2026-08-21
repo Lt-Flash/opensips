@@ -499,7 +499,7 @@ modparam("cachedb_perf", "replicate_collections", "th")
 	<section id="param_pull_slots" xreflabel="pull_slots">
 		<title><varname>pull_slots</varname> (integer)</title>
 		<para>
-		How many pulls may be in flight at once (8..65536).  A miss that
+		How many pulls may be in flight at once (8..16384).  A miss that
 		finds the pool dry is not queued - it is answered as a miss, and
 		counted in <emphasis>pulls_skip_noslot</emphasis>.
 		</para>
@@ -512,8 +512,12 @@ modparam("cachedb_perf", "replicate_collections", "th")
 		concurrent miss burst - the peak miss rate times
 		<varname>pull_timeout_ms</varname> - not for the worker count.
 		Each slot costs roughly <varname>pull_max_key</varname> +
-		<varname>pull_max_value</varname> bytes of shared memory, so even
-		generous pools are cheap.
+		<varname>pull_max_value</varname> bytes of shared memory, plus one
+		file descriptor <emphasis>in every OpenSIPS process</emphasis>: the
+		wakeup eventfds must be created before the fork, so a reply landing
+		in any process can wake the one that asked.  A large pool therefore
+		needs a matching <varname>open_files_limit</varname>; startup fails
+		with a clear error when the fd limit is too low.
 		</para>
 		<para>
 		<emphasis>

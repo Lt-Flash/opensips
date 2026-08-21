@@ -132,7 +132,8 @@ static int  pc_shtag_cid;              /* parsed tag cluster                 */
  * users suspend transactions instead of workers, so hundreds can be in
  * flight at once - size this for the expected concurrent miss burst, not
  * for the worker count.  A pull that finds the pool dry is not queued, it
- * is a miss. */
+ * is a miss.  Every slot carries a pre-fork eventfd, so each slot costs
+ * one fd in EVERY process - open_files_limit bounds this, hence the cap. */
 static int pull_slot_count = 64;
 /* Defaults for the pull_max_value / pull_max_key modparams below. Sized from
  * measurement rather than round numbers: the live cachedb_perf collections on
@@ -5012,10 +5013,10 @@ static int mod_init(void)
 				pull_max_key = pull_max_key < 1
 					? PCACHE_PULL_MAX_KEY_DEF : PCACHE_PULL_MAX_KEY;
 			}
-			if (pull_slot_count < 8 || pull_slot_count > 65536) {
-				LM_WARN("pull_slots %d out of range 8..65536 - clamping\n",
+			if (pull_slot_count < 8 || pull_slot_count > 16384) {
+				LM_WARN("pull_slots %d out of range 8..16384 - clamping\n",
 					pull_slot_count);
-				pull_slot_count = pull_slot_count < 8 ? 64 : 65536;
+				pull_slot_count = pull_slot_count < 8 ? 64 : 16384;
 			}
 			pull_slot_sz = (int)sizeof(struct pcache_pull_slot)
 				+ pull_max_key + pull_max_value;
@@ -5053,8 +5054,10 @@ static int mod_init(void)
 			for (i = 0; i < pull_slot_count; i++) {
 				pull_slot_at(i)->efd = eventfd(0, EFD_NONBLOCK);
 				if (pull_slot_at(i)->efd < 0) {
-					LM_ERR("cannot create the pull wakeup fds: %s\n",
-						strerror(errno));
+					LM_ERR("cannot create the pull wakeup fds (pull_slots "
+						"%d - one fd per slot, in every process): %s - "
+						"raise open_files_limit or lower pull_slots\n",
+						pull_slot_count, strerror(errno));
 					return -1;
 				}
 			}

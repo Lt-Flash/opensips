@@ -174,7 +174,11 @@ bootstrap (a starting node preloads it and begins nearly converged -
 anything newer than the last flush is simply re-pulled on demand),
 and the last resort of the lookup chain (a record whose owner crashed
 before any peer pulled it is still served, by any node, from the
-database).
+database).  The bootstrap also tells the truth about time: rows that
+expired while the cluster was down are swept from the table before
+the load and never enter memory, so after a whole-cluster outage the
+first node to start cleans the graveyard once and later-starting
+nodes find only live registrations.
 Rows are keyed by *(username, domain, contact)* - deployments must
 add a unique index over these columns - and written with
 insert-on-duplicate-update semantics, so N nodes writing the same

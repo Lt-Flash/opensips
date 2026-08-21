@@ -466,6 +466,18 @@ int preload_udomain(db_con_t* _c, udomain_t* _d)
 	columns[17] = &attr_col;
 	columns[UL_COLS - 1] = &domain_col; /* "domain" always stays last */
 
+	/* pull-sharing: reap the long-expired rows BEFORE loading.  After a
+	 * whole-cluster outage the table is a graveyard - anything past the
+	 * grace is dead by definition, and sweeping it server-side here (one
+	 * statement, idempotent) means neither this node nor any node
+	 * starting after it wastes memory, expiry events or another sweep on
+	 * records that expired while the cluster was down. */
+	if (cluster_mode == CM_PULL_SHARING) {
+		get_act_time();
+		if (db_grace_sweep_udomain(_d) < 0)
+			LM_ERR("pre-load sweep failed - proceeding with the load\n");
+	}
+
 	if (ul_dbf.use_table(_c, _d->name) < 0) {
 		LM_ERR("sql use_table failed\n");
 		return -1;
@@ -543,6 +555,14 @@ int preload_udomain(db_con_t* _c, udomain_t* _d)
 					continue;
 				}
 			}
+
+			/* pull-sharing: a row already expired (the pre-load sweep
+			 * leaves a <= grace band) is never loaded - it would only
+			 * sit in memory until the first timer pass and fire a
+			 * long-stale expiry event */
+			if (cluster_mode == CM_PULL_SHARING
+			        && ci->expires <= act_time)
+				continue;
 
 			unpack_indexes(ci->contact_id, &aorhash, &rlabel, &clabel);
 

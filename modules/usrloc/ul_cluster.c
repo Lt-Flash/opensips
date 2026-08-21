@@ -22,6 +22,8 @@
 
 #include "../../forward.h"
 
+#include "../../parser/parse_uri.h"
+
 #include "ul_cluster.h"
 #include "ul_mod.h"
 #include "dlist.h"
@@ -1527,9 +1529,93 @@ error_unlock:
 	return -1;
 }
 
+/* is the UA leg of this contact connection-oriented?  Judged from the
+ * received URI (the NAT binding) or the contact URI - NOT from the
+ * socket or Path, which describe our side and the proxy chain */
+static int ul_ct_conn_oriented(ucontact_t *c)
+{
+	struct sip_uri puri;
+	str *u = c->received.s ? &c->received : &c->c;
+
+	if (parse_uri(u->s, u->len, &puri) < 0)
+		return 0;
+	return puri.proto == PROTO_TCP || puri.proto == PROTO_TLS
+	    || puri.proto == PROTO_WS  || puri.proto == PROTO_WSS;
+}
+
+/* pull-sharing: a dead node's connection-oriented contacts are corpses -
+ * the clients are reachable only over connections that died with it.
+ * Dropping them now means an immediate 404 and a fast re-REGISTER
+ * instead of Path-routing into a dead box until natural expiry.  Every
+ * survivor runs this on the same event; the ledger deletes overlap
+ * idempotently, and a node without a DB handle in this process simply
+ * leaves the rows to the grace sweep. */
+static void ul_pull_node_down_purge(int dead_nid)
+{
+	dlist_t *dl;
+	udomain_t *dom;
+	map_iterator_t it, prev;
+	void **dest;
+	urecord_t *r;
+	ucontact_t *c, *t;
+	int i, purged = 0, touched;
+
+	for (dl = root; dl; dl = dl->next) {
+		dom = dl->d;
+		for (i = 0; i < dom->size; i++) {
+			lock_ulslot(dom, i);
+			map_first(dom->table[i].records, &it);
+			while (iterator_is_valid(&it)) {
+				dest = iterator_val(&it);
+				if (!dest)
+					break;
+				r = (urecord_t *)*dest;
+				prev = it;
+				iterator_next(&it);
+
+				touched = 0;
+				c = r->contacts;
+				while (c) {
+					t = c;
+					c = c->next;
+
+					if (ul_ct_is_mine(t)
+					        || ul_ct_owner_nid(t) != dead_nid
+					        || !ul_ct_conn_oriented(t))
+						continue;
+
+					if (sql_wmode == SQL_WRITE_THROUGH && ul_dbh
+					        && db_delete_ucontact_natkey(t) < 0)
+						LM_ERR("failed to reap dead node's row\n");
+					delete_ucontact(r, t, NULL, 1);
+					purged++;
+					touched = 1;
+				}
+
+				if (touched) {
+					ul_pull_unpublish(r);
+					if (!r->contacts && r->no_clear_ref <= 0) {
+						iterator_delete(&prev);
+						mem_delete_urecord(dom, r);
+					}
+				}
+			}
+			unlock_ulslot(dom, i);
+		}
+	}
+
+	if (purged)
+		LM_INFO("node %d down: dropped %d connection-oriented contacts "
+			"(unreachable without their connections)\n",
+			dead_nid, purged);
+}
+
 void receive_cluster_event(enum clusterer_event ev, int node_id)
 {
 	if (ev == SYNC_REQ_RCV && receive_sync_request(node_id) < 0)
 		LM_ERR("Failed to send sync data to node: %d\n", node_id);
+
+	if (ev == CLUSTER_NODE_DOWN && cluster_mode == CM_PULL_SHARING)
+		ul_pull_node_down_purge(node_id);
 }
 

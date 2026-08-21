@@ -311,6 +311,50 @@ front, of which this workload used 426 MB.
   <img alt="Shared memory really used versus contacts held, owner and pulling node: HG_MALLOC v3 and F_MALLOC as before, with the same allocators plus cachedb_perf's separate cache arena as dotted lines running about 400 MB lower at one million contacts" src="doc/pull-sharing/mem-used-arena-light.svg">
 </picture>
 
+### Controls: fixed arena (v2) and no GC (v1)
+
+Two older HG_MALLOC generations were run through the same 1M protocol
+with a fixed 3,072 MB arena (`-a HG_MALLOC -m 3072`, no cache arena) as
+controls for the v3 row: v2 keeps v3's buddy allocator and inline garbage
+collection (`gc_class`, `HG_GC_KEEP 0`) but can neither grow nor shrink,
+so it isolates the elastic-growth machinery; v1 is the original bump/slab
+allocator with neither buddy nor GC, so it isolates the GC. Two further
+columns came with them: F_PARALLEL_MALLOC on the same binary
+(`-s F_PARALLEL_MALLOC -k F_MALLOC -m 3072` — it has no pkg
+implementation, so `-a` is refused at start) and v3 with an auto-scaling
+profile, which could not be started (below). Latency figures quote the
+worse of the two load generators.
+
+| | F_MALLOC | HG v3 | HG v2 | HG v1 | F_PARALLEL_MALLOC | HG v3 + profile |
+|---|---|---|---|---|---|---|
+| puller at 1M, shm real-used / used | 1,953 / 1,310 MB | 1,761 / 1,365 MB | 1,791 / 1,394 MB | crashed | 1,936 / 1,291 MB | not run |
+| mapped / committed to hold that | 3,072 MB fixed | 2,336 MB grown | 3,072 MB fixed (2,344 MB carved at peak) | — | 3,072 MB fixed, 32 pools | — |
+| cold pull p50 / p95 / p99 | 1.5 / 8.9 / 34 ms | 1.35 / 16 / 60 ms | 1.25 / 4.0 / 29 ms | — | 1.4 / 12.7 / 40 ms | — |
+| warm hit p99 | 0.78 ms | 15 ms | 0.77 ms | — | 0.73 ms | — |
+| warm seconds with p95 > 5 ms | 0 | 41 | 0 | — | 0 | — |
+| requests lost during the sweeps | 0 | 210 | 0 | — | 0 | — |
+| shm still used after all 1M expired (owner / puller) | 236 / 448 MB | 238 / 450 MB | 238 / 450 MB | — | 400 / 762 MB | — |
+
+Measured: take the growth away and leave the GC in, and the tail goes
+with it — v2 matches F_MALLOC on every latency row (warm p99 0.77 ms, no
+stall seconds, nothing lost, cold p99 29 ms) at v3's footprint (1,791 MB
+at 1M, 238 / 450 MB retained after the expiry), while its GC ran at v3's
+volume over the warm sweep (27k passes and 28.6k blocks returned on v2,
+35k / 37k on v3). This revises the attribution given above: the periodic
+warm-hit stall is not the `gc_class` passes themselves but something in
+what v3 adds on top of v2 — the elastic commit/shrink machinery — which
+these runs do not resolve further. v1 segfaulted in a UDP worker two
+seconds into the first cross-node pulls (the fill itself completed: 1M ×
+200, owners at 879 MB), so the no-GC control has no numbers.
+F_PARALLEL_MALLOC tracks F_MALLOC on latency and footprint but keeps
+400 / 762 MB after the expiry, since each process's pool recycles only
+its own frees. The profile run never started: the stock profile
+validator (`pt_scaling.c`, `max_procs >= 1000` is an error) rejects any
+scale-up target of 1,000 or more, which an MB-scale arena profile cannot
+avoid on this binary — `scale up to 3072 ...` fails with "invalid
+relation or range for MIN/MAX processes" with or without a scale-down
+clause or `within`.
+
 ## Observability
 
 * Exact fleet contact count: `sum(owned_contacts)` across nodes (ownership

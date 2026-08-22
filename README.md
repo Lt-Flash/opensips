@@ -318,22 +318,23 @@ with a fixed 3,072 MB arena (`-a HG_MALLOC -m 3072`, no cache arena) as
 controls for the v3 row: v2 keeps v3's buddy allocator and inline garbage
 collection (`gc_class`, `HG_GC_KEEP 0`) but can neither grow nor shrink,
 so it isolates the elastic-growth machinery; v1 is the original bump/slab
-allocator with neither buddy nor GC, so it isolates the GC. Three further
-columns came with them: F_PARALLEL_MALLOC on the same binary
+allocator with neither buddy nor GC, so it isolates the GC. Four further
+columns came with them: the v3 binary on a plain fixed `-m 3072`,
+F_PARALLEL_MALLOC on the same binary
 (`-s F_PARALLEL_MALLOC -k F_MALLOC -m 3072` — it has no pkg
 implementation, so `-a` is refused at start) and v3 with an auto-scaling
 profile, run twice — with the stock 30 s growth tick and with a 2 s one
 (below). Latency figures quote the worse of the two load generators.
 
-| | F_MALLOC | HG v3 | HG v2 | HG v1 | F_PARALLEL_MALLOC | HG v3 + profile | HG v3 + profile, 2 s tick |
-|---|---|---|---|---|---|---|---|
-| puller at 1M, shm real-used / used | 1,953 / 1,310 MB | 1,761 / 1,365 MB | 1,791 / 1,394 MB | crashed | 1,936 / 1,291 MB | 1,810 / 1,413 MB | 1,841 / 1,443 MB |
-| mapped / committed to hold that | 3,072 MB fixed | 2,336 MB grown | 3,072 MB fixed (2,344 MB carved at peak) | — | 3,072 MB fixed, 32 pools | 2,496 MB grown (2,800 MB after the expiry wait) | 3,072 MB grown — the whole reservation |
-| cold pull p50 / p95 / p99 | 1.5 / 8.9 / 34 ms | 1.35 / 16 / 60 ms | 1.25 / 4.0 / 29 ms | — | 1.4 / 12.7 / 40 ms | 1.2 / 8.8 / 53 ms | 1.2 / 21 / 109 ms |
-| warm hit p99 | 0.78 ms | 15 ms | 0.77 ms | — | 0.73 ms | 0.73 ms | 0.71 ms |
-| warm seconds with p95 > 5 ms | 0 | 41 | 0 | — | 0 | 9 | 0 |
-| requests lost during the sweeps | 0 | 210 | 0 | — | 0 | 0 | 883 (+ 23 in the fill) |
-| shm still used after all 1M expired (owner / puller) | 236 / 448 MB | 238 / 450 MB | 238 / 450 MB | — | 400 / 762 MB | 238 / 450 MB | 238 / 450 MB |
+| | F_MALLOC | HG v3 | HG v2 | HG v3, fixed `-m 3072` | HG v1 | F_PARALLEL_MALLOC | HG v3 + profile | HG v3 + profile, 2 s tick |
+|---|---|---|---|---|---|---|---|---|
+| puller at 1M, shm real-used / used | 1,953 / 1,310 MB | 1,761 / 1,365 MB | 1,791 / 1,394 MB | 1,839 / 1,441 MB | crashed | 1,936 / 1,291 MB | 1,810 / 1,413 MB | 1,841 / 1,443 MB |
+| mapped / committed to hold that | 3,072 MB fixed | 2,336 MB grown | 3,072 MB fixed (2,344 MB carved at peak) | 3,072 MB fixed (no cap: `hcap == hsize`) | — | 3,072 MB fixed, 32 pools | 2,496 MB grown (2,800 MB after the expiry wait) | 3,072 MB grown — the whole reservation |
+| cold pull p50 / p95 / p99 | 1.5 / 8.9 / 34 ms | 1.35 / 16 / 60 ms | 1.25 / 4.0 / 29 ms | 1.2 / 2.0 / 19 ms | — | 1.4 / 12.7 / 40 ms | 1.2 / 8.8 / 53 ms | 1.2 / 21 / 109 ms |
+| warm hit p99 | 0.78 ms | 15 ms | 0.77 ms | 0.67 ms | — | 0.73 ms | 0.73 ms | 0.71 ms |
+| warm seconds with p95 > 5 ms | 0 | 41 | 0 | 0 | — | 0 | 9 | 0 |
+| requests lost during the sweeps | 0 | 210 | 0 | 0 | — | 0 | 0 | 883 (+ 23 in the fill) |
+| shm still used after all 1M expired (owner / puller) | 236 / 448 MB | 238 / 450 MB | 238 / 450 MB | 238 / 451 MB | — | 400 / 762 MB | 238 / 450 MB | 238 / 450 MB |
 
 Measured: take the growth away and leave the GC in, and the tail goes
 with it — v2 matches F_MALLOC on every latency row (warm p99 0.77 ms, no
@@ -346,6 +347,13 @@ what v3 adds on top of v2 — the elastic commit/shrink machinery — which
 these runs do not resolve further. v1 segfaulted in a UDP worker two
 seconds into the first cross-node pulls (the fill itself completed: 1M ×
 200, owners at 879 MB), so the no-GC control has no numbers.
+The v3 binary itself confirms it: started with a plain `-m 3072` (no
+`INIT:CAP`, so `hcap == hsize` and neither growth nor shrink can run —
+the code's own definition of v2 behaviour) it is at least as clean as v2
+on every row — cold p95 2.0 / p99 19 ms, warm p99 0.67 ms, zero stall
+seconds, zero lost, zero kernel UDP drops — with the same GC volume
+(26.7k vs 27.4k passes on the warm sweep) and the same retention, so v2
+is subsumed and everything in v3's tail is the elastic path.
 F_PARALLEL_MALLOC tracks F_MALLOC on latency and footprint but keeps
 400 / 762 MB after the expiry, since each process's pool recycles only
 its own frees. The profile runs needed a bench-only lift of the stock
@@ -380,7 +388,7 @@ on log and linear scales, tail health, growth events and a summary table:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="doc/pull-sharing/allocators-overview-dark.svg">
-  <img alt="Twelve-panel overview of all nine allocator configurations on the 1M pull-sharing bench: zoomed memory dot-plots for the pulling node, an owner node and after expiry; cold, warm and REGISTER latency ladders (p50, p95, p99) on log and linear axes; lost requests and stall-seconds; elastic growth events with the committed size; and a summary table. HG_MALLOC v2 and F_MALLOC have clean tails; HG_MALLOC v3 elastic has a 15 ms warm p99 and 210 lost requests; the auto-scaling profile removes the warm tail; the 2 s growth tick has the worst tails of all with 997 lost requests and the whole 3,072 MB committed" src="doc/pull-sharing/allocators-overview-light.svg">
+  <img alt="Twelve-panel overview of all ten allocator configurations on the 1M pull-sharing bench: zoomed memory dot-plots for the pulling node, an owner node and after expiry; cold, warm and REGISTER latency ladders (p50, p95, p99) on log and linear axes; lost requests and stall-seconds; elastic growth events with the committed size; and a summary table. HG_MALLOC v2, HG_MALLOC v3 on a fixed arena and F_MALLOC have clean tails; HG_MALLOC v3 elastic has a 15 ms warm p99 and 210 lost requests; the auto-scaling profile removes the warm tail; the 2 s growth tick has the worst tails of all with 997 lost requests and the whole 3,072 MB committed" src="doc/pull-sharing/allocators-overview-light.svg">
 </picture>
 
 ## Observability

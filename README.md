@@ -394,8 +394,8 @@ monitor's scrapes, and the same stall lands on any scraped production node
 with a large arena. With that path made O(1) the fixed arena passes all
 thirteen bars of the validation harness (`/dn/pullbench/validate.py`:
 cold p99 ≤ 1.25× the reference, warm p99 ≤ 1 ms, zero lost, zero UDP
-drops, no lock hold over 1 ms, GC under 1 ms, memory and retention within
-a few percent): cold p99 17 ms, warm p99 0.66 ms with a 4 ms maximum,
+drops, no more than ten lock holds over 1 ms in a run, GC under 1 ms,
+memory and retention within a few percent): cold p99 17 ms, warm p99 0.66 ms with a 4 ms maximum,
 worst lock hold 0.8 ms. The elastic arena then has exactly one remaining
 lock holder above a millisecond: the 16 MB commit inside each exhaustion
 grow (`MADV_COLLAPSE` + `mlock` on the THP tier), 115 of them per 1M

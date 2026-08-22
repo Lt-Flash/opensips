@@ -28,8 +28,40 @@
 #include "../../mem/mem.h"
 #include "../../mem/shm_mem.h"
 
+#include <strings.h>
 #include "pcache_arena.h"
 #include "pcache_mem.h"
+
+/* the core's module-arena facade (HG_MALLOC v3 trees); older cores have no
+ * such header - then only the own backing exists */
+#if defined(__has_include)
+# if __has_include("../../mem/mem_arena.h")
+#  include "../../mem/mem_arena.h"
+#  define PCACHE_HAVE_MEM_ARENA 1
+# endif
+#endif
+#ifndef PCACHE_HAVE_MEM_ARENA
+typedef void mem_arena_t;
+static inline mem_arena_t *shm_arena_create(char *n, unsigned long i,
+		unsigned long c) { return NULL; }
+static inline int shm_arena_set_profile(mem_arena_t *a, const char *p)
+{ return -1; }
+static inline int shm_allocator_is_hg(void) { return 0; }
+static inline mem_arena_t *shm_arena_core(void) { return NULL; }
+static inline void mem_arena_extents(const mem_arena_t *a, unsigned long *lo,
+		unsigned long *hi) { *lo = 0; *hi = 0; }
+static inline int mem_arena_tier(const mem_arena_t *a) { return 0; }
+static inline void mem_arena_usage(mem_arena_t *a, unsigned long *c,
+		unsigned long *k, unsigned long *l) { *c = 0; *k = 0; *l = 0; }
+#define mem_arena_malloc(a, s)     ((void *)0)
+#define mem_arena_free(a, p)       do { } while (0)
+#endif
+
+char *pcache_backing_policy = "auto";
+int pcache_arena_hugepage_cap_mb = 0;
+char *pcache_arena_profile = NULL;
+static int backing = PCACHE_BACKING_OWN;
+static mem_arena_t *hg_handle;            /* CORE: the shm block; OWN_HG: ours */
 
 /* CP-20: MB to reserve for the huge-page arena; 0 = disabled (shm_malloc).
  * Set by the cachedb_perf "arena_hugepage_mb" modparam. */
@@ -236,6 +268,66 @@ int pcache_arena_init(void)
 		size2class[idx] = (unsigned char)c;   /* NCLASSES = impossible */
 	}
 
+	/*
+	 * Which backing? An HG_MALLOC build can hand the whole job to HG: a
+	 * dedicated arena becomes an HG arena of our own (own-hg), and with
+	 * no arena asked for, cells go straight into the core shm arena when
+	 * that allocator is HG (core). Only without HG does this file's
+	 * chunked allocator run (own). The policy modparam can force any.
+	 */
+	{
+		const char *pol = pcache_backing_policy ? pcache_backing_policy : "auto";
+		int want_arena = pcache_arena_hugepage_mb > 0;
+		int try_own_hg = 0, try_core = 0;
+
+		if (!strcasecmp(pol, "auto")) {
+			try_own_hg = want_arena;
+			try_core = !want_arena;
+		} else if (!strcasecmp(pol, "own-hg")) {
+			try_own_hg = 1;
+		} else if (!strcasecmp(pol, "core")) {
+			try_core = 1;
+		} else if (strcasecmp(pol, "own")) {
+			LM_ERR("memory_backing '%s' is not auto|core|own-hg|own\n", pol);
+			return -1;
+		}
+		if (try_own_hg) {
+			unsigned long init = (unsigned long)(pcache_arena_hugepage_mb > 0 ?
+				pcache_arena_hugepage_mb : 64) << 20;
+			unsigned long cap = (unsigned long)pcache_arena_hugepage_cap_mb << 20;
+
+			hg_handle = shm_arena_create("cachedb_perf", init,
+				cap > init ? cap : init);
+			if (hg_handle) {
+				backing = PCACHE_BACKING_OWN_HG;
+				if (pcache_arena_profile &&
+				    shm_arena_set_profile(hg_handle, pcache_arena_profile) < 0) {
+					LM_ERR("arena_profile '%s' could not be attached\n",
+						pcache_arena_profile);
+					return -1;
+				}
+			} else if (strcasecmp(pol, "auto")) {
+				LM_ERR("memory_backing=own-hg: no HG_MALLOC arena available "
+					"(not an HG_MALLOC build, or the reservation failed)\n");
+				return -1;
+			}
+		}
+		if (backing == PCACHE_BACKING_OWN && try_core) {
+			hg_handle = shm_arena_core();
+			if (hg_handle) {
+				backing = PCACHE_BACKING_CORE;
+			} else if (strcasecmp(pol, "auto")) {
+				LM_ERR("memory_backing=core: the shm allocator is not "
+					"HG_MALLOC\n");
+				return -1;
+			}
+		}
+	}
+	if (backing != PCACHE_BACKING_OWN) {
+		LM_DBG("arena ready: %s\n", pcache_arena_backing_str());
+		return 0;
+	}
+
 	/* CP-20: reserve the huge-page arena, pre-fork, if requested */
 	if (pcache_arena_hugepage_mb > 0) {
 		arena->hsize = (unsigned long)pcache_arena_hugepage_mb << 20;
@@ -266,6 +358,19 @@ void *pcache_region_alloc(size_t size)
 	unsigned long need = size + sizeof(pcache_region_t) + 64;
 	char *aligned;
 
+	if (backing != PCACHE_BACKING_OWN) {
+		/* HG hands out whole regions too; nothing to register - the
+		 * arena's extents and accounting are HG's */
+		rg = mem_arena_malloc(hg_handle, need);
+		if (!rg) {
+			LM_ERR("no more arena memory for a %lu byte region\n", need);
+			return NULL;
+		}
+		__atomic_fetch_add(&arena->bytes, need, __ATOMIC_RELAXED);
+		return (char *)(((unsigned long)rg + sizeof(pcache_region_t) + 63)
+		                & ~63UL);
+	}
+
 	rg = pcache_chunk_backing(need);
 	if (!rg) {
 		LM_ERR("no more shm memory for a %lu byte region\n", need);
@@ -295,6 +400,15 @@ void pcache_arena_destroy(void)
 
 	if (!arena)
 		return;
+
+	if (backing != PCACHE_BACKING_OWN) {
+		/* the cells and regions are HG's; the arena mapping (ours or the
+		 * core's) goes with the process */
+		lock_destroy(&arena->lock);
+		shm_free(arena);
+		arena = NULL;
+		return;
+	}
 
 	/* blocks carved from the huge reservation are part of one mmap - they
 	 * must be munmap'd as a whole (below), never shm_free'd individually */
@@ -328,7 +442,7 @@ void pcache_arena_child_init(void)
 {
 	struct pcache_palloc *pl = my_palloc;
 
-	if (!pl)
+	if (backing != PCACHE_BACKING_OWN || !pl)
 		return;
 
 	/*
@@ -377,6 +491,18 @@ void *pcache_cell_alloc(unsigned int size)
 		return NULL;
 	}
 	c = size2class[(size + 31) >> 5];
+
+	if (backing != PCACHE_BACKING_OWN) {
+		/* an HG slab cell, class-rounded so pcache_cell_bound() stays
+		 * exact; byte 0 carries our class id exactly as in own chunks
+		 * (HG's own header sits in front of the pointer it returns) */
+		cell = mem_arena_malloc(hg_handle, cell_sizes[c]);
+		if (!cell)
+			return NULL;
+		*(unsigned char *)cell = (unsigned char)c;
+		__atomic_fetch_add(&arena->bytes, cell_sizes[c], __ATOMIC_RELAXED);
+		return cell;
+	}
 
 	pl = get_palloc();
 	if (!pl)
@@ -438,6 +564,12 @@ void pcache_cell_free(void *cell)
 		return;
 	}
 
+	if (backing != PCACHE_BACKING_OWN) {
+		__atomic_fetch_sub(&arena->bytes, cell_sizes[c], __ATOMIC_RELAXED);
+		mem_arena_free(hg_handle, cell);
+		return;
+	}
+
 	pl = get_palloc();
 	if (!pl) {
 		/* cannot even track it privately - hand it to the pool */
@@ -471,6 +603,11 @@ void pcache_cell_free_global(void *cell)
 			cell, c);
 		return;
 	}
+	if (backing != PCACHE_BACKING_OWN) {
+		__atomic_fetch_sub(&arena->bytes, cell_sizes[c], __ATOMIC_RELAXED);
+		mem_arena_free(hg_handle, cell);
+		return;
+	}
 	lock_get(&arena->lock);
 	gpool_push(c, cell);
 	lock_release(&arena->lock);
@@ -487,6 +624,12 @@ unsigned int pcache_cell_bound(const void *cell)
 
 void pcache_arena_extents(unsigned long *lo, unsigned long *hi)
 {
+	if (backing != PCACHE_BACKING_OWN) {
+		/* the HG reservation (the whole cap): every pointer HG ever
+		 * hands out from this arena lies inside it */
+		mem_arena_extents(hg_handle, lo, hi);
+		return;
+	}
 	/* unlocked on purpose: both only ever grow outward.  A reader mixing
 	 * a fresh lo with a stale hi sees a subset - the check then fails
 	 * closed (treated as invalid) for a moment during a chunk carve */
@@ -496,6 +639,11 @@ void pcache_arena_extents(unsigned long *lo, unsigned long *hi)
 
 void pcache_arena_stats(unsigned int *nchunks, unsigned long *bytes)
 {
+	if (backing != PCACHE_BACKING_OWN) {
+		*nchunks = 0;                  /* no chunks of ours: HG's cells */
+		*bytes = __atomic_load_n(&arena->bytes, __ATOMIC_RELAXED);
+		return;
+	}
 	lock_get(&arena->lock);
 	*nchunks = arena->nchunks;
 	*bytes = arena->bytes;
@@ -514,7 +662,63 @@ int pcache_arena_tier(void)
 	 * HG_MALLOC.  Returning PCACHE_MEM_4K here reported a property of an
 	 * arena that does not exist, and was read live as "the cache is on
 	 * small pages" while it was actually on hugepages. */
+	if (backing == PCACHE_BACKING_OWN_HG)
+		return mem_arena_tier(hg_handle);     /* same enum values */
+	if (backing == PCACHE_BACKING_CORE)
+		return PCACHE_MEM_NO_ARENA;           /* the core arena's tier */
 	return arena->hbase ? (int)arena->htier : PCACHE_MEM_NO_ARENA;
+}
+
+int pcache_arena_backing(void)
+{
+	return backing;
+}
+
+const char *pcache_arena_backing_str(void)
+{
+	switch (backing) {
+	case PCACHE_BACKING_CORE:
+		return "core (HG_MALLOC shm arena cells)";
+	case PCACHE_BACKING_OWN_HG:
+		return "own arena managed by HG_MALLOC";
+	default:
+		return arena && arena->hbase ? "own chunks in a dedicated reservation"
+		                             : "own chunks in shm";
+	}
+}
+
+void pcache_arena_backing_notice(void)
+{
+	unsigned long committed, cap, live;
+
+	switch (backing) {
+	case PCACHE_BACKING_CORE:
+		LM_NOTICE("memory backing IN USE: the core HG_MALLOC shm arena - "
+			"every cache cell is an HG slab cell (classes, per-process "
+			"caches, GC and re-typing, growth and maintenance are HG's); "
+			"counted in core's shmem: stats%s\n",
+			pcache_arena_hugepage_mb > 0 ? " (arena_hugepage_mb ignored "
+			"under memory_backing=core)" : "");
+		break;
+	case PCACHE_BACKING_OWN_HG:
+		mem_arena_usage(hg_handle, &committed, &cap, &live);
+		LM_NOTICE("memory backing IN USE: a dedicated arena managed by "
+			"HG_MALLOC - %lu MB committed, can grow to %lu MB%s; see "
+			"hg_stats 'cachedb_perf'\n", committed >> 20, cap >> 20,
+			pcache_arena_profile ? " under its auto-scaling profile" : "");
+		break;
+	default:
+		if (pcache_arena_hugepage_mb > 0)
+			LM_NOTICE("memory backing IN USE: a separate %d MB reservation, "
+				"OUTSIDE OpenSIPS shared memory (arena_hugepage_mb), "
+				"cachedb_perf's own chunk allocator\n",
+				pcache_arena_hugepage_mb);
+		else
+			LM_NOTICE("memory backing IN USE: OpenSIPS shared memory "
+				"(shm_malloc), cachedb_perf's own chunk allocator - NOT a "
+				"separate reservation; counted in core's own shmem: stats. "
+				"Set arena_hugepage_mb to reserve a dedicated arena.\n");
+	}
 }
 
 /*
@@ -528,9 +732,25 @@ int pcache_arena_tier(void)
  * 0/0/0 alone cannot distinguish "no dedicated reservation exists" from
  * "a reservation exists and happens to be still empty".
  */
+static void pcache_arena_hg_capacity(int *active, unsigned long *total,
+		unsigned long *used, unsigned long *free)
+{
+	unsigned long committed, cap, live;
+
+	mem_arena_usage(hg_handle, &committed, &cap, &live);
+	*active = 1;
+	*total = cap;
+	*used = live;
+	*free = cap > live ? cap - live : 0;
+}
+
 void pcache_arena_hugepage_capacity(int *active, unsigned long *total,
 		unsigned long *used, unsigned long *free)
 {
+	if (backing == PCACHE_BACKING_OWN_HG) {
+		pcache_arena_hg_capacity(active, total, used, free);
+		return;
+	}
 	if (!arena->hbase) {
 		*active = 0;
 		*total = 0;

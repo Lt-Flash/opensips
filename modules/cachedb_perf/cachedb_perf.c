@@ -635,6 +635,9 @@ static const param_export_t params[] = {
 	{ "arena_selftest",    INT_PARAM, &arena_selftest },
 	{ "htable_selftest",   INT_PARAM, &htable_selftest },
 	{ "arena_hugepage_mb", INT_PARAM, &pcache_arena_hugepage_mb },
+	{ "arena_hugepage_cap_mb", INT_PARAM, &pcache_arena_hugepage_cap_mb },
+	{ "arena_profile",     STR_PARAM, &pcache_arena_profile },
+	{ "memory_backing",    STR_PARAM, &pcache_backing_policy },
 	{ "expiry_sweep_period", INT_PARAM, &expiry_sweep_period },
 	{ "growth_load_factor",  INT_PARAM, &growth_load_factor },
 	{ "growth_budget",       INT_PARAM, &growth_budget },
@@ -1197,7 +1200,10 @@ static mi_response_t *mi_perf_stats(str *col_s)
 		goto err;
 	pcache_arena_stats(&nchunks, &bytes);
 	if (add_mi_number(aobj, MI_SSTR("chunks"), nchunks) < 0 ||
-	    add_mi_number(aobj, MI_SSTR("bytes"), bytes) < 0)
+	    add_mi_number(aobj, MI_SSTR("bytes"), bytes) < 0 ||
+	    add_mi_string(aobj, MI_SSTR("backing"),
+	        (char *)pcache_arena_backing_str(),
+	        strlen(pcache_arena_backing_str())) < 0)
 		goto err;
 
 	/* _probe = what this host is CAPABLE of (startup capability check,
@@ -4945,15 +4951,6 @@ static int mod_init(void)
 			"tier %d/4 - %s\n",
 			pcache_mem.tier, pcache_mem_tier_str(pcache_mem.tier));
 
-	if (pcache_arena_hugepage_mb > 0)
-		LM_NOTICE("memory backing IN USE: a separate %d MB reservation, "
-			"OUTSIDE OpenSIPS shared memory (arena_hugepage_mb)\n",
-			pcache_arena_hugepage_mb);
-	else
-		LM_NOTICE("memory backing IN USE: OpenSIPS shared memory "
-			"(shm_malloc) - NOT a separate reservation; counted in core's "
-			"own shmem: stats, not a cachedb_perf-specific total. Set "
-			"arena_hugepage_mb to reserve a dedicated arena instead.\n");
 
 	switch (pcache_mem.tier) {
 	case PCACHE_MEM_HUGETLB:
@@ -4976,11 +4973,14 @@ static int mod_init(void)
 			"returned on exit, so nothing is held while unused)\n");
 	}
 
-	/* the slab arena (DESIGN 3.3) - shm globals, pre-fork */
+	/* the slab arena (DESIGN 3.3) - shm globals, pre-fork; decides the
+	 * memory backing (own chunks / the core HG arena / an HG arena of our
+	 * own) and says which one is in use */
 	if (pcache_arena_init() < 0) {
 		LM_ERR("failed to init the arena\n");
 		return -1;
 	}
+	pcache_arena_backing_notice();
 
 	/* CP-11: huge pages were asked for but the arena settled on a lesser
 	 * tier - flagged now, raised from the first timer tick (EVI has no

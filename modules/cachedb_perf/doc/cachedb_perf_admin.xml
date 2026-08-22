@@ -230,6 +230,94 @@ modparam("cachedb_perf", "arena_hugepage_mb", 512)
 </programlisting>
 		</example>
 	</section>
+	<section id="param_memory_backing" xreflabel="memory_backing">
+		<title><varname>memory_backing</varname> (string)</title>
+		<para>
+		Where the cache's memory comes from and who manages it. At startup
+		the module looks at the allocator the core runs and, on an
+		<emphasis>HG_MALLOC</emphasis> core, hands the whole job to it
+		instead of managing chunks itself:
+		</para>
+		<itemizedlist>
+		<listitem><para><emphasis>core</emphasis> - the shared-memory
+		allocator is HG_MALLOC: every cache cell is an HG slab cell in the
+		shm arena, so size classes, per-process caches, block garbage
+		collection with re-typing, elastic growth and the maintenance
+		process are HG's. Nothing is duplicated in the module and the
+		memory is counted in the core's <emphasis>shmem:</emphasis>
+		statistics.</para></listitem>
+		<listitem><para><emphasis>own-hg</emphasis> - an HG_MALLOC build
+		with <xref linkend="param_arena_hugepage_mb"/> set: the dedicated
+		arena is created through the core's module-arena facade as an HG
+		arena of the module's own, <emphasis>arena_hugepage_mb</emphasis>
+		committed at start and able to grow to
+		<xref linkend="param_arena_hugepage_cap_mb"/>, fully managed by HG
+		and listed by name (<emphasis>cachedb_perf</emphasis>) in the
+		<emphasis>hg_stats</emphasis> MI command. This works whatever
+		allocator <emphasis>-a</emphasis> selected for the core, as long as
+		HG_MALLOC is compiled in.</para></listitem>
+		<listitem><para><emphasis>own</emphasis> - the module's own chunk
+		allocator, in shm or in its own reservation, as on cores without
+		HG_MALLOC.</para></listitem>
+		<listitem><para><emphasis>auto</emphasis> (default) - own-hg when
+		an arena is asked for, core when the shm allocator is HG_MALLOC,
+		own otherwise. The explicit values refuse to start when that
+		backing is not available.</para></listitem>
+		</itemizedlist>
+		<para>
+		The backing in use is reported at startup and as
+		<emphasis>arena.backing</emphasis> in <emphasis>perf_stats</emphasis>.
+		</para>
+		<example>
+		<title>Set <varname>memory_backing</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("cachedb_perf", "memory_backing", "core")
+...
+</programlisting>
+		</example>
+	</section>
+	<section id="param_arena_hugepage_cap_mb" xreflabel="arena_hugepage_cap_mb">
+		<title><varname>arena_hugepage_cap_mb</varname> (integer)</title>
+		<para>
+		Upper size, in megabytes, the module's own HG_MALLOC arena
+		(<emphasis>memory_backing</emphasis> own-hg) may grow to. The arena
+		starts at <xref linkend="param_arena_hugepage_mb"/> and grows and
+		shrinks between the two on demand, exactly as the core's elastic
+		<emphasis>-m INIT:CAP</emphasis> arena does. 0 (default) or a value
+		not above <emphasis>arena_hugepage_mb</emphasis> gives a fixed-size
+		arena. Ignored by the other backings.
+		</para>
+		<example>
+		<title>Set <varname>arena_hugepage_cap_mb</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("cachedb_perf", "arena_hugepage_mb", 512)
+modparam("cachedb_perf", "arena_hugepage_cap_mb", 2048)
+...
+</programlisting>
+		</example>
+	</section>
+	<section id="param_arena_profile" xreflabel="arena_profile">
+		<title><varname>arena_profile</varname> (string)</title>
+		<para>
+		Name of a core <emphasis>auto_scaling_profile</emphasis> to drive
+		the growth and shrink of the module's own HG_MALLOC arena
+		(<emphasis>memory_backing</emphasis> own-hg), as
+		<emphasis>shm_auto_scaling_profile</emphasis> does for the core
+		arena. Without it the arena follows HG's default headroom rule.
+		Startup fails when the profile does not exist. Ignored by the
+		other backings.
+		</para>
+		<example>
+		<title>Set <varname>arena_profile</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("cachedb_perf", "arena_profile", "CACHE_ARENA")
+...
+</programlisting>
+		</example>
+	</section>
 
 	<section id="param_arena_selftest" xreflabel="arena_selftest">
 		<title><varname>arena_selftest</varname> (integer)</title>
@@ -915,7 +1003,8 @@ WARNING:cachedb_perf:mod_init: replicate_collections is set but
 		<listitem><para><emphasis>entries</emphasis> - live records across all collections</para></listitem>
 		<listitem><para><emphasis>seqlock_retries</emphasis> - optimistic-read retries (the contention signal)</para></listitem>
 		<listitem><para><emphasis>lock_fallbacks</emphasis> - reads that fell back to the bucket lock</para></listitem>
-		<listitem><para><emphasis>arena_bytes</emphasis> / <emphasis>arena_chunks</emphasis> - memory taken from shm</para></listitem>
+		<listitem><para><emphasis>arena_bytes</emphasis> / <emphasis>arena_chunks</emphasis> - memory taken from shm; with the <emphasis>core</emphasis> or <emphasis>own-hg</emphasis> backing the cells are HG_MALLOC's and <emphasis>arena_chunks</emphasis> reads 0</para></listitem>
+		<listitem><para><emphasis>arena.backing</emphasis> (perf_stats) - the memory backing in use, see <xref linkend="param_memory_backing"/></para></listitem>
 		<listitem><para><emphasis>memory_tier_probe</emphasis> / <emphasis>memory_tier_active</emphasis> - the huge-page tier the host was probed for, and the one the module's own arena actually runs on (1 hugetlb .. 4 plain 4K). They differ when <varname>arena_hugepage_mb</varname> could not be satisfied.</para></listitem>
 		<listitem><para><emphasis>hugepage_arena_active</emphasis>, <emphasis>hugepage_arena_total_bytes</emphasis>, <emphasis>hugepage_arena_used_bytes</emphasis>, <emphasis>hugepage_arena_free_bytes</emphasis> - the module's own hugepage arena, which is SEPARATE from the OpenSIPS shm arena. Records live in one or the other, never both, so these do not add to <emphasis>arena_bytes</emphasis>.</para></listitem>
 	</itemizedlist>

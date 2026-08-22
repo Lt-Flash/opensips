@@ -19,22 +19,26 @@ cachedb_perf Module
               1.3.4. growth_load_factor (integer)
               1.3.5. growth_budget (integer)
               1.3.6. arena_hugepage_mb (integer)
-              1.3.7. arena_selftest (integer)
-              1.3.8. htable_selftest (integer)
-              1.3.9. event_expired_collections (string)
-              1.3.10. db_url (string)
-              1.3.11. db_table (string)
-              1.3.12. db_mode (integer)
-              1.3.13. persist_collections (string)
-              1.3.14. sync_cluster_id (integer)
-              1.3.15. sync_shtag (string)
-              1.3.16. replicate_collections (string)
-              1.3.17. pull_transport (string)
-              1.3.18. pull_timeout_ms (integer)
-              1.3.19. pull_slots (integer)
-              1.3.20. pull_authoritative_serve (integer)
-              1.3.21. pull_negative_ms (integer)
-              1.3.22. pull_on_miss (integer)
+              1.3.7. memory_backing (string)
+              1.3.8. arena_hugepage_cap_mb (integer)
+              1.3.9. arena_profile (string)
+              1.3.10. arena_selftest (integer)
+              1.3.11. htable_selftest (integer)
+              1.3.12. event_expired_collections (string)
+              1.3.13. db_url (string)
+              1.3.14. db_table (string)
+              1.3.15. db_mode (integer)
+              1.3.16. persist_collections (string)
+              1.3.17. sync_cluster_id (integer)
+              1.3.18. sync_shtag (string)
+              1.3.19. replicate_collections (string)
+              1.3.20. pull_transport (string)
+              1.3.21. pull_timeout_ms (integer)
+              1.3.22. pull_slots (integer)
+              1.3.23. pull_authoritative_serve (integer)
+              1.3.24. pull_linger_ms (integer)
+              1.3.25. pull_negative_ms (integer)
+              1.3.26. pull_on_miss (integer)
 
         1.4. DB persistence
         1.5. Cluster sync
@@ -50,7 +54,9 @@ cachedb_perf Module
                       perf_dump / perf_get / perf_probe /
                       perf_pull / perf_set / perf_ttl / perf_del
 
-              1.8.4. perf_cluster_size
+              1.8.4. perf_cluster_size - live per-node entry
+                      counts
+
               1.8.5. perf_save / perf_load
               1.8.6. perf_sync
 
@@ -79,26 +85,102 @@ cachedb_perf Module
    1.4. Set growth_load_factor parameter
    1.5. Set growth_budget parameter
    1.6. Set arena_hugepage_mb parameter
-   1.7. Set arena_selftest parameter
-   1.8. Set htable_selftest parameter
-   1.9. Set event_expired_collections parameter
-   1.10. Set db_url parameter
-   1.11. Set db_mode parameter
-   1.12. Set persist_collections parameter
-   1.13. Set sync_cluster_id parameter
-   1.14. Setting sync_shtag
-   1.15. Setting replicate_collections
-   1.16. Cluster-sync setup (one authority, two read replicas)
-   1.17. perf_stats usage
-   1.18. perf_stats_reset usage
-   1.19. introspection usage
-   1.20. perf_save / perf_load usage
-   1.21. perf_sync usage
-   1.22. perf_del() usage
-   1.23. perf_mget() usage
-   1.24. perf_mget_json() usage
+   1.7. Set memory_backing parameter
+   1.8. Set arena_hugepage_cap_mb parameter
+   1.9. Set arena_profile parameter
+   1.10. Set arena_selftest parameter
+   1.11. Set htable_selftest parameter
+   1.12. Set event_expired_collections parameter
+   1.13. Set db_url parameter
+   1.14. Set db_mode parameter
+   1.15. Set persist_collections parameter
+   1.16. Set sync_cluster_id parameter
+   1.17. Setting sync_shtag
+   1.18. Setting replicate_collections
+   1.19. Cluster-sync setup (one authority, two read replicas)
+   1.20. perf_stats usage
+   1.21. perf_stats_reset usage
+   1.22. introspection usage
+   1.23. perf_cluster_size usage
+   1.24. perf_save / perf_load usage
+   1.25. perf_sync usage
+   1.26. perf_del() usage
+   1.27. perf_mget() usage
+   1.28. perf_mget_json() usage
 
 Chapter 1. Admin Guide
+
+   Table of Contents
+
+   1.1. Overview
+   1.2. Dependencies
+
+        1.2.1. OpenSIPS Modules
+        1.2.2. External Libraries or Applications
+
+   1.3. Exported Parameters
+
+        1.3.1. cache_collections (string)
+        1.3.2. expiry_sweep_period (integer)
+        1.3.3. cachedb_url (string)
+        1.3.4. growth_load_factor (integer)
+        1.3.5. growth_budget (integer)
+        1.3.6. arena_hugepage_mb (integer)
+        1.3.7. memory_backing (string)
+        1.3.8. arena_hugepage_cap_mb (integer)
+        1.3.9. arena_profile (string)
+        1.3.10. arena_selftest (integer)
+        1.3.11. htable_selftest (integer)
+        1.3.12. event_expired_collections (string)
+        1.3.13. db_url (string)
+        1.3.14. db_table (string)
+        1.3.15. db_mode (integer)
+        1.3.16. persist_collections (string)
+        1.3.17. sync_cluster_id (integer)
+        1.3.18. sync_shtag (string)
+        1.3.19. replicate_collections (string)
+        1.3.20. pull_transport (string)
+        1.3.21. pull_timeout_ms (integer)
+        1.3.22. pull_slots (integer)
+        1.3.23. pull_authoritative_serve (integer)
+        1.3.24. pull_linger_ms (integer)
+        1.3.25. pull_negative_ms (integer)
+        1.3.26. pull_on_miss (integer)
+
+   1.4. DB persistence
+   1.5. Cluster sync
+   1.6. Degraded operation: what each surface does without its
+          modules
+
+   1.7. Exported Statistics
+   1.8. Exported MI Functions
+
+        1.8.1. perf_stats
+        1.8.2. perf_stats_reset
+        1.8.3. Key introspection: perf_keys / perf_scan /
+                perf_dump / perf_get / perf_probe / perf_pull /
+                perf_set / perf_ttl / perf_del
+
+        1.8.4. perf_cluster_size - live per-node entry counts
+        1.8.5. perf_save / perf_load
+        1.8.6. perf_sync
+
+   1.9. Exported Events
+
+        1.9.1. E_CACHEDB_PERF_EXPIRED
+        1.9.2. E_CACHEDB_PERF_NOMEM
+        1.9.3. E_CACHEDB_PERF_GROWN
+        1.9.4. E_CACHEDB_PERF_MEM_DEGRADED
+        1.9.5. E_CACHEDB_PERF_SYNCED
+
+   1.10. Exported Functions
+
+        1.10.1. perf_del(glob[, collection])
+        1.10.2. perf_mget(glob, keys_avp, vals_avp[, collection[,
+                limit]])
+
+        1.10.3. perf_mget_json(glob, dst_var[, collection[,
+                limit]])
 
 1.1. Overview
 
@@ -266,29 +348,93 @@ modparam("cachedb_perf", "growth_budget", 4096)
 modparam("cachedb_perf", "arena_hugepage_mb", 512)
 ...
 
-1.3.7. arena_selftest (integer)
+1.3.7. memory_backing (string)
+
+   Where the cache's memory comes from and who manages it. At
+   startup the module looks at the allocator the core runs and, on
+   an HG_MALLOC core, hands the whole job to it instead of
+   managing chunks itself:
+     * core - the shared-memory allocator is HG_MALLOC: every
+       cache cell is an HG slab cell in the shm arena, so size
+       classes, per-process caches, block garbage collection with
+       re-typing, elastic growth and the maintenance process are
+       HG's. Nothing is duplicated in the module and the memory is
+       counted in the core's shmem: statistics.
+     * own-hg - an HG_MALLOC build with arena_hugepage_mb set: the
+       dedicated arena is created through the core's module-arena
+       facade as an HG arena of the module's own,
+       arena_hugepage_mb committed at start and able to grow to
+       arena_hugepage_cap_mb, fully managed by HG and listed by
+       name (cachedb_perf) in the hg_stats MI command. This works
+       whatever allocator -a selected for the core, as long as
+       HG_MALLOC is compiled in.
+     * own - the module's own chunk allocator, in shm or in its
+       own reservation, as on cores without HG_MALLOC.
+     * auto (default) - own-hg when an arena is asked for, core
+       when the shm allocator is HG_MALLOC, own otherwise. The
+       explicit values refuse to start when that backing is not
+       available.
+
+   The backing in use is reported at startup and as arena.backing
+   in perf_stats.
+
+   Example 1.7. Set memory_backing parameter
+...
+modparam("cachedb_perf", "memory_backing", "core")
+...
+
+1.3.8. arena_hugepage_cap_mb (integer)
+
+   Upper size, in megabytes, the module's own HG_MALLOC arena
+   (memory_backing own-hg) may grow to. The arena starts at
+   arena_hugepage_mb and grows and shrinks between the two on
+   demand, exactly as the core's elastic -m INIT:CAP arena does. 0
+   (default) or a value not above arena_hugepage_mb gives a
+   fixed-size arena. Ignored by the other backings.
+
+   Example 1.8. Set arena_hugepage_cap_mb parameter
+...
+modparam("cachedb_perf", "arena_hugepage_mb", 512)
+modparam("cachedb_perf", "arena_hugepage_cap_mb", 2048)
+...
+
+1.3.9. arena_profile (string)
+
+   Name of a core auto_scaling_profile to drive the growth and
+   shrink of the module's own HG_MALLOC arena (memory_backing
+   own-hg), as shm_auto_scaling_profile does for the core arena.
+   Without it the arena follows HG's default headroom rule.
+   Startup fails when the profile does not exist. Ignored by the
+   other backings.
+
+   Example 1.9. Set arena_profile parameter
+...
+modparam("cachedb_perf", "arena_profile", "CACHE_ARENA")
+...
+
+1.3.10. arena_selftest (integer)
 
    When set to 1, the slab arena runs a self-test at startup and
    aborts startup on any mismatch - a permanent, cheap diagnostic.
    Default is 0 (off).
 
-   Example 1.7. Set arena_selftest parameter
+   Example 1.10. Set arena_selftest parameter
 ...
 modparam("cachedb_perf", "arena_selftest", 1)
 ...
 
-1.3.8. htable_selftest (integer)
+1.3.11. htable_selftest (integer)
 
    When set to 1, the hash table and its runtime-growth machinery
    run a self-test at startup and abort startup on any mismatch.
    Default is 0 (off).
 
-   Example 1.8. Set htable_selftest parameter
+   Example 1.11. Set htable_selftest parameter
 ...
 modparam("cachedb_perf", "htable_selftest", 1)
 ...
 
-1.3.9. event_expired_collections (string)
+1.3.12. event_expired_collections (string)
 
    Comma-separated list of the collections that raise
    E_CACHEDB_PERF_EXPIRED (one event per reaped key) as the sweep
@@ -298,55 +444,55 @@ modparam("cachedb_perf", "htable_selftest", 1)
    something is listening for them. Empty (default) means no
    collection raises the event. See Exported Events.
 
-   Example 1.9. Set event_expired_collections parameter
+   Example 1.12. Set event_expired_collections parameter
 ...
 modparam("cachedb_perf", "event_expired_collections", "sessions,subscrip
 tions")
 ...
 
-1.3.10. db_url (string)
+1.3.13. db_url (string)
 
    URL of a db_* (SQL) backend used to persist collections - see
    DB persistence. The matching db_* module must be loaded. When
    unset, persistence is disabled. The DB is a shared, durable
    store; the in-memory cache is a view over it.
 
-   Example 1.10. Set db_url parameter
+   Example 1.13. Set db_url parameter
 ...
 modparam("cachedb_perf", "db_url", "mysql://opensips:pw@localhost/opensi
 ps")
 ...
 
-1.3.11. db_table (string)
+1.3.14. db_table (string)
 
    Table that holds the persisted entries. Default is
    “cachedb_perf”. See DB persistence for the schema.
 
-1.3.12. db_mode (integer)
+1.3.15. db_mode (integer)
 
    Automatic persistence for the collections listed in
    persist_collections: 0 = off (default; load/save only on the
    perf_load/ perf_save MI commands), 1 = load them from the DB at
    startup, 2 = load at startup and save on a graceful shutdown.
 
-   Example 1.11. Set db_mode parameter
+   Example 1.14. Set db_mode parameter
 ...
 modparam("cachedb_perf", "db_mode", 2)
 ...
 
-1.3.13. persist_collections (string)
+1.3.16. persist_collections (string)
 
    Comma-separated list of the collections that db_mode loads at
    startup and saves at shutdown. Empty (default) means none are
    persisted automatically - though perf_save/perf_load still work
    on any collection on demand.
 
-   Example 1.12. Set persist_collections parameter
+   Example 1.15. Set persist_collections parameter
 ...
 modparam("cachedb_perf", "persist_collections", "sessions,profiles")
 ...
 
-1.3.14. sync_cluster_id (integer)
+1.3.17. sync_cluster_id (integer)
 
    Cluster to signal on perf_sync - see Cluster sync. 0 (default)
    = off. When set, the clusterer module must be loaded (before
@@ -354,14 +500,14 @@ modparam("cachedb_perf", "persist_collections", "sessions,profiles")
    perf_sync degrades to a DB save with no peer signal (a soft
    dependency, never fatal).
 
-   Example 1.13. Set sync_cluster_id parameter
+   Example 1.16. Set sync_cluster_id parameter
 ...
 loadmodule "clusterer.so"
 loadmodule "cachedb_perf.so"
 modparam("cachedb_perf", "sync_cluster_id", 1)
 ...
 
-1.3.15. sync_shtag (string)
+1.3.18. sync_shtag (string)
 
    A clusterer sharing tag, as “name/cluster_id”, that arms the
    failover sync. A node whose tag turns active warms every
@@ -377,11 +523,11 @@ modparam("cachedb_perf", "sync_cluster_id", 1)
 
    Default value is unset (failover sync off).
 
-   Example 1.14. Setting sync_shtag
+   Example 1.17. Setting sync_shtag
 modparam("clusterer", "sharing_tag", "vip1/1=backup")
 modparam("cachedb_perf", "sync_shtag", "vip1/1")
 
-1.3.16. replicate_collections (string)
+1.3.19. replicate_collections (string)
 
    Comma-separated collections whose keys may be fetched from
    another node when this one misses (“pull on miss”). Nothing is
@@ -415,11 +561,11 @@ modparam("cachedb_perf", "sync_shtag", "vip1/1")
 
    Default value is unset (no collection is pulled).
 
-   Example 1.15. Setting replicate_collections
+   Example 1.18. Setting replicate_collections
 modparam("cachedb_perf", "sync_cluster_id", 1)
 modparam("cachedb_perf", "replicate_collections", "th")
 
-1.3.17. pull_transport (string)
+1.3.20. pull_transport (string)
 
    How cross-node pulls travel: bin (default) uses the clusterer's
    BIN links. clctr rides the clusterer_controller module's
@@ -436,7 +582,7 @@ modparam("cachedb_perf", "replicate_collections", "th")
 
    Default value is “bin”.
 
-1.3.18. pull_timeout_ms (integer)
+1.3.21. pull_timeout_ms (integer)
 
    How long a pull waits for the cluster, in milliseconds
    (1..5000). It is a backstop, not the normal cost: with every
@@ -446,7 +592,7 @@ modparam("cachedb_perf", "replicate_collections", "th")
 
    Default value is “50”.
 
-1.3.19. pull_slots (integer)
+1.3.22. pull_slots (integer)
 
    How many pulls may be in flight at once (8..16384). A miss that
    finds the pool dry is not queued - it is answered as a miss,
@@ -468,7 +614,7 @@ modparam("cachedb_perf", "replicate_collections", "th")
 
    Default value is “64”.
 
-1.3.20. pull_authoritative_serve (integer)
+1.3.23. pull_authoritative_serve (integer)
 
    In a converged cluster several nodes hold most keys, and a
    broadcast pull is answered by every one of them - with the full
@@ -497,7 +643,34 @@ modparam("cachedb_perf", "replicate_collections", "th")
 
    Default value is “0” (every holder answers with the value).
 
-1.3.21. pull_negative_ms (integer)
+1.3.24. pull_linger_ms (integer)
+
+   A pull whose answer arrives after pull_timeout_ms is no longer
+   anyone's answer - the caller has moved on - but it is still a
+   perfectly good value. The module keeps the request slot around
+   and stores such a late answer into the cache, so the next
+   lookup hits locally instead of asking the cluster again.
+   Without this, the cache never converges on exactly the keys
+   that are hardest to fetch.
+
+   This parameter is an optional extra bound on how late is too
+   late, in milliseconds past the pull timeout. The default of “0”
+   means no time bound: what makes a late answer valid is that the
+   value is still valid, and the value carries its own expiry,
+   computed against this node's clock. The practical ceiling is
+   the request slot's own lifetime.
+
+   Set it non-zero only where the script deletes keys from a
+   replicated collection: a late store cannot tell “never had it”
+   from “deleted a moment ago”, so a peer's copy could resurrect a
+   key the script removed. A deployment that only writes and lets
+   TTLs expire cannot hit that. A late answer never overwrites a
+   live local entry in any case - it fills gaps, it does not
+   compete with fresher writes.
+
+   Default value is “0” (no extra bound).
+
+1.3.25. pull_negative_ms (integer)
 
    How long to remember that the whole cluster answered “not here”
    for a key, in milliseconds (0..2000; 0 disables it). A SIP
@@ -518,7 +691,7 @@ modparam("cachedb_perf", "replicate_collections", "th")
 
    Default value is “300”.
 
-1.3.22. pull_on_miss (integer)
+1.3.26. pull_on_miss (integer)
 
    Repair a miss on the ordinary read path: when a lookup finds
    nothing locally, ask the cluster and return whatever comes back
@@ -614,7 +787,7 @@ Warning
    persistence): it is an occasional refresh, not something to
    fire on a timer or per request.
 
-   Example 1.16. Cluster-sync setup (one authority, two read
+   Example 1.19. Cluster-sync setup (one authority, two read
    replicas)
 # on every node - clusterer must load before cachedb_perf (the module
 # declares a soft dependency, so init order is handled either way):
@@ -753,11 +926,25 @@ WARNING:cachedb_perf:mod_init: replicate_collections is set but
        large gap between stores and entries with a small destroyed
        means most churn is same-key overwrites rather than expiry
        or deletes.
+     * stores_immortal - stores made with an expiry of 0, i.e.
+       records that never time out. This is a count of store
+       OPERATIONS, not a live population: such a record can still
+       be dropped by an explicit remove (accounted in removes,
+       never in expired), and re-storing a key with a TTL does not
+       unwind the earlier count. Its purpose is to give expired an
+       honest denominator - on a collection mixing timed and
+       never-expiring records, measuring expiry against every
+       store understates it, which is why perf_stats reports
+       expired_pct_of_expirable rather than a share of all stores.
      * entries - live records across all collections
      * seqlock_retries - optimistic-read retries (the contention
        signal)
      * lock_fallbacks - reads that fell back to the bucket lock
-     * arena_bytes / arena_chunks - memory taken from shm
+     * arena_bytes / arena_chunks - memory taken from shm; with
+       the core or own-hg backing the cells are HG_MALLOC's and
+       arena_chunks reads 0
+     * arena.backing (perf_stats) - the memory backing in use, see
+       memory_backing
      * memory_tier_probe / memory_tier_active - the huge-page tier
        the host was probed for, and the one the module's own arena
        actually runs on (1 hugetlb .. 4 plain 4K). They differ
@@ -790,12 +977,13 @@ WARNING:cachedb_perf:mod_init: replicate_collections is set but
        answered that it does not have the key. pulls_oversize - a
        peer has it but it exceeds the cluster transport limit.
        pulls_timed_out - nothing came back in pull_timeout_ms.
-       pulls_held - a peer holds a passive copy and defers to the
-       authoritative holder (pull_authoritative_serve); serve-side
-       twin: pulls_served_held. pulls_forced - only held copies
-       were on offer, so one holder was re-asked with force.
        pulls_send_failed - the transport refused the datagram, so
-       no peer was ever asked.
+       no peer was ever asked. pulls_held - a peer answered that
+       it holds a passive copy but defers to the authoritative
+       holder (pull_authoritative_serve); its serve-side twin is
+       pulls_served_held. pulls_forced - every peer answered yet
+       only held copies were on offer, so one holder was re-asked
+       directly with the force flag.
      * pulls_stored - answers written into the cache.
        pulls_in_flight - requests outstanding right now (a gauge,
        not a total).
@@ -821,13 +1009,13 @@ WARNING:cachedb_perf:mod_init: replicate_collections is set but
        the two apart.
 
    The two identities:
-
 misses          = pulls_requested + pulls_suppressed
                   + pulls_skip_notreplicated + pulls_skip_toolong
                   + pulls_skip_nopeers + pulls_skip_noslot
 
 pulls_requested = pulls_received + pulls_negative + pulls_oversize
-                  + pulls_timed_out + pulls_send_failed + pulls_in_flight
+                  + pulls_timed_out + pulls_send_failed + pulls_in_fligh
+t
 
    The second holds exactly on a two-node cluster. pulls_negative
    is counted per REPLY, so with more peers one request can raise
@@ -855,7 +1043,7 @@ pulls_requested = pulls_received + pulls_negative + pulls_oversize
 
    Name: perf_stats. Parameters: collection (optional).
 
-   Example 1.17. perf_stats usage
+   Example 1.20. perf_stats usage
 opensips-cli -x mi cachedb_perf:perf_stats
 opensips-cli -x mi cachedb_perf:perf_stats th
 
@@ -883,7 +1071,7 @@ opensips-cli -x mi cachedb_perf:perf_stats th
 
    Name: perf_stats_reset. Parameters: collection (optional).
 
-   Example 1.18. perf_stats_reset usage
+   Example 1.21. perf_stats_reset usage
 opensips-cli -x mi cachedb_perf:perf_stats_reset
 opensips-cli -x mi cachedb_perf:perf_stats_reset th
 
@@ -941,7 +1129,7 @@ perf_get / perf_probe / perf_pull / perf_set / perf_ttl / perf_del
        the glob; returns the count. The MI face of the perf_del()
        script function.
 
-   Example 1.19. introspection usage
+   Example 1.22. introspection usage
 opensips-cli -x mi cachedb_perf:perf_keys "session-*"
 opensips-cli -x mi cachedb_perf:perf_keys "session-*" th 50
 opensips-cli -x mi cachedb_perf:perf_scan 0
@@ -952,20 +1140,20 @@ opensips-cli -x mi cachedb_perf:perf_set greeting hello 300
 opensips-cli -x mi cachedb_perf:perf_ttl "session-*" 1800
 opensips-cli -x mi cachedb_perf:perf_del "session-abc*"
 
-1.8.4. perf_cluster_size
+1.8.4. perf_cluster_size - live per-node entry counts
 
-   perf_cluster_size <collection> asks every cluster member for its
-   LIVE entry count in one collection and reports them side by
-   side, the local count included. For a replicated collection this
-   is the convergence gauge: each node's count climbs toward the
-   full set as its pulls decay toward zero. Because the answers are
-   live there is nothing to age or interpret - a node that does not
-   answer within the wait is exactly as unreachable as it would be
-   for a pull, and is listed with "no reply" (the reported total
-   then says it covers the answering nodes only). One query runs at
-   a time; it is an operator path.
+   perf_cluster_size <collection> asks every cluster member for
+   its LIVE entry count in one collection and reports them side by
+   side, the local count included. For a replicated collection
+   this is the convergence gauge: each node's count climbs toward
+   the full set as its pulls decay toward zero. Because the
+   answers are live there is nothing to age or interpret - a node
+   that does not answer within the wait is exactly as unreachable
+   as it would be for a pull, and is listed with no reply (the
+   reported total then says it covers the answering nodes only).
+   One query runs at a time; it is an operator path.
 
-   Example. perf_cluster_size usage
+   Example 1.23. perf_cluster_size usage
 opensips-cli -x mi cachedb_perf:perf_cluster_size ul
 { "collection": "ul",
   "nodes": [
@@ -984,7 +1172,7 @@ opensips-cli -x mi cachedb_perf:perf_cluster_size ul
    reply reports how many collections and entries were written or
    read.
 
-   Example 1.20. perf_save / perf_load usage
+   Example 1.24. perf_save / perf_load usage
 opensips-cli -x mi cachedb_perf:perf_save
 opensips-cli -x mi cachedb_perf:perf_save sessions
 opensips-cli -x mi cachedb_perf:perf_load sessions
@@ -995,7 +1183,7 @@ opensips-cli -x mi cachedb_perf:perf_load sessions
    (see Cluster sync); all declared collections if none is named.
    Also available as a script function, perf_sync([collection]).
 
-   Example 1.21. perf_sync usage
+   Example 1.25. perf_sync usage
 opensips-cli -x mi cachedb_perf:perf_sync sessions
 
 1.9. Exported Events
@@ -1061,7 +1249,7 @@ opensips-cli -x mi cachedb_perf:perf_sync sessions
    Returns the number of keys removed, or -1 (false) if none
    matched.
 
-   Example 1.22. perf_del() usage
+   Example 1.26. perf_del() usage
 ...
 perf_del("session-*");
 perf_del("th-*", "th");
@@ -1076,7 +1264,7 @@ perf_del("th-*", "th");
    0 = unbounded. Returns the match count, or -1 (false) if none
    matched.
 
-   Example 1.23. perf_mget() usage
+   Example 1.27. perf_mget() usage
 ...
 if (perf_mget("user-*", $avp(k), $avp(v))) {
     xlog("first match: $(avp(k)[0]) = $(avp(v)[0])\n");
@@ -1092,7 +1280,7 @@ if (perf_mget("user-*", $avp(k), $avp(v))) {
    through unescaped - strict JSON consumers therefore need UTF-8
    values. Returns the match count, or -1 (false) if none matched.
 
-   Example 1.24. perf_mget_json() usage
+   Example 1.28. perf_mget_json() usage
 ...
 if (perf_mget_json("user-*", $var(blob), , 100))
     xlog("users: $var(blob)\n");

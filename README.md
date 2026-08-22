@@ -326,15 +326,15 @@ implementation, so `-a` is refused at start) and v3 with an auto-scaling
 profile, run twice — with the stock 30 s growth tick and with a 2 s one
 (below). Latency figures quote the worse of the two load generators.
 
-| | F_MALLOC | HG v3 | HG v2 | HG v3, fixed `-m 3072` | HG v1 | F_PARALLEL_MALLOC | HG v3 + profile | HG v3 + profile, 2 s tick |
-|---|---|---|---|---|---|---|---|---|
-| puller at 1M, shm real-used / used | 1,953 / 1,310 MB | 1,761 / 1,365 MB | 1,791 / 1,394 MB | 1,839 / 1,441 MB | crashed | 1,936 / 1,291 MB | 1,810 / 1,413 MB | 1,841 / 1,443 MB |
-| mapped / committed to hold that | 3,072 MB fixed | 2,336 MB grown | 3,072 MB fixed (2,344 MB carved at peak) | 3,072 MB fixed (no cap: `hcap == hsize`) | — | 3,072 MB fixed, 32 pools | 2,496 MB grown (2,800 MB after the expiry wait) | 3,072 MB grown — the whole reservation |
-| cold pull p50 / p95 / p99 | 1.5 / 8.9 / 34 ms | 1.35 / 16 / 60 ms | 1.25 / 4.0 / 29 ms | 1.2 / 2.0 / 19 ms | — | 1.4 / 12.7 / 40 ms | 1.2 / 8.8 / 53 ms | 1.2 / 21 / 109 ms |
-| warm hit p99 | 0.78 ms | 15 ms | 0.77 ms | 0.67 ms | — | 0.73 ms | 0.73 ms | 0.71 ms |
-| warm seconds with p95 > 5 ms | 0 | 41 | 0 | 0 | — | 0 | 9 | 0 |
-| requests lost during the sweeps | 0 | 210 | 0 | 0 | — | 0 | 0 | 883 (+ 23 in the fill) |
-| shm still used after all 1M expired (owner / puller) | 236 / 448 MB | 238 / 450 MB | 238 / 450 MB | 238 / 451 MB | — | 400 / 762 MB | 238 / 450 MB | 238 / 450 MB |
+| | F_MALLOC | HG v3 | HG v2 | HG v3, fixed `-m 3072` | HG v1 | F_PARALLEL_MALLOC | HG v3 + profile | HG v3 + profile, 2 s tick | HG v3 fixed, + T1 (stats walk fixed) | HG v3 elastic, + T1 (stats walk fixed) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| puller at 1M, shm real-used / used | 1,953 / 1,310 MB | 1,761 / 1,365 MB | 1,791 / 1,394 MB | 1,839 / 1,441 MB | crashed | 1,936 / 1,291 MB | 1,810 / 1,413 MB | 1,841 / 1,443 MB | 1,847 / 1,449 MB | 1,847 / 1,449 MB |
+| mapped / committed to hold that | 3,072 MB fixed | 2,336 MB grown | 3,072 MB fixed (2,344 MB carved at peak) | 3,072 MB fixed (no cap: `hcap == hsize`) | — | 3,072 MB fixed, 32 pools | 2,496 MB grown (2,800 MB after the expiry wait) | 3,072 MB grown — the whole reservation | 3,072 MB fixed | 2,352 MB grown (115 grows, all on exhaustion) |
+| cold pull p50 / p95 / p99 | 1.5 / 8.9 / 34 ms | 1.35 / 16 / 60 ms | 1.25 / 4.0 / 29 ms | 1.2 / 2.0 / 19 ms | — | 1.4 / 12.7 / 40 ms | 1.2 / 8.8 / 53 ms | 1.2 / 21 / 109 ms | 1.2 / 1.8 / 17 ms | 1.2 / 5.7 / 49 ms |
+| warm hit p99 | 0.78 ms | 15 ms | 0.77 ms | 0.67 ms | — | 0.73 ms | 0.73 ms | 0.71 ms | 0.66 ms (max 4 ms) | 0.67 ms (max 28 ms) |
+| warm seconds with p95 > 5 ms | 0 | 41 | 0 | 0 | — | 0 | 9 | 0 | 0 | 0 |
+| requests lost during the sweeps | 0 | 210 | 0 | 0 | — | 0 | 0 | 883 (+ 23 in the fill) | 0 | 0 |
+| shm still used after all 1M expired (owner / puller) | 236 / 448 MB | 238 / 450 MB | 238 / 450 MB | 238 / 451 MB | — | 400 / 762 MB | 238 / 450 MB | 238 / 450 MB | 238 / 451 MB | 238 / 451 MB |
 
 Measured: take the growth away and leave the GC in, and the tail goes
 with it — v2 matches F_MALLOC on every latency row (warm p99 0.77 ms, no
@@ -382,13 +382,35 @@ sets how often the data path stalls. v3 has no proactive-growth counter
 and no distinguishable log line for it — the split here is by tick
 cadence; both to be added under T1.
 
+T1 has since landed on the v3 branch (`feature/hg-malloc-v3-master`, lock
+hold/wait histograms per reason, `gc` and `commit` timed on their own,
+stall counters, `E_CORE_HG_LOCK_STALL`, proactive/exhaustion grow
+attribution), and its first run on this rig found that the biggest
+holder of the arena lock was the bench itself: every `shmem:` statistics
+read walked the whole chunk registry under the lock (7 ms mean, up to
+30 ms on the puller), so the 42–95 ms warm *maximum* of every row above —
+v2 and F_MALLOC included — and part of the fixed-arena cold p99 were the
+monitor's scrapes, and the same stall lands on any scraped production node
+with a large arena. With that path made O(1) the fixed arena passes all
+thirteen bars of the validation harness (`/dn/pullbench/validate.py`:
+cold p99 ≤ 1.25× the reference, warm p99 ≤ 1 ms, zero lost, zero UDP
+drops, no lock hold over 1 ms, GC under 1 ms, memory and retention within
+a few percent): cold p99 17 ms, warm p99 0.66 ms with a 4 ms maximum,
+worst lock hold 0.8 ms. The elastic arena then has exactly one remaining
+lock holder above a millisecond: the 16 MB commit inside each exhaustion
+grow (`MADV_COLLAPSE` + `mlock` on the THP tier), 115 of them per 1M
+absorb at a mean of 64 ms and a maximum of 126 ms, behind which SIP
+workers wait up to 126 ms for a class refill — cold p99 49 ms with zero
+lost requests, and every other allocator path under 1 ms. Moving that
+commit off the hot path is the next change.
+
 Every configuration above on one sheet — memory (zoomed, with the cache
 arena and the committed size where they apply), the three latency ladders
 on log and linear scales, tail health, growth events and a summary table:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="doc/pull-sharing/allocators-overview-dark.svg">
-  <img alt="Twelve-panel overview of all ten allocator configurations on the 1M pull-sharing bench: zoomed memory dot-plots for the pulling node, an owner node and after expiry; cold, warm and REGISTER latency ladders (p50, p95, p99) on log and linear axes; lost requests and stall-seconds; elastic growth events with the committed size; and a summary table. HG_MALLOC v2, HG_MALLOC v3 on a fixed arena and F_MALLOC have clean tails; HG_MALLOC v3 elastic has a 15 ms warm p99 and 210 lost requests; the auto-scaling profile removes the warm tail; the 2 s growth tick has the worst tails of all with 997 lost requests and the whole 3,072 MB committed" src="doc/pull-sharing/allocators-overview-light.svg">
+  <img alt="Twelve-panel overview of all twelve allocator configurations on the 1M pull-sharing bench: zoomed memory dot-plots for the pulling node, an owner node and after expiry; cold, warm and REGISTER latency ladders (p50, p95, p99) on log and linear axes; lost requests and stall-seconds; elastic growth events with the committed size; and a summary table. HG_MALLOC v2, HG_MALLOC v3 on a fixed arena and F_MALLOC have clean tails, and v3 with the T1 stats-walk fix has the cleanest (warm max 4 ms); HG_MALLOC v3 elastic has a 15 ms warm p99 and 210 lost requests; the auto-scaling profile removes the warm tail; the 2 s growth tick has the worst tails of all with 997 lost requests and the whole 3,072 MB committed" src="doc/pull-sharing/allocators-overview-light.svg">
 </picture>
 
 ## Observability

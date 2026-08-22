@@ -326,15 +326,15 @@ implementation, so `-a` is refused at start) and v3 with an auto-scaling
 profile, run twice — with the stock 30 s growth tick and with a 2 s one
 (below). Latency figures quote the worse of the two load generators.
 
-| | F_MALLOC | HG v3 | HG v2 | HG v3, fixed `-m 3072` | HG v1 | F_PARALLEL_MALLOC | HG v3 + profile | HG v3 + profile, 2 s tick | HG v3 fixed, + T1 (stats walk fixed) | HG v3 elastic, + T1 (stats walk fixed) | HG v3 elastic, + T1/T6, `shmem_enabled=advise` | HG v3 elastic, + two-phase commit (T14), `advise` |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| puller at 1M, shm real-used / used | 1,953 / 1,310 MB | 1,761 / 1,365 MB | 1,791 / 1,394 MB | 1,839 / 1,441 MB | crashed | 1,936 / 1,291 MB | 1,810 / 1,413 MB | 1,841 / 1,443 MB | 1,847 / 1,449 MB | 1,847 / 1,449 MB | 1,852 / 1,449 MB | 1,850 / 1,449 MB |
-| mapped / committed to hold that | 3,072 MB fixed | 2,336 MB grown | 3,072 MB fixed (2,344 MB carved at peak) | 3,072 MB fixed (no cap: `hcap == hsize`) | — | 3,072 MB fixed, 32 pools | 2,496 MB grown (2,800 MB after the expiry wait) | 3,072 MB grown — the whole reservation | 3,072 MB fixed | 2,352 MB grown (115 grows, all on exhaustion) | 2,352 MB grown (115 grows, all on exhaustion) | 2,352 MB grown (115 grows, all on exhaustion) |
-| cold pull p50 / p95 / p99 | 1.5 / 8.9 / 34 ms | 1.35 / 16 / 60 ms | 1.25 / 4.0 / 29 ms | 1.2 / 2.0 / 19 ms | — | 1.4 / 12.7 / 40 ms | 1.2 / 8.8 / 53 ms | 1.2 / 21 / 109 ms | 1.2 / 1.8 / 17 ms | 1.2 / 5.7 / 49 ms | 1.2 / 2.1 / 20 ms | 1.2 / 1.8 / 15 ms |
-| warm hit p99 | 0.78 ms | 15 ms | 0.77 ms | 0.67 ms | — | 0.73 ms | 0.73 ms | 0.71 ms | 0.66 ms (max 4 ms) | 0.67 ms (max 28 ms) | 0.70 ms | 0.68 ms |
-| warm seconds with p95 > 5 ms | 0 | 41 | 0 | 0 | — | 0 | 9 | 0 | 0 | 0 | 0 | 0 |
-| requests lost during the sweeps | 0 | 210 | 0 | 0 | — | 0 | 0 | 883 (+ 23 in the fill) | 0 | 0 | 0 | 0 |
-| shm still used after all 1M expired (owner / puller) | 236 / 448 MB | 238 / 450 MB | 238 / 450 MB | 238 / 451 MB | — | 400 / 762 MB | 238 / 450 MB | 238 / 450 MB | 238 / 451 MB | 238 / 451 MB | 238 / 452 MB | 238 / 451 MB |
+| | F_MALLOC | HG v3 | HG v2 | HG v3, fixed `-m 3072` | HG v1 | F_PARALLEL_MALLOC | HG v3 + profile | HG v3 + profile, 2 s tick | HG v3 fixed, + T1 (stats walk fixed) | HG v3 elastic, + T1 (stats walk fixed) | HG v3 elastic, + T1/T6, `shmem_enabled=advise` | HG v3 elastic, + two-phase commit (T14), `advise` | HG v3 elastic, + maintenance process, `advise` | HG v3 elastic, + maintenance process, `never` |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| puller at 1M, shm real-used / used | 1,953 / 1,310 MB | 1,761 / 1,365 MB | 1,791 / 1,394 MB | 1,839 / 1,441 MB | crashed | 1,936 / 1,291 MB | 1,810 / 1,413 MB | 1,841 / 1,443 MB | 1,847 / 1,449 MB | 1,847 / 1,449 MB | 1,852 / 1,449 MB | 1,850 / 1,449 MB | 1,853 / 1,449 MB | 1,813 / 1,449 MB |
+| mapped / committed to hold that | 3,072 MB fixed | 2,336 MB grown | 3,072 MB fixed (2,344 MB carved at peak) | 3,072 MB fixed (no cap: `hcap == hsize`) | — | 3,072 MB fixed, 32 pools | 2,496 MB grown (2,800 MB after the expiry wait) | 3,072 MB grown — the whole reservation | 3,072 MB fixed | 2,352 MB grown (115 grows, all on exhaustion) | 2,352 MB grown (115 grows, all on exhaustion) | 2,352 MB grown (115 grows, all on exhaustion) | 2,688 MB grown (136 grows, all ahead of demand) | 2,688 MB grown (136 grows, all ahead of demand) |
+| cold pull p50 / p95 / p99 | 1.5 / 8.9 / 34 ms | 1.35 / 16 / 60 ms | 1.25 / 4.0 / 29 ms | 1.2 / 2.0 / 19 ms | — | 1.4 / 12.7 / 40 ms | 1.2 / 8.8 / 53 ms | 1.2 / 21 / 109 ms | 1.2 / 1.8 / 17 ms | 1.2 / 5.7 / 49 ms | 1.2 / 2.1 / 20 ms | 1.2 / 1.8 / 15 ms | 1.2 / 1.9 / 17 ms | 1.2 / 2.0 / 18 ms |
+| warm hit p99 | 0.78 ms | 15 ms | 0.77 ms | 0.67 ms | — | 0.73 ms | 0.73 ms | 0.71 ms | 0.66 ms (max 4 ms) | 0.67 ms (max 28 ms) | 0.70 ms | 0.68 ms | 0.72 ms (max 4.3 ms) | 0.69 ms (max 4.4 ms) |
+| warm seconds with p95 > 5 ms | 0 | 41 | 0 | 0 | — | 0 | 9 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| requests lost during the sweeps | 0 | 210 | 0 | 0 | — | 0 | 0 | 883 (+ 23 in the fill) | 0 | 0 | 0 | 0 | 0 | 0 |
+| shm still used after all 1M expired (owner / puller) | 236 / 448 MB | 238 / 450 MB | 238 / 450 MB | 238 / 451 MB | — | 400 / 762 MB | 238 / 450 MB | 238 / 450 MB | 238 / 451 MB | 238 / 451 MB | 238 / 452 MB | 238 / 451 MB | 238 / 451 MB | 238 / 451 MB |
 
 Measured: take the growth away and leave the GC in, and the tail goes
 with it — v2 matches F_MALLOC on every latency row (warm p99 0.77 ms, no
@@ -433,13 +433,30 @@ are gone too (worst hold 1.9 ms, was 98–126 ms) but the waiters still
 pay the requester's populate-plus-collapse (mean 39 ms): that residue is
 what growing a granule ahead of demand would remove.
 
+The last two columns are the branch head: an elastic shm arena now gets
+a dedicated core process, `HG maintenance`, which takes the arena lock
+for microseconds once a second to keep the free grid above twice the
+reserve floor (and runs the profile and shrink gates every thirtieth
+tick), so every granule is populated in that process before any worker
+needs it. On both host configurations all 136 grows were ahead of
+demand, no worker ever waited, and the kernel-default `never` host now
+matches the `advise` one on every request figure (fill p99 0.88, cold
+p99 18 ms, zero lost) — the sysctl of the previous column is a CPU and
+memory optimisation, no longer a latency prerequisite. The price is the
+headroom, ~330 MB more committed than growing on exhaustion alone. Along
+the way a size-bucketed free list for the large tier was tried and
+reverted: it cut that tier's lock holds from 235 µs to 9 µs and made the
+cold-pull p99 10 ms worse on four runs out of four, for reasons the
+counters do not yet explain — a change whose only request-level effect
+is a slower tail does not stay in, and the harness exists to say so.
+
 Every configuration above on one sheet — memory (zoomed, with the cache
 arena and the committed size where they apply), the three latency ladders
 on log and linear scales, tail health, growth events and a summary table:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="doc/pull-sharing/allocators-overview-dark.svg">
-  <img alt="Twelve-panel overview of all fourteen allocator configurations on the 1M pull-sharing bench: zoomed memory dot-plots for the pulling node, an owner node and after expiry; cold, warm and REGISTER latency ladders (p50, p95, p99) on log and linear axes; lost requests and stall-seconds; elastic growth events with the committed size; and a summary table. HG_MALLOC v2, HG_MALLOC v3 on a fixed arena and F_MALLOC have clean tails, and v3 with the T1 stats-walk fix has the cleanest (warm max 4 ms); HG_MALLOC v3 elastic has a 15 ms warm p99 and 210 lost requests; the auto-scaling profile removes the warm tail; the 2 s growth tick has the worst tails of all with 997 lost requests and the whole 3,072 MB committed" src="doc/pull-sharing/allocators-overview-light.svg">
+  <img alt="Twelve-panel overview of all sixteen allocator configurations on the 1M pull-sharing bench: zoomed memory dot-plots for the pulling node, an owner node and after expiry; cold, warm and REGISTER latency ladders (p50, p95, p99) on log and linear axes; lost requests and stall-seconds; elastic growth events with the committed size; and a summary table. HG_MALLOC v2, HG_MALLOC v3 on a fixed arena and F_MALLOC have clean tails, and v3 with the T1 stats-walk fix has the cleanest (warm max 4 ms); HG_MALLOC v3 elastic has a 15 ms warm p99 and 210 lost requests; the auto-scaling profile removes the warm tail; the 2 s growth tick has the worst tails of all with 997 lost requests and the whole 3,072 MB committed" src="doc/pull-sharing/allocators-overview-light.svg">
 </picture>
 
 ## Observability

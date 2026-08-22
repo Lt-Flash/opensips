@@ -318,22 +318,22 @@ with a fixed 3,072 MB arena (`-a HG_MALLOC -m 3072`, no cache arena) as
 controls for the v3 row: v2 keeps v3's buddy allocator and inline garbage
 collection (`gc_class`, `HG_GC_KEEP 0`) but can neither grow nor shrink,
 so it isolates the elastic-growth machinery; v1 is the original bump/slab
-allocator with neither buddy nor GC, so it isolates the GC. Two further
+allocator with neither buddy nor GC, so it isolates the GC. Three further
 columns came with them: F_PARALLEL_MALLOC on the same binary
 (`-s F_PARALLEL_MALLOC -k F_MALLOC -m 3072` — it has no pkg
 implementation, so `-a` is refused at start) and v3 with an auto-scaling
-profile, which could not be started (below). Latency figures quote the
-worse of the two load generators.
+profile, run twice — with the stock 30 s growth tick and with a 2 s one
+(below). Latency figures quote the worse of the two load generators.
 
-| | F_MALLOC | HG v3 | HG v2 | HG v1 | F_PARALLEL_MALLOC | HG v3 + profile |
-|---|---|---|---|---|---|---|
-| puller at 1M, shm real-used / used | 1,953 / 1,310 MB | 1,761 / 1,365 MB | 1,791 / 1,394 MB | crashed | 1,936 / 1,291 MB | not run |
-| mapped / committed to hold that | 3,072 MB fixed | 2,336 MB grown | 3,072 MB fixed (2,344 MB carved at peak) | — | 3,072 MB fixed, 32 pools | — |
-| cold pull p50 / p95 / p99 | 1.5 / 8.9 / 34 ms | 1.35 / 16 / 60 ms | 1.25 / 4.0 / 29 ms | — | 1.4 / 12.7 / 40 ms | — |
-| warm hit p99 | 0.78 ms | 15 ms | 0.77 ms | — | 0.73 ms | — |
-| warm seconds with p95 > 5 ms | 0 | 41 | 0 | — | 0 | — |
-| requests lost during the sweeps | 0 | 210 | 0 | — | 0 | — |
-| shm still used after all 1M expired (owner / puller) | 236 / 448 MB | 238 / 450 MB | 238 / 450 MB | — | 400 / 762 MB | — |
+| | F_MALLOC | HG v3 | HG v2 | HG v1 | F_PARALLEL_MALLOC | HG v3 + profile | HG v3 + profile, 2 s tick |
+|---|---|---|---|---|---|---|---|
+| puller at 1M, shm real-used / used | 1,953 / 1,310 MB | 1,761 / 1,365 MB | 1,791 / 1,394 MB | crashed | 1,936 / 1,291 MB | 1,810 / 1,413 MB | 1,841 / 1,443 MB |
+| mapped / committed to hold that | 3,072 MB fixed | 2,336 MB grown | 3,072 MB fixed (2,344 MB carved at peak) | — | 3,072 MB fixed, 32 pools | 2,496 MB grown (2,800 MB after the expiry wait) | 3,072 MB grown — the whole reservation |
+| cold pull p50 / p95 / p99 | 1.5 / 8.9 / 34 ms | 1.35 / 16 / 60 ms | 1.25 / 4.0 / 29 ms | — | 1.4 / 12.7 / 40 ms | 1.2 / 8.8 / 53 ms | 1.2 / 21 / 109 ms |
+| warm hit p99 | 0.78 ms | 15 ms | 0.77 ms | — | 0.73 ms | 0.73 ms | 0.71 ms |
+| warm seconds with p95 > 5 ms | 0 | 41 | 0 | — | 0 | 9 | 0 |
+| requests lost during the sweeps | 0 | 210 | 0 | — | 0 | 0 | 883 (+ 23 in the fill) |
+| shm still used after all 1M expired (owner / puller) | 236 / 448 MB | 238 / 450 MB | 238 / 450 MB | — | 400 / 762 MB | 238 / 450 MB | 238 / 450 MB |
 
 Measured: take the growth away and leave the GC in, and the tail goes
 with it — v2 matches F_MALLOC on every latency row (warm p99 0.77 ms, no
@@ -348,12 +348,31 @@ seconds into the first cross-node pulls (the fill itself completed: 1M ×
 200, owners at 879 MB), so the no-GC control has no numbers.
 F_PARALLEL_MALLOC tracks F_MALLOC on latency and footprint but keeps
 400 / 762 MB after the expiry, since each process's pool recycles only
-its own frees. The profile run never started: the stock profile
-validator (`pt_scaling.c`, `max_procs >= 1000` is an error) rejects any
-scale-up target of 1,000 or more, which an MB-scale arena profile cannot
-avoid on this binary — `scale up to 3072 ...` fails with "invalid
-relation or range for MIN/MAX processes" with or without a scale-down
-clause or `within`.
+its own frees. The profile runs needed a bench-only lift of the stock
+validator first (`pt_scaling.c` rejects any scale-up target of 1,000 or
+more as an invalid process count — a v3 bug, its own examples use 1024);
+the profile was `scale up to 3072 on 35% for 1 cycles` / `scale down to
+512 on 5% for 120 cycles` on an elastic `-m 512:3072` arena. With the
+stock 30 s tick the proactive path is one 16 MB granule per tick: 41 of
+the puller's 143 grows, of which only 11 fell in the cold sweep (the
+other 102 were exhaustion grows, as without a profile), while the gate —
+gross carve footprint against committed — kept adding a granule every
+30 s through the idle warm sweep and the expiry wait (2,800 MB committed
+on the puller, 1,744 MB per owner, none released: nothing gets under the
+5% down-threshold); the tail moved towards v2 rather than away from it
+(cold p99 53 vs 60 ms, 26 vs 39 stall seconds, 0 vs 210 lost, warm p99
+0.73 ms with 9 stall seconds at the 30 s grow cadence), which one run
+each cannot separate from run-to-run variance. A 2 s tick (a scratch
+second timer, flags 0, `timer_workers=2`) made every grow proactive —
+160 of 160 per node, the reserve floor never crossed, a warm sweep
+without a single stall second — and the tails the worst of the table
+(fill p99 31 ms with 23 REGISTERs lost, cold p99 109 ms, max 2.2 s, 47
+stall seconds, 883 lost), with all three nodes at the 3,072 MB ceiling
+inside five minutes: the 16 MB commit runs under the arena lock inside
+whichever SIP or TCP worker reads the timer-job pipe, so the cadence only
+sets how often the data path stalls. v3 has no proactive-growth counter
+and no distinguishable log line for it — the split here is by tick
+cadence; both to be added under T1.
 
 ## Observability
 

@@ -374,6 +374,15 @@ sets how often the data path stalls. v3 has no proactive-growth counter
 and no distinguishable log line for it — the split here is by tick
 cadence; both to be added under T1.
 
+Every configuration above on one sheet — memory (zoomed, with the cache
+arena and the committed size where they apply), the three latency ladders
+on log and linear scales, tail health, growth events and a summary table:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/pull-sharing/allocators-overview-dark.svg">
+  <img alt="Twelve-panel overview of all nine allocator configurations on the 1M pull-sharing bench: zoomed memory dot-plots for the pulling node, an owner node and after expiry; cold, warm and REGISTER latency ladders (p50, p95, p99) on log and linear axes; lost requests and stall-seconds; elastic growth events with the committed size; and a summary table. HG_MALLOC v2 and F_MALLOC have clean tails; HG_MALLOC v3 elastic has a 15 ms warm p99 and 210 lost requests; the auto-scaling profile removes the warm tail; the 2 s growth tick has the worst tails of all with 997 lost requests and the whole 3,072 MB committed" src="doc/pull-sharing/allocators-overview-light.svg">
+</picture>
+
 ## Observability
 
 * Exact fleet contact count: `sum(owned_contacts)` across nodes (ownership

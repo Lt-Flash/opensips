@@ -215,7 +215,11 @@ typedef struct pcache_arena {
 	 * MAP_SHARED region; slots bump from it at hoff, regions too */
 	char                 *hbase;
 	unsigned long         hsize;
-	unsigned long         hoff;             /* frontier, under the lock */
+	unsigned long         hoff;             /* chunk frontier, grows UP (lock) */
+	unsigned long         rtop;             /* region frontier, grows DOWN: the
+	                                         * index tables never share a 2 MB
+	                                         * group with chunks, so groups of
+	                                         * retired chunks can be punched out */
 	enum pcache_mem_tier  htier;
 	unsigned long         hlocked_mb;
 } pcache_arena_t;
@@ -439,7 +443,7 @@ static pcache_chunk_t *slot_take(void)
 		arena->bytes += PCACHE_SLOT;
 		ch = rslot_at(i);
 		ch->cold = 0;
-	} else if (arena->hbase && arena->hoff + PCACHE_SLOT <= arena->hsize) {
+	} else if (arena->hbase && arena->hoff + PCACHE_SLOT <= arena->rtop) {
 		ch = (pcache_chunk_t *)(arena->hbase + arena->hoff);
 		arena->hoff += PCACHE_SLOT;
 		arena->slots_total++;
@@ -636,6 +640,7 @@ int pcache_arena_init(void)
 		} else {
 			arena->lo = (unsigned long)arena->hbase;
 			arena->hi = (unsigned long)arena->hbase + arena->hsize;
+			arena->rtop = arena->hsize;
 			arena->rslots = arena->hsize >> PCACHE_SLOT_SHIFT;
 			arena->rwarm = shm_malloc(2 * ((arena->rslots + BITS_PER_LONG - 1)
 				/ BITS_PER_LONG) * sizeof(unsigned long));
@@ -686,9 +691,9 @@ void *pcache_region_alloc(size_t size)
 
 	lock_get(&arena->lock);
 	slots = (need + PCACHE_SLOT - 1) >> PCACHE_SLOT_SHIFT;
-	if (arena->hbase && arena->hoff + slots * PCACHE_SLOT <= arena->hsize) {
-		rg = (pcache_region_t *)(arena->hbase + arena->hoff);
-		arena->hoff += slots * PCACHE_SLOT;
+	if (arena->hbase && arena->hoff + slots * PCACHE_SLOT <= arena->rtop) {
+		arena->rtop -= slots * PCACHE_SLOT;
+		rg = (pcache_region_t *)(arena->hbase + arena->rtop);
 		arena->bytes += slots * PCACHE_SLOT;
 		arena->regions_bytes += slots * PCACHE_SLOT;
 		rg->size = 0;                       /* lives in the reservation */
@@ -1360,7 +1365,7 @@ void pcache_arena_hugepage_capacity(int *active, unsigned long *total,
 	}
 	*active = 1;
 	*total = arena->hsize;
-	*used = n * PCACHE_SLOT;
+	*used = n * PCACHE_SLOT + (arena->hsize - arena->rtop);   /* + the tables */
 	*free = arena->hsize - *used;
 	lock_release(&arena->lock);
 }

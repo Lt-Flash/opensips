@@ -5294,7 +5294,10 @@ static int mod_init(void)
 	 * it: a key is only worth asking the cluster about if it means the
 	 * same thing on every node, which only the operator knows. */
 	if (replicate_collections && *replicate_collections) {
-		const char *pt = pull_transport_str ? pull_transport_str : "bin";
+		/* pull_bind set and no transport named = the module's own udp
+		 * socket; nothing set = the clusterer's links, zero config */
+		const char *pt = pull_transport_str ? pull_transport_str
+			: (pcache_pull_bind && *pcache_pull_bind) ? "udp" : "bin";
 		int use_clctr = !strcasecmp(pt, "clctr");
 		int xkind = !strcasecmp(pt, "udp") ? PCACHE_XPORT_UDP :
 		            !strcasecmp(pt, "tcp") ? PCACHE_XPORT_TCP :

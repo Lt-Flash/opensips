@@ -656,21 +656,27 @@ modparam("cachedb_perf", "replicate_collections", "th")
 1.3.24. pull_transport (string)
 
    How cross-node pulls travel:
-     * bin (default) - the clusterer's BIN links. Every request
-       and reply is one TCP message the core's TCP dispatcher
-       hands to a receiver and back; at a few thousand pulls a
-       second that single process is the limit, and any stall on
-       the receiving side queues everything behind it. bins is the
-       same choice - whether the links are bin or bins is the
-       clusterer's node URLs, not this parameter.
-     * udp - the module's own datagram socket (pull_bind):
-       requests leave the asking process directly, replies arrive
-       in a dedicated cachedb_perf transport process that only
-       parses, copies into the pull slot and wakes the waiter. No
-       core dispatcher, no controller. Loss is handled by
-       pull_timeout_ms as for every transport. Payloads above the
-       MTU ride on IP fragmentation (DF cleared), which is for one
-       LAN or a path the operator knows passes fragments.
+     * bin (default when pull_bind is not set) - the clusterer's
+       BIN links: nothing to configure, but every request and
+       reply is one TCP message the core's TCP dispatcher hands to
+       a receiver and back, and those processes allocate per
+       message. At a few thousand pulls a second the dispatcher is
+       one process at the edge of a core, the receivers contend on
+       the shared-memory allocator, and any stall on the receiving
+       side queues everything behind it. Measured on a three-node
+       1,000,000-entry rig: pull p50 1.2 ms over bin, 0.75 ms over
+       udp. bins is the same choice - whether the links are bin or
+       bins is the clusterer's node URLs, not this parameter.
+     * udp (recommended; the default when pull_bind is set) - the
+       module's own datagram socket: requests leave the asking
+       process directly, replies arrive in a dedicated
+       cachedb_perf transport process that only parses, copies
+       into the pull slot and wakes the waiter. No core
+       dispatcher, no allocator traffic on the way, no controller.
+       Loss is handled by pull_timeout_ms as for every transport.
+       Payloads above the MTU ride on IP fragmentation (DF
+       cleared), which is for one LAN or a path the operator knows
+       passes fragments.
      * tcp - the module's own stream connections, one per
        direction per peer, owned by the transport process (other
        processes hand it their sends through IPC): ordered,
@@ -700,9 +706,9 @@ modparam("cachedb_perf", "pull_bind", "10.0.0.5:5580")
 1.3.25. pull_bind (string)
 
    The local ip:port (or [ip6]:port) the module's own pull
-   transport binds: the udp socket, or the tcp listener. Required
-   for pull_transport udp, tcp and tls; announced to the peers in
-   the HELLO.
+   transport binds: the udp socket, or the tcp listener. Setting
+   it selects udp unless pull_transport says otherwise; required
+   for udp, tcp and tls; announced to the peers in the HELLO.
 
    Example 1.24. Set pull_bind parameter
 ...

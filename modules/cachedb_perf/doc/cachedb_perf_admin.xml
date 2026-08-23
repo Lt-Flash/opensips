@@ -640,19 +640,25 @@ modparam("cachedb_perf", "replicate_collections", "th")
 		How cross-node pulls travel:
 		</para>
 		<itemizedlist>
-		<listitem><para><emphasis>bin</emphasis> (default) - the clusterer's
-		BIN links. Every request and reply is one TCP message the core's
-		TCP dispatcher hands to a receiver and back; at a few thousand pulls
-		a second that single process is the limit, and any stall on the
-		receiving side queues everything behind it. <emphasis>bins</emphasis>
-		is the same choice - whether the links are bin or bins is the
-		clusterer's node URLs, not this parameter.</para></listitem>
-		<listitem><para><emphasis>udp</emphasis> - the module's own datagram
-		socket (<xref linkend="param_pull_bind"/>): requests leave the
-		asking process directly, replies arrive in a dedicated
-		<emphasis>cachedb_perf transport</emphasis> process that only parses,
-		copies into the pull slot and wakes the waiter. No core dispatcher,
-		no controller. Loss is handled by <xref linkend="param_pull_timeout_ms"/>
+		<listitem><para><emphasis>bin</emphasis> (default when
+		<xref linkend="param_pull_bind"/> is not set) - the clusterer's
+		BIN links: nothing to configure, but every request and reply is one
+		TCP message the core's TCP dispatcher hands to a receiver and back,
+		and those processes allocate per message. At a few thousand pulls a
+		second the dispatcher is one process at the edge of a core, the
+		receivers contend on the shared-memory allocator, and any stall on
+		the receiving side queues everything behind it. Measured on a
+		three-node 1,000,000-entry rig: pull p50 1.2 ms over bin, 0.75 ms
+		over udp. <emphasis>bins</emphasis> is the same choice - whether the
+		links are bin or bins is the clusterer's node URLs, not this
+		parameter.</para></listitem>
+		<listitem><para><emphasis>udp</emphasis> (recommended; the default
+		when <emphasis>pull_bind</emphasis> is set) - the module's own
+		datagram socket: requests leave the asking process directly, replies
+		arrive in a dedicated <emphasis>cachedb_perf transport</emphasis>
+		process that only parses, copies into the pull slot and wakes the
+		waiter. No core dispatcher, no allocator traffic on the way, no
+		controller. Loss is handled by <xref linkend="param_pull_timeout_ms"/>
 		as for every transport. Payloads above the MTU ride on IP
 		fragmentation (DF cleared), which is for one LAN or a path the
 		operator knows passes fragments.</para></listitem>
@@ -695,8 +701,9 @@ modparam("cachedb_perf", "pull_bind", "10.0.0.5:5580")
 		<para>
 		The local <emphasis>ip:port</emphasis> (or <emphasis>[ip6]:port</emphasis>)
 		the module's own pull transport binds: the udp socket, or the tcp
-		listener. Required for <emphasis>pull_transport</emphasis> udp, tcp
-		and tls; announced to the peers in the HELLO.
+		listener. Setting it selects <emphasis>udp</emphasis> unless
+		<emphasis>pull_transport</emphasis> says otherwise; required for udp,
+		tcp and tls; announced to the peers in the HELLO.
 		</para>
 		<example>
 		<title>Set <varname>pull_bind</varname> parameter</title>

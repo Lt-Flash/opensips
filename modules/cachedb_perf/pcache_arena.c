@@ -94,7 +94,6 @@ static inline mem_arena_t *shm_arena_create(char *n, unsigned long i,
 		unsigned long c) { return NULL; }
 static inline int shm_arena_set_profile(mem_arena_t *a, const char *p)
 { return -1; }
-static inline int shm_allocator_is_hg(void) { return 0; }
 static inline mem_arena_t *shm_arena_core(void) { return NULL; }
 static inline void mem_arena_extents(const mem_arena_t *a, unsigned long *lo,
 		unsigned long *hi) { *lo = 0; *hi = 0; }

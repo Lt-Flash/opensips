@@ -2071,7 +2071,8 @@ err:
 
 static unsigned int neg_hash(pcache_col_t *col, const str *key)
 {
-	unsigned int h = core_hash((str *)key, &col->col_name, 0);
+	unsigned int h = pcache_key_hash(key) ^
+		(pcache_key_hash(&col->col_name) * 0x9e3779b1U);
 
 	return h ? h : 1;                    /* 0 marks a free slot */
 }

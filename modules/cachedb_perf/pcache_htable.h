@@ -60,6 +60,9 @@ typedef struct pcache_rec {
 } pcache_rec_t;
 
 #define PCACHE_REC_HDR              16
+
+/* the key hash (MurmurHash3 x86_32), local to this node */
+unsigned int pcache_key_hash(const str *key);
 #define PCACHE_REC_SIZE(_kl, _vl)   (PCACHE_REC_HDR + (_kl) + (_vl))
 
 /* rflags: native int64 counter (CP-04) - the value payload is 8 raw

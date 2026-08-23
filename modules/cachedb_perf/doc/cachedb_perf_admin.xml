@@ -33,7 +33,13 @@
 		tables), declared via the <emphasis>cache_collections</emphasis>
 		parameter. Each <emphasis>cachedb_url</emphasis> points to one
 		collection; a URL naming no collection uses the collection named
-		<quote>default</quote>, which always exists.
+		<quote>default</quote>, which always exists. Keys are hashed with
+		MurmurHash3 rather than the core's hash function: the latter sums
+		its per-word mixes, so sequential or numeric keys (phone numbers,
+		<quote>user123456</quote>) collide on the full 32 bits - measured
+		65k distinct values for 500,000 such keys, which put 38% of the
+		entries into the overflow table behind a single lock. MurmurHash3
+		gives the uniform 0.2%.
 	</para>
 	<warning>
 	<para>

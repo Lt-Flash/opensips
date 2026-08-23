@@ -638,6 +638,10 @@ static const param_export_t params[] = {
 	{ "arena_hugepage_cap_mb", INT_PARAM, &pcache_arena_hugepage_cap_mb },
 	{ "arena_profile",     STR_PARAM, &pcache_arena_profile },
 	{ "memory_backing",    STR_PARAM, &pcache_backing_policy },
+	{ "reclaim_keep",      INT_PARAM, &pcache_reclaim_keep },
+	{ "reclaim_quiet_s",   INT_PARAM, &pcache_reclaim_quiet_s },
+	{ "reclaim_cooloff_s", INT_PARAM, &pcache_reclaim_cooloff_s },
+	{ "reclaim_giveback",  INT_PARAM, &pcache_reclaim_giveback },
 	{ "expiry_sweep_period", INT_PARAM, &expiry_sweep_period },
 	{ "growth_load_factor",  INT_PARAM, &growth_load_factor },
 	{ "growth_budget",       INT_PARAM, &growth_budget },
@@ -1203,7 +1207,8 @@ static mi_response_t *mi_perf_stats(str *col_s)
 	    add_mi_number(aobj, MI_SSTR("bytes"), bytes) < 0 ||
 	    add_mi_string(aobj, MI_SSTR("backing"),
 	        (char *)pcache_arena_backing_str(),
-	        strlen(pcache_arena_backing_str())) < 0)
+	        strlen(pcache_arena_backing_str())) < 0 ||
+	    pcache_arena_mi(aobj) < 0)
 		goto err;
 
 	/* _probe = what this host is CAPABLE of (startup capability check,
@@ -3963,6 +3968,22 @@ static const dep_export_t deps = {
 };
 
 /** module exports */
+/* the own backing's reclaim process: retires drained chunks and gives
+ * memory back, one tick a second, off every request path and off the
+ * shared timer handler; switched off in mod_init for the HG backings */
+static void pcache_reclaim_proc(int rank)
+{
+	for (;;) {
+		sleep(1);
+		pcache_arena_reclaim_tick();
+	}
+}
+
+static proc_export_t procs[] = {
+	{ "cachedb_perf reclaim", NULL, NULL, pcache_reclaim_proc, 1, 0 },
+	{ NULL, NULL, NULL, NULL, 0, 0 },
+};
+
 struct module_exports exports = {
 	"cachedb_perf",             /* module name */
 	MOD_TYPE_CACHEDB,           /* class of this module */
@@ -3977,7 +3998,7 @@ struct module_exports exports = {
 	mi_cmds,                    /* exported MI functions */
 	0,                          /* exported pseudo-variables */
 	0,                          /* exported transformations */
-	0,                          /* extra processes */
+	procs,                      /* extra processes: the own backing's reclaim */
 	0,                          /* module pre-initialization function */
 	mod_init,                   /* module initialization function */
 	(response_function) 0,      /* response handling function */
@@ -4981,6 +5002,10 @@ static int mod_init(void)
 		return -1;
 	}
 	pcache_arena_backing_notice();
+	/* the reclaim process exists only for the own backing; HG reclaims
+	 * its own arenas (core / own-hg) */
+	if (pcache_arena_backing() != PCACHE_BACKING_OWN)
+		procs[0].no = 0;
 
 	/* CP-11: huge pages were asked for but the arena settled on a lesser
 	 * tier - flagged now, raised from the first timer tick (EVI has no

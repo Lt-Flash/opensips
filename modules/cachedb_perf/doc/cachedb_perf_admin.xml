@@ -318,6 +318,93 @@ modparam("cachedb_perf", "arena_profile", "CACHE_ARENA")
 </programlisting>
 		</example>
 	</section>
+	<section id="param_reclaim_keep" xreflabel="reclaim_keep">
+		<title><varname>reclaim_keep</varname> (integer)</title>
+		<para>
+		<emphasis>own</emphasis> backing only. The module's own allocator
+		cuts its memory into 256 KB slots, one size class per slot, and
+		keeps a free list per slot, so a slot whose every cell has come
+		home is provably drained. A reclaim process of the module's own
+		(<emphasis>cachedb_perf reclaim</emphasis>, one tick a second, off
+		every request path) retires drained slots beyond this many per
+		size class; a retired slot is re-cut for any class on the next
+		carve, so the footprint follows the peak total of the cache, not
+		the sum of every class's peak. The same count of whole shm pages
+		(16 slots) is kept resident instead of being given back. Default
+		1.
+		</para>
+		<para>
+		What stays after a mass expiry is bounded: this many drained slots
+		per class, plus one slot per class per allocating process (the
+		remainder of the slot a process is carving from - sent home on
+		that process's next surplus free), plus the hash tables, which
+		grow and never shrink.
+		</para>
+		<example>
+		<title>Set <varname>reclaim_keep</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("cachedb_perf", "reclaim_keep", 4)
+...
+</programlisting>
+		</example>
+	</section>
+	<section id="param_reclaim_quiet_s" xreflabel="reclaim_quiet_s">
+		<title><varname>reclaim_quiet_s</varname> (integer)</title>
+		<para>
+		<emphasis>own</emphasis> backing only. Seconds a retired slot has to
+		stay free before its memory is given back to the host: a whole 2 MB
+		group of the dedicated reservation is punched out with
+		<emphasis>MADV_REMOVE</emphasis> (the mapping stays, a later carve
+		re-faults it; hugetlb pages return to the pool), a whole shm page
+		goes back through <emphasis>shm_free</emphasis>. Carves take the
+		lowest free slot of the reservation and the fullest page, so the
+		give-back units do become empty. Default 5.
+		</para>
+		<example>
+		<title>Set <varname>reclaim_quiet_s</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("cachedb_perf", "reclaim_quiet_s", 30)
+...
+</programlisting>
+		</example>
+	</section>
+	<section id="param_reclaim_cooloff_s" xreflabel="reclaim_cooloff_s">
+		<title><varname>reclaim_cooloff_s</varname> (integer)</title>
+		<para>
+		<emphasis>own</emphasis> backing only. No memory is given back for
+		this many seconds after the last carve, so a release can never
+		re-trigger the growth that follows it. Default 10.
+		</para>
+		<example>
+		<title>Set <varname>reclaim_cooloff_s</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("cachedb_perf", "reclaim_cooloff_s", 60)
+...
+</programlisting>
+		</example>
+	</section>
+	<section id="param_reclaim_giveback" xreflabel="reclaim_giveback">
+		<title><varname>reclaim_giveback</varname> (integer)</title>
+		<para>
+		<emphasis>own</emphasis> backing only. 0 keeps every retired slot
+		resident (re-cut for any class, never returned to the host); 1
+		(default) gives whole empty groups and pages back as described
+		under <xref linkend="param_reclaim_quiet_s"/>. If the kernel
+		refuses <emphasis>MADV_REMOVE</emphasis> on the reservation the
+		module logs it once and behaves as 0 from then on.
+		</para>
+		<example>
+		<title>Set <varname>reclaim_giveback</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("cachedb_perf", "reclaim_giveback", 0)
+...
+</programlisting>
+		</example>
+	</section>
 
 	<section id="param_arena_selftest" xreflabel="arena_selftest">
 		<title><varname>arena_selftest</varname> (integer)</title>
@@ -1005,6 +1092,7 @@ WARNING:cachedb_perf:mod_init: replicate_collections is set but
 		<listitem><para><emphasis>lock_fallbacks</emphasis> - reads that fell back to the bucket lock</para></listitem>
 		<listitem><para><emphasis>arena_bytes</emphasis> / <emphasis>arena_chunks</emphasis> - memory taken from shm; with the <emphasis>core</emphasis> or <emphasis>own-hg</emphasis> backing the cells are HG_MALLOC's and <emphasis>arena_chunks</emphasis> reads 0</para></listitem>
 		<listitem><para><emphasis>arena.backing</emphasis> (perf_stats) - the memory backing in use, see <xref linkend="param_memory_backing"/></para></listitem>
+		<listitem><para>own backing reclaim (perf_stats <emphasis>arena</emphasis>): <emphasis>slots_total</emphasis>, <emphasis>slots_free_warm</emphasis> (retired, resident), <emphasis>slots_free_cold</emphasis> (retired, punched out), <emphasis>chunks_strand</emphasis> (slots held by classes with nothing live - the class-mix ratchet), <emphasis>chunks_retired</emphasis>, <emphasis>pages</emphasis> / <emphasis>pages_freed</emphasis>, <emphasis>released_bytes</emphasis> (cumulative give-back), <emphasis>cold_bytes</emphasis>, <emphasis>reclaim_ticks</emphasis>, <emphasis>last_carve_age_s</emphasis>, and <emphasis>classes</emphasis> = "size:slots/peak/cells_not_home" per class in use (cells not home are live records plus what processes hold privately - their free stacks and the remainder of the slot each is carving from)</para></listitem>
 		<listitem><para><emphasis>memory_tier_probe</emphasis> / <emphasis>memory_tier_active</emphasis> - the huge-page tier the host was probed for, and the one the module's own arena actually runs on (1 hugetlb .. 4 plain 4K). They differ when <varname>arena_hugepage_mb</varname> could not be satisfied.</para></listitem>
 		<listitem><para><emphasis>hugepage_arena_active</emphasis>, <emphasis>hugepage_arena_total_bytes</emphasis>, <emphasis>hugepage_arena_used_bytes</emphasis>, <emphasis>hugepage_arena_free_bytes</emphasis> - the module's own hugepage arena, which is SEPARATE from the OpenSIPS shm arena. Records live in one or the other, never both, so these do not add to <emphasis>arena_bytes</emphasis>.</para></listitem>
 	</itemizedlist>

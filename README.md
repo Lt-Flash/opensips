@@ -472,6 +472,69 @@ on log and linear scales, tail health, growth events and a summary table:
   <img alt="Twelve-panel overview of all eighteen allocator configurations on the 1M pull-sharing bench: zoomed memory dot-plots for the pulling node, an owner node and after expiry; cold, warm and REGISTER latency ladders (p50, p95, p99) on log and linear axes; lost requests and stall-seconds; elastic growth events with the committed size; and a summary table. HG_MALLOC v2, HG_MALLOC v3 on a fixed arena and F_MALLOC have clean tails, and v3 with the T1 stats-walk fix has the cleanest (warm max 4 ms); HG_MALLOC v3 elastic has a 15 ms warm p99 and 210 lost requests; the auto-scaling profile removes the warm tail; the 2 s growth tick has the worst tails of all with 997 lost requests and the whole 3,072 MB committed" src="doc/pull-sharing/allocators-overview-light.svg">
 </picture>
 
+### Where the cache's memory lives: the backing
+
+Every column above kept one thing constant: the cache's records sat in
+cachedb_perf's own 256 KB chunks, carved out of shm (or a dedicated
+reservation) and never given back — the 238 / 450 MB "still used after
+all 1M expired" row is exactly those chunks. The module now decides at
+startup where its cells live (`memory_backing = auto | core | own-hg |
+own`): on an HG_MALLOC core it can hand the whole job to the allocator —
+`core` puts every cell in the shm arena as an HG slab cell, `own-hg`
+turns `arena_hugepage_mb` into a dedicated HG arena created through the
+core's module-arena facade (whatever `-a` selected for the core) — and on
+any other core `own` runs the module's own slot allocator, which now
+reclaims: per-chunk free lists make a drained chunk provable, a reclaim
+process of the module's own retires drained slots beyond `reclaim_keep`
+and re-cuts them for any class, asks every process through IPC to send
+its private cells home when chunks linger, and gives whole empty pages
+back to shm (or punches whole 2 MB groups out of the reservation with
+`MADV_REMOVE`) after a quiet window. The same 1M protocol, one column
+per backing; the HG columns run the T22 head, the `own` columns run on
+F_MALLOC because that is the core they exist for:
+
+| | own chunks, never returned (T22 head, HG core) | `core`: HG cells in the shm arena | `own-hg`: a dedicated HG arena (256 → 1,024 MB) | `own` + reclaim, shm pages (F_MALLOC) | `own` + reclaim, 512 MB reservation (F_MALLOC) |
+|---|---|---|---|---|---|
+| puller at 1M: shm real-used + cache arena | 1,852 MB | 2,001 MB | 1,407 + 575 = 1,982 MB | 1,958 MB | 1,519 + 490 = 2,009 MB |
+| owner at 500k | 893 MB | 965 MB | 678 + ~290 MB | 930 MB | 700 + 248 MB |
+| still used after all 1M expired, puller (shm + arena) | 451 MB | 59 MB | 23 + 35 MB | 70 MB | 23 + 98 MB (97 of it the hash tables) |
+| same, owner | 238 MB | 42 MB | 23 + 19 MB | 54 MB | 23 + 53 MB |
+| cold pull p50 / p95 / p99 | 1.2 / 1.9 / 19 ms | 1.2 / 4.9 / 32 ms | 1.2 / 3.0 / 27 ms | 1.3 / 4.4 / 32 ms | 1.3 / 5.4 / 32 ms |
+| cold sweep, per-second p95 in the last third | 6.0 ms | 21.4 ms | 15.2 ms | 21.9 ms | 22.9 ms |
+| warm hit p99 | 0.67 ms | 0.70 ms | 0.70 ms | 0.73 ms | 0.71 ms |
+| requests lost | 0 | 0 | 0 | 0 | 0 |
+| harness verdict | 15 / 15 | 13 / 15 | 14 / 15 | 11 / 11 vs F_MALLOC | 11 / 11 vs F_MALLOC |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/pull-sharing/cache-backings-dark.svg">
+  <img alt="Three panels comparing the five cache memory backings: memory at peak and after expiry for the puller and an owner, the cold pull latency ladder with the warm p99, and the cold sweep's per-second p95 over the early, middle and late third of the sweep" src="doc/pull-sharing/cache-backings-light.svg">
+</picture>
+
+Three things the table says. First, the retention problem is gone in
+every backing that reclaims: after the mass expiry the nodes are back
+at their 42 MB start-up baseline plus what the policy keeps (one drained
+slot per class, one spare page) plus the hash tables, which grow and
+never shrink — 23–70 MB instead of 238–451. Second, HG's price for
+managing the cells is memory, not CPU: about 7–8 % more per cell than
+the module's tightly packed chunks (2,001 vs 1,852 MB on the puller), and
+a profile of the late sweep shows no HG symbol above 0.6 %. Third, the
+two HG-backed columns fail the cold p99 bar, and the reason is not the
+allocator. The per-second trace shows all backings equal for the first
+200 s of the sweep and diverging only in the last third; a host-wide
+profile over that window puts the puller's `TCP main` — the dispatcher
+every `bin`-over-TCP pull request and reply passes through — at 0.93–0.97
+of a core in *every* configuration, the module's own chunks included.
+That queue is at its edge at 1,500 pulls/s on this host, and what the HG
+columns add is receive-side stalls (shm-arena lock waits of a
+millisecond or more, three to four times more frequent than with own
+chunks), which a saturated, per-connection serial dispatcher turns into
+head-of-line blocking. The `own` columns on F_MALLOC show the same late
+third as F_MALLOC itself (25–26 ms), i.e. the allocator's own tail. The
+fix for that tail is therefore on the transport side — a pull transport
+that does not route every message through one dispatcher, with the
+receiving process only parsing and waking while the waiting worker does
+the store — and it is written up, not built.
+
 ## Observability
 
 * Exact fleet contact count: `sum(owned_contacts)` across nodes (ownership

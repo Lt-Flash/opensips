@@ -77,6 +77,7 @@
 #include "../../mem/mem.h"
 #include "../../mem/shm_mem.h"
 #include "../../mi/mi.h"
+#include "../../ipc.h"
 #include "pcache_arena.h"
 #include "pcache_mem.h"
 
@@ -155,7 +156,7 @@ typedef struct pcache_chunk {
 	unsigned int in_avail;       /* 1 while on (or heading to) the avail stack */
 	unsigned int cold;           /* memory punched out; a carve re-faults it */
 	unsigned int free_at;        /* reclaim tick the slot became free */
-	unsigned int pad;
+	unsigned int home_since;     /* reclaim tick the first cell came home */
 	/* padded to PCACHE_CHUNK_HDR; cells follow */
 } pcache_chunk_t;
 
@@ -204,6 +205,8 @@ typedef struct pcache_arena {
 	unsigned int carve_tick;                /* tick of the last carve */
 	unsigned int giveback_off;              /* MADV_REMOVE refused: stay resident */
 	unsigned long chunks_retired;           /* cumulative */
+	unsigned long flush_broadcasts;         /* "send your hoard home" rounds */
+	unsigned int flush_tick;                /* tick of the last broadcast */
 	unsigned long pages_freed;              /* cumulative */
 	unsigned long released_bytes;           /* cumulative give-back */
 	unsigned long cold_bytes;               /* currently punched out */
@@ -269,6 +272,7 @@ static void cell_home(void *cell)
 
 	if (__atomic_add_fetch(&ch->nfree, 1, __ATOMIC_ACQ_REL) != 1)
 		return;
+	__atomic_store_n(&ch->home_since, arena->tick, __ATOMIC_RELAXED);
 	old = NULL;
 	if (!__atomic_compare_exchange_n(&ch->in_avail, (unsigned int *)&old,
 	        1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
@@ -483,6 +487,7 @@ static int carve_chunk(int c, struct pcache_palloc *pl)
 	ch->nfree = 0;
 	ch->in_avail = 0;
 	ch->free_at = 0;
+	ch->home_since = 0;
 
 	cells = (char *)ch + PCACHE_CHUNK_HDR;
 	for (i = 0; i < ch->cells; i++)
@@ -1108,6 +1113,19 @@ static void giveback_tick(void)
 }
 
 /*
+ * "Send your hoard home": runs in EVERY process through the core's IPC,
+ * between its messages.  A process's private free stack and the remainder
+ * of the slot it is carving from pin their chunks - a few hundred cells
+ * scattered over as many chunks keep those chunks from ever draining - so
+ * when chunks linger partially home the reclaim process asks everyone to
+ * let go; the next allocation simply refills from the arena.
+ */
+static void pcache_flush_rpc(int sender, void *param)
+{
+	pcache_arena_flush_private();
+}
+
+/*
  * One reclaim tick.  Drained chunks live on the class avail stacks (a
  * chunk with cells home is always there, or the allocator's current one,
  * or on its way): take the stack, retire the drained ones beyond
@@ -1117,7 +1135,7 @@ static void giveback_tick(void)
 void pcache_arena_reclaim_tick(void)
 {
 	pcache_chunk_t *ch, *next, *head;
-	unsigned int kept;
+	unsigned int kept, nfree, lingering = 0;
 	int c;
 
 	if (backing != PCACHE_BACKING_OWN)
@@ -1130,11 +1148,17 @@ void pcache_arena_reclaim_tick(void)
 		head = __atomic_exchange_n(&arena->avail[c], NULL, __ATOMIC_ACQ_REL);
 		for (ch = head; ch; ch = next) {
 			next = ch->link;
-			if (__atomic_load_n(&ch->nfree, __ATOMIC_ACQUIRE) == ch->cells &&
+			nfree = __atomic_load_n(&ch->nfree, __ATOMIC_ACQUIRE);
+			if (nfree == ch->cells &&
 			    kept++ >= (unsigned int)pcache_reclaim_keep) {
 				chunk_retire(ch);
 				continue;
 			}
+			/* partially home for a whole quiet window, nobody taking
+			 * the cells and nobody bringing the rest: a hoard pins it */
+			if (nfree && nfree < ch->cells &&
+			    arena->tick - ch->home_since >= (unsigned int)pcache_reclaim_quiet_s)
+				lingering++;
 			avail_push(c, ch);
 		}
 		/* the allocator's current chunk is not on the stack */
@@ -1145,6 +1169,14 @@ void pcache_arena_reclaim_tick(void)
 			chunk_retire(ch);
 	}
 	giveback_tick();
+	if (lingering &&
+	    arena->tick - arena->flush_tick >= (unsigned int)pcache_reclaim_quiet_s) {
+		arena->flush_tick = arena->tick;
+		arena->flush_broadcasts++;
+		lock_release(&arena->lock);
+		ipc_send_rpc_all(pcache_flush_rpc, NULL);
+		return;
+	}
 	lock_release(&arena->lock);
 }
 
@@ -1206,6 +1238,7 @@ int pcache_arena_mi(mi_item_t *aobj)
 	     add_mi_number(aobj, MI_SSTR("slots_free_cold"), arena->nfree_cold) < 0 ||
 	     add_mi_number(aobj, MI_SSTR("chunks_strand"), strand) < 0 ||
 	     add_mi_number(aobj, MI_SSTR("chunks_retired"), arena->chunks_retired) < 0 ||
+	     add_mi_number(aobj, MI_SSTR("flush_broadcasts"), arena->flush_broadcasts) < 0 ||
 	     add_mi_number(aobj, MI_SSTR("pages"), arena->npages) < 0 ||
 	     add_mi_number(aobj, MI_SSTR("pages_freed"), arena->pages_freed) < 0 ||
 	     add_mi_number(aobj, MI_SSTR("released_bytes"), arena->released_bytes) < 0 ||

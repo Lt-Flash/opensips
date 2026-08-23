@@ -437,11 +437,15 @@ modparam("cachedb_perf", "arena_profile", "CACHE_ARENA")
    every class's peak. The same count of whole shm pages (16
    slots) is kept resident instead of being given back. Default 1.
 
-   What stays after a mass expiry is bounded: this many drained
-   slots per class, plus one slot per class per allocating process
-   (the remainder of the slot a process is carving from - sent
-   home on that process's next surplus free), plus the hash
-   tables, which grow and never shrink.
+   A process's private free stack and the remainder of the slot it
+   is carving from would pin their chunks for as long as that
+   process stays quiet, so when chunks linger partially home for a
+   quiet window the reclaim process asks every process, through
+   the core's IPC, to send its private cells home; the next
+   allocation refills from the arena. What stays after a mass
+   expiry is therefore bounded by this many drained slots per
+   class, one spare page, and the hash tables, which grow and
+   never shrink.
 
    Example 1.10. Set reclaim_keep parameter
 ...
@@ -1026,9 +1030,10 @@ WARNING:cachedb_perf:mod_init: replicate_collections is set but
        slots_free_warm (retired, resident), slots_free_cold
        (retired, punched out), chunks_strand (slots held by
        classes with nothing live - the class-mix ratchet),
-       chunks_retired, pages / pages_freed, released_bytes
-       (cumulative give-back), cold_bytes, reclaim_ticks,
-       last_carve_age_s, and classes =
+       chunks_retired, flush_broadcasts (rounds of asking every
+       process to send its private cells home), pages /
+       pages_freed, released_bytes (cumulative give-back),
+       cold_bytes, reclaim_ticks, last_carve_age_s, and classes =
        "size:slots/peak/cells_not_home" per class in use (cells
        not home are live records plus what processes hold
        privately - their free stacks and the remainder of the slot

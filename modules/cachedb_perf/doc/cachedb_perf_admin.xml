@@ -334,11 +334,14 @@ modparam("cachedb_perf", "arena_profile", "CACHE_ARENA")
 		1.
 		</para>
 		<para>
-		What stays after a mass expiry is bounded: this many drained slots
-		per class, plus one slot per class per allocating process (the
-		remainder of the slot a process is carving from - sent home on
-		that process's next surplus free), plus the hash tables, which
-		grow and never shrink.
+		A process's private free stack and the remainder of the slot it
+		is carving from would pin their chunks for as long as that process
+		stays quiet, so when chunks linger partially home for a quiet
+		window the reclaim process asks every process, through the core's
+		IPC, to send its private cells home; the next allocation refills
+		from the arena. What stays after a mass expiry is therefore
+		bounded by this many drained slots per class, one spare page, and
+		the hash tables, which grow and never shrink.
 		</para>
 		<example>
 		<title>Set <varname>reclaim_keep</varname> parameter</title>
@@ -1092,7 +1095,7 @@ WARNING:cachedb_perf:mod_init: replicate_collections is set but
 		<listitem><para><emphasis>lock_fallbacks</emphasis> - reads that fell back to the bucket lock</para></listitem>
 		<listitem><para><emphasis>arena_bytes</emphasis> / <emphasis>arena_chunks</emphasis> - memory taken from shm; with the <emphasis>core</emphasis> or <emphasis>own-hg</emphasis> backing the cells are HG_MALLOC's and <emphasis>arena_chunks</emphasis> reads 0</para></listitem>
 		<listitem><para><emphasis>arena.backing</emphasis> (perf_stats) - the memory backing in use, see <xref linkend="param_memory_backing"/></para></listitem>
-		<listitem><para>own backing reclaim (perf_stats <emphasis>arena</emphasis>): <emphasis>slots_total</emphasis>, <emphasis>slots_free_warm</emphasis> (retired, resident), <emphasis>slots_free_cold</emphasis> (retired, punched out), <emphasis>chunks_strand</emphasis> (slots held by classes with nothing live - the class-mix ratchet), <emphasis>chunks_retired</emphasis>, <emphasis>pages</emphasis> / <emphasis>pages_freed</emphasis>, <emphasis>released_bytes</emphasis> (cumulative give-back), <emphasis>cold_bytes</emphasis>, <emphasis>reclaim_ticks</emphasis>, <emphasis>last_carve_age_s</emphasis>, and <emphasis>classes</emphasis> = "size:slots/peak/cells_not_home" per class in use (cells not home are live records plus what processes hold privately - their free stacks and the remainder of the slot each is carving from)</para></listitem>
+		<listitem><para>own backing reclaim (perf_stats <emphasis>arena</emphasis>): <emphasis>slots_total</emphasis>, <emphasis>slots_free_warm</emphasis> (retired, resident), <emphasis>slots_free_cold</emphasis> (retired, punched out), <emphasis>chunks_strand</emphasis> (slots held by classes with nothing live - the class-mix ratchet), <emphasis>chunks_retired</emphasis>, <emphasis>flush_broadcasts</emphasis> (rounds of asking every process to send its private cells home), <emphasis>pages</emphasis> / <emphasis>pages_freed</emphasis>, <emphasis>released_bytes</emphasis> (cumulative give-back), <emphasis>cold_bytes</emphasis>, <emphasis>reclaim_ticks</emphasis>, <emphasis>last_carve_age_s</emphasis>, and <emphasis>classes</emphasis> = "size:slots/peak/cells_not_home" per class in use (cells not home are live records plus what processes hold privately - their free stacks and the remainder of the slot each is carving from)</para></listitem>
 		<listitem><para><emphasis>memory_tier_probe</emphasis> / <emphasis>memory_tier_active</emphasis> - the huge-page tier the host was probed for, and the one the module's own arena actually runs on (1 hugetlb .. 4 plain 4K). They differ when <varname>arena_hugepage_mb</varname> could not be satisfied.</para></listitem>
 		<listitem><para><emphasis>hugepage_arena_active</emphasis>, <emphasis>hugepage_arena_total_bytes</emphasis>, <emphasis>hugepage_arena_used_bytes</emphasis>, <emphasis>hugepage_arena_free_bytes</emphasis> - the module's own hugepage arena, which is SEPARATE from the OpenSIPS shm arena. Records live in one or the other, never both, so these do not add to <emphasis>arena_bytes</emphasis>.</para></listitem>
 	</itemizedlist>

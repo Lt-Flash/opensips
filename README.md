@@ -535,6 +535,71 @@ that does not route every message through one dispatcher, with the
 receiving process only parsing and waking while the waiting worker does
 the store — and it is written up, not built.
 
+### The pull transport, two core costs found underneath it, and the hash that was the climb
+
+Every pull above travelled over the clusterer's bin links: one TCP
+message each way, each handed by the core's TCP main to a receiver and
+back, each copied into shared memory for the clusterer's IPC dispatch.
+The module now has a transport of its own (`pull_transport = udp | tcp`,
+with `pull_bind`; `tls` reserved): over udp the asking process sends
+straight to the wire and a dedicated transport process receives, parses,
+copies into the pull slot and wakes the waiter; over tcp that process
+owns one connection per direction per peer and the others hand it their
+sends through IPC. Peers learn each other's address from a HELLO over the
+bin capability. The same 1M protocol, the `core` backing throughout:
+
+| | bin (clusterer links) | udp (own socket) | tcp (own connections) | bin + io_wait fix | udp + io_wait fix | udp + both fixes | udp + both fixes + MurmurHash3 keys |
+|---|---|---|---|---|---|---|---|
+| cold pull p50 / p95 / p99 | 1.21 / 4.9 / 32 ms | 0.77 / 4.8 / 30 ms | 0.83 / 6.2 / 32 ms | 1.02 / 4.2 / 32 ms | 0.70 / 4.8 / 30 ms | 0.71 / 2.3 / 27 ms | **0.66 / 0.88 / 1.0 ms** |
+| per-second p95, first / last third of the sweep | 1.7 / 21.4 ms | 1.0 / 17.9 ms | 1.1 / 21.7 ms | 1.3 / 19.3 ms | 0.9 / 17.5 ms | 1.0 / 17.3 ms | **0.9 / 0.9 ms** |
+| UDP receive drops over the run | 0 | 129 | 0 | 0 | 0 | 0 | 0 |
+| requests lost | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/pull-sharing/pull-transports-dark.svg">
+  <img alt="Per-second p95 of the cold pull RTT over the 334-second sweep for bin, udp and tcp transports with and without the two core fixes, and the pull RTT ladder per run" src="doc/pull-sharing/pull-transports-light.svg">
+</picture>
+
+Three things came out of it. The transport is the fixed cost: the
+dispatcher hop is 0.4–0.5 ms of every pull (p50 1.21 → 0.77 ms), and a
+host-wide profile put TCP main at 0.93–0.97 of a core in every
+configuration. Underneath it sat two costs that had nothing to do with
+the cache: `check_io_data()` in `io_wait.h`, a consistency pass over the
+reactor's whole fd map on every `io_watch_add()` and `io_watch_del()` —
+O(`open_files_limit`) per async registration, ~0.6 ms each here, two
+cores at 1,500 pulls/s, the largest user-space symbol of the profile
+(now `EXTRA_DEBUG`-only: upstream PR #4221); and usrloc's
+`owned_contacts` / `remote_contacts` statistics, each a walk of every
+contact under every slot lock, twice per statistics read, which under a
+monitor reading them every few seconds made the request tail grow with
+the contact count — the smooth climb over the last two minutes of every
+sweep in the figure (now taken on the timer pass the table already gets,
+published per domain). Neither of those was the climb, though: with both fixed the
+last third still ran at 17 ms.
+
+The climb itself was the hash. `core_hash()` adds its per-word mixes, so
+keys whose 4-byte words sum alike collide on the full 32 bits — and
+sequential or numeric keys do that constantly: 64,657 distinct values for
+the rig's 500,000 `uA…` keys, 158,700 for 500,000 phone-number AoRs,
+against 499,971 from MurmurHash3 (random usernames hash fine under
+`core_hash`, which is why no earlier study saw it). In the table the
+collisions showed up as the overflow: sampled live on the puller, 38% of
+the 1,000,001 entries were in the overflow table by the end of the sweep
+— 1,024 chains of ~375 entries behind one lock — and a pull-on-miss
+lookup is a local miss by definition, so every one walked a chain under
+that lock; the better the transport, the sooner the table got there. With
+the module hashing keys through MurmurHash3 the same sweep ends with 1.8%
+in overflow, and the per-second p95 is 0.9 ms from the first second to the
+last: cold pull p50 / p95 / p99 of 0.66 / 0.88 / 1.0 ms at 1,500 pulls/s,
+zero lost, zero stall-seconds — against 1.17 / 1.83 / 16.6 for the fixed
+arena over bin that every harness bar is measured from, and 1.21 / 4.86 /
+31.9 for the same `core` backing over bin that started the day. The only
+bar the run still fails is HG's +7.7% memory per cell.
+
+The same `core_hash` keys usrloc's AoR table and the dialog module's
+tables, with the same collision rate on numeric AoRs; that is a core-wide
+change and a separate decision.
+
 ## Observability
 
 * Exact fleet contact count: `sum(owned_contacts)` across nodes (ownership

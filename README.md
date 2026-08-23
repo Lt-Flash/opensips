@@ -600,6 +600,15 @@ The same `core_hash` keys usrloc's AoR table and the dialog module's
 tables, with the same collision rate on numeric AoRs; that is a core-wide
 change and a separate decision.
 
+With every fix in, the `own` backing over the plain clusterer links —
+the zero-configuration setup — is the first elastic run to pass all
+fifteen harness bars: cold pull 0.96 / 1.22 / 1.4 ms, a per-second p95
+of 1.2 ms from the first second to the last, zero lost, zero drops, zero
+stall-seconds, 1,868 MB at 1M and 75 / 55 MB after the expiry. The
+memory-backing table and figure earlier in this README predate the hash
+fix; their memory columns stand, their late-sweep latencies were this
+hash.
+
 ## Observability
 
 * Exact fleet contact count: `sum(owned_contacts)` across nodes (ownership

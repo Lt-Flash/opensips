@@ -1206,8 +1206,10 @@ void mem_delete_urecord(udomain_t* _d, struct urecord* _r)
 int mem_timer_udomain(udomain_t* _d)
 {
 	struct urecord* ptr;
+	struct ucontact* c;
 	void ** dest;
 	int i,ret=0,flush=0;
+	unsigned long own = 0, rem = 0;
 	map_iterator_t it,prev;
 
 	cid_len = 0;
@@ -1240,6 +1242,16 @@ int mem_timer_udomain(udomain_t* _d)
 			if (ret)
 				flush=1;
 
+			/* ownership accounting on the pass we already pay for: what
+			 * survived timer_urecord() is valid now */
+			if (cluster_mode == CM_PULL_SHARING) {
+				for (c = ptr->contacts; c; c = c->next) {
+					if (ul_ct_is_mine(c))
+						own++;
+					else
+						rem++;
+				}
+			}
 			/* Remove the entire record if it is empty */
 			if (ptr->no_clear_ref <= 0 && ptr->contacts == NULL)
 			{
@@ -1261,6 +1273,10 @@ int mem_timer_udomain(udomain_t* _d)
 		unlock_ulslot(_d, i);
 	}
 
+	if (cluster_mode == CM_PULL_SHARING) {
+		_d->owned_ct = own;
+		_d->remote_ct = rem;
+	}
 	/* delete all the contacts left pending in the "to-be-delete" buffer */
 	if (cid_len &&
 	db_multiple_ucontact_delete(_d->name, cid_keys, cid_vals, cid_len) < 0) {

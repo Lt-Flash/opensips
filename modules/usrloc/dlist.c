@@ -1047,49 +1047,26 @@ void free_all_udomains(void)
 /*! \brief
  *  Loops through all domains summing up the number of users.
  */
-/* pull-sharing observability: exact-by-construction fleet accounting.
- * Ownership is disjoint across the cluster, so summing owned_contacts
- * over all nodes gives the exact cluster-wide count of live contacts;
- * remote_contacts gauges this node's convergence copies (memory
- * overhead, pull activity).  Counted by walking, never by transition
- * bookkeeping: a number the whole fleet is summed by must not drift. */
+/* pull-sharing observability: fleet accounting.  Ownership is disjoint
+ * across the cluster, so summing owned_contacts over all nodes gives the
+ * cluster-wide count of live contacts; remote_contacts gauges this node's
+ * convergence copies (memory overhead, pull activity).  The numbers are
+ * taken on the timer pass every domain already gets (mem_timer_udomain,
+ * every timer_interval) and published per domain - exact as of that pass,
+ * never computed on a request or MI path.  The previous on-demand walk of
+ * every contact under every slot lock, twice per statistics read, was the
+ * largest CPU consumer on a 1,000,000-contact node under a monitor and
+ * the reason its request tail grew with the contact count. */
 void ul_count_contacts_by_ownership(unsigned long *owned,
 		unsigned long *remote)
 {
 	dlist_t *dl;
-	udomain_t *dom;
-	map_iterator_t it;
-	void **dest;
-	urecord_t *r;
-	ucontact_t *c;
 	unsigned long own = 0, rem = 0;
-	int i;
-
-	get_act_time();
 
 	for (dl = root; dl; dl = dl->next) {
-		dom = dl->d;
-		for (i = 0; i < dom->size; i++) {
-			lock_ulslot(dom, i);
-			for (map_first(dom->table[i].records, &it);
-			        iterator_is_valid(&it); iterator_next(&it)) {
-				dest = iterator_val(&it);
-				if (!dest)
-					break;
-				r = (urecord_t *)*dest;
-				for (c = r->contacts; c; c = c->next) {
-					if (!VALID_CONTACT(c, act_time))
-						continue;
-					if (ul_ct_is_mine(c))
-						own++;
-					else
-						rem++;
-				}
-			}
-			unlock_ulslot(dom, i);
-		}
+		own += dl->d->owned_ct;
+		rem += dl->d->remote_ct;
 	}
-
 	*owned = own;
 	*remote = rem;
 }

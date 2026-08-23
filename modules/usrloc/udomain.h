@@ -61,6 +61,12 @@ typedef struct udomain {
 	stat_var *users;           /*!< no of registered users */
 	stat_var *contacts;        /*!< no of registered contacts */
 	stat_var *expires;         /*!< no of expires */
+	/* pull-sharing ownership accounting, taken during the timer pass over
+	 * the domain (mem_timer_udomain) and read by the owned_contacts /
+	 * remote_contacts statistics: exact as of that pass, never older than
+	 * timer_interval, and never computed on a request or MI path */
+	unsigned long owned_ct;    /*!< valid contacts this node owns */
+	unsigned long remote_ct;   /*!< valid convergence copies of peers' */
 } udomain_t;
 
 

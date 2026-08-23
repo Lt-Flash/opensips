@@ -539,6 +539,13 @@ the store — and it is written up, not built.
 
 * Exact fleet contact count: `sum(owned_contacts)` across nodes (ownership
   is disjoint, so the sum is exact — a Prometheus recording rule away).
+  `owned_contacts` and `remote_contacts` are taken on usrloc's timer pass
+  over the table (every `timer_interval`, 60 s by default) and published
+  per domain, so a statistics read costs nothing: exact as of that pass.
+  They used to be computed on demand by walking every contact under every
+  slot lock — on a 1,000,000-contact node under a monitor that walk was
+  the largest CPU consumer on the host and the reason the request tail
+  grew with the contact count.
 * Per-node convergence: one `perf_cluster_size ul` MI call — live entry
   counts from every node, unreachable nodes flagged.
 * Inventory: the ledger (`WHERE expires > now`) or the concatenation of

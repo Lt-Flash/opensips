@@ -299,6 +299,14 @@ again:
 	}while(0)
 
 
+/* A full consistency pass over the fd map - every one of the max_fd_no
+ * entries - on EVERY io_watch_add() and io_watch_del(). That is O(the
+ * reactor size), i.e. O(open_files_limit), per async registration or
+ * removal: on a node with a 21k-entry reactor each costs ~0.6 ms, and a
+ * module doing a few thousand async operations a second burns two cores
+ * on it. A debugging aid, so it is one only with EXTRA_DEBUG; the plain
+ * build sets check_error to 0 and moves on. */
+#ifdef EXTRA_DEBUG
 #define check_io_data() \
 	do { \
 		struct fd_map* _e;\
@@ -354,6 +362,10 @@ again:
 			check_error = 1;\
 		}\
 	} while(0)
+#else
+#define check_io_data() \
+	do { check_error = 0; } while(0)
+#endif
 
 
 /*! \brief generic io_watch_add function

@@ -52,6 +52,7 @@
 #include "cachedb_perf.h"
 #include "pcache_mem.h"
 #include "pcache_arena.h"
+#include "pcache_xport.h"
 #include "pcache_htable.h"
 #include "pcache_db.h"
 
@@ -126,6 +127,7 @@ static int  pc_shtag_cid;              /* parsed tag cluster                 */
  * collection, riding the same capability the pulls do */
 #define PCACHE_STAT_REQ     4
 #define PCACHE_STAT_RPL     5
+#define PCACHE_PULL_HELLO   6     /* "I pull at ip:port" (pcache_xport)  */
 
 /* Concurrent in-flight pulls (the "pull_slots" modparam).  64 matches the
  * blocking mode, where the UDP worker count caps concurrency anyway.  Async
@@ -163,7 +165,7 @@ static int pull_slot_count = 64;
  * beyond it we only know it HAS answered at some point, not that it still
  * would - which is why the raw counters are reported beside the verdict */
 #define PCACHE_PEER_FRESH_S    300
-#define CL_MAX_NODE_ID         256    /* the cluster stack's design cap    */
+/* CL_MAX_NODE_ID (256) comes from pcache_xport.h */
 static char *pull_transport_str;       /* "bin" (default) | "clctr"          */
 static int   pull_max_value  = PCACHE_PULL_MAX_VAL_DEF;
 static int   pull_max_key    = PCACHE_PULL_MAX_KEY_DEF;
@@ -217,6 +219,13 @@ static str  pull_channel = str_init("cdbperf-pull");
 #endif
 /* stays 0 for the whole run when the controller is not compiled in */
 static int  pull_via_clctr;
+/* the module's own sockets (pcache_xport.c): udp / tcp / tls */
+static int  pull_via_xport;
+#define PULL_VIA_BIN    0
+#define PULL_VIA_CLCTR  1
+#define PULL_VIA_XPORT  2
+/* the flat wire format below, sized for the module's own transport */
+#define PULL_WIRE_MAX   (14 + PCACHE_PULL_MAX_KEY + PCACHE_PULL_MAX_VAL + 64)
 
 /* flat wire format for the controller plane, which carries bytes rather
  * than the BIN push/pop stream.  All integers network order.
@@ -511,6 +520,8 @@ static void pcache_cluster_event(enum clusterer_event ev, int node_id)
 	pc_view->last_node   = node_id;
 	pc_view->last_was_up = (ev == CLUSTER_NODE_UP);
 	pc_view->last_change = get_ticks();
+	if (ev == CLUSTER_NODE_UP && pull_via_xport)
+		pcache_pull_hello(node_id);
 	if (ev == CLUSTER_NODE_UP)
 		__sync_fetch_and_add(&pc_view->node_ups, 1);
 	else
@@ -653,6 +664,8 @@ static const param_export_t params[] = {
 	{ "sync_cluster_id",     INT_PARAM, &sync_cluster_id },
 	{ "sync_shtag",          STR_PARAM, &sync_shtag_str },
 	{ "pull_transport",      STR_PARAM, &pull_transport_str },
+	{ "pull_bind",           STR_PARAM, &pcache_pull_bind },
+	{ "pull_port",           INT_PARAM, &pcache_pull_port },
 	{ "pull_timeout_ms",     INT_PARAM, &pull_timeout_ms },
 	{ "pull_slots",          INT_PARAM, &pull_slot_count },
 	{ "pull_authoritative_serve", INT_PARAM, &pull_authoritative_serve },
@@ -1305,6 +1318,27 @@ static mi_response_t *mi_perf_stats(str *col_s)
 		     add_mi_number(clobj, MI_SSTR("pulls_abandoned"),
 		        pull_stats[PULL_ST_ABANDONED]) < 0))
 			goto err;
+		{
+			unsigned long xs[PCACHE_XPORT_NSTATS];
+			const char *tn = pull_via_xport ? pcache_xport_name()
+			                : pull_via_clctr ? "clctr" : "bin";
+
+			pcache_xport_stats(xs);
+			if (add_mi_string(clobj, MI_SSTR("pull_transport"), (char *)tn,
+			        strlen(tn)) < 0)
+				goto err;
+			if (pull_via_xport &&
+			    (add_mi_number(clobj, MI_SSTR("pull_peers_known"),
+			         pcache_xport_peers_known()) < 0 ||
+			     add_mi_number(clobj, MI_SSTR("xport_tx"), xs[0]) < 0 ||
+			     add_mi_number(clobj, MI_SSTR("xport_tx_failed"), xs[1]) < 0 ||
+			     add_mi_number(clobj, MI_SSTR("xport_rx"), xs[2]) < 0 ||
+			     add_mi_number(clobj, MI_SSTR("xport_rx_bad"), xs[3]) < 0 ||
+			     add_mi_number(clobj, MI_SSTR("xport_tcp_connects"), xs[4]) < 0 ||
+			     add_mi_number(clobj, MI_SSTR("xport_tcp_accepts"), xs[5]) < 0 ||
+			     add_mi_number(clobj, MI_SSTR("xport_tcp_errors"), xs[6]) < 0))
+				goto err;
+		}
 		/* in-flight requests: a gauge, not a counter.  It should sit at 0
 		 * when nothing is being asked; anything else parked there means
 		 * slots are being taken and not released, which ends as "all pull
@@ -2135,40 +2169,87 @@ static struct pcache_pull_slot *pull_slot_get(unsigned int id)
  * and answering a BIN request over the multicast plane (or the reverse)
  * means the requester waits out its timeout for an answer that was sent,
  * which is indistinguishable from packet loss. */
-static void pcache_pull_send_rpl(int dst_node, unsigned int id, const str *key,
-		int found, int ttl, const str *val, int via_clctr)
+/* the flat reply: [u8 RPL][u32 id][u8 found][u32 ttl][u16 klen][key][u16 vlen][val];
+ * returns the length, or -1 when it does not fit @lim */
+static int pull_rpl_payload(char *buf, int lim, unsigned int id,
+		const str *key, int found, int ttl, const str *val)
 {
-#ifdef CLUSTERER_CTRL_SUPPORT
-	if (via_clctr) {
-		char buf[CLCTR_MAX_PAYLOAD];
-		str pl;
-		uint32_t id_be = htonl(id), ttl_be = htonl((uint32_t)ttl);
-		uint16_t kl = htons((uint16_t)key->len);
-		int vlen = (found == PCACHE_FOUND_YES) ? val->len : 0;
-		uint16_t vl = htons((uint16_t)vlen);
-		int n = 0;
+	uint32_t id_be = htonl(id), ttl_be = htonl((uint32_t)ttl);
+	uint16_t kl = htons((uint16_t)key->len);
+	int vlen = (found == PCACHE_FOUND_YES) ? val->len : 0;
+	uint16_t vl = htons((uint16_t)vlen);
+	int n = 0;
 
-		/* Never trust the caller to have sized this: the key is echoed
-		 * straight back from the request, so a peer sending an oversized
-		 * one would otherwise write past the buffer.  The serve path
-		 * rejects those already - this is the second lock on the door. */
-		if (PCACHE_CLCTR_RPL_HDR + key->len + vlen > (int)sizeof buf) {
+	if (PCACHE_CLCTR_RPL_HDR + key->len + vlen > lim)
+		return -1;
+	buf[n++] = PCACHE_CLCTR_RPL;
+	memcpy(buf + n, &id_be, 4);  n += 4;
+	buf[n++] = (char)found;
+	memcpy(buf + n, &ttl_be, 4); n += 4;
+	memcpy(buf + n, &kl, 2);     n += 2;
+	memcpy(buf + n, key->s, key->len); n += key->len;
+	memcpy(buf + n, &vl, 2);     n += 2;
+	if (found == PCACHE_FOUND_YES) {
+		memcpy(buf + n, val->s, val->len);
+		n += val->len;
+	}
+	return n;
+}
+
+/* the flat request: [u8 REQ][u32 id][u8 collen][col][u16 klen][key][u8 flags] */
+static int pull_req_payload(char *buf, int lim, unsigned int id,
+		const str *col, const str *key, int force)
+{
+	uint32_t id_be = htonl(id);
+	uint16_t kl = htons((uint16_t)key->len);
+	int n = 0;
+
+	if (PCACHE_CLCTR_REQ_HDR + col->len + key->len + 1 > lim)
+		return -1;
+	buf[n++] = PCACHE_CLCTR_REQ;
+	memcpy(buf + n, &id_be, 4); n += 4;
+	buf[n++] = (char)col->len;
+	memcpy(buf + n, col->s, col->len); n += col->len;
+	memcpy(buf + n, &kl, 2); n += 2;
+	memcpy(buf + n, key->s, key->len); n += key->len;
+	buf[n++] = (char)(force ? 1 : 0);
+	return n;
+}
+
+static void pcache_pull_send_rpl(int dst_node, unsigned int id, const str *key,
+		int found, int ttl, const str *val, int via)
+{
+	if (via == PULL_VIA_XPORT) {
+		char buf[PULL_WIRE_MAX];
+		int n = pull_rpl_payload(buf, pcache_xport_max_payload(), id, key,
+			found, ttl, val);
+
+		if (n < 0) {
 			LM_ERR("pull reply for a %d byte key with %d bytes of value "
-				"does not fit %d - dropping it\n", key->len, vlen,
-				(int)sizeof buf);
+				"does not fit the transport (%d) - dropping it\n", key->len,
+				found == PCACHE_FOUND_YES ? val->len : 0,
+				pcache_xport_max_payload());
 			return;
 		}
+		if (pcache_xport_send(dst_node, buf, n) < 0)
+			pull_send_failed("a reply did not get through", dst_node);
+		else if (found == PCACHE_FOUND_YES)
+			__sync_fetch_and_add(&pull_stats[PULL_ST_SERVED], 1);
+		return;
+	}
+#ifdef CLUSTERER_CTRL_SUPPORT
+	if (via == PULL_VIA_CLCTR) {
+		char buf[CLCTR_MAX_PAYLOAD];
+		str pl;
+		int n = pull_rpl_payload(buf, pcache_clctr_payload_lim((int)sizeof buf),
+			id, key, found, ttl, val);
 
-		buf[n++] = PCACHE_CLCTR_RPL;
-		memcpy(buf + n, &id_be, 4);  n += 4;
-		buf[n++] = (char)found;
-		memcpy(buf + n, &ttl_be, 4); n += 4;
-		memcpy(buf + n, &kl, 2);     n += 2;
-		memcpy(buf + n, key->s, key->len); n += key->len;
-		memcpy(buf + n, &vl, 2);     n += 2;
-		if (found == PCACHE_FOUND_YES) {
-			memcpy(buf + n, val->s, val->len);
-			n += val->len;
+		if (n < 0) {
+			LM_ERR("pull reply for a %d byte key with %d bytes of value "
+				"does not fit %d - dropping it\n", key->len,
+				found == PCACHE_FOUND_YES ? val->len : 0,
+				pcache_clctr_payload_lim((int)sizeof buf));
+			return;
 		}
 		pl.s = buf;
 		pl.len = n;
@@ -2180,7 +2261,6 @@ static void pcache_pull_send_rpl(int dst_node, unsigned int id, const str *key,
 		return;
 	}
 #endif
-
 	{
 		bin_packet_t out;
 		str empty = {NULL, 0};
@@ -2210,7 +2290,7 @@ static void pcache_pull_send_rpl(int dst_node, unsigned int id, const str *key,
  * and the controller-plane receivers decode their own framing and land
  * here, so the two can never disagree about what is served. */
 static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
-		str *key, int via_clctr, int force)
+		str *key, int via, int force)
 {
 	pcache_col_t *col;
 	str val = {NULL, 0};
@@ -2287,7 +2367,6 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 	 * it.  Say "I have it but cannot send it" rather than "not here":
 	 * the requester must not conclude the key is absent from a node that
 	 * demonstrably holds it. */
-#ifdef CLUSTERER_CTRL_SUPPORT
 	/* The effective bound, not the compile-time constant: cc_max_payload
 	 * follows the interface MTU and is SMALLER than CLCTR_MAX_PAYLOAD on a
 	 * link under ~1411 (VPN, tunnel, PPPoE).  Budgeting against the constant
@@ -2297,12 +2376,11 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 	 * to give. */
 	/* Bound by CLCTR_MAX_PAYLOAD, which is what the reply buffer in
 	 * pcache_pull_send_rpl() is sized to - there is no buffer in scope here. */
-	budget = via_clctr
-		? pcache_clctr_payload_lim(CLCTR_MAX_PAYLOAD)
-		  - (int)(PCACHE_CLCTR_RPL_HDR + key->len)
-		: pull_max_value;
-#else
 	budget = pull_max_value;
+#ifdef CLUSTERER_CTRL_SUPPORT
+	if (via == PULL_VIA_CLCTR)
+		budget = pcache_clctr_payload_lim(CLCTR_MAX_PAYLOAD)
+			- (int)(PCACHE_CLCTR_RPL_HDR + key->len);
 #endif
 	if (val.len > budget) {
 		/* An error on EVERY occurrence, deliberately: each one is a value
@@ -2314,8 +2392,8 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 			"held-but-unsendable, so the value stays unpullable from "
 			"this node - %s\n",
 			key->len, key->s, val.len, budget,
-			via_clctr ? "switch pull_transport to 'bin', which has no "
-			            "such limit, to serve values this large"
+			via == PULL_VIA_CLCTR ? "switch pull_transport to 'bin', 'udp' or "
+			            "'tcp', which have no such limit, to serve values this large"
 			          : "raise pull_max_value (on every node) to cover "
 			            "values this large");
 		found = PCACHE_FOUND_OVERSIZE;
@@ -2330,7 +2408,7 @@ static void pcache_pull_do_serve(int src_node, unsigned int id, str *coll,
 
 reply:
 	peer_note_served(src_node);
-	pcache_pull_send_rpl(src_node, id, key, found, ttl_left, &val, via_clctr);
+	pcache_pull_send_rpl(src_node, id, key, found, ttl_left, &val, via);
 	if (val.s)
 		pkg_free(val.s);
 }
@@ -2353,7 +2431,7 @@ static void pcache_pull_serve(bin_packet_t *in)
 		force = 0;
 	/* arrived over BIN, so it is answered over BIN - even on a node whose
 	 * own pull_transport is the controller plane */
-	pcache_pull_do_serve(in->src_id, id, &coll, &key, 0, force);
+	pcache_pull_do_serve(in->src_id, id, &coll, &key, PULL_VIA_BIN, force);
 }
 
 /* A peer answered.  Fill the waiting slot; first positive answer wins and
@@ -2615,6 +2693,124 @@ static void pcache_pull_reply(bin_packet_t *in)
 	pcache_pull_do_reply(in->src_id, id, &key, found, ttl_left, &val);
 }
 
+/* the flat wire format (clctr plane and the module's own transport):
+ * parse one message and hand it to the serve or reply path */
+static void pcache_pull_dispatch(int src_node, const char *p, int left, int via)
+{
+	uint32_t id_be, ttl_be;
+	uint16_t l16;
+	str coll, key, val;
+	unsigned char type;
+	int found;
+
+	if (left < 6)
+		goto bad;
+	type = (unsigned char)*p++; left--;
+	memcpy(&id_be, p, 4); p += 4; left -= 4;
+	if (type == PCACHE_CLCTR_REQ) {
+		if (left < 1)
+			goto bad;
+		coll.len = (unsigned char)*p++; left--;
+		if (left < coll.len + 2)
+			goto bad;
+		coll.s = (char *)p; p += coll.len; left -= coll.len;
+		memcpy(&l16, p, 2); p += 2; left -= 2;
+		key.len = ntohs(l16);
+		if (left < key.len)
+			goto bad;
+		key.s = (char *)p;
+		pcache_pull_do_serve(src_node, ntohl(id_be), &coll, &key, via,
+			left > key.len ? (p[key.len] & 1) : 0);
+		return;
+	}
+	if (type == PCACHE_CLCTR_RPL) {
+		if (left < 7)
+			goto bad;
+		found = (unsigned char)*p++; left--;
+		memcpy(&ttl_be, p, 4); p += 4; left -= 4;
+		memcpy(&l16, p, 2); p += 2; left -= 2;
+		key.len = ntohs(l16);
+		if (left < key.len + 2)
+			goto bad;
+		key.s = (char *)p; p += key.len; left -= key.len;
+		memcpy(&l16, p, 2); p += 2; left -= 2;
+		val.len = ntohs(l16);
+		if (left < val.len)
+			goto bad;
+		val.s = (char *)p;
+		pcache_pull_do_reply(src_node, ntohl(id_be), &key, found,
+			(int)ntohl(ttl_be), &val);
+		return;
+	}
+bad:
+	LM_ERR("malformed pull message from node %d (%s)\n", src_node,
+		via == PULL_VIA_XPORT ? pcache_xport_name() : "clctr");
+}
+
+/* the module's own transport hands every message here (transport process) */
+static void pcache_xport_recv(int src_node, const char *p, int len)
+{
+	pcache_pull_dispatch(src_node, p, len, PULL_VIA_XPORT);
+}
+
+/* announce where we pull, over the clusterer links: to one node or to all */
+int pcache_pull_peers_expected(void)
+{
+	int ids[CL_MAX_NODE_ID];
+	unsigned int gen;
+	int n = pcache_cluster_members(ids, CL_MAX_NODE_ID, &gen, NULL);
+
+	return n < 0 ? 0 : n;
+}
+
+int pcache_pull_hello(int dst_node)
+{
+	bin_packet_t out;
+	char a[80];
+	str as;
+	int rc;
+
+	if (!pull_via_xport)
+		return -1;
+	as.len = pcache_xport_my_addr(a, sizeof a);
+	as.s = a;
+	if (bin_init(&out, &pcache_sync_cap, PCACHE_PULL_HELLO,
+	        PCACHE_SYNC_VERSION, 0) < 0)
+		return -1;
+	if (bin_push_str(&out, &as) < 0) {
+		bin_free_packet(&out);
+		return -1;
+	}
+	if (dst_node > 0)
+		rc = clusterer_api.send_to(&out, sync_cluster_id, dst_node);
+	else
+		rc = clusterer_api.send_all(&out, sync_cluster_id);
+	LM_DBG("pull HELLO '%.*s' to %s: %d\n", as.len, as.s,
+		dst_node > 0 ? "one node" : "all", rc);
+	bin_free_packet(&out);
+	return rc == CLUSTERER_SEND_SUCCESS ? 0 : -1;
+}
+
+/* the clusterer's address of a node, for pull_port-derived peers */
+int pcache_pull_node_addr(int node, union sockaddr_union *su)
+{
+	clusterer_node_t *list, *n;
+	int rc = -1;
+
+	if (!clusterer_api.get_nodes)
+		return -1;
+	list = clusterer_api.get_nodes(sync_cluster_id);
+	for (n = list; n; n = n->next)
+		if (n->node_id == node) {
+			*su = n->addr;
+			rc = 0;
+			break;
+		}
+	if (list && clusterer_api.free_nodes)
+		clusterer_api.free_nodes(list);
+	return rc;
+}
+
 #ifdef CLUSTERER_CTRL_SUPPORT
 /* Controller-plane framing -> the shared paths.  Runs in the controller's
  * receiving process; the cache is in shm, so serving from here is fine. */
@@ -2679,86 +2875,12 @@ static void pull_foreign_cluster(int cluster_id)
 static void pcache_clctr_recv(int cluster_id, int src_node_id, str *channel,
 		str *payload)
 {
-	const char *p = payload->s;
-	int left = payload->len;
-	uint32_t id_be, ttl_be;
-	uint16_t l16;
-	str coll, key, val;
-	unsigned char type;
-	int found;
-
-	/* Honour the cluster the message arrived on. This is the ONLY place the
-	 * controller plane can be scoped: register_channel() takes a name and a
-	 * callback and nothing else (clusterer_controller/api.h), cl_ctr_channels[]
-	 * is one global table, and cl_ctr_consumer_dispatch() matches on channel
-	 * NAME alone before passing cl->cluster_id here
-	 * (clusterer_controller.c:7388-7402). The channel name is the fixed
-	 * literal "cdbperf-pull", so every cachedb_perf in every cluster shares
-	 * it.
-	 *
-	 * Serving a foreign cluster's request is wrong twice over: the value
-	 * comes out of THIS cache, which is not the one that cluster is
-	 * converging, and the reply is unicast with send_ucast(sync_cluster_id,
-	 * src_node_id) - a node id from the sender's cluster used to address
-	 * sync_cluster_id's members, where the same number is a different
-	 * machine. Symmetrically an inbound reply could satisfy a pending local
-	 * pull with another cluster's value and credit another cluster's node in
-	 * peer_stats.
-	 *
-	 * This is configuration, not misuse: CL_CTR_MAX_CLUSTERS is 16, and the
-	 * documented hybrid topology has native and controller-managed clusters
-	 * side by side on one node with distinct ids. The BIN transport never had
-	 * the hole - clusterer_api.register_capability() binds delivery to
-	 * sync_cluster_id, so scoping happens before the callback. */
 	if (cluster_id != sync_cluster_id) {
 		pull_foreign_cluster(cluster_id);
 		return;
 	}
-
-	if (left < 6)
-		goto bad;
-	type = (unsigned char)*p++; left--;
-	memcpy(&id_be, p, 4); p += 4; left -= 4;
-
-	if (type == PCACHE_CLCTR_REQ) {
-		if (left < 1)
-			goto bad;
-		coll.len = (unsigned char)*p++; left--;
-		if (left < coll.len + 2)
-			goto bad;
-		coll.s = (char *)p; p += coll.len; left -= coll.len;
-		memcpy(&l16, p, 2); p += 2; left -= 2;
-		key.len = ntohs(l16);
-		if (left < key.len)
-			goto bad;
-		key.s = (char *)p;
-		/* optional trailing flags byte - absent on the previous format */
-		pcache_pull_do_serve(src_node_id, ntohl(id_be), &coll, &key, 1,
-			left > key.len ? (p[key.len] & 1) : 0);
-		return;
-	}
-	if (type == PCACHE_CLCTR_RPL) {
-		if (left < 7)
-			goto bad;
-		found = (unsigned char)*p++; left--;
-		memcpy(&ttl_be, p, 4); p += 4; left -= 4;
-		memcpy(&l16, p, 2); p += 2; left -= 2;
-		key.len = ntohs(l16);
-		if (left < key.len + 2)
-			goto bad;
-		key.s = (char *)p; p += key.len; left -= key.len;
-		memcpy(&l16, p, 2); p += 2; left -= 2;
-		val.len = ntohs(l16);
-		if (left < val.len)
-			goto bad;
-		val.s = (char *)p;
-		pcache_pull_do_reply(src_node_id, ntohl(id_be), &key, found,
-			(int)ntohl(ttl_be), &val);
-		return;
-	}
-bad:
-	LM_ERR("malformed pull message from node %d on <%.*s>\n", src_node_id,
-		channel->len, channel->s);
+	pcache_pull_dispatch(src_node_id, payload->s, payload->len,
+		PULL_VIA_CLCTR);
 }
 #endif
 
@@ -2895,6 +3017,27 @@ static int pcache_pull_start(pcache_col_t *col, const str *key, int hint_node,
 	lock_release(pull_lock);
 
 	__sync_fetch_and_add(&pull_stats[PULL_ST_REQUESTED], 1);
+	if (pull_via_xport) {
+		char buf[PULL_WIRE_MAX];
+		int n = pull_req_payload(buf, pcache_xport_max_payload(), id,
+			&col->col_name, key, force), k, fails = 0;
+
+		if (n < 0) {
+			LM_ERR("pull request for a %d byte key does not fit the "
+				"transport\n", key->len);
+			goto fail;
+		}
+		if (hint_node > 0) {
+			fails = pcache_xport_send(hint_node, buf, n) < 0;
+		} else {
+			for (k = 0; k < nmembers; k++)
+				if (pcache_xport_send(ids[k], buf, n) < 0)
+					fails++;
+		}
+		if (fails)
+			pull_send_failed(hint_node > 0 ? "a request could not be sent"
+				: "a request reached no or only some nodes", hint_node);
+	} else
 #ifdef CLUSTERER_CTRL_SUPPORT
 	if (pull_via_clctr) {
 		char buf[CLCTR_MAX_PAYLOAD];
@@ -3548,6 +3691,23 @@ static void pcache_sync_recv(bin_packet_t *packet)
 		pcache_pull_reply(packet);
 		return;
 	}
+	if (packet->type == PCACHE_PULL_HELLO) {
+		str addr;
+		int is_new = 0;
+
+		if (bin_pop_str(packet, &addr) < 0) {
+			LM_ERR("malformed pull HELLO from node %d\n", packet->src_id);
+			return;
+		}
+		LM_DBG("pull HELLO from node %d: '%.*s'\n", packet->src_id,
+			addr.len, addr.s);
+		if (pull_via_xport) {
+			pcache_xport_learn(packet->src_id, addr.s, addr.len, &is_new);
+			if (is_new)
+				pcache_pull_hello(packet->src_id);   /* tell it ours */
+		}
+		return;
+	}
 	if (packet->type == PCACHE_STAT_REQ) {
 		pcache_stat_serve(packet);
 		return;
@@ -3981,6 +4141,10 @@ static void pcache_reclaim_proc(int rank)
 
 static proc_export_t procs[] = {
 	{ "cachedb_perf reclaim", NULL, NULL, pcache_reclaim_proc, 1, 0 },
+	/* the own pull transport's receive (and, for tcp, send) process;
+	 * switched off in mod_init unless pull_transport is udp/tcp/tls */
+	{ "cachedb_perf transport", NULL, NULL, pcache_xport_proc, 1,
+	  PROC_FLAG_HAS_IPC },
 	{ NULL, NULL, NULL, NULL, 0, 0 },
 };
 
@@ -5130,14 +5294,27 @@ static int mod_init(void)
 	 * it: a key is only worth asking the cluster about if it means the
 	 * same thing on every node, which only the operator knows. */
 	if (replicate_collections && *replicate_collections) {
-		int use_clctr = pull_transport_str &&
-			!strcasecmp(pull_transport_str, "clctr");
+		const char *pt = pull_transport_str ? pull_transport_str : "bin";
+		int use_clctr = !strcasecmp(pt, "clctr");
+		int xkind = !strcasecmp(pt, "udp") ? PCACHE_XPORT_UDP :
+		            !strcasecmp(pt, "tcp") ? PCACHE_XPORT_TCP :
+		            !strcasecmp(pt, "tls") ? PCACHE_XPORT_TLS : PCACHE_XPORT_NONE;
 
-		if (pull_transport_str && strcasecmp(pull_transport_str, "bin") &&
-		        !use_clctr) {
-			LM_ERR("bad pull_transport '%s' - expected 'bin' or 'clctr'\n",
-				pull_transport_str);
+		/* "bins" = the clusterer's links too; whether they are bin or
+		 * bins is the clusterer's node URLs, not ours */
+		if (strcasecmp(pt, "bin") && strcasecmp(pt, "bins") && !use_clctr &&
+		        !xkind) {
+			LM_ERR("bad pull_transport '%s' - expected bin, bins, udp, tcp, "
+				"tls or clctr\n", pt);
 			return -1;
+		}
+		if (xkind) {
+			if (pcache_xport_init(xkind,
+			        clusterer_api.get_my_id ? clusterer_api.get_my_id() : 0,
+			        pcache_xport_recv,
+			        PCACHE_CLCTR_RPL_HDR + pull_max_key + pull_max_value) < 0)
+				return -1;
+			pull_via_xport = 1;
 		}
 		if (use_clctr) {
 			/* The controller is optional at build time AND at run time.
@@ -5429,6 +5606,11 @@ static int mod_init(void)
 			"but their memory is never reclaimed\n");
 	}
 
+	/* the own pull transport's process exists only when that transport
+	 * was selected above (udp/tcp/tls); decided here, after the parsing */
+	if (!pull_via_xport)
+		procs[1].no = 0;
+
 	return 0;
 }
 
@@ -5504,6 +5686,7 @@ static void mod_destroy(void)
 	}
 
 	pcache_arena_destroy();
+	pcache_xport_destroy();
 }
 
 

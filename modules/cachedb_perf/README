@@ -37,12 +37,14 @@ cachedb_perf Module
               1.3.22. sync_shtag (string)
               1.3.23. replicate_collections (string)
               1.3.24. pull_transport (string)
-              1.3.25. pull_timeout_ms (integer)
-              1.3.26. pull_slots (integer)
-              1.3.27. pull_authoritative_serve (integer)
-              1.3.28. pull_linger_ms (integer)
-              1.3.29. pull_negative_ms (integer)
-              1.3.30. pull_on_miss (integer)
+              1.3.25. pull_bind (string)
+              1.3.26. pull_port (integer)
+              1.3.27. pull_timeout_ms (integer)
+              1.3.28. pull_slots (integer)
+              1.3.29. pull_authoritative_serve (integer)
+              1.3.30. pull_linger_ms (integer)
+              1.3.31. pull_negative_ms (integer)
+              1.3.32. pull_on_miss (integer)
 
         1.4. DB persistence
         1.5. Cluster sync
@@ -105,16 +107,19 @@ cachedb_perf Module
    1.20. Set sync_cluster_id parameter
    1.21. Setting sync_shtag
    1.22. Setting replicate_collections
-   1.23. Cluster-sync setup (one authority, two read replicas)
-   1.24. perf_stats usage
-   1.25. perf_stats_reset usage
-   1.26. introspection usage
-   1.27. perf_cluster_size usage
-   1.28. perf_save / perf_load usage
-   1.29. perf_sync usage
-   1.30. perf_del() usage
-   1.31. perf_mget() usage
-   1.32. perf_mget_json() usage
+   1.23. Set pull_transport parameter
+   1.24. Set pull_bind parameter
+   1.25. Set pull_port parameter
+   1.26. Cluster-sync setup (one authority, two read replicas)
+   1.27. perf_stats usage
+   1.28. perf_stats_reset usage
+   1.29. introspection usage
+   1.30. perf_cluster_size usage
+   1.31. perf_save / perf_load usage
+   1.32. perf_sync usage
+   1.33. perf_del() usage
+   1.34. perf_mget() usage
+   1.35. perf_mget_json() usage
 
 Chapter 1. Admin Guide
 
@@ -152,12 +157,14 @@ Chapter 1. Admin Guide
         1.3.22. sync_shtag (string)
         1.3.23. replicate_collections (string)
         1.3.24. pull_transport (string)
-        1.3.25. pull_timeout_ms (integer)
-        1.3.26. pull_slots (integer)
-        1.3.27. pull_authoritative_serve (integer)
-        1.3.28. pull_linger_ms (integer)
-        1.3.29. pull_negative_ms (integer)
-        1.3.30. pull_on_miss (integer)
+        1.3.25. pull_bind (string)
+        1.3.26. pull_port (integer)
+        1.3.27. pull_timeout_ms (integer)
+        1.3.28. pull_slots (integer)
+        1.3.29. pull_authoritative_serve (integer)
+        1.3.30. pull_linger_ms (integer)
+        1.3.31. pull_negative_ms (integer)
+        1.3.32. pull_on_miss (integer)
 
    1.4. DB persistence
    1.5. Cluster sync
@@ -648,22 +655,75 @@ modparam("cachedb_perf", "replicate_collections", "th")
 
 1.3.24. pull_transport (string)
 
-   How cross-node pulls travel: bin (default) uses the clusterer's
-   BIN links. clctr rides the clusterer_controller module's
-   encrypted multicast plane instead: one datagram reaches every
-   peer, and the payload is encrypted, which the BIN links are
-   not.
+   How cross-node pulls travel:
+     * bin (default) - the clusterer's BIN links. Every request
+       and reply is one TCP message the core's TCP dispatcher
+       hands to a receiver and back; at a few thousand pulls a
+       second that single process is the limit, and any stall on
+       the receiving side queues everything behind it. bins is the
+       same choice - whether the links are bin or bins is the
+       clusterer's node URLs, not this parameter.
+     * udp - the module's own datagram socket (pull_bind):
+       requests leave the asking process directly, replies arrive
+       in a dedicated cachedb_perf transport process that only
+       parses, copies into the pull slot and wakes the waiter. No
+       core dispatcher, no controller. Loss is handled by
+       pull_timeout_ms as for every transport. Payloads above the
+       MTU ride on IP fragmentation (DF cleared), which is for one
+       LAN or a path the operator knows passes fragments.
+     * tcp - the module's own stream connections, one per
+       direction per peer, owned by the transport process (other
+       processes hand it their sends through IPC): ordered,
+       reliable, no MTU ceiling on values.
+     * tls - reserved for the tcp transport under TLS; refused at
+       startup for now.
+     * clctr - the clusterer_controller module's encrypted
+       multicast plane: one datagram reaches every peer and the
+       payload is encrypted. Needs the controller; when it is not
+       loaded, clctr logs a warning and degrades to bin.
 
-   The controller is optional, at build time and at run time. When
-   this build does not include clusterer_controller, or the module
-   is not loaded, clctr logs a warning and degrades to bin; if the
-   clusterer module is unavailable too, cross-node pull and sync
-   are disabled and the cache runs purely node-local. Missing
-   cluster infrastructure never stops the module from starting.
+   With udp and tcp the nodes learn each other's transport address
+   from a HELLO the module announces over the clusterer links
+   (every 2 s until every cluster member is known, then every 30
+   s, and whenever a node comes up); pull_port gives an address to
+   use before the first HELLO. The transport in use and its
+   counters are in perf_stats (pull_transport, pull_peers_known,
+   xport_tx / xport_tx_failed / xport_rx / xport_rx_bad /
+   xport_tcp_connects / xport_tcp_accepts / xport_tcp_errors).
 
-   Default value is “bin”.
+   Example 1.23. Set pull_transport parameter
+...
+modparam("cachedb_perf", "pull_transport", "udp")
+modparam("cachedb_perf", "pull_bind", "10.0.0.5:5580")
+...
 
-1.3.25. pull_timeout_ms (integer)
+1.3.25. pull_bind (string)
+
+   The local ip:port (or [ip6]:port) the module's own pull
+   transport binds: the udp socket, or the tcp listener. Required
+   for pull_transport udp, tcp and tls; announced to the peers in
+   the HELLO.
+
+   Example 1.24. Set pull_bind parameter
+...
+modparam("cachedb_perf", "pull_bind", "10.0.0.5:5580")
+...
+
+1.3.26. pull_port (integer)
+
+   Optional. A port to assume for a peer whose HELLO has not
+   arrived yet, combined with the peer's address from the
+   clusterer's node table: lets the first pulls after a start go
+   out before the announcements have converged when every node
+   binds its transport on the same port. An announced address
+   always outranks the assumption. Default 0 (wait for the HELLO).
+
+   Example 1.25. Set pull_port parameter
+...
+modparam("cachedb_perf", "pull_port", 5580)
+...
+
+1.3.27. pull_timeout_ms (integer)
 
    How long a pull waits for the cluster, in milliseconds
    (1..5000). It is a backstop, not the normal cost: with every
@@ -673,7 +733,7 @@ modparam("cachedb_perf", "replicate_collections", "th")
 
    Default value is “50”.
 
-1.3.26. pull_slots (integer)
+1.3.28. pull_slots (integer)
 
    How many pulls may be in flight at once (8..16384). A miss that
    finds the pool dry is not queued - it is answered as a miss,
@@ -695,7 +755,7 @@ modparam("cachedb_perf", "replicate_collections", "th")
 
    Default value is “64”.
 
-1.3.27. pull_authoritative_serve (integer)
+1.3.29. pull_authoritative_serve (integer)
 
    In a converged cluster several nodes hold most keys, and a
    broadcast pull is answered by every one of them - with the full
@@ -724,7 +784,7 @@ modparam("cachedb_perf", "replicate_collections", "th")
 
    Default value is “0” (every holder answers with the value).
 
-1.3.28. pull_linger_ms (integer)
+1.3.30. pull_linger_ms (integer)
 
    A pull whose answer arrives after pull_timeout_ms is no longer
    anyone's answer - the caller has moved on - but it is still a
@@ -751,7 +811,7 @@ modparam("cachedb_perf", "replicate_collections", "th")
 
    Default value is “0” (no extra bound).
 
-1.3.29. pull_negative_ms (integer)
+1.3.31. pull_negative_ms (integer)
 
    How long to remember that the whole cluster answered “not here”
    for a key, in milliseconds (0..2000; 0 disables it). A SIP
@@ -772,7 +832,7 @@ modparam("cachedb_perf", "replicate_collections", "th")
 
    Default value is “300”.
 
-1.3.30. pull_on_miss (integer)
+1.3.32. pull_on_miss (integer)
 
    Repair a miss on the ordinary read path: when a lookup finds
    nothing locally, ask the cluster and return whatever comes back
@@ -868,7 +928,7 @@ Warning
    persistence): it is an occasional refresh, not something to
    fire on a timer or per request.
 
-   Example 1.23. Cluster-sync setup (one authority, two read
+   Example 1.26. Cluster-sync setup (one authority, two read
    replicas)
 # on every node - clusterer must load before cachedb_perf (the module
 # declares a soft dependency, so init order is handled either way):
@@ -1136,7 +1196,7 @@ t
 
    Name: perf_stats. Parameters: collection (optional).
 
-   Example 1.24. perf_stats usage
+   Example 1.27. perf_stats usage
 opensips-cli -x mi cachedb_perf:perf_stats
 opensips-cli -x mi cachedb_perf:perf_stats th
 
@@ -1164,7 +1224,7 @@ opensips-cli -x mi cachedb_perf:perf_stats th
 
    Name: perf_stats_reset. Parameters: collection (optional).
 
-   Example 1.25. perf_stats_reset usage
+   Example 1.28. perf_stats_reset usage
 opensips-cli -x mi cachedb_perf:perf_stats_reset
 opensips-cli -x mi cachedb_perf:perf_stats_reset th
 
@@ -1222,7 +1282,7 @@ perf_get / perf_probe / perf_pull / perf_set / perf_ttl / perf_del
        the glob; returns the count. The MI face of the perf_del()
        script function.
 
-   Example 1.26. introspection usage
+   Example 1.29. introspection usage
 opensips-cli -x mi cachedb_perf:perf_keys "session-*"
 opensips-cli -x mi cachedb_perf:perf_keys "session-*" th 50
 opensips-cli -x mi cachedb_perf:perf_scan 0
@@ -1246,7 +1306,7 @@ opensips-cli -x mi cachedb_perf:perf_del "session-abc*"
    reported total then says it covers the answering nodes only).
    One query runs at a time; it is an operator path.
 
-   Example 1.27. perf_cluster_size usage
+   Example 1.30. perf_cluster_size usage
 opensips-cli -x mi cachedb_perf:perf_cluster_size ul
 { "collection": "ul",
   "nodes": [
@@ -1265,7 +1325,7 @@ opensips-cli -x mi cachedb_perf:perf_cluster_size ul
    reply reports how many collections and entries were written or
    read.
 
-   Example 1.28. perf_save / perf_load usage
+   Example 1.31. perf_save / perf_load usage
 opensips-cli -x mi cachedb_perf:perf_save
 opensips-cli -x mi cachedb_perf:perf_save sessions
 opensips-cli -x mi cachedb_perf:perf_load sessions
@@ -1276,7 +1336,7 @@ opensips-cli -x mi cachedb_perf:perf_load sessions
    (see Cluster sync); all declared collections if none is named.
    Also available as a script function, perf_sync([collection]).
 
-   Example 1.29. perf_sync usage
+   Example 1.32. perf_sync usage
 opensips-cli -x mi cachedb_perf:perf_sync sessions
 
 1.9. Exported Events
@@ -1342,7 +1402,7 @@ opensips-cli -x mi cachedb_perf:perf_sync sessions
    Returns the number of keys removed, or -1 (false) if none
    matched.
 
-   Example 1.30. perf_del() usage
+   Example 1.33. perf_del() usage
 ...
 perf_del("session-*");
 perf_del("th-*", "th");
@@ -1357,7 +1417,7 @@ perf_del("th-*", "th");
    0 = unbounded. Returns the match count, or -1 (false) if none
    matched.
 
-   Example 1.31. perf_mget() usage
+   Example 1.34. perf_mget() usage
 ...
 if (perf_mget("user-*", $avp(k), $avp(v))) {
     xlog("first match: $(avp(k)[0]) = $(avp(v)[0])\n");
@@ -1373,7 +1433,7 @@ if (perf_mget("user-*", $avp(k), $avp(v))) {
    through unescaped - strict JSON consumers therefore need UTF-8
    values. Returns the match count, or -1 (false) if none matched.
 
-   Example 1.32. perf_mget_json() usage
+   Example 1.35. perf_mget_json() usage
 ...
 if (perf_mget_json("user-*", $var(blob), , 100))
     xlog("users: $var(blob)\n");

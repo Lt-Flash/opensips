@@ -637,26 +637,94 @@ modparam("cachedb_perf", "replicate_collections", "th")
 	<section id="param_pull_transport" xreflabel="pull_transport">
 		<title><varname>pull_transport</varname> (string)</title>
 		<para>
-		How cross-node pulls travel: <emphasis>bin</emphasis> (default)
-		uses the clusterer's BIN links.  <emphasis>clctr</emphasis> rides
-		the clusterer_controller module's encrypted multicast plane
-		instead: one datagram reaches every peer, and the payload is
-		encrypted, which the BIN links are not.
+		How cross-node pulls travel:
 		</para>
+		<itemizedlist>
+		<listitem><para><emphasis>bin</emphasis> (default) - the clusterer's
+		BIN links. Every request and reply is one TCP message the core's
+		TCP dispatcher hands to a receiver and back; at a few thousand pulls
+		a second that single process is the limit, and any stall on the
+		receiving side queues everything behind it. <emphasis>bins</emphasis>
+		is the same choice - whether the links are bin or bins is the
+		clusterer's node URLs, not this parameter.</para></listitem>
+		<listitem><para><emphasis>udp</emphasis> - the module's own datagram
+		socket (<xref linkend="param_pull_bind"/>): requests leave the
+		asking process directly, replies arrive in a dedicated
+		<emphasis>cachedb_perf transport</emphasis> process that only parses,
+		copies into the pull slot and wakes the waiter. No core dispatcher,
+		no controller. Loss is handled by <xref linkend="param_pull_timeout_ms"/>
+		as for every transport. Payloads above the MTU ride on IP
+		fragmentation (DF cleared), which is for one LAN or a path the
+		operator knows passes fragments.</para></listitem>
+		<listitem><para><emphasis>tcp</emphasis> - the module's own stream
+		connections, one per direction per peer, owned by the transport
+		process (other processes hand it their sends through IPC): ordered,
+		reliable, no MTU ceiling on values.</para></listitem>
+		<listitem><para><emphasis>tls</emphasis> - reserved for the tcp
+		transport under TLS; refused at startup for now.</para></listitem>
+		<listitem><para><emphasis>clctr</emphasis> - the clusterer_controller
+		module's encrypted multicast plane: one datagram reaches every peer
+		and the payload is encrypted. Needs the controller; when it is not
+		loaded, clctr logs a warning and degrades to bin.</para></listitem>
+		</itemizedlist>
 		<para>
-		The controller is optional, at build time and at run time.  When
-		this build does not include clusterer_controller, or the module
-		is not loaded, <emphasis>clctr</emphasis> logs a warning and
-		degrades to <emphasis>bin</emphasis>; if the clusterer module is
-		unavailable too, cross-node pull and sync are disabled and the
-		cache runs purely node-local.  Missing cluster infrastructure
-		never stops the module from starting.
+		With udp and tcp the nodes learn each other's transport address
+		from a HELLO the module announces over the clusterer links (every
+		2 s until every cluster member is known, then every 30 s, and
+		whenever a node comes up); <xref linkend="param_pull_port"/> gives
+		an address to use before the first HELLO. The transport in use and
+		its counters are in <emphasis>perf_stats</emphasis>
+		(<emphasis>pull_transport</emphasis>, <emphasis>pull_peers_known</emphasis>,
+		<emphasis>xport_tx</emphasis> / <emphasis>xport_tx_failed</emphasis> /
+		<emphasis>xport_rx</emphasis> / <emphasis>xport_rx_bad</emphasis> /
+		<emphasis>xport_tcp_connects</emphasis> / <emphasis>xport_tcp_accepts</emphasis> /
+		<emphasis>xport_tcp_errors</emphasis>).
 		</para>
+		<example>
+		<title>Set <varname>pull_transport</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("cachedb_perf", "pull_transport", "udp")
+modparam("cachedb_perf", "pull_bind", "10.0.0.5:5580")
+...
+</programlisting>
+		</example>
+	</section>
+	<section id="param_pull_bind" xreflabel="pull_bind">
+		<title><varname>pull_bind</varname> (string)</title>
 		<para>
-		<emphasis>
-			Default value is <quote>bin</quote>.
-		</emphasis>
+		The local <emphasis>ip:port</emphasis> (or <emphasis>[ip6]:port</emphasis>)
+		the module's own pull transport binds: the udp socket, or the tcp
+		listener. Required for <emphasis>pull_transport</emphasis> udp, tcp
+		and tls; announced to the peers in the HELLO.
 		</para>
+		<example>
+		<title>Set <varname>pull_bind</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("cachedb_perf", "pull_bind", "10.0.0.5:5580")
+...
+</programlisting>
+		</example>
+	</section>
+	<section id="param_pull_port" xreflabel="pull_port">
+		<title><varname>pull_port</varname> (integer)</title>
+		<para>
+		Optional. A port to assume for a peer whose HELLO has not arrived
+		yet, combined with the peer's address from the clusterer's node
+		table: lets the first pulls after a start go out before the
+		announcements have converged when every node binds its transport
+		on the same port. An announced address always outranks the
+		assumption. Default 0 (wait for the HELLO).
+		</para>
+		<example>
+		<title>Set <varname>pull_port</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("cachedb_perf", "pull_port", 5580)
+...
+</programlisting>
+		</example>
 	</section>
 
 	<section id="param_pull_timeout_ms" xreflabel="pull_timeout_ms">

@@ -39,6 +39,9 @@
  * every later hardcoded id is one too high. The raise site is itself
  * statistics-gated, so the pairing stays consistent. */
 #define EVI_SHM_GROW_BLOCKED_ID	6
+/* T1: an hb->lock hold at or above hg_lock_stall_us, raised from the
+ * sweep timer with the most recent stall's reason/duration/process */
+#define EVI_HG_LOCK_STALL_ID	7
 
 
 #define EVI_CORE_PREFIX		"E_CORE_"

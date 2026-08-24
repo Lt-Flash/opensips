@@ -71,6 +71,8 @@ char *hg_shm_profile_name = NULL;
 char *hg_pkg_profile_name = NULL;
 int hg_ram_floor_mb = 0;
 int hg_autoscale_dry_run = 0;
+int hg_lock_stall_us = 1000;
+int hg_grow_ahead = 1;
 /* auto-scaling sampling and checking time cycle is 1 sec by default */
 int auto_scaling_cycle = 1;
 /*!< by default choose the best method */

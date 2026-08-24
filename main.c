@@ -109,6 +109,7 @@
 #include "globals.h"
 #include "mem/mem.h"
 #include "mem/shm_mem.h"
+#include "mem/hg_maint.h"
 #include "mem/rpm_mem.h"
 #include "sr_module.h"
 #include "timer.h"
@@ -277,6 +278,12 @@ static int main_loop(void)
 	/* fork for the timer process*/
 	if (start_timer_processes()!=0) {
 		LM_CRIT("cannot start timer process(es)\n");
+		goto error;
+	}
+
+	/* fork the HG_MALLOC maintenance process (elastic shm arenas only) */
+	if (hg_maint_start()!=0) {
+		LM_CRIT("cannot start the HG maintenance process\n");
 		goto error;
 	}
 

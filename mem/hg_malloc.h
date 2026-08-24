@@ -24,6 +24,7 @@
 #define hg_malloc_h
 
 #include <stdio.h>
+#include <time.h>
 #include "meminfo.h"
 #include "common.h"
 /* for process_no, used by hg_pstat_mine() below to pick this process's
@@ -335,6 +336,57 @@ enum hg_corrupt_kind {
 /* for the two checks that fire where no arena pointer exists */
 extern unsigned long hg_corrupt_noarena[HG_CORRUPT_KINDS];
 
+/*
+ * Lock-hold / lock-wait instrumentation (T1). Every hb->lock section is a
+ * slow path already (refill, return, flush, large, region, policy, stats),
+ * so two clock_gettime(CLOCK_MONOTONIC) reads per section - ~20 ns each via
+ * the vDSO - are noise next to the work they bracket, and the fast path
+ * (cache hits) never comes here. Everything below is written UNDER the lock
+ * it measures, so it needs no atomics: the wait figure is recorded after
+ * the acquire, the hold figure before the release.
+ *
+ * Histograms are log2 in microseconds: bucket 0 is "< 1 us", bucket k is
+ * [2^(k-1), 2^k) us, the last bucket collects everything >= 64 ms. A hold
+ * at or above hg_lock_stall_us counts as a stall: it is tallied per reason,
+ * remembered as the most recent stall for the deferred E_CORE_HG_LOCK_STALL
+ * event (raised from the sweep timer, never under the lock), and logged
+ * once per second per process at most.
+ */
+enum hg_lock_reason {
+	HG_LK_REFILL = 0,   /* class refill: gpool pop, chunk carve, grow */
+	HG_LK_RETURN,       /* cell return: gpool push, donate, gc_class */
+	HG_LK_FLUSH,        /* per-process cell-cache flush (sweep / floor) */
+	HG_LK_LARGE,        /* large tier alloc / free */
+	HG_LK_REGION,       /* region (run) alloc / publish */
+	HG_LK_POLICY,       /* grow/shrink tick, profile apply */
+	HG_LK_STATS,        /* statistics walks, live-cell enumeration */
+	HG_LK_OTHER,
+	HG_LK_REASONS
+};
+#define HG_LK_BUCKETS 18           /* <1us, 1,2,4,...,32ms, >=64ms */
+
+struct hg_lkstat {
+	unsigned long n;
+	unsigned long total_ns;
+	unsigned long max_ns;
+	unsigned long stalls;              /* holds >= hg_lock_stall_us */
+	unsigned long hist[HG_LK_BUCKETS];
+};
+
+/* the phases of hg_mem_commit() on the THP path, timed separately so a
+ * slow grow says WHICH part of the commit is slow: the /proc/meminfo read,
+ * the madvise, the populating mlock, the backing verification (a meminfo
+ * counter delta), the MADV_COLLAPSE retrofit (with its second meminfo read) */
+enum hg_commit_phase {
+	HG_CP_MEMINFO = 0, HG_CP_ADVISE, HG_CP_MLOCK, HG_CP_VERIFY, HG_CP_COLLAPSE,
+	HG_CP_PHASES
+};
+
+enum hg_grow_why {
+	HG_GROW_EXHAUSTION = 0,   /* a request found nothing to carve */
+	HG_GROW_PROACTIVE         /* the profile's tick, ahead of demand */
+};
+
 struct hg_block {
 	char *name; /* purpose of this memory block */
 
@@ -342,6 +394,12 @@ struct hg_block {
 
 	struct hg_chunk *chunks;
 	unsigned int nchunks;
+	/* sum of cells * cell_size over the registered chunks, kept at carve
+	 * and gc time so hg_slab_recycled() is an O(1) read instead of a walk
+	 * of every chunk under hb->lock on every shmem: stat scrape (T1 measured
+	 * that walk at 7 ms mean / 30 ms max on a 1.8 GB arena, with SIP
+	 * workers waiting up to 46 ms behind it) */
+	unsigned long slab_capacity;
 	/* upper bound on one chunk, derived from the arena size at init -
 	 * see chunk_size_for() in hg_arena.c */
 	unsigned int chunk_max;
@@ -427,6 +485,10 @@ struct hg_block {
 	volatile unsigned long hoff;
 	enum hg_mem_tier      tier;
 	unsigned long         locked_mb;
+	/* T5: init could not mlock the arena (RLIMIT_MEMLOCK) and went on
+	 * unpinned; growth then populates without pinning too instead of
+	 * refusing every grow the way it used to */
+	unsigned int          unpinned;
 	/* MAP_SHARED vs MAP_PRIVATE, as passed to hg_malloc_init(). Stored
 	 * because growth policy depends on it: a pkg delta is per PROCESS,
 	 * so its host-RAM cost is delta x nproc, and the ceiling check must
@@ -512,6 +574,39 @@ struct hg_block {
 	 * successful grow.
 	 */
 	unsigned int          grow_refuse_said;
+	/* T1 lock instrumentation - see enum hg_lock_reason. lk_t0/lk_cur are
+	 * the section in progress (valid only while the lock is held). */
+	unsigned long         lk_t0;
+	int                   lk_cur;
+	struct hg_lkstat      lk_hold[HG_LK_REASONS];
+	struct hg_lkstat      lk_wait[HG_LK_REASONS];
+	struct hg_lkstat      lk_commit;      /* hg_mem_commit() inside a grow */
+	struct hg_lkstat      lk_gc;          /* gc_class() block returns */
+	struct hg_lkstat      lk_cphase[HG_CP_PHASES]; /* commit, by phase */
+	/* T14 two-phase commit: a grow RESERVES [hsize, hsize_pending) under
+	 * the lock, populates it with the lock released, then publishes it
+	 * under the lock. One grow in flight at a time; a worker that exhausts
+	 * meanwhile waits for the publish without the lock (lk_grow_wait). */
+	unsigned long         hsize_pending;  /* hsize + the in-flight delta */
+	/* T8: the maintenance process is alive and owns the proactive ticks */
+	unsigned int          maint_active;
+	int                   maint_proc;
+	unsigned int          grow_inflight;  /* 0/1 */
+	unsigned long         grow_waits;     /* workers that waited for a grow */
+	unsigned long         grow_wait_timeouts; /* ...and gave up (refused) */
+	struct hg_lkstat      lk_grow_wait;   /* their unlocked wait times */
+	unsigned long         lk_worst_ns;    /* longest hold ever, and whose */
+	int                   lk_worst_reason;
+	int                   lk_worst_proc;
+	unsigned long         lk_stalls;      /* sum over reasons */
+	unsigned long         lk_last_stall_ns; /* most recent stall, for the */
+	int                   lk_last_stall_reason; /* deferred event */
+	int                   lk_last_stall_proc;
+	unsigned int          lk_stall_event_due;
+	/* growth attribution: the shared "arena grew" line used to hide which
+	 * path asked - the tick or an exhausted request */
+	unsigned long         grows_proactive;
+	unsigned long         grows_exhaustion;
 	/*
 	 * The alertable grow-blocked state, RESOURCE refusals only - an admin
 	 * cap doing its job is policy, not an incident, and never latches.
@@ -751,7 +846,13 @@ void hg_malloc_destroy(struct hg_block *hb);
  * verification probes live there; called by hg_buddy_grow() under
  * hb->lock.
  */
-int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta);
+/* Commit [off, off+delta) of the reservation: populate, pin, verify the
+ * backing (and retrofit huge pages where the host needs it). Called WITHOUT
+ * hb->lock held (T14): it touches no allocator state except the locked_mb
+ * total (atomically) and the once-per-episode refusal flag; the phase
+ * timings come back in @cp_ns for the caller to merge under the lock. */
+int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
+		unsigned long cp_ns[HG_CP_PHASES]);
 
 /*
  * The host-RAM limb of the growth ceiling: would committing @delta more
@@ -893,6 +994,80 @@ static inline int hg_owns(struct hg_block *hb, void *cell_start)
 {
 	return (char *)cell_start >= hb->hbase &&
 	       (char *)cell_start < hb->hbase + hb->hsize;
+}
+
+/* --- T1: lock instrumentation helpers ---------------------------------- */
+/* hg_lock_stall_us (cfg, default 1000 us) is declared in globals.h */
+extern const char * const hg_lk_reason_str[HG_LK_REASONS];
+extern const char * const hg_cp_phase_str[HG_CP_PHASES];
+
+static inline unsigned long hg_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (unsigned long)ts.tv_sec * 1000000000UL + (unsigned long)ts.tv_nsec;
+}
+
+static inline void hg_lkstat_add(struct hg_lkstat *s, unsigned long ns)
+{
+	unsigned long us = ns / 1000;
+	unsigned int b = 0;
+
+	if (us) {
+		/* b = floor(log2(us)) + 1, capped at the overflow bucket */
+		while (us > 1 && b < HG_LK_BUCKETS - 2) {
+			us >>= 1;
+			b++;
+		}
+		b++;
+	}
+	s->n++;
+	s->total_ns += ns;
+	if (ns > s->max_ns)
+		s->max_ns = ns;
+	s->hist[b]++;
+}
+
+/* the stall bookkeeping + rate-limited WARN; out of line (hg_arena.c) so
+ * the header stays free of dprint */
+void hg_lock_stall_note(struct hg_block *hb, int reason, unsigned long held_ns);
+
+static inline void hg_lock_enter(struct hg_block *hb, enum hg_lock_reason r)
+{
+	unsigned long t0 = hg_now_ns(), t1;
+
+	lock_get(&hb->lock);
+	t1 = hg_now_ns();
+	hg_lkstat_add(&hb->lk_wait[r], t1 - t0);
+	hb->lk_t0 = t1;
+	hb->lk_cur = r;
+}
+
+static inline void hg_lock_leave(struct hg_block *hb)
+{
+	unsigned long held = hg_now_ns() - hb->lk_t0;
+	int r = hb->lk_cur;
+	int stalled = 0;
+
+	hg_lkstat_add(&hb->lk_hold[r], held);
+	if (held > hb->lk_worst_ns) {
+		hb->lk_worst_ns = held;
+		hb->lk_worst_reason = r;
+		hb->lk_worst_proc = process_no;
+	}
+	if (hg_lock_stall_us > 0 && held >= (unsigned long)hg_lock_stall_us * 1000UL) {
+		hb->lk_hold[r].stalls++;
+		hb->lk_stalls++;
+		hb->lk_last_stall_ns = held;
+		hb->lk_last_stall_reason = r;
+		hb->lk_last_stall_proc = process_no;
+		hb->lk_stall_event_due = 1;
+		stalled = 1;
+	}
+	lock_release(&hb->lock);
+	if (stalled)
+		hg_lock_stall_note(hb, r, held);
 }
 
 #define HG_ARENA_REG_MAX 8
@@ -1057,6 +1232,16 @@ unsigned long hg_slab_recycled(struct hg_block *hb);
  */
 #ifdef HG_MALLOC
 int hg_register_stats(void);
+
+/* --- module arenas (see hg_arena_create() in hg_malloc.c) --------------- */
+#define HG_CAP_BY_NAME (~0UL)   /* hg_malloc_init_cap: take the cap from -m/-M */
+struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
+		char *name, int shared, const char *proc_desc, unsigned int flags);
+/* a shared, elastic arena of the module's own; @name must outlive the block;
+ * pre-fork only. NULL = refused (logged) */
+struct hg_block *hg_arena_create(char *name, unsigned long init_bytes,
+		unsigned long cap_bytes);
+int hg_arena_set_profile(struct hg_block *hb, const char *profile_name);
 #else
 /* No-op without the allocator, so callers (statistics.c) need no #ifdef of
  * their own. Building with -DHG_MALLOC removed previously failed at link with

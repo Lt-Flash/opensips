@@ -1003,6 +1003,77 @@ static mi_response_t *w_reload_routes(const mi_params_t *params,
  */
 /* @per_process: this arena is private to the answering process (pkg), so stamp
  * whose it is into the payload - see the call site for why that matters */
+/* T1: one lock/gc/commit timing record - count, mean, max, stalls and the
+ * log2-microsecond histogram (bucket 0 = <1 us, k = [2^(k-1), 2^k) us,
+ * the last = >= 64 ms) */
+static int hg_stats_lk(mi_item_t *parent, const char *name,
+                       const struct hg_lkstat *st)
+{
+	mi_item_t *o, *h;
+	int b;
+
+	if (!st->n)
+		return 0;
+	o = add_mi_object(parent, (char *)name, strlen(name));
+	if (!o)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("n"), st->n) < 0 ||
+	    add_mi_number(o, MI_SSTR("mean_us"), st->total_ns / st->n / 1000) < 0 ||
+	    add_mi_number(o, MI_SSTR("max_us"), st->max_ns / 1000) < 0 ||
+	    add_mi_number(o, MI_SSTR("stalls"), st->stalls) < 0)
+		return -1;
+	h = add_mi_array(o, MI_SSTR("hist_log2us"));
+	if (!h)
+		return -1;
+	for (b = 0; b < HG_LK_BUCKETS; b++)
+		if (add_mi_number(h, NULL, 0, st->hist[b]) < 0)
+			return -1;
+	return 0;
+}
+
+static int hg_stats_lock(mi_item_t *parent, struct hg_block *hb)
+{
+	mi_item_t *o, *ho, *wo;
+	const char *r;
+	int i;
+
+	o = add_mi_object(parent, MI_SSTR("lock"));
+	if (!o)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("stall_threshold_us"), hg_lock_stall_us) < 0 ||
+	    add_mi_number(o, MI_SSTR("stalls"), hb->lk_stalls) < 0 ||
+	    add_mi_number(o, MI_SSTR("worst_hold_us"), hb->lk_worst_ns / 1000) < 0 ||
+	    add_mi_number(o, MI_SSTR("worst_process"), hb->lk_worst_proc) < 0)
+		return -1;
+	r = hb->lk_worst_reason >= 0 && hb->lk_worst_reason < HG_LK_REASONS ?
+	    hg_lk_reason_str[hb->lk_worst_reason] : "none";
+	if (add_mi_string(o, MI_SSTR("worst_reason"), (char *)r, strlen(r)) < 0)
+		return -1;
+	ho = add_mi_object(o, MI_SSTR("hold"));
+	wo = add_mi_object(o, MI_SSTR("wait"));
+	if (!ho || !wo)
+		return -1;
+	for (i = 0; i < HG_LK_REASONS; i++) {
+		if (hg_stats_lk(ho, hg_lk_reason_str[i], &hb->lk_hold[i]) < 0 ||
+		    hg_stats_lk(wo, hg_lk_reason_str[i], &hb->lk_wait[i]) < 0)
+			return -1;
+	}
+	if (hg_stats_lk(o, "commit", &hb->lk_commit) < 0 ||
+	    hg_stats_lk(o, "gc", &hb->lk_gc) < 0 ||
+	    hg_stats_lk(o, "grow_wait", &hb->lk_grow_wait) < 0)
+		return -1;
+	if (hb->lk_commit.n) {
+		mi_item_t *cp = add_mi_object(o, MI_SSTR("commit_phases"));
+
+		if (!cp)
+			return -1;
+		for (i = 0; i < HG_CP_PHASES; i++)
+			if (hg_stats_lk(cp, hg_cp_phase_str[i], &hb->lk_cphase[i]) < 0)
+				return -1;
+	}
+	return 0;
+}
+
 static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
                         int per_process)
 {
@@ -1090,6 +1161,22 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 	if (add_mi_number(o, MI_SSTR("grow_bytes"), hb->grow_bytes) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("grow_refused"), hb->grow_refused) < 0)
+		return -1;
+	/* T1: which path asked for each grow */
+	if (add_mi_number(o, MI_SSTR("grows_proactive"), hb->grows_proactive) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("grows_exhaustion"), hb->grows_exhaustion) < 0)
+		return -1;
+	/* T14: the two-phase commit's state and the waits it caused */
+	if (add_mi_number(o, MI_SSTR("grow_inflight"), hb->grow_inflight) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("grow_waits"), hb->grow_waits) < 0)
+		return -1;
+	if (add_mi_number(o, MI_SSTR("grow_wait_timeouts"), hb->grow_wait_timeouts) < 0)
+		return -1;
+	/* T8: -1 = no maintenance process (fixed arena), else its process no */
+	if (add_mi_number(o, MI_SSTR("maintenance_process"),
+			hb->maint_active ? hb->maint_proc : -1) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("grow_blocked"), hb->grow_blocked) < 0)
 		return -1;
@@ -1211,6 +1298,9 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 	if (add_mi_number(o, MI_SSTR("below_floor"), hb->below_floor) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("floor_crossings"), hb->floor_crossings) < 0)
+		return -1;
+	/* T1: lock hold/wait histograms, gc and commit timings */
+	if (hg_stats_lock(o, hb) < 0)
 		return -1;
 
 	/*
@@ -1528,6 +1618,23 @@ static mi_response_t *mi_hg_stats(const mi_params_t *params,
 		if (hg_stats_one(resp_obj, "pkg", (struct hg_block *)mem_block, 1) < 0)
 			goto error;
 		reported++;
+	}
+
+	/* module arenas (hg_arena_create): every registered shared block that
+	 * is not the core shm block - they exist whatever -a says */
+	{
+		int i;
+
+		for (i = 0; i < HG_ARENA_REG_MAX; i++) {
+			struct hg_block *hb = hg_arena_reg[i].hb;
+
+			if (!hb || !hb->shared || (void *)hb == shm_block ||
+			    !hb->name || !strcmp(hb->name, "shm_dbg"))
+				continue;
+			if (hg_stats_one(resp_obj, hb->name, hb, 0) < 0)
+				goto error;
+			reported++;
+		}
 	}
 
 	if (!reported) {

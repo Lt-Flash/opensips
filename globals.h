@@ -66,6 +66,8 @@ extern char *hg_shm_profile_name;
 extern char *hg_pkg_profile_name;
 extern int hg_ram_floor_mb;        /* 0 = auto: max(256MB, MemTotal/20) */
 extern int hg_autoscale_dry_run;   /* 1 = ticks log, never act */
+extern int hg_lock_stall_us;       /* arena lock hold counted as a stall */
+extern int hg_grow_ahead;          /* keep the free grid above 2x the floor */
 extern int auto_scaling_cycle;
 
 /* TCP network layer related parameters */

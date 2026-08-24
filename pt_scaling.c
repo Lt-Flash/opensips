@@ -87,8 +87,12 @@ int create_auto_scaling_profile( char *name,
 		down_cycles_tocheck = 0;
 		down_cycles_delay = 0;
 	}
-	if (max_procs==0 || max_procs <= min_procs || max_procs>=1000) {
-		LM_ERR("invalid relation or range for MIN/MAX processes [%d,%d]\n",
+	/* a profile is a set of numbers that may drive a process group (counts,
+	 * checked again at create_process_group() time, where a four-digit
+	 * process count is refused) or an HG_MALLOC arena (MB, where 1024 and
+	 * far above are ordinary) - so only the relation is checked here */
+	if (max_procs==0 || max_procs <= min_procs || max_procs >= (1u << 20)) {
+		LM_ERR("invalid relation or range for MIN/MAX [%d,%d]\n",
 			min_procs, max_procs);
 		return -1;
 	}
@@ -174,6 +178,13 @@ int create_process_group(enum process_type type,
 	struct process_group *pg, *it;
 	int h_size;
 	str type_s;
+
+	if (prof->max_procs >= 1000) {
+		LM_ERR("profile <%s>: %u is not a plausible number of processes "
+			"(MB-scale targets belong to shm/pkg_auto_scaling_profile)\n",
+			prof->name, prof->max_procs);
+		return -1;
+	}
 
 	/* how much of a history do we need in order to cover both up and down
 	 * tranzitions ? */

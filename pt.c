@@ -43,6 +43,7 @@
 #include "sr_module.h"
 #include "dprint.h"
 #include "pt.h"
+#include "mem/hg_maint.h"
 #include "bin_interface.h"
 #include "core_stats.h"
 
@@ -860,6 +861,9 @@ int count_child_processes(void)
 	/* Timer related processes */
 	proc_no += timer_count_processes( &extra );
 	proc_extra_no += extra;
+
+	/* the HG_MALLOC maintenance process, for an elastic shm arena */
+	proc_no += hg_maint_count_processes();
 
 	/* attendent */
 	proc_no++;

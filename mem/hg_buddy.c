@@ -24,6 +24,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "hg_version.h"
 #include "hg_malloc.h"
@@ -337,7 +338,7 @@ int hg_buddy_init(struct hg_block *hb)
  * exhaustion (carve_chunk and the large tier), which also bounds how often
  * it runs: once per granule of genuine demand, never on the fast path.
  *
- * The pre-fault inside hg_mem_commit() happens under the arena lock - a
+ * The pre-fault inside hg_mem_commit() used to happen under the arena lock (it is released around it since T14) - a
  * deliberate trade. Growth is rare (once per granule, ratcheting), the
  * granule is sized to keep the stall in the low milliseconds, and the
  * alternative - dropping the lock to fault, then re-taking it - opens a
@@ -418,10 +419,17 @@ void hg_grow_blocked_tick(struct hg_block *hb)
 	}
 }
 
-int hg_buddy_grow(struct hg_block *hb, unsigned long need)
+/* how long an exhausted worker waits, lock released, for a grow that
+ * another worker has in flight: a populate takes tens of ms, the collapse
+ * retrofit up to ~200 ms; past this the request is refused and counted */
+#define HG_GROW_WAIT_MAX_NS  2000000000UL
+#define HG_GROW_WAIT_SLICE_US 100
+
+int hg_buddy_grow(struct hg_block *hb, unsigned long need, enum hg_grow_why why)
 {
-	unsigned long delta, room, old_pages, i, limit;
-	int tier;
+	unsigned long delta, room, old_pages, i, limit, t0, off, commit_ns;
+	unsigned long cp_ns[HG_CP_PHASES];
+	int tier, reason;
 
 	if (!hb->buddy_ready)
 		return -1;
@@ -438,6 +446,37 @@ int hg_buddy_grow(struct hg_block *hb, unsigned long need)
 				hb->name, need, hb->hsize >> 20);
 		}
 		return -1;
+	}
+
+	/*
+	 * T14: another worker is populating a granule right now. Its publish
+	 * is what this caller needs, so wait for it WITHOUT the lock - every
+	 * other slow path keeps running meanwhile - and report "grew" so the
+	 * caller retries its carve against the fresh pages.
+	 */
+	if (hb->grow_inflight) {
+		unsigned long seen = hb->hsize, waited;
+
+		hb->grow_waits++;
+		reason = hb->lk_cur;
+		hg_lock_leave(hb);
+		t0 = hg_now_ns();
+		do {
+			usleep(HG_GROW_WAIT_SLICE_US);
+			waited = hg_now_ns() - t0;
+		} while (__atomic_load_n(&hb->grow_inflight, __ATOMIC_ACQUIRE) &&
+		         __atomic_load_n(&hb->hsize, __ATOMIC_ACQUIRE) == seen &&
+		         waited < HG_GROW_WAIT_MAX_NS);
+		hg_lock_enter(hb, (enum hg_lock_reason)reason);
+		hg_lkstat_add(&hb->lk_grow_wait, waited);
+		if (hb->hsize != seen)
+			return 0;                 /* it landed: retry the carve */
+		if (hb->grow_inflight) {
+			hb->grow_wait_timeouts++; /* still populating - give up */
+			hb->grow_refused++;
+			return -1;
+		}
+		/* the in-flight grow was refused; fall through and try ours */
 	}
 
 	/* the profile's scale-up target is the admin ceiling WITHIN the
@@ -481,14 +520,39 @@ int hg_buddy_grow(struct hg_block *hb, unsigned long need)
 	if (hg_grow_ram_refused(hb, delta))
 		return grow_resource_refused(hb);
 
-	tier = hg_mem_commit(hb, hb->hsize, delta);
+	/*
+	 * T14 phase 1 - RESERVE under the lock: the granule's range is fixed
+	 * now, nobody else grows or shrinks until it is published or given
+	 * back (shrink checks grow_inflight; a second exhausted worker waits
+	 * above).
+	 */
+	off = hb->hsize;
+	hb->grow_inflight = 1;
+	hb->hsize_pending = off + delta;
+	reason = hb->lk_cur;
+	hg_lock_leave(hb);
+
+	/* phase 2 - POPULATE with the lock released: the page faults, the
+	 * pin and the backing verification (tens of ms for 16 MB) no longer
+	 * stall every other slow path in the arena */
+	t0 = hg_now_ns();
+	tier = hg_mem_commit(hb, off, delta, cp_ns);
+	commit_ns = hg_now_ns() - t0;
+
+	/* phase 3 - PUBLISH under the lock */
+	hg_lock_enter(hb, (enum hg_lock_reason)reason);
+	hg_lkstat_add(&hb->lk_commit, commit_ns);
+	for (i = 0; i < HG_CP_PHASES; i++)
+		if (cp_ns[i])
+			hg_lkstat_add(&hb->lk_cphase[i], cp_ns[i]);
+	__atomic_store_n(&hb->grow_inflight, 0, __ATOMIC_RELEASE);
 	if (tier < 0) {
-		/* the commit rolled itself back; nothing was published */
+		/* the commit rolled itself back; give the reservation back */
+		hb->hsize_pending = hb->hsize;
 		return grow_resource_refused(hb);
 	}
 
 	hb->tier_bytes[tier] += delta;
-	hb->hsize += delta;
 	/* hb->size is the figure every "total/free" surface reports (shmem
 	 * statistics, hg_info, hg_advise's configured_mb) and free_to_carve
 	 * is literally size - real_used: leave it behind and that subtraction
@@ -498,29 +562,38 @@ int hg_buddy_grow(struct hg_block *hb, unsigned long need)
 	 * behaviour mid-flight for a marginal win. */
 	hb->size += delta;
 	old_pages = hb->npages;
-	hb->npages = (unsigned long)(hb->hbase + hb->hsize - hb->pbase)
+	hb->npages = (unsigned long)(hb->hbase + off + delta - hb->pbase)
 	             >> hb->hps_shift;
 
 	for (i = old_pages; i < hb->npages; i++) {
 		hb->pages[i].tier = (unsigned char)tier;
 		page_publish_whole(hb, &hb->pages[i]);
 	}
+	/* the published size moves last, with release semantics: a waiter
+	 * polling hsize lock-free must not see it before the pages exist */
+	__atomic_store_n(&hb->hsize, off + delta, __ATOMIC_RELEASE);
+	hb->hsize_pending = hb->hsize;
 
 	/* keep the floor at 1/16 of the grid it now guards */
 	hb->reserve_floor = (hb->npages * hg_leaves_per_page(hb)) / 16;
 
 	hb->grows++;
 	hb->grow_bytes += delta;
+	if (why == HG_GROW_PROACTIVE)
+		hb->grows_proactive++;
+	else
+		hb->grows_exhaustion++;
 	hb->shrink_quiet = 0;    /* fresh demand voids any quiet window */
 	hb->pol_cooldown = hb->pol.active ? hb->pol.cooldown : 0;
 	hb->pol_dry_said = 0;
 	hg_grow_unblock(hb, "the arena grew, the resource came back");
 
-	LM_NOTICE("%s arena grew by %lu MB to %lu MB (%lu new pages on %s; "
-		"%lu MB headroom left)\n", hb->name, delta >> 20,
-		hb->hsize >> 20, hb->npages - old_pages,
+	LM_NOTICE("%s arena grew %s by %lu MB to %lu MB (%lu new pages on %s; "
+		"commit %lu us with the lock released; %lu MB headroom left)\n",
+		hb->name, why == HG_GROW_PROACTIVE ? "proactively" : "on exhaustion",
+		delta >> 20, hb->hsize >> 20, hb->npages - old_pages,
 		hg_mem_tier_str((enum hg_mem_tier)tier),
-		(hb->hcap - hb->hsize) >> 20);
+		commit_ns / 1000, (hb->hcap - hb->hsize) >> 20);
 	return 0;
 }
 
@@ -586,6 +659,7 @@ static void hg_buddy_shrink(struct hg_block *hb)
 	}
 	hb->npages -= n;
 	hb->hsize -= len;
+	hb->hsize_pending = hb->hsize;
 	hb->size -= len;
 	hb->shrinks++;
 	hb->shrink_bytes += len;
@@ -627,6 +701,11 @@ void hg_shrink_tick(struct hg_block *hb)
 		hb->shrink_quiet = 0;
 		return;
 	}
+	/* T14: never move the top while a grow is populating above it */
+	if (hb->grow_inflight) {
+		hb->shrink_quiet = 0;
+		return;
+	}
 	/* post-grow cool-off: the profile grammar's 10x-cycles hold, so an
 	 * arena that just grew cannot immediately give the growth back */
 	if (hb->pol_cooldown) {
@@ -646,7 +725,7 @@ void hg_shrink_tick(struct hg_block *hb)
 		/* the profile's own quiet test: usage at or below its
 		 * down-threshold, plus the giving-a-granule-back-stays-safe
 		 * floor guard */
-		if (hb->real_used * 100 > (unsigned long)hb->pol.down_pct *
+		if (hg_get_real_used(hb) * 100 > (unsigned long)hb->pol.down_pct *
 		                          hb->hsize ||
 		    hb->buddy_free_leaves <
 		        (hb->grow_granule >> HG_LEAF_SHIFT) +
@@ -672,7 +751,7 @@ void hg_shrink_tick(struct hg_block *hb)
 			hb->pol_dry_said = 1;
 			LM_NOTICE("%s: DRY RUN - would shrink (committed %lu MB, "
 				"usage %lu%%)\n", hb->name, hb->hsize >> 20,
-				hb->real_used * 100 / hb->hsize);
+				hg_get_real_used(hb) * 100 / hb->hsize);
 		}
 		return;
 	}
@@ -687,17 +766,40 @@ void hg_shrink_tick(struct hg_block *hb)
  * also stays armed WITH a profile - a burst between ticks must not fail
  * allocations while the timer catches up).
  */
+/*
+ * T13: the always-on headroom rule, profile or not. The warm-path tail
+ * was measured to be "arena at its reserve floor" (every sweep flushing
+ * caches to stay above it); with the commit off the hot path (T14) a
+ * proactive granule costs the data path nothing, so keep the free grid
+ * above twice the floor whenever the reservation allows it. Ticked every
+ * second by the maintenance process when there is one, else once per
+ * sweep interval. Returns 1 if it grew.
+ */
+int hg_grow_headroom_tick(struct hg_block *hb)
+{
+	if (!hb->buddy_ready || !hg_grow_ahead)
+		return 0;
+	if (hb->hsize < hb->hcap && !hb->grow_inflight &&
+	    hb->buddy_free_leaves < 2 * hb->reserve_floor)
+		return hg_buddy_grow(hb, hb->grow_granule, HG_GROW_PROACTIVE) == 0;
+	return 0;
+}
+
 void hg_grow_tick(struct hg_block *hb)
 {
 	int hit;
 
-	if (!hb->buddy_ready || !hb->pol.active)
+	if (!hb->buddy_ready)
+		return;
+	if (!hb->maint_active && hg_grow_headroom_tick(hb))
+		return;
+	if (!hb->pol.active)
 		return;
 	if (hb->hsize >= hb->pol.up_bytes)
 		return;                          /* at the profile ceiling */
 
 	hb->pol_up_ticks++;
-	if (hb->real_used * 100 >= (unsigned long)hb->pol.up_pct * hb->hsize)
+	if (hg_get_real_used(hb) * 100 >= (unsigned long)hb->pol.up_pct * hb->hsize)
 		hb->pol_up_hits++;
 
 	if (hb->pol_up_ticks <
@@ -715,12 +817,12 @@ void hg_grow_tick(struct hg_block *hb)
 			LM_NOTICE("%s: DRY RUN - would grow (committed %lu MB, "
 				"usage %lu%%, profile ceiling %lu MB)\n",
 				hb->name, hb->hsize >> 20,
-				hb->real_used * 100 / hb->hsize,
+				hg_get_real_used(hb) * 100 / hb->hsize,
 				hb->pol.up_bytes >> 20);
 		}
 		return;
 	}
-	hg_buddy_grow(hb, hb->grow_granule);
+	hg_buddy_grow(hb, hb->grow_granule, HG_GROW_PROACTIVE);
 }
 
 /* --- allocate --------------------------------------------------------- */

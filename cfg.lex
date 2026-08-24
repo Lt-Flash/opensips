@@ -297,6 +297,8 @@ SHM_AUTO_SCALING_PROFILE "shm_auto_scaling_profile"
 PKG_AUTO_SCALING_PROFILE "pkg_auto_scaling_profile"
 HG_RAM_FLOOR_MB "hg_ram_floor_mb"
 HG_AUTOSCALE_DRY_RUN "hg_autoscale_dry_run"
+HG_LOCK_STALL_US "hg_lock_stall_us"
+HG_GROW_AHEAD "hg_grow_ahead"
 AUTO_SCALING_CYCLE "auto_scaling_cycle"
 TIMER_WORKERS "timer_workers"
 
@@ -563,6 +565,10 @@ SPACE		[ ]
 									return HG_RAM_FLOOR_MB; }
 <INITIAL>{HG_AUTOSCALE_DRY_RUN}	{	count(); yylval.strval=yytext;
 									return HG_AUTOSCALE_DRY_RUN; }
+<INITIAL>{HG_LOCK_STALL_US}	{	count(); yylval.strval=yytext;
+									return HG_LOCK_STALL_US; }
+<INITIAL>{HG_GROW_AHEAD}	{	count(); yylval.strval=yytext;
+									return HG_GROW_AHEAD; }
 <INITIAL>{AUTO_SCALING_CYCLE}	{	count(); yylval.strval=yytext;
 									return AUTO_SCALING_CYCLE; }
 <INITIAL>{TIMER_WORKERS}	{	count(); yylval.strval=yytext;

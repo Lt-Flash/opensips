@@ -63,6 +63,9 @@
 #ifndef MADV_COLLAPSE
 #define MADV_COLLAPSE 25
 #endif
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
 #endif /* __OS_linux */
 
 /*
@@ -153,45 +156,32 @@ static long hg_meminfo_kb(const char *key)
 	return kb;
 }
 
-static long hg_read_shmem_huge_kb(void)
+/*
+ * The huge-page counter a mapping shows up in: shared anonymous memory
+ * is shmem (ShmemHugePages), private anonymous memory is AnonHugePages.
+ */
+static long hg_read_huge_kb(int shared)
 {
-	return hg_meminfo_kb("ShmemHugePages");
+	return hg_meminfo_kb(shared ? "ShmemHugePages" : "AnonHugePages");
 }
 
-/* is the huge-page-sized range starting at @addr PMD-mapped here? */
-static int hg_range_is_huge(unsigned long addr)
+/*
+ * Did a populate of @len bytes land on huge pages? Answered from the
+ * system-wide counter delta across the populate - the same test the
+ * MADV_COLLAPSE branch has always used - instead of parsing
+ * /proc/self/smaps, which walks the page tables of the WHOLE mapping:
+ * measured at 8-11 ms per 16 MB grow on a 3 GB arena, under the arena
+ * lock (T1 commit phases). The counter is host-wide, so concurrent huge
+ * faults elsewhere can over-count; 90% of the range is demanded to keep
+ * a partial fallback from reading as success, and a false negative only
+ * costs the collapse retry it would have taken anyway.
+ */
+static int hg_delta_is_huge(long before_kb, long after_kb, unsigned long len)
 {
-	FILE *f;
-	char line[256], *p;
-	unsigned long start, end, kb;
-	int in_range = 0, huge = 0;
-
-	f = fopen("/proc/self/smaps", "r");
-	if (!f)
-		return 0;
-
-	while (fgets(line, sizeof line, f)) {
-		if (sscanf(line, "%lx-%lx ", &start, &end) == 2) {
-			in_range = (start <= addr && addr < end);
-			continue;
-		}
-		if (!in_range)
-			continue;
-		if (!strncmp(line, "AnonHugePages:", 14) ||
-		        !strncmp(line, "ShmemPmdMapped:", 15) ||
-		        !strncmp(line, "FilePmdMapped:", 14)) {
-			p = strchr(line, ':');
-			kb = strtoul(p + 1, NULL, 10);
-			if (kb >= HG_HPS / 1024) {
-				huge = 1;
-				break;
-			}
-		}
-	}
-
-	fclose(f);
-	return huge;
+	return before_kb >= 0 && after_kb >= 0 &&
+	       after_kb - before_kb >= (long)(len / 1024) * 9 / 10;
 }
+
 
 /*
  * Keep the arena out of core dumps - unless someone is trying to debug the
@@ -372,7 +362,7 @@ static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 	 * covers the whole cap so growth deltas inherit it - each delta still
 	 * gets its backing VERIFIED at grow time, never assumed from here. */
 	madvise(base, csize, MADV_HUGEPAGE);
-	shmem_kb = hg_read_shmem_huge_kb();
+	shmem_kb = hg_read_huge_kb(shared);
 	if (mlock(base, asize) == 0) {
 		*locked_mb = asize >> 20;
 	} else {
@@ -383,11 +373,11 @@ static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 		memset(base, 0, asize);        /* still pre-fault */
 	}
 
-	if (hg_range_is_huge((unsigned long)base)) {
+	if (hg_delta_is_huge(shmem_kb, hg_read_huge_kb(shared), asize)) {
 		*tier = HG_MEM_THP_ADVISE;
 	} else if (shmem_kb >= 0 &&
 	           madvise(base, asize, MADV_COLLAPSE) == 0 &&
-	           hg_read_shmem_huge_kb() - shmem_kb >= (long)(asize / 1024)) {
+	           hg_read_huge_kb(shared) - shmem_kb >= (long)(asize / 1024)) {
 		*tier = HG_MEM_THP_COLLAPSE;
 	} else {
 		*tier = HG_MEM_4K;         /* reserved+pinned but 4K */
@@ -489,9 +479,24 @@ int hg_grow_ram_refused(struct hg_block *hb, unsigned long delta)
  * munlock'd again (refuse, never half-commit). No hg_exclude_from_core()
  * here: reserve time already excluded the whole cap.
  */
-int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta)
+const char * const hg_cp_phase_str[HG_CP_PHASES] = {
+	"meminfo", "advise", "mlock_populate", "verify", "collapse"
+};
+
+#define HG_CP_TIME(phase, stmt) do { \
+		unsigned long _t0 = hg_now_ns(); \
+		stmt; \
+		cp_ns[phase] = hg_now_ns() - _t0; \
+	} while (0)
+
+int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
+		unsigned long cp_ns[HG_CP_PHASES])
 {
 	char *base = hb->hbase + off;
+	int mlock_rc, is_huge, collapsed, i;
+
+	for (i = 0; i < HG_CP_PHASES; i++)
+		cp_ns[i] = 0;
 
 	if (off + delta > hb->hcap) {
 		LM_BUG("%s: commit of %lu@%lu overruns the %lu byte cap\n",
@@ -500,7 +505,8 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta)
 	}
 
 	if (hb->tier == HG_MEM_HUGETLB) {
-		if (mlock(base, delta) != 0) {
+		HG_CP_TIME(HG_CP_MLOCK, mlock_rc = mlock(base, delta));
+		if (mlock_rc != 0) {
 			/* once per episode - see grow_refuse_said's comment */
 			if (!hb->grow_refuse_said) {
 				hb->grow_refuse_said = 1;
@@ -512,20 +518,34 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta)
 			munlock(base, delta);
 			return -1;
 		}
-		hb->locked_mb += delta >> 20;
+		__sync_fetch_and_add(&hb->locked_mb, delta >> 20);
 		return HG_MEM_HUGETLB;
 	}
 
 #ifdef __OS_linux
 	{
-		long shmem_kb = hg_read_shmem_huge_kb();
+		long shmem_kb;
+
+		HG_CP_TIME(HG_CP_MEMINFO, shmem_kb = hg_read_huge_kb(hb->shared));
 
 		/* re-advise the delta: cheap, and correct even though reserve
 		 * time advised the whole cap - a later madvise elsewhere in the
 		 * VMA may have split it */
-		madvise(base, delta, MADV_HUGEPAGE);
+		HG_CP_TIME(HG_CP_ADVISE, madvise(base, delta, MADV_HUGEPAGE));
 
-		if (mlock(base, delta) != 0) {
+		if (hb->unpinned) {
+			/* T5: the arena runs unpinned (init's mlock failed and it
+			 * carried on) - grow the same way rather than refuse: a
+			 * populating write fault is the pre-fault without the pin */
+			HG_CP_TIME(HG_CP_MLOCK, {
+				if (madvise(base, delta, MADV_POPULATE_WRITE) != 0)
+					memset(base, 0, delta);   /* pre-5.14 kernels */
+			});
+			mlock_rc = 0;
+		} else {
+			HG_CP_TIME(HG_CP_MLOCK, mlock_rc = mlock(base, delta));
+		}
+		if (mlock_rc != 0) {
 			/* once per episode - see grow_refuse_said's comment */
 			if (!hb->grow_refuse_said) {
 				hb->grow_refuse_said = 1;
@@ -537,18 +557,25 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta)
 			munlock(base, delta);
 			return -1;
 		}
-		hb->locked_mb += delta >> 20;
+		if (!hb->unpinned)
+			__sync_fetch_and_add(&hb->locked_mb, delta >> 20);
 
 		/*
 		 * The delta's backing is a fresh negotiation - the arena's init
 		 * tier says NOTHING about what this range just got. Verify it
 		 * the same way init does: read what the kernel actually did.
 		 */
-		if (hg_range_is_huge((unsigned long)base))
+		/* T6: O(1) verification - the counter delta across the populate,
+		 * not a walk of the whole VMA's page tables */
+		HG_CP_TIME(HG_CP_VERIFY, is_huge = hg_delta_is_huge(shmem_kb,
+			hg_read_huge_kb(hb->shared), delta));
+		if (is_huge)
 			return HG_MEM_THP_ADVISE;
-		if (shmem_kb >= 0 &&
-		    madvise(base, delta, MADV_COLLAPSE) == 0 &&
-		    hg_read_shmem_huge_kb() - shmem_kb >= (long)(delta / 1024))
+		HG_CP_TIME(HG_CP_COLLAPSE,
+			collapsed = shmem_kb >= 0 &&
+			    madvise(base, delta, MADV_COLLAPSE) == 0 &&
+			    hg_read_huge_kb(hb->shared) - shmem_kb >= (long)(delta / 1024));
+		if (collapsed)
 			return HG_MEM_THP_COLLAPSE;
 		return HG_MEM_4K;
 	}
@@ -556,7 +583,7 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta)
 	if (mlock(base, delta) != 0) {
 		memset(base, 0, delta);        /* still pre-fault */
 	} else {
-		hb->locked_mb += delta >> 20;
+		__sync_fetch_and_add(&hb->locked_mb, delta >> 20);
 	}
 	return HG_MEM_4K;
 #endif
@@ -653,7 +680,7 @@ static int hg_autoscale_apply(struct hg_block *hb, const char *which,
 	}
 
 	if (hb) {
-		lock_get(&hb->lock);
+		hg_lock_enter(hb, HG_LK_POLICY);
 		hb->pol.active      = 1;
 		hb->pol.up_bytes    = up_b;
 		hb->pol.down_bytes  = down_b ? down_b : hb->hsize_min;
@@ -665,7 +692,7 @@ static int hg_autoscale_apply(struct hg_block *hb, const char *which,
 		hb->pol.cooldown    = p->down_cycles_delay;
 		if (down_b)
 			hb->hsize_min = down_b;   /* the profile IS the ask now */
-		lock_release(&hb->lock);
+		hg_lock_leave(hb);
 	} else {
 		hg_pkg_pol_resolved.valid       = 1;
 		hg_pkg_pol_resolved.up_bytes    = up_b;
@@ -827,6 +854,15 @@ static void hg_arena_reg_del(struct hg_block *hb)
 struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 		const char *proc_desc, unsigned int flags)
 {
+	/* the core arenas take their cap by name (below); a module arena
+	 * brings its own - see hg_arena_create() */
+	return hg_malloc_init_cap(size, HG_CAP_BY_NAME, name, shared, proc_desc,
+		flags);
+}
+
+struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
+		char *name, int shared, const char *proc_desc, unsigned int flags)
+{
 	enum hg_mem_tier tier;
 	unsigned long locked_mb;
 	unsigned long cap;
@@ -845,7 +881,9 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 	 * they cannot come from the config, which is parsed only after this
 	 * arena exists (and, for tier 1, after the pool reservation is
 	 * already taken). */
-	if (!strcmp(name, "shm"))
+	if (cap_req != HG_CAP_BY_NAME)
+		cap = cap_req;
+	else if (!strcmp(name, "shm"))
 		cap = hg_shm_cap_bytes;
 	else if (!strcmp(name, "pkg"))
 		cap = hg_pkg_cap_bytes;
@@ -875,6 +913,7 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 	hb->hbase = base;
 	hb->hsize = HG_HPS_ROUND(size);
 	hb->hsize_min = hb->hsize;
+	hb->hsize_pending = hb->hsize;
 	hb->hcap = cap;
 	/* one committed-size step per grow: big enough that a growth spurt is
 	 * a handful of commits, small enough that the pre-fault under the
@@ -885,6 +924,7 @@ struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 	hb->hps = HG_HPS;
 	hb->tier = tier;
 	hb->locked_mb = locked_mb;
+	hb->unpinned = (tier != HG_MEM_HUGETLB && locked_mb == 0);
 	hb->tier_bytes[tier] = hb->hsize;
 	hb->shared = shared;
 
@@ -1197,3 +1237,79 @@ void hg_status_dbg(struct hg_block *hb)
 #endif
 
 #endif /* HG_MALLOC */
+
+/* --- module arenas ------------------------------------------------------
+ *
+ * A module that wants its own memory - a cache whose lifetime, class mix and
+ * growth have nothing to do with transactions - asks for an arena here and
+ * gets one that HG_MALLOC manages completely: the slab classes with their
+ * per-process caches, block GC and re-typing, elastic growth and shrink
+ * inside the module's own INIT:CAP, the maintenance process (which ticks
+ * every registered shared arena), hg_stats. The arena is created BEFORE the
+ * fork (mod_init), so every child inherits the one shared mapping exactly
+ * as it does the shm arena; the ownership registry routes a free to the
+ * arena that owns the pointer, whichever one it is. Independent of the -a
+ * choice: the core allocator can be anything while the module's cells live
+ * in HG.
+ */
+struct hg_block *hg_arena_create(char *name, unsigned long init_bytes,
+		unsigned long cap_bytes)
+{
+	struct hg_block *hb;
+	int i, free_slot = -1;
+
+	if (!name || !*name) {
+		LM_ERR("module arena needs a name\n");
+		return NULL;
+	}
+	if (init_bytes < 2 * HG_HPS) {
+		LM_ERR("module arena '%s': %lu MB is below the %lu MB minimum "
+			"viable arena\n", name, init_bytes >> 20, (2 * HG_HPS) >> 20);
+		return NULL;
+	}
+	if (cap_bytes < init_bytes)
+		cap_bytes = init_bytes;
+	for (i = 0; i < HG_ARENA_REG_MAX; i++) {
+		if (hg_arena_reg[i].hb && hg_arena_reg[i].hb->name &&
+		    !strcmp(hg_arena_reg[i].hb->name, name)) {
+			LM_ERR("module arena '%s' already exists\n", name);
+			return NULL;
+		}
+		if (free_slot < 0 && !hg_arena_reg[i].base)
+			free_slot = i;
+	}
+	if (free_slot < 0) {
+		LM_ERR("module arena '%s': all %d arena slots are taken\n",
+			name, HG_ARENA_REG_MAX);
+		return NULL;
+	}
+
+	hb = hg_malloc_init_cap(init_bytes, HG_HPS_ROUND(cap_bytes), name, 1,
+		NULL, 0);
+	if (!hb) {
+		LM_ERR("module arena '%s': could not reserve %lu MB (cap %lu MB)\n",
+			name, init_bytes >> 20, cap_bytes >> 20);
+		return NULL;
+	}
+	LM_NOTICE("module arena '%s': %lu MB committed, can grow to %lu MB - "
+		"managed by HG_MALLOC (classes, GC, growth, maintenance)\n",
+		name, hb->hsize >> 20, hb->hcap >> 20);
+	return hb;
+}
+
+/* attach an auto_scaling_profile to a module arena (mod_init, pre-fork) */
+int hg_arena_set_profile(struct hg_block *hb, const char *profile_name)
+{
+	struct scaling_profile *p;
+
+	if (!hb || !profile_name)
+		return -1;
+	p = get_scaling_profile((char *)profile_name);
+	if (!p) {
+		LM_ERR("arena '%s': '%s' does not name an auto_scaling_profile\n",
+			hb->name, profile_name);
+		return -1;
+	}
+	return hg_autoscale_apply(hb, hb->name, p, hb->hsize_min, hb->hcap);
+}
+

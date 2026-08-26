@@ -112,6 +112,11 @@ typedef int (*check_addr_f)(int cluster_id, str *ip_str,
  */
 typedef int (*get_my_id_f)(void);
 
+/* task #102: 1 once @cluster_id exists AND this node holds an enabled
+ * identity in it - the signal consumers gate cluster traffic on, instead
+ * of probing with sends that fail while the cluster is still forming */
+typedef int (*cluster_ready_f)(int cluster_id);
+
 /*
  * Get the SIP address of the current node within cluster @cluster_id.
  *
@@ -314,6 +319,7 @@ struct clusterer_binds {
 	shtag_get_sync_status_f shtag_get_sync_status;
 	shtag_set_sync_status_f shtag_set_sync_status;
 	shtag_sync_all_backup_f shtag_sync_all_backup;
+	cluster_ready_f cluster_ready;
 };
 
 typedef int (*load_clusterer_f)(struct clusterer_binds *binds);

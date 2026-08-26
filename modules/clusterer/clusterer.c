@@ -414,6 +414,16 @@ enum clusterer_send_ret clusterer_send_msg(bin_packet_t *packet,
 		return CLUSTERER_SEND_ERR;
 	}
 
+	/* see clusterer_bcast_msg(): no identity yet in a controller-managed
+	 * cluster means there is nothing to send from */
+	if (!cl->current_node) {
+		LM_DBG("cluster [%d] has no identity yet - cannot send\n",
+			cluster_id);
+		if (!locked)
+			lock_stop_read(cl_list_lock);
+		return CLUSTERER_CURR_DISABLED;
+	}
+
 	lock_get(cl->current_node->lock);
 	if (!(cl->current_node->flags & NODE_STATE_ENABLED)) {
 		lock_release(cl->current_node->lock);
@@ -510,6 +520,17 @@ clusterer_bcast_msg(bin_packet_t *packet, int dst_cid,
 		LM_ERR("Unknown cluster, id [%d]\n", dst_cid);
 		lock_stop_read(cl_list_lock);
 		return CLUSTERER_SEND_ERR;
+	}
+
+	/* A controller-managed cluster exists from config parse, but its
+	 * current_node is only filled in once the controller has assigned this
+	 * node an identity.  Anything that broadcasts before that - a module
+	 * timer, a HELLO announcement - would otherwise dereference NULL. */
+	if (!dst_cl->current_node) {
+		LM_DBG("cluster [%d] has no identity yet - cannot broadcast\n",
+			dst_cid);
+		lock_stop_read(cl_list_lock);
+		return CLUSTERER_CURR_DISABLED;
 	}
 
 	lock_get(dst_cl->current_node->lock);
@@ -2159,4 +2180,26 @@ unsigned long clusterer_get_num_nodes(int state)
 	lock_stop_read(cl_list_lock);
 
 	return nodecount;
+}
+
+/* task #102: consumers ASK whether a cluster is formed instead of inferring
+ * it from failed sends.  A controller-managed cluster exists from config
+ * parse, but its current_node only appears once the controller assigns this
+ * node an identity - until then nothing can be sent from it. */
+int cl_cluster_ready(int cluster_id)
+{
+	cluster_info_t *cl;
+	int ready = 0;
+
+	if (!cl_list_lock)
+		return 0;
+	lock_start_read(cl_list_lock);
+	cl = get_cluster_by_id(cluster_id);
+	if (cl && cl->current_node) {
+		lock_get(cl->current_node->lock);
+		ready = (cl->current_node->flags & NODE_STATE_ENABLED) ? 1 : 0;
+		lock_release(cl->current_node->lock);
+	}
+	lock_stop_read(cl_list_lock);
+	return ready;
 }

@@ -90,6 +90,7 @@ struct xp_peer {
 struct xp_shm {
 	gen_lock_t lock;
 	int proc_no;                            /* the transport process        */
+	int my_node;                            /* latched at formation (#102)  */
 	struct xp_peer peers[CL_MAX_NODE_ID + 1];
 	unsigned long st[PCACHE_XPORT_NSTATS];
 };
@@ -330,7 +331,7 @@ static int open_listen(void)
 int pcache_xport_init(int k, int node, pcache_xport_recv_f *cb, int maxp)
 {
 	kind = k;
-	my_node = node;
+	my_node = node > 0 ? node : 0;
 	recv_cb = cb;
 	max_msg = maxp;
 	if (kind == PCACHE_XPORT_NONE)
@@ -360,6 +361,7 @@ int pcache_xport_init(int k, int node, pcache_xport_recv_f *cb, int maxp)
 		return -1;
 	}
 	memset(xp, 0, sizeof *xp);
+	xp->my_node = my_node;
 	if (!lock_init(&xp->lock)) {
 		LM_ERR("cannot init the transport lock\n");
 		return -1;
@@ -444,11 +446,30 @@ static int peer_derive(int node, union sockaddr_union *su, socklen_t *sulen)
 	return 0;
 }
 
+/* task #102: the effective node id.  mod_init may run before the cluster
+ * forms (controller-managed clusters assign identities at runtime), so the
+ * shm copy - latched at formation, visible to every forked process - wins
+ * over the static one each process inherited. */
+static inline int xp_node(void)
+{
+	return xp && xp->my_node > 0 ? xp->my_node : my_node;
+}
+
+void pcache_xport_set_node(int node)
+{
+	if (node <= 0)
+		return;
+	if (xp && xp->my_node <= 0)
+		xp->my_node = node;
+	if (my_node <= 0)
+		my_node = node;
+}
+
 /* ---- sending ------------------------------------------------------------ */
 
 static void put_hdr(char *b)
 {
-	uint32_t n = htonl((uint32_t)my_node);
+	uint32_t n = htonl((uint32_t)xp_node());
 
 	memcpy(b, XP_MAGIC, 4);
 	memcpy(b + 4, &n, 4);
@@ -464,6 +485,19 @@ int pcache_xport_send(int dst_node, const char *payload, int len)
 
 	if (kind == PCACHE_XPORT_NONE || !xp || len <= 0 || len > max_msg)
 		return -1;
+	/* task #102: no cluster communication before the cluster is formed.
+	 * Latched lazily so a SIP worker does not depend on the transport
+	 * process having observed formation first. */
+	if (xp_node() <= 0) {
+		int id = pcache_cluster_formed();
+
+		if (id <= 0) {
+			st_inc(ST_TX_FAIL);
+			LM_DBG("cluster still forming - not sending a pull frame\n");
+			return -1;
+		}
+		pcache_xport_set_node(id);
+	}
 	if (peer_get(dst_node, &su, &sulen) < 0 &&
 	    peer_derive(dst_node, &su, &sulen) < 0) {
 		st_inc(ST_TX_FAIL);
@@ -621,7 +655,7 @@ static void deliver(const char *b, int len, const union sockaddr_union *from,
 	}
 	memcpy(&src, b + 4, 4);
 	src = ntohl(src);
-	if (src == 0 || src > CL_MAX_NODE_ID || (int)src == my_node) {
+	if (src == 0 || src > CL_MAX_NODE_ID || (int)src == xp_node()) {
 		st_inc(ST_RX_BAD);
 		return;
 	}
@@ -732,11 +766,25 @@ static int hello_cb(int fd, void *param, int was_timeout)
 
 	while (read(fd, &n, sizeof n) == (ssize_t)sizeof n)
 		;
+	/* task #102: while the cluster is still forming, attempt NOTHING.
+	 * Formation is asked of the clusterer as local state - never inferred
+	 * from sends failing and being retried until they stop. */
+	if (xp_node() <= 0) {
+		int id = pcache_cluster_formed();
+
+		if (id <= 0)
+			return 0;
+		pcache_xport_set_node(id);
+		LM_INFO("cluster formed - announcing our pull address as node %d\n",
+			id);
+	}
 	ticks++;
 	if (last_rc < 0 || pcache_xport_peers_known() < pcache_pull_peers_expected()
 	        || ticks % (XP_HELLO_S / XP_HELLO_TICK_S) == 0) {
 		LM_DBG("announcing our pull address to the cluster\n");
 		last_rc = pcache_pull_hello(0);
+		if (last_rc < 0)
+			LM_ERR("pull address announcement failed on a formed cluster\n");
 	}
 	return 0;
 }

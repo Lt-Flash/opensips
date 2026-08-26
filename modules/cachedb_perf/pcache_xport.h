@@ -82,6 +82,11 @@ void pcache_xport_stats(unsigned long out[PCACHE_XPORT_NSTATS]);
  * transport process at start and on a timer, and by learn() for a peer we
  * did not know (unicast reply) */
 int  pcache_pull_hello(int dst_node);        /* 0 = sent, -1 = not (yet) */
+
+/* task #102: latch this node's identity once the cluster forms (shm-wide) */
+void pcache_xport_set_node(int node);
+/* task #102, in cachedb_perf.c: node id once formed | 0 forming | -1 none */
+int  pcache_cluster_formed(void);
 /* how many peers the clusterer currently lists (implemented by the module) */
 int  pcache_pull_peers_expected(void);
 /* the clusterer's address of a node (its bin link), through the module;

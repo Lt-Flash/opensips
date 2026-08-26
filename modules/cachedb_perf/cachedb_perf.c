@@ -569,6 +569,24 @@ static int pcache_cluster_members(int *ids, int max, unsigned int *gen,
 		clusterer_api.free_nodes(list);
 	return cnt;
 }
+
+/* task #102: the one authoritative answer to "may cluster traffic flow?".
+ * A controller-managed cluster exists from config parse but only becomes
+ * usable once the controller assigns this node its identity - so nothing
+ * cluster-bound may trust mod_init-time state.  Falls back to get_my_id()
+ * when the clusterer predates the cluster_ready export. */
+int pcache_cluster_formed(void)
+{
+	int id;
+
+	if (!cluster_ready)
+		return -1;
+	if (clusterer_api.cluster_ready
+	        && !clusterer_api.cluster_ready(sync_cluster_id))
+		return 0;
+	id = clusterer_api.get_my_id ? clusterer_api.get_my_id() : 0;
+	return id > 0 ? id : 0;
+}
 #define PCACHE_SYNC_RELOAD  1
 #define PCACHE_SYNC_VERSION 1
 /* raised on a node that reloaded because a peer issued perf_sync */

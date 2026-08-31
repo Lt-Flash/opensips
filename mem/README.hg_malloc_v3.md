@@ -181,6 +181,9 @@ Next: Section 2 for the smallest working `-m`/`-M`/`-a` invocation.
 ```bash
 # 128 MB now, allowed to grow to 1 GB:
 opensips -f opensips.cfg -m 128:1024 -M 16:64 -a HG_MALLOC
+
+# same grammar takes k/m/g suffixes on either half - bare numbers are MB:
+opensips -f opensips.cfg -m 16:128 -M 512k:1m -a HG_MALLOC
 ```
 
 That alone gives you **exhaustion-triggered growth**: an allocation that
@@ -1052,6 +1055,169 @@ corruption counters 0, tier-1 hugetlb throughout, and the
 `E_CORE_SHM_GROW_BLOCKED` event never fired.
 
 ---
+
+### 13.9 Small footprint — KB-scale arenas for constrained hosts
+
+Everything in the sizing grammar takes `k`/`m`/`g` suffixes — `-m`/`-M`
+on either half of `INIT:CAP`, and the profile's two size positions —
+with bare numbers keeping their historical MB meaning. The minimums
+follow the arena's own geometry, not a fixed number:
+
+| whole reservation (`max(INIT, CAP)`) | page grid | grow/shrink step | minimum |
+|---|---|---|---|
+| ≥ 1 system huge page (2 MB typical) | huge pages | 16 MB granule / whole pages | **1 huge page** |
+| < 1 huge page ("small mode") | 256 KB | **256 KB** | **512 KB** |
+
+A box where 4 MB per worker is too much to ask:
+
+```bash
+# pkg: half a megabyte per worker, growing to at most 1 MB, in 256 KB steps
+opensips -f opensips.cfg -m 16:64 -M 512k:1m -a HG_MALLOC
+```
+
+```
+auto_scaling_profile = MEM_PKG
+    scale up to 1m on 70% for 2 cycles within 4
+    scale down to 512k on 20% for 40 cycles
+
+pkg_auto_scaling_profile = MEM_PKG
+```
+
+Small mode skips the hugetlb/THP tiers by construction (nothing
+sub-huge-page can ever become a huge page), so these arenas run plain
+4 K pages regardless of host configuration — the init line says so:
+
+```
+NOTICE:core:hg_malloc_init_cap: pkg HG_MALLOC_V3 arena (UDP receiver): 512 KB on plain 4K pages, 512 KB pinned from swapping
+NOTICE:core:hg_malloc_init_cap: pkg arena can grow to 1 MB (512 KB headroom reserved, uncommitted)
+```
+
+**The two consequences to size against before choosing a sub-MB pkg:**
+
+* **The reactor scales with pkg.** The core caps each process's reactor
+  at 10% of pkg memory: `-M 4` gives ~10,500 fds, `-M 512k` gives
+  **1,310** (the startup WARN names the number). That is also the
+  effective ceiling on TCP connections when it is lower than
+  `tcp_max_connections` (default 2048). Measured against a real LB's 13
+  days of traffic (worst process: 125 fds), 1,310 is 10× headroom — but
+  measure yours, do not assume.
+* **A pkg spike above the cap fails allocations on that worker.** A
+  1 MB cap is a real ceiling; the 13-day peak on the reference LB was
+  680 KB (66%). Check `proc_max_used_size` per process over a long
+  window before committing to a small cap.
+
+Why the floor is 512 KB and not less: a buddy block never spans pages,
+so the 256 KB page caps every contiguous allocation — and the arena's
+own furniture (the ~31 KB header, slab chunks up to ~131 KB, core
+startup's single ~140 KB `init_pvar_support` object) needs that
+ceiling to exist at all. A 64 KB grid was built and measured failing on
+exactly those.
+
+### 13.10 Deliberate plain-4K: no huge pages at all
+
+The opposite of 13.5: run an elastic arena on plain 4 K pages on
+purpose (fleet uniformity, a host whose huge pages belong to another
+tenant, or simply to measure the tier's cost). Huge pages must be
+removed from every rung of the ladder, and one of the knobs is not the
+obvious one:
+
+```bash
+# /etc/sysctl.d/60-opensips.conf — no hugetlb pool, no surplus:
+vm.nr_hugepages=0
+vm.nr_overcommit_hugepages=0
+```
+
+```bash
+# THP off for anon (pkg) AND shmem (shm). shmem needs DENY, not never:
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo deny  > /sys/kernel/mm/transparent_hugepage/shmem_enabled
+```
+
+```
+# persist the sysfs pair, e.g. /etc/tmpfiles.d/opensips-thp.conf:
+w /sys/kernel/mm/transparent_hugepage/enabled - - - - never
+w /sys/kernel/mm/transparent_hugepage/shmem_enabled - - - - deny
+```
+
+**Why `deny`:** `never` only gates fault-time THP and khugepaged — the
+`MADV_COLLAPSE` retrofit (tier 3) is an explicit request that bypasses
+it by design. Measured on a 6.12 kernel: with `never`/`never` the shm
+arena still came up reading `THP 2M pages via MADV_COLLAPSE (post-fill
+retrofit)`; only `shmem_enabled=deny` forbids the collapse and yields
+an honest `plain 4K pages`. Also mind the overcommit pool: with
+`nr_overcommit_hugepages > 0`, `mmap(MAP_HUGETLB)` succeeds from
+surplus even when the static pool is zero — both must be 0 to kill
+tier 1.
+
+Costs to expect: huge pages bought ~19% of the allocator's own
+self-time in the isolated measurements (Section 19), and mlock pinning
+now applies (tiers 2–4 pin explicitly; keep `LimitMEMLOCK` sized).
+What you get back: the whole hugetlb reservation returns to general
+RAM (a 790-page pool is 1.58 GB), and sizing no longer needs pool
+arithmetic at all — no `vm.nr_hugepages` to fit the caps into.
+
+### 13.11 Tuning from measurement — the full walkthrough
+
+The method used on the reference LB after 13 days of real traffic,
+start to finish. Upper limits (caps, up-targets) stay; only floors
+tighten.
+
+**1. Read the high-water marks** (both are cheap, run them on the live
+node):
+
+```bash
+opensips-cli -x mi core:hg_advise    # per-arena verdict + recommendation
+opensips-cli -x mi core:hg_stats     # carved_peak / live_peak / grows
+```
+
+The reference numbers: shm `peak_bytes` 8.6 MB against a 32 MB start
+(25%, verdict "reasonable", recommendation 18 MB — an *upper bound*,
+per the large-tier caveat in the output); pkg `carved_peak` 680 KB
+against 4 MB (13%). `grows: 0` on both — the starts had never been
+touched.
+
+**2. Choose the INIT sizes**: put the measured peak at 50–70% of the
+new start, so a normal day sits under the profile's up-trigger and the
+arena neither flaps at startup nor carries dead headroom.
+8.4 MB / 0.52 → shm `16`; 680 KB / 0.66 → pkg `1m` cap with a `512k`
+start (small mode, 13.9) — or `2:16` if the cap must stay.
+
+**3. Choose the floors**: as low as geometry allows, unless long-lived
+state argues otherwise. `2m` for any huge-page-mode arena, `512k` for
+small mode. A floor below the steady live size is harmless — shrink
+stops at live data regardless; the floor is permission, not a demand.
+
+**4. Apply and re-read.** `hg_advise` says it itself: some large
+consumers size themselves as a fraction of the arena, so apply once,
+restart, and read again rather than iterating on stale numbers.
+
+```bash
+# /etc/default/opensips — before -> after on the reference LB:
+SHM_MEMORY=32:128   ->  SHM_MEMORY=16:128
+PKG_MEMORY=4:16     ->  PKG_MEMORY=512k:1m
+```
+
+```
+auto_scaling_profile = MEM_SHM
+    scale up to 128 on 70% for 2 cycles within 4
+    scale down to 2m on 20% for 20 cycles
+auto_scaling_profile = MEM_PKG
+    scale up to 1m on 70% for 2 cycles within 4
+    scale down to 512k on 20% for 40 cycles
+```
+
+The startup NOTICEs are the confirmation the whole chain took:
+
+```
+NOTICE:core:hg_autoscale_apply: shm auto-scaling profile 'MEM_SHM': 2 MB..128 MB (start 16 MB), up at 70% for 2/4 cycles, down at 20% for 20 cycles (cooldown 200)
+NOTICE:core:hg_autoscale_apply: pkg auto-scaling profile 'MEM_PKG': 512 KB..1 MB (start 512 KB), up at 70% for 2/4 cycles, down at 20% for 40 cycles (cooldown 400)
+```
+
+One relation to keep in mind while picking numbers: an unaligned floor
+rounds **up** to the arena's page and the NOTICE prints the effective
+value (`down to 1m` under a 16 MB cap reads back as `2 MB..16 MB`) —
+a floor below 2 MB is only reachable when the whole reservation is
+below one huge page, because half a huge page cannot exist.
 
 ## 14. Monitoring and alerting
 

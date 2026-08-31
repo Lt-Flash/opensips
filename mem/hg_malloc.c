@@ -124,6 +124,58 @@ static unsigned long hg_hps(void)
  * all go through this one macro rather than repeating the expression. */
 #define HG_HPS_ROUND(s) (((s) + HG_HPS - 1) & ~(HG_HPS - 1))
 
+/*
+ * Small-arena mode: an arena whose whole reservation cannot even hold one
+ * huge page has no use for the hugetlb or THP tiers (a transparent huge
+ * page IS a huge page - there is nothing sub-2MB to collapse into), so its
+ * page grid runs on 256 KB "pages" instead. Everything downstream - the
+ * buddy layout, growth publication, shrink granularity, tier accounting -
+ * already reads the per-arena hb->hps/hps_shift, so the geometry follows
+ * from this one choice.
+ *
+ * Why 256 KB and not smaller: a buddy block never spans pages, so the page
+ * IS the ceiling on any contiguous allocation - and the arena's own
+ * furniture needs that ceiling high enough. The largest slab class (64 KB
+ * cells) has a hard chunk floor of header + 2 cells = ~131 KB
+ * (chunk_size_for()'s "least"), and core startup takes a single ~140 KB
+ * large-tier object (init_pvar_support) before serving anything. A 64 KB
+ * page was tried and measured failing on exactly those ("class 19 wants a
+ * 98432 byte chunk, larger than the 65536 byte page"). 256 KB clears every
+ * fixed cost; with the ~31 KB hg_block header on page 0, TWO pages
+ * (512 KB) is the honest minimum in this mode.
+ *
+ * In huge-page mode the minimum is ONE system huge page, not two: the
+ * reserve floor, buddy order math and metadata carve were all verified
+ * fine at npages=1, and the mapping itself cannot be smaller anyway.
+ */
+#define HG_SMALL_PAGE_SHIFT 18
+#define HG_SMALL_PAGE (1UL << HG_SMALL_PAGE_SHIFT)
+
+/* the page unit an arena with this init/cap runs on */
+static inline unsigned long hg_arena_page(unsigned long init_b,
+		unsigned long cap_b)
+{
+	unsigned long m = cap_b > init_b ? cap_b : init_b;
+
+	return (m && m < HG_HPS) ? HG_SMALL_PAGE : HG_HPS;
+}
+
+static inline unsigned long hg_page_round(unsigned long v, unsigned long pg)
+{
+	return (v + pg - 1) & ~(pg - 1);
+}
+
+/* the smallest arena that can function in this page unit */
+static inline unsigned long hg_min_viable(unsigned long apage)
+{
+	return apage < HG_HPS ? 2 * apage : apage;
+}
+
+/* "512 KB" vs "48 MB" in one printable pair, for the error messages that
+ * used to hard-code MB */
+#define HG_SZ_VAL(b)  ((b) < (1UL << 20) ? (b) >> 10 : (b) >> 20)
+#define HG_SZ_UNIT(b) ((b) < (1UL << 20) ? "KB" : "MB")
+
 /* HG_ROUNDTO=2^k so the following works (same trick as f_malloc.c) */
 #define ROUNDTO_MASK   (~((unsigned long)HG_ROUNDTO-1))
 #define ROUNDUP_TO(s)  (((s)+(HG_ROUNDTO-1))&ROUNDTO_MASK)
@@ -250,17 +302,18 @@ static void hg_exclude_from_core(void *base, unsigned long size)
  *                        between processes through the shared gpool.
  */
 static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
-		enum hg_mem_tier *tier, unsigned long *locked_mb, int shared,
-		int inherited)
+		enum hg_mem_tier *tier, unsigned long *locked_b, int shared,
+		int inherited, unsigned long apage)
 {
-	unsigned long asize = HG_HPS_ROUND(size);
-	unsigned long csize = HG_HPS_ROUND(*cap < size ? size : *cap);
+	unsigned long asize = hg_page_round(size, apage);
+	unsigned long csize = hg_page_round(*cap < size ? size : *cap, apage);
 	int vis = shared ? MAP_SHARED : MAP_PRIVATE;
+	int small = apage < HG_HPS;
 	char *resv, *base;
 	long shmem_kb;
 	void *p;
 
-	*locked_mb = 0;
+	*locked_b = 0;
 	*tier = HG_MEM_4K;
 	*cap = csize;        /* rewritten below if a fallback shrinks it */
 
@@ -273,7 +326,7 @@ static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 		return NULL;
 	hg_exclude_from_core(p, csize);
 	if (mlock(p, asize) == 0)
-		*locked_mb = asize >> 20;
+		*locked_b = asize;
 	else
 		memset(p, 0, asize);
 	return p;
@@ -297,9 +350,10 @@ static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 	 * That arena starts the ladder at THP, whose COW splits to 4K pages
 	 * instead. See the flag's comment in hg_malloc.h.
 	 */
-	p = inherited ? MAP_FAILED : mmap(NULL, csize, PROT_READ|PROT_WRITE,
+	p = (inherited || small) ? MAP_FAILED :
+	    mmap(NULL, csize, PROT_READ|PROT_WRITE,
 	         vis|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
-	if (p == MAP_FAILED && !inherited && csize > asize) {
+	if (p == MAP_FAILED && !inherited && !small && csize > asize) {
 		p = mmap(NULL, asize, PROT_READ|PROT_WRITE,
 		         vis|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
 		if (p != MAP_FAILED) {
@@ -317,7 +371,7 @@ static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 		hg_exclude_from_core(p, *cap);
 		memset(p, 0, asize);
 		*tier = HG_MEM_HUGETLB;
-		*locked_mb = asize >> 20;
+		*locked_b = asize;
 		return p;
 	}
 
@@ -343,19 +397,35 @@ static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 	 * entries, not memory - test B: 64 MB of mapped-untouched span held
 	 * RSS at 576 kB.
 	 */
-	resv = mmap(NULL, csize + HG_HPS, PROT_NONE,
+	resv = mmap(NULL, csize + apage, PROT_NONE,
 	            MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	if (resv == MAP_FAILED)
 		return NULL;
-	base = (char *)(((unsigned long)resv + HG_HPS - 1) & ~(HG_HPS - 1));
+	base = (char *)(((unsigned long)resv + apage - 1) & ~(apage - 1));
 	p = mmap(base, csize, PROT_READ|PROT_WRITE,
 	         vis|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
 	if (p == MAP_FAILED) {
-		munmap(resv, csize + HG_HPS);
+		munmap(resv, csize + apage);
 		return NULL;
 	}
 
 	hg_exclude_from_core(base, csize);
+
+	/* a small-mode arena is done here: THP advice on a sub-huge-page
+	 * range can never produce a huge page, so skip the whole detection
+	 * dance and report the 4K tier it genuinely runs on - pinned and
+	 * pre-faulted all the same */
+	if (small) {
+		if (mlock(base, asize) == 0) {
+			*locked_b = asize;
+		} else {
+			LM_WARN("mlock of the %lu KB HG_MALLOC arena failed "
+				"(%s): continuing unpinned (swappable)\n",
+				asize >> 10, strerror(errno));
+			memset(base, 0, asize);        /* still pre-fault */
+		}
+		return base;
+	}
 
 	/* advise huge before first touch (tier 2), then pin+populate: a cold
 	 * mlock populates to pin, so it doubles as the pre-fault. The advice
@@ -364,7 +434,7 @@ static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 	madvise(base, csize, MADV_HUGEPAGE);
 	shmem_kb = hg_read_huge_kb(shared);
 	if (mlock(base, asize) == 0) {
-		*locked_mb = asize >> 20;
+		*locked_b = asize;
 	} else {
 		LM_WARN("mlock of the %lu MB HG_MALLOC arena failed (%s): "
 			"continuing unpinned (swappable). If running under "
@@ -642,39 +712,52 @@ static int hg_autoscale_apply(struct hg_block *hb, const char *which,
 		struct scaling_profile *p, unsigned long init_bytes,
 		unsigned long cap_bytes)
 {
-	unsigned long up_b   = HG_HPS_ROUND((unsigned long)p->max_procs << 20);
+	/* profile numbers are MB, or KB when the config used a size suffix
+	 * (p->mem_kb_units, set by the parser); rounding and the viability
+	 * floor follow the page unit THIS arena runs on, so a small-mode
+	 * arena is judged in its own 64 KB currency, not huge pages */
+	int ush = p->mem_kb_units ? 10 : 20;
+	unsigned long apage = hb ? hb->hps :
+		hg_arena_page(init_bytes, cap_bytes);
+	unsigned long up_b   =
+		hg_page_round((unsigned long)p->max_procs << ush, apage);
 	unsigned long down_b = p->min_procs
-		? HG_HPS_ROUND((unsigned long)p->min_procs << 20) : 0;
+		? hg_page_round((unsigned long)p->min_procs << ush, apage) : 0;
 
-	if (cap_bytes <= HG_HPS_ROUND(init_bytes)) {
+	if (cap_bytes <= hg_page_round(init_bytes, apage)) {
 		LM_ERR("%s profile '%s': the arena has no growth room - give "
 			"the reservation on the command line (-%s INIT:CAP)\n",
 			which, p->name, hb || !strcmp(which, "shm") ? "m" : "M");
 		return -1;
 	}
-	if (up_b <= HG_HPS_ROUND(init_bytes)) {
-		LM_ERR("%s profile '%s': scale-up target %u MB does not exceed "
-			"the initial %lu MB - the profile could never act\n",
-			which, p->name, p->max_procs, init_bytes >> 20);
+	if (up_b <= hg_page_round(init_bytes, apage)) {
+		LM_ERR("%s profile '%s': scale-up target %lu %s does not exceed "
+			"the initial %lu %s - the profile could never act\n",
+			which, p->name, HG_SZ_VAL(up_b), HG_SZ_UNIT(up_b),
+			HG_SZ_VAL(init_bytes), HG_SZ_UNIT(init_bytes));
 		return -1;
 	}
 	if (up_b > cap_bytes) {
-		LM_ERR("%s profile '%s': scale-up target %u MB exceeds the "
-			"%lu MB reservation - raise the :CAP\n",
-			which, p->name, p->max_procs, cap_bytes >> 20);
+		LM_ERR("%s profile '%s': scale-up target %lu %s exceeds the "
+			"%lu %s reservation - raise the :CAP\n",
+			which, p->name, HG_SZ_VAL(up_b), HG_SZ_UNIT(up_b),
+			HG_SZ_VAL(cap_bytes), HG_SZ_UNIT(cap_bytes));
 		return -1;
 	}
 	if (down_b) {
-		if (down_b < 2 * HG_HPS) {
-			LM_ERR("%s profile '%s': scale-down target %u MB is below "
-				"the %lu MB minimum viable arena\n",
-				which, p->name, p->min_procs, (2 * HG_HPS) >> 20);
+		if (down_b < hg_min_viable(apage)) {
+			LM_ERR("%s profile '%s': scale-down target %lu %s is below "
+				"the %lu %s minimum viable arena\n",
+				which, p->name, HG_SZ_VAL(down_b), HG_SZ_UNIT(down_b),
+				HG_SZ_VAL(hg_min_viable(apage)),
+				HG_SZ_UNIT(hg_min_viable(apage)));
 			return -1;
 		}
 		if (down_b >= up_b) {
-			LM_ERR("%s profile '%s': scale-down target %u MB is not "
-				"below the scale-up target %u MB\n",
-				which, p->name, p->min_procs, p->max_procs);
+			LM_ERR("%s profile '%s': scale-down target %lu %s is not "
+				"below the scale-up target %lu %s\n",
+				which, p->name, HG_SZ_VAL(down_b), HG_SZ_UNIT(down_b),
+				HG_SZ_VAL(up_b), HG_SZ_UNIT(up_b));
 			return -1;
 		}
 	}
@@ -705,12 +788,15 @@ static int hg_autoscale_apply(struct hg_block *hb, const char *which,
 		hg_pkg_pol_resolved.cooldown    = p->down_cycles_delay;
 	}
 
-	LM_NOTICE("%s auto-scaling profile '%s'%s: %lu..%lu MB (start %lu), "
-		"up at %u%% for %u/%u cycles, down at %u%% for %u cycles "
-		"(cooldown %u)\n", which, p->name,
+	LM_NOTICE("%s auto-scaling profile '%s'%s: %lu %s..%lu %s (start "
+		"%lu %s), up at %u%% for %u/%u cycles, down at %u%% for %u "
+		"cycles (cooldown %u)\n", which, p->name,
 		hg_autoscale_dry_run ? " [DRY RUN - advise only]" : "",
-		(down_b ? down_b : HG_HPS_ROUND(init_bytes)) >> 20, up_b >> 20,
-		init_bytes >> 20, p->up_threshold, p->up_cycles_needed,
+		HG_SZ_VAL(down_b ? down_b : hg_page_round(init_bytes, apage)),
+		HG_SZ_UNIT(down_b ? down_b : hg_page_round(init_bytes, apage)),
+		HG_SZ_VAL(up_b), HG_SZ_UNIT(up_b),
+		HG_SZ_VAL(init_bytes), HG_SZ_UNIT(init_bytes),
+		p->up_threshold, p->up_cycles_needed,
 		p->up_cycles_tocheck, p->down_threshold, p->down_cycles_tocheck,
 		p->down_cycles_delay);
 	return 0;
@@ -864,8 +950,8 @@ struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 		char *name, int shared, const char *proc_desc, unsigned int flags)
 {
 	enum hg_mem_tier tier;
-	unsigned long locked_mb;
-	unsigned long cap;
+	unsigned long locked_b;
+	unsigned long cap, apage;
 	char *base;
 	struct hg_block *hb;
 
@@ -889,8 +975,16 @@ struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 		cap = hg_pkg_cap_bytes;
 	else
 		cap = 0;
-	base = hg_mem_reserve(size, &cap, &tier, &locked_mb, shared,
-		(flags & HG_INIT_INHERITED) != 0);
+	apage = hg_arena_page(size, cap);
+	if (size < hg_min_viable(apage)) {
+		LM_ERR("%s arena: %lu %s is below the %lu %s minimum viable "
+			"arena\n", name, HG_SZ_VAL(size), HG_SZ_UNIT(size),
+			HG_SZ_VAL(hg_min_viable(apage)),
+			HG_SZ_UNIT(hg_min_viable(apage)));
+		return NULL;
+	}
+	base = hg_mem_reserve(size, &cap, &tier, &locked_b, shared,
+		(flags & HG_INIT_INHERITED) != 0, apage);
 	if (!base) {
 		LM_ERR("failed to reserve %lu bytes for %s HG_MALLOC arena\n",
 			size, name);
@@ -911,20 +1005,24 @@ struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 	hb->size = size;
 	hb->lo = ~0UL;
 	hb->hbase = base;
-	hb->hsize = HG_HPS_ROUND(size);
+	hb->hsize = hg_page_round(size, apage);
 	hb->hsize_min = hb->hsize;
 	hb->hsize_pending = hb->hsize;
 	hb->hcap = cap;
 	/* one committed-size step per grow: big enough that a growth spurt is
 	 * a handful of commits, small enough that the pre-fault under the
-	 * arena lock stays bounded. Overridable by config later. */
-	hb->grow_granule = HG_HPS_ROUND(16UL << 20);
-	/* hg_hps() is private to this file, and hg_arena_init() needs the probed
-	 * value to lay out the page grid - hand it over rather than re-probing */
-	hb->hps = HG_HPS;
+	 * arena lock stays bounded. A small-mode arena steps one of its own
+	 * 256 KB pages at a time - a 16 MB granule would overshoot its whole
+	 * cap. Overridable by config later. */
+	hb->grow_granule = apage < HG_HPS ?
+		apage : HG_HPS_ROUND(16UL << 20);
+	/* the page unit this arena's whole grid runs on: the probed huge page
+	 * size, or the small-mode 64 KB page - hg_arena_init() lays out the
+	 * page grid from this, never re-probing */
+	hb->hps = apage;
 	hb->tier = tier;
-	hb->locked_mb = locked_mb;
-	hb->unpinned = (tier != HG_MEM_HUGETLB && locked_mb == 0);
+	hb->locked_mb = locked_b >> 20;
+	hb->unpinned = (tier != HG_MEM_HUGETLB && locked_b == 0);
 	hb->tier_bytes[tier] = hb->hsize;
 	hb->shared = shared;
 
@@ -976,20 +1074,26 @@ struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 	 * (looks like "an mlock() call happened") and was caught live during
 	 * a real diagnosis session mid-2026-08-07 being misread that way. */
 	if (proc_desc)
-		LM_NOTICE("%s " HG_MALLOC_NAME " arena (%s): %lu MB on %s, %lu MB "
+		LM_NOTICE("%s " HG_MALLOC_NAME " arena (%s): %lu %s on %s, %lu %s "
 			"pinned from swapping\n",
-			name, proc_desc, size >> 20, hg_mem_tier_str(tier), locked_mb);
+			name, proc_desc, HG_SZ_VAL(size), HG_SZ_UNIT(size),
+			hg_mem_tier_str(tier),
+			HG_SZ_VAL(locked_b), HG_SZ_UNIT(locked_b));
 	else
-		LM_NOTICE("%s " HG_MALLOC_NAME " arena: %lu MB on %s, %lu MB "
+		LM_NOTICE("%s " HG_MALLOC_NAME " arena: %lu %s on %s, %lu %s "
 			"pinned from swapping%s\n",
-			name, size >> 20, hg_mem_tier_str(tier), locked_mb,
+			name, HG_SZ_VAL(size), HG_SZ_UNIT(size),
+			hg_mem_tier_str(tier),
+			HG_SZ_VAL(locked_b), HG_SZ_UNIT(locked_b),
 			(flags & HG_INIT_INHERITED) ?
 			" (pre-fork arena, inherited copy-on-write by every child: "
 			"hugetlb deliberately skipped, its COW cannot fall back)" : "");
 	if (hb->hcap > hb->hsize)
-		LM_NOTICE("%s arena can grow to %lu MB (%lu MB headroom "
-			"reserved, uncommitted)\n", name, hb->hcap >> 20,
-			(hb->hcap - hb->hsize) >> 20);
+		LM_NOTICE("%s arena can grow to %lu %s (%lu %s headroom "
+			"reserved, uncommitted)\n", name,
+			HG_SZ_VAL(hb->hcap), HG_SZ_UNIT(hb->hcap),
+			HG_SZ_VAL(hb->hcap - hb->hsize),
+			HG_SZ_UNIT(hb->hcap - hb->hsize));
 
 	return hb;
 }
@@ -1262,13 +1366,18 @@ struct hg_block *hg_arena_create(char *name, unsigned long init_bytes,
 		LM_ERR("module arena needs a name\n");
 		return NULL;
 	}
-	if (init_bytes < 2 * HG_HPS) {
-		LM_ERR("module arena '%s': %lu MB is below the %lu MB minimum "
-			"viable arena\n", name, init_bytes >> 20, (2 * HG_HPS) >> 20);
-		return NULL;
-	}
 	if (cap_bytes < init_bytes)
 		cap_bytes = init_bytes;
+	if (init_bytes < hg_min_viable(hg_arena_page(init_bytes, cap_bytes))) {
+		unsigned long mv =
+			hg_min_viable(hg_arena_page(init_bytes, cap_bytes));
+
+		LM_ERR("module arena '%s': %lu %s is below the %lu %s minimum "
+			"viable arena\n", name,
+			HG_SZ_VAL(init_bytes), HG_SZ_UNIT(init_bytes),
+			HG_SZ_VAL(mv), HG_SZ_UNIT(mv));
+		return NULL;
+	}
 	for (i = 0; i < HG_ARENA_REG_MAX; i++) {
 		if (hg_arena_reg[i].hb && hg_arena_reg[i].hb->name &&
 		    !strcmp(hg_arena_reg[i].hb->name, name)) {
@@ -1284,11 +1393,14 @@ struct hg_block *hg_arena_create(char *name, unsigned long init_bytes,
 		return NULL;
 	}
 
-	hb = hg_malloc_init_cap(init_bytes, HG_HPS_ROUND(cap_bytes), name, 1,
-		NULL, 0);
+	hb = hg_malloc_init_cap(init_bytes,
+		hg_page_round(cap_bytes, hg_arena_page(init_bytes, cap_bytes)),
+		name, 1, NULL, 0);
 	if (!hb) {
-		LM_ERR("module arena '%s': could not reserve %lu MB (cap %lu MB)\n",
-			name, init_bytes >> 20, cap_bytes >> 20);
+		LM_ERR("module arena '%s': could not reserve %lu %s (cap "
+			"%lu %s)\n", name,
+			HG_SZ_VAL(init_bytes), HG_SZ_UNIT(init_bytes),
+			HG_SZ_VAL(cap_bytes), HG_SZ_UNIT(cap_bytes));
 		return NULL;
 	}
 	LM_NOTICE("module arena '%s': %lu MB committed, can grow to %lu MB - "

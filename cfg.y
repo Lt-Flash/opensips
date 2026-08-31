@@ -101,6 +101,7 @@
 #include "name_alias.h"
 #include "ut.h"
 #include "pt_scaling.h"
+#include <limits.h>
 #include "dset.h"
 #include "pvar.h"
 #include "blacklists.h"
@@ -196,6 +197,56 @@ union route_name_var {
 	struct _pv_elem *ename;
 	void *data;
 } rn_tmp;
+
+/* A profile size number with an optional k/m/g suffix.  A suffix-less
+ * number passes through POSITIVE, keeping the profile's legacy unit
+ * (process count for the worker scaler, MB for the memory arenas); a
+ * suffixed number is normalized to KB and carried NEGATED, so the two
+ * kinds survive yacc's plain-int value stack without a union member the
+ * lexer's cfg.tab.h could not see the type of.  scale_suffix_kb() encodes,
+ * create_scaling_profile_units() decodes. */
+static long scale_suffix_kb(long num, const char *suf)
+{
+	if (!suf || !suf[0] || suf[1] || num <= 0)
+		return 0;
+	switch (suf[0]) {
+	case 'k': case 'K': return -num;
+	case 'm': case 'M':
+		return num > LONG_MAX / 1024 ? 0 : -(num * 1024);
+	case 'g': case 'G':
+		return num > LONG_MAX / (1024 * 1024) ? 0 :
+			-(num * 1024 * 1024);
+	}
+	return 0;
+}
+
+/* wraps create_auto_scaling_profile(): when either size carries a suffix
+ * (arrives negated, in KB), normalize BOTH to KB (a bare number is then
+ * read as MB) and flag the profile, so hg_autoscale_apply() knows the
+ * unit.  Suffix-less profiles take the untouched legacy path - the worker
+ * scaler never sees a change. */
+static int create_scaling_profile_units(char *name,
+		long up, int u_pct, int u_need, int u_win,
+		long down, int d_pct, int d_cyc, int d_delay)
+{
+	struct scaling_profile *p;
+	int kb = up < 0 || down < 0;
+
+	if (kb) {
+		up   = up < 0 ? -up : up * 1024;
+		down = down < 0 ? -down : down * 1024;
+	}
+	if (create_auto_scaling_profile(name, up, u_pct, u_need, u_win,
+	        down, d_pct, d_cyc, d_delay) < 0)
+		return -1;
+	if (kb) {
+		p = get_scaling_profile(name);
+		if (!p)
+			return -1;
+		p->mem_kb_units = 1;
+	}
+	return 0;
+}
 
 #ifndef SHM_EXTRA_STATS
 struct multi_str{
@@ -514,6 +565,7 @@ extern int cfg_parse_only_routes;
 %type <sockid> listen_id_def
 %type <sockid> phostport phostportrange
 %type <bondlst> socket_bond_elems
+%type <intval> scale_size
 %type <intval> proto port any_proto
 %type <strval> host_sep
 %type <intval> equalop compop matchop strop intop
@@ -937,32 +989,40 @@ mpath_def_list: mpath_def_list COLON STRING {IFOR(); add_mpath($3);}
 		| STRING { IFOR(); add_mpath($1);}
 		;
 
+scale_size:	  NUMBER { $$ = $1; }
+		| NUMBER ID {
+			$$ = scale_suffix_kb($1, $2);
+			if ($$ == 0)
+				yyerror("bad size suffix - use k, m or g");
+		}
+		;
+
 auto_scale_profile_def:
-		  ID SCALE_UP_TO NUMBER ON NUMBER MODULO FOR
+		  ID SCALE_UP_TO scale_size ON NUMBER MODULO FOR
 				NUMBER CYCLES_WITHIN NUMBER
-		  SCALE_DOWN_TO NUMBER ON NUMBER MODULO FOR
+		  SCALE_DOWN_TO scale_size ON NUMBER MODULO FOR
 				NUMBER CYCLES { IFOR();
-			if (create_auto_scaling_profile($1,$3,$5,$8,$10,
+			if (create_scaling_profile_units($1,$3,$5,$8,$10,
 			$12, $14, $17,10*$17)<0)
 				yyerror("failed to create auto scaling profile");
 		 }
-		| ID SCALE_UP_TO NUMBER ON NUMBER MODULO FOR
+		| ID SCALE_UP_TO scale_size ON NUMBER MODULO FOR
 				NUMBER CYCLES
-		  SCALE_DOWN_TO NUMBER ON NUMBER MODULO FOR
+		  SCALE_DOWN_TO scale_size ON NUMBER MODULO FOR
 				NUMBER CYCLES { IFOR();
-			if (create_auto_scaling_profile($1,$3,$5,$8,$8,
+			if (create_scaling_profile_units($1,$3,$5,$8,$8,
 			$11, $13, $16, 10*$16)<0)
 				yyerror("failed to create auto scaling profile");
 		 }
-		| ID SCALE_UP_TO NUMBER ON NUMBER MODULO FOR
+		| ID SCALE_UP_TO scale_size ON NUMBER MODULO FOR
 				NUMBER CYCLES_WITHIN NUMBER { IFOR();
-			if (create_auto_scaling_profile($1,$3,$5,$8,$10,
+			if (create_scaling_profile_units($1,$3,$5,$8,$10,
 			0, 0, 0, 0)<0)
 				yyerror("failed to create auto scaling profile");
 		}
-		| ID SCALE_UP_TO NUMBER ON NUMBER MODULO FOR
+		| ID SCALE_UP_TO scale_size ON NUMBER MODULO FOR
 				NUMBER CYCLES { IFOR();
-			if (create_auto_scaling_profile($1,$3,$5,$8,$8,
+			if (create_scaling_profile_units($1,$3,$5,$8,$8,
 			0, 0, 0, 0)<0)
 				yyerror("failed to create auto scaling profile");
 		}

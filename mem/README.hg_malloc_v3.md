@@ -698,9 +698,45 @@ ERROR: shm_auto_scaling_profile 'MEM_SHM' does not name an auto_scaling_profile
 ERROR: shm profile 'MEM_SHM': the arena has no growth room - give the reservation on the command line (-m INIT:CAP)
 ERROR: shm profile 'MEM_SHM': scale-up target 96 MB does not exceed the initial 128 MB - the profile could never act
 ERROR: shm profile 'MEM_SHM': scale-up target 2048 MB exceeds the 1024 MB reservation - raise the :CAP
-ERROR: shm profile 'MEM_SHM': scale-down target 2 MB is below the 4 MB minimum viable arena
+ERROR: shm profile 'MEM_SHM': scale-down target 1 MB is below the 2 MB minimum viable arena
 ERROR: shm profile 'MEM_SHM': scale-down target 512 MB is not below the scale-up target 256 MB
 ```
+
+### Units, small arenas, and the minimum
+
+The profile numbers are **MB by default**; any of the two size positions
+takes a `k`/`m`/`g` suffix, and one suffix anywhere switches the whole
+profile to KB internally (`scale up to 16m ... down to 512k` is
+consistent). `-m`/`-M` take the same suffixes on either half of
+`INIT[:CAP]` — `-M 512k:1m` — with bare numbers staying MB, so no
+existing invocation changes meaning.
+
+The minimum viable arena follows the arena's own page unit, not a fixed
+number:
+
+* An arena whose whole reservation (`max(INIT, CAP)`) holds at least one
+  system huge page runs on huge-page geometry, and its minimum — for the
+  initial size and for a profile's scale-down floor alike — is **one**
+  system huge page (2 MB on a stock x86_64 host, whatever
+  `/proc/meminfo Hugepagesize` says elsewhere). It used to be two.
+* An arena whose whole reservation is smaller than one huge page runs in
+  **small mode**: a 256 KB page grid, the hugetlb/THP tiers skipped
+  outright (nothing sub-huge-page can ever become a huge page), growth
+  stepping one 256 KB page at a time, and a **512 KB** minimum.
+  `-M 512k:1m` is a real, growing, shrinking elastic arena on a box
+  where 4 MB per worker is too much to ask. The 512 KB floor is
+  physics, not policy: a buddy block never spans pages, so the page caps
+  every contiguous allocation — and the arena's own fixed furniture (the
+  ~31 KB `hg_block` header, slab chunks up to ~131 KB for the largest
+  class, core startup's single ~140 KB `init_pvar_support` object)
+  needs a 256 KB ceiling to exist at all. A 64 KB grid was tried and
+  failed on exactly those.
+
+The one geometric consequence to know: a floor below 2 MB requires the
+whole arena to be sub-huge-page. With a 16 MB cap the arena is on
+huge-page geometry and committed sizes are whole huge pages — `scale
+down to 1m` is not refusable-policy but impossible-geometry (half a huge
+page cannot exist), so the floor there is `2m`.
 
 A profile named while a different allocator runs is ignored with a
 WARN. Every accepted profile announces itself once, so a config's

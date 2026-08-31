@@ -465,6 +465,8 @@ extern int cfg_parse_only_routes;
 %token PKG_AUTO_SCALING_PROFILE
 %token HG_RAM_FLOOR_MB
 %token HG_AUTOSCALE_DRY_RUN
+%token SHM_GROW_GRANULE
+%token PKG_GROW_GRANULE
 %token HG_LOCK_STALL_US
 %token HG_GROW_AHEAD
 %token AUTO_SCALING_CYCLE
@@ -1739,6 +1741,23 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 				hg_autoscale_dry_run=$3; }
 		| HG_AUTOSCALE_DRY_RUN EQUAL error {
 				yyerror("integer value expected");
+				}
+		| SHM_GROW_GRANULE EQUAL scale_size { IFOR();
+				/* scale_size: positive = MB, negated = KB */
+				hg_shm_grow_granule = $3 < 0 ?
+					(unsigned long)(-$3) << 10 :
+					(unsigned long)$3 << 20;
+				}
+		| SHM_GROW_GRANULE EQUAL error {
+				yyerror("size expected (number, optional k/m/g)");
+				}
+		| PKG_GROW_GRANULE EQUAL scale_size { IFOR();
+				hg_pkg_grow_granule = $3 < 0 ?
+					(unsigned long)(-$3) << 10 :
+					(unsigned long)$3 << 20;
+				}
+		| PKG_GROW_GRANULE EQUAL error {
+				yyerror("size expected (number, optional k/m/g)");
 				}
 		| HG_LOCK_STALL_US EQUAL NUMBER { IFOR();
 				hg_lock_stall_us=$3; }

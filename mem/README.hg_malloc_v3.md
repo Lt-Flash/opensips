@@ -437,6 +437,29 @@ Granule: 16 MB (huge-page rounded).
 
 ---
 
+### 6.1 The grow granule is a knob
+
+The 16 MB default step suits arenas with hundreds of MB of cap; on a
+lean arena it turns one trip over the headroom threshold into a 2.6×
+committed jump (measured: a 10 MB arena grew to 26 on a single call).
+Both granules take the size grammar:
+
+```
+shm_grow_granule = 2m       # per grow event; plain number = MB, k/m/g ok
+pkg_grow_granule = 512k     # applies to every worker arena
+```
+
+Rounded up to the arena's own page (2 MB huge-page mode, 256 KB small
+mode), never below one page; unset keeps the default (16 MB, or one
+page in small mode). The core shm arena picks it up post-config via
+the same hook as the profile; worker pkg arenas take it at fork.
+Module arenas keep the default. Measured with a 2 MB granule under a
+forced soak: ten consecutive `grew on exhaustion by 2 MB` steps,
+each commit 1.4–1.6 ms with the lock released — versus 11–62 ms for a
+16 MB commit. Smaller steps trade a few more grow events for gentler
+commits and a committed size that tracks demand instead of
+overshooting it.
+
 ## 7. The three-limit ceiling
 
 `min(admin, tier, host RAM)` — each limb enforced where it is real:

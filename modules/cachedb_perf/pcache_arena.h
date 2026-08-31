@@ -45,8 +45,32 @@
  * and takes cross-process frees (expiry / maintenance worker).
  */
 
+#include "../../mi/item.h"
+
 #define PCACHE_CELL_MAX   65536   /* largest cell; bigger allocs fail (v1) */
 #define PCACHE_NCLASSES   21
+
+/* Memory backing, decided in pcache_arena_init() (mod_init, pre-fork):
+ *   PCACHE_BACKING_OWN     - this file's chunked allocator (chunks from
+ *                            shm_malloc or the dedicated reservation)
+ *   PCACHE_BACKING_CORE    - the core shm allocator is HG_MALLOC: every cell
+ *                            is an HG slab cell in the shm arena
+ *   PCACHE_BACKING_OWN_HG  - arena_hugepage_mb set on an HG_MALLOC build: the
+ *                            arena is an HG arena of its own, fully managed
+ *                            by HG (classes, GC, growth/shrink, maintenance)
+ * Policy: the "memory_backing" modparam (auto|core|own-hg|own). */
+enum pcache_backing { PCACHE_BACKING_OWN = 0, PCACHE_BACKING_CORE,
+                      PCACHE_BACKING_OWN_HG };
+extern char *pcache_backing_policy;          /* modparam memory_backing */
+extern int pcache_arena_hugepage_cap_mb;     /* modparam, 0 = fixed */
+extern char *pcache_arena_profile;           /* modparam arena_profile */
+extern int pcache_reclaim_keep;              /* drained chunks kept per class */
+extern int pcache_reclaim_quiet_s;           /* quiet window before give-back */
+extern int pcache_reclaim_cooloff_s;         /* no give-back after a carve */
+extern int pcache_reclaim_giveback;          /* 0 = retire/re-cut only */
+int pcache_arena_backing(void);
+const char *pcache_arena_backing_str(void);
+void pcache_arena_backing_notice(void);
 
 int pcache_arena_init(void);
 void pcache_arena_destroy(void);
@@ -55,6 +79,9 @@ void pcache_arena_destroy(void);
  * chunk / private cells to the global pool.  Two processes must never
  * share a bump pointer. */
 void pcache_arena_child_init(void);
+void pcache_arena_flush_private(void);       /* a done process sends cells home */
+void pcache_arena_reclaim_tick(void);        /* the reclaim process, 1/s */
+int pcache_arena_mi(mi_item_t *aobj);        /* reclaim view for perf_stats */
 
 /* a cell of at least @size bytes (including the class byte), or NULL if
  * size > PCACHE_CELL_MAX or shm is exhausted */

@@ -128,7 +128,10 @@ void *hg_buddy_alloc(struct hg_block *hb, unsigned int order);
 /* v3: commit up to max(granule, @need) more of the reservation and publish
  * the new whole pages as free. hb->lock must be held. 0 = grew (retry the
  * allocation), -1 = cannot (at cap / no cap / host refused the commit). */
-int hg_buddy_grow(struct hg_block *hb, unsigned long need);
+int hg_buddy_grow(struct hg_block *hb, unsigned long need, enum hg_grow_why why);
+/* the always-on headroom rule on its own (the maintenance process ticks it
+ * every second); hb->lock held; 1 = grew */
+int hg_grow_headroom_tick(struct hg_block *hb);
 
 /* v3: end a grow-blocked episode (say so if one was latched) and re-arm
  * the once-per-episode reporting. hb->lock must be held. Called by the

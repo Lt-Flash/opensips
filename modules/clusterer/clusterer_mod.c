@@ -1659,6 +1659,7 @@ int load_clusterer(struct clusterer_binds *binds)
 	binds->shtag_get_sync_status = shtag_get_sync_status;
 	binds->shtag_set_sync_status = shtag_set_sync_status;
 	binds->shtag_sync_all_backup = shtag_sync_all_backup;
+	binds->cluster_ready = cl_cluster_ready;
 
 	return 1;
 }

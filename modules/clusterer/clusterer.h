@@ -201,6 +201,7 @@ int clusterer_check_addr(int cluster_id, str *ip_str,
 int has_bridge(int src_cluster_id);
 enum clusterer_send_ret cl_send_to(bin_packet_t *, int cluster_id, int node_id);
 enum clusterer_send_ret cl_send_all(bin_packet_t *, int cluster_id);
+int cl_cluster_ready(int cluster_id);
 enum clusterer_send_ret cl_send_all_bridges(bin_packet_t *, int my_cluster);
 enum clusterer_send_ret
 cl_send_all_having(bin_packet_t *packet, int dst_cluster_id,

@@ -414,6 +414,8 @@ extern int cfg_parse_only_routes;
 %token PKG_AUTO_SCALING_PROFILE
 %token HG_RAM_FLOOR_MB
 %token HG_AUTOSCALE_DRY_RUN
+%token HG_LOCK_STALL_US
+%token HG_GROW_AHEAD
 %token AUTO_SCALING_CYCLE
 %token TIMER_WORKERS
 
@@ -1676,6 +1678,16 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 		| HG_AUTOSCALE_DRY_RUN EQUAL NUMBER { IFOR();
 				hg_autoscale_dry_run=$3; }
 		| HG_AUTOSCALE_DRY_RUN EQUAL error {
+				yyerror("integer value expected");
+				}
+		| HG_LOCK_STALL_US EQUAL NUMBER { IFOR();
+				hg_lock_stall_us=$3; }
+		| HG_LOCK_STALL_US EQUAL error {
+				yyerror("integer value expected");
+				}
+		| HG_GROW_AHEAD EQUAL NUMBER { IFOR();
+				hg_grow_ahead=$3; }
+		| HG_GROW_AHEAD EQUAL error {
 				yyerror("integer value expected");
 				}
 		| AUTO_SCALING_CYCLE EQUAL NUMBER { IFOR();

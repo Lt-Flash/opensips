@@ -19,6 +19,19 @@ With no cap configured, **nothing changes**: the arena is fixed at
      never below the shrink floor, never above the ceiling
 ```
 
+## Status (2026-08-23)
+
+Complete and validated: `feature/hg-malloc-v3-master`. Elastic shm and
+pkg arenas with two-phase commit, live-usage gating, a maintenance
+process that grows ahead of demand, whole-page large chunks, lock
+histograms and a stall event, and module arenas (section 11b). On the
+three-node 1,000,000-contact rig it passes every harness bar on both
+host configurations: 2,272 MB committed where a fixed arena needs 3,072,
+zero lost requests, cold-pull p99 46% / 58% below F_MALLOC at 5% less
+memory. Figures and per-configuration numbers: the README of
+`feature/usrloc-pull-sharing-devel`. Price: ~7% more memory per cell
+than a hand-packed chunk allocator when HG manages a module's cells.
+
 ## 0. Why an elastic arena
 
 Every OpenSIPS deployment ships with two numbers somebody guessed:
@@ -211,7 +224,7 @@ opensips-cli -x mi core:hg_stats           # committed / cap / grows / shrinks /
 
 ## 3. Concepts and architecture
 
-### 2.1 Committed vs reserved
+### 3.1 Committed vs reserved
 
 The arena block (`struct hg_block`) carries two sizes:
 
@@ -222,7 +235,7 @@ The arena block (`struct hg_block`) carries two sizes:
 
 `hcap == hsize` (no `:CAP` given) is a fixed arena — exactly v2.
 
-### 2.2 The one invariant everything rests on
+### 3.2 The one invariant everything rests on
 
 **The whole cap is mapped once, `MAP_SHARED`, before fork.** Growth and
 shrink never create, destroy, or re-protect mappings — they only change
@@ -250,7 +263,7 @@ every process by construction. The untouched reserved tail costs only
 page-table entries: a 64 MB mapped-untouched span was measured at
 **576 kB of RSS**.
 
-### 2.3 The buddy grid grows without moving metadata
+### 3.3 The buddy grid grows without moving metadata
 
 The buddy allocator's per-page descriptors (`struct hg_page`,
 leaf-order arrays, bitmaps) are laid out at init **for the full cap**
@@ -265,7 +278,7 @@ commit that brought it in** (one byte, fits existing padding) — that is
 what keeps the per-tier accounting truthful in both directions, since
 shrink releases top pages that may come from any delta.
 
-### 2.4 The ownership registry records the cap
+### 3.4 The ownership registry records the cap
 
 `hg_arena_reg[]` (the cross-arena pointer-ownership table used on free
 paths) records `hcap`, not `hsize`. Growth must never invalidate a
@@ -349,8 +362,54 @@ If the arena grew, the freshly published whole pages satisfy the retry
 by construction; a second miss can only mean the grow itself was
 refused, and the caller's ordinary exhaustion error follows.
 
+**The commit is two-phase.** A grow reserves its granule under the
+arena lock (`committed_pending` moves, `grow_inflight` is set), then
+releases the lock for the expensive part — the page faults, the pin and
+the backing verification, tens of milliseconds for 16 MB — and takes it
+again only to publish the new whole pages (O(1)). Every other slow path
+keeps running during the populate. One grow is in flight at a time; a
+worker that exhausts while it runs waits for the publish *without* the
+lock (100 µs slices, 2 s cap, then the request is refused and counted
+in `grow_wait_timeouts`) and retries its carve against the fresh pages.
+Shrink never moves the top while a grow is in flight.
+
+Measured on the 1M-record bench (3 nodes, 16 MB granules, 115 grows per
+million records absorbed, host on `shmem_enabled=advise`, Section 13.5):
+before the split a grow held the lock for the whole populate — 20 ms
+mean, 34 ms max, every other slow path queued behind it; after it the
+worst hold in the arena is 0.9 ms, the exhausted workers wait 10 ms on
+average without the lock, and the elastic arena's request latencies
+equal the fixed arena's (cold-pull p99 15 vs 17 ms, fill p99 0.83 vs
+0.89, zero loss) while committing 2,352 MB instead of 3,072 (2,272 once
+the large tier packs whole pages, 13.7). On a host
+left at `shmem_enabled=never` the lock holds are gone as well, but the
+waiters still pay the requester's populate plus collapse (39 ms mean).
+
+**The maintenance process.** An elastic shm arena (a cap above the
+initial size) gets a dedicated core process, `HG maintenance`, forked
+after the timer processes. It serves no request; every second it takes
+the arena lock for microseconds to run the headroom rule below, and
+every thirtieth tick — the profile's cycle — the profile gate and the
+shrink gate; the populate of any granule it decides to grow runs in
+*this* process, with the lock released. It exists because timer jobs are
+executed by whichever process reads the timer-job pipe, the SIP workers
+included, so a "proactive" grow from a timer job still parked a worker
+for the populate (measured: a 2 s grow tick made the tails worse). While
+it is alive the sweep's own ticks stand down (`hg_stats` →
+`maintenance_process`); exhaustion growth stays armed in every process
+as the backstop it always was. A fixed arena (no cap) forks no process.
+
+**Headroom, always on (`hg_grow_ahead`, default 1).** Every second in
+the maintenance process (once per sweep interval without one), whenever
+the reservation still has room and the free buddy grid has dropped below
+twice the reserve floor, one granule is grown ahead of demand. This is the rule the warm-path tail asked for — the
+arena sitting at its floor, every sweep flushing caches to stay above it
+— and with the two-phase commit it costs the data path nothing.
+
 **Proactive (with a profile).** Once per sweep interval (30 s), usage
-(carved-of-committed) is compared to the profile's up-threshold using a
+(live — what is handed out, not the carved footprint with its recycled
+caches, which the gate used until it drove a 35 % profile straight to the
+ceiling) is compared to the profile's up-threshold using a
 cycles-in-window count. Crossing it grows one granule **before any
 allocation fails**. The exhaustion path stays armed for bursts between
 ticks.
@@ -494,7 +553,7 @@ the log carries the fact.
 
 ## 9. Shrink
 
-### 8.1 Why it is safe with zero cross-process coordination
+### 9.1 Why it is safe with zero cross-process coordination
 
 Only pages the buddy proves **wholly free** can be released, and only
 from the **top** of the committed range:
@@ -510,7 +569,7 @@ from the **top** of the committed range:
   ownership registry valid — the address-space invariants of the whole
   allocator.
 
-### 8.2 The primitive — measured, with the wrong answers named
+### 9.2 The primitive — measured, with the wrong answers named
 
 `munlock()` + `madvise(MADV_REMOVE)` for the shared arena: it punches
 the **shmem object**, so every mapped process is affected. Measured on
@@ -528,13 +587,13 @@ pkg arenas (`MAP_PRIVATE`) use `MADV_DONTNEED` — per-process memory,
 no cross-process question exists.
 
 The one primitive that must never be used is
-`mmap(PROT_NONE|MAP_FIXED)` over the range — see 2.2; it was measured
+`mmap(PROT_NONE|MAP_FIXED)` over the range — see 3.2; it was measured
 leaving other workers reading stale bytes.
 
 A kernel that refuses the advice latches `shrink_unsupported` once and
 the arena simply stays grown — nothing retries, nothing spams.
 
-### 8.3 Ordering and policy
+### 9.3 Ordering and policy
 
 The punch runs **before** any bookkeeping, under the arena lock, so a
 refused release changes nothing and no worker can carve from pages
@@ -594,6 +653,8 @@ shm_auto_scaling_profile = <NAME>
 pkg_auto_scaling_profile = <NAME>       # optional, may be a different profile
 hg_ram_floor_mb          = <MB>         # 0 = auto (max(256MB, MemTotal/20))
 hg_autoscale_dry_run     = 0|1
+hg_lock_stall_us         = N        # arena-lock hold counted as a stall; 0 disables; default 1000
+hg_grow_ahead            = 0|1      # keep the free grid above 2x the reserve floor by growing a granule ahead (default 1)
 ```
 
 | element | meaning for an arena |
@@ -602,12 +663,31 @@ hg_autoscale_dry_run     = 0|1
 | `on P% for C within W` | grow when usage ≥ P% in C of the last W cycles (`within W` omitted ⇒ W = C) |
 | `down to M` | shrink **floor**, MB — may be *below* `-m` |
 | `on Q% for C` | shrink one granule after C consecutive cycles at ≤ Q% |
-| one cycle | one sweep interval (30 s) |
+| one cycle | one sweep interval (30 s); with the maintenance process, thirty of its one-second ticks |
 | implicit | post-grow cool-off of 10×C cycles before shrink counting resumes |
 
-Usage is carved-of-committed. Profile numbers are copied **into** the
-(possibly shared) arena block at attach — never pointed to; the profile
-structs live in process-local memory.
+Usage is **live** — what is handed out, `live_committed` in `hg_stats`
+— not the carved footprint with its recycled caches (the gate used that
+figure until a 35 % profile drove a 893 MB working set straight to its
+3,072 MB ceiling). Profile numbers are copied **into** the (possibly
+shared) arena block at attach — never pointed to; the profile structs
+live in process-local memory.
+
+### Choosing the numbers
+
+Read `P` as the occupancy you want the arena to run at: the profile
+grows one granule per cycle for as long as live usage is above `P` % of
+committed, so `on 35%` means "keep two thirds of the committed arena
+free" — measured on the 1M-record bench that is 1,840 MB committed for a
+238 MB working set on the owners and the ceiling on the puller, nothing
+wrong with the gate, just what 35 asks for. For a production node `P`
+of 70–80 % is the usual shape (the headroom rule of Section 6 already
+keeps the free grid above twice the reserve floor underneath it), and
+`Q` well below `P` — 20–40 % — so the band between them is wide enough
+that a busy hour does not oscillate; `C` for the shrink in cycles of
+30 s (20 cycles = 10 minutes quiet), and remember the implicit cool-off
+of 10×C after any grow before shrinking even starts counting. The
+examples in the cookbook (13.1, 13.2, 13.4) are of that shape.
 
 ### Validation — fail-loud, all real messages
 
@@ -658,6 +738,40 @@ tune thresholds against the advice lines, flip to 0.
 
 ---
 
+## 11b. Module arenas — memory a module asks for and HG manages
+
+A module whose memory has nothing to do with transactions — a cache with
+its own lifetime, class mix and growth — can ask for an arena of its own
+instead of carving chunks out of shm and managing them itself:
+
+```c
+#include "../../mem/mem_arena.h"
+mem_arena_t *a = shm_arena_create("cachedb_perf", init_bytes, cap_bytes); /* mod_init only */
+shm_arena_set_profile(a, "CACHE_PROFILE");     /* optional: the Section 10 grammar */
+p = mem_arena_malloc(a, size);  mem_arena_free(a, p);
+```
+
+The arena is an HG block like shm — slab classes, per-process caches,
+block GC and cross-class re-typing, elastic growth and shrink within its
+own `INIT:CAP`, the maintenance process (which ticks every registered
+shared arena), its own section in `hg_stats` and its own lock
+histograms — created before the fork so every child inherits the one
+shared mapping, independent of which allocator `-a` selected for the
+core. The ownership registry routes a free to whichever arena owns the
+pointer. With no HG_MALLOC compiled in, `shm_arena_create()` returns
+NULL and the module falls back to its own scheme. Up to 8 arenas.
+
+**First consumer: cachedb_perf.** Its `memory_backing` parameter
+(`auto|core|own-hg|own`) decides at startup where its cells live:
+`core` — the shm allocator is HG, so every cache cell is an HG slab
+cell and nothing is managed in the module; `own-hg` — `arena_hugepage_mb`
+(and `arena_hugepage_cap_mb`, `arena_profile`) turn into an HG arena
+named `cachedb_perf`, listed by name in `hg_stats`, whatever `-a`
+selected for the core; `own` — any other allocator, where the module
+runs its own slot allocator with its own reclaim process. `auto` picks
+own-hg when an arena is asked for, core when the shm allocator is HG,
+own otherwise.
+
 ## 12. pkg arenas — what is different
 
 * **Per-child, post-config.** Each worker's private arena is created at
@@ -706,7 +820,7 @@ word intact.
 
 ## 13. Deployment cookbook
 
-### 12.1 Billing gateway, hugetlb tier
+### 13.1 Billing gateway, hugetlb tier
 
 Start at the proven working size, allow storm growth, never shrink
 below the start (a gateway holds long-lived state).
@@ -756,7 +870,7 @@ late children down the tier ladder. If the pool cannot fit a cap:
 NOTICE: hugetlb pool cannot back a 1024 MB cap; reserving the 128 MB in use instead - the arena keeps huge pages but cannot grow. Raise vm.nr_hugepages to allow growth.
 ```
 
-### 12.2 Load balancer, measured-first
+### 13.2 Load balancer, measured-first
 
 An LB's real footprint is small (a production LB measured **11.9 MB
 peak shm over 15 h** of full traffic; worst per-process pkg 2.4 MB).
@@ -777,11 +891,11 @@ shm_auto_scaling_profile = MEM_LB
 `down to 32` sits below `-m 64` deliberately: after a storm passes, the
 arena returns even part of the initial allocation.
 
-### 12.3 First rollout — dry-run
+### 13.3 First rollout — dry-run
 
 Section 11. Profile + `hg_autoscale_dry_run = 1`, observe, tune, flip.
 
-### 12.4 Cap only, no profile
+### 13.4 Cap only, no profile
 
 ```bash
 opensips -f opensips.cfg -m 256:2048 -a HG_MALLOC
@@ -791,7 +905,72 @@ Exhaustion growth + conservative built-in shrink (4 quiet intervals per
 granule, never below `-m 256`). No proactive behaviour, no config
 surface at all.
 
-### 12.5 The first soak, charted
+### 13.5 Shared-memory THP at fault: `shmem_enabled=advise`
+
+The kernel default `transparent_hugepage/shmem_enabled = never` means a
+shared (shm) arena gets huge pages only through the `MADV_COLLAPSE`
+retrofit: every grow populates 4 K pages and then copies them into huge
+pages. Measured on the 1M bench, that collapse is three quarters of each
+grow's commit — 48 ms of the 64 ms a 16 MB grow held the arena lock —
+and it is the part that costs requests: fill p99 6.05 ms with 151 lost
+REGISTERs, cold-pull p99 50 ms, 2,143 kernel UDP drops. With
+
+```
+echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled
+```
+
+(runtime, no restart; persist via sysfs in your config management) the
+`MADV_HUGEPAGE` the arena already issues makes the populate fault 2 MB
+pages directly — the init line reads `THP 2M pages via MADV_HUGEPAGE
+(huge at fault)` — and the same run gave fill p99 0.89 ms, cold p99
+23 ms, zero lost, zero drops, the commit down to 29 ms mean. Set it on
+every host that runs an elastic shm arena; the hugetlb tier (13.1) is
+unaffected by it.
+
+### 13.6 A residual stall is latency, not loss: `maxbuffer`
+
+A worker parked for tens of milliseconds cannot drain its UDP socket;
+with the default 256 KB receive buffer a burst of ~1,500 INVITE-sized
+datagrams overflows it and the kernel drops (`UdpRcvbufErrors`) — the
+lost-request counts in every elastic run above came from exactly that.
+The socket queue is the only buffer between the NIC and the workers
+(OpenSIPS reads one datagram at a time with `recvfrom()`; there is no
+second, internal queue), and its size is what OpenSIPS asks for at
+startup — the core parameter `maxbuffer`, 256 KB by default — bounded by
+what the kernel allows, `net.core.rmem_max`. Both have to move, and
+neither is code:
+
+```
+sysctl -w net.core.rmem_max=8388608      # the kernel's ceiling
+maxbuffer = 8388608                       # opensips.cfg: what the SIP sockets ask for
+```
+
+Raising only the sysctl changes nothing (the sockets still ask for
+256 KB); raising only `maxbuffer` is clamped at the old ceiling. With
+both, a burst that a stall leaves unread parks in the queue and is
+drained afterwards, one datagram at a time — a stall the allocator has
+not yet removed becomes latency rather than loss. All UDP workers of a
+socket share that queue, so a single parked worker never drops anything;
+drops need every worker parked at once, which is what the two-phase
+commit ended.
+
+### 13.7 Large allocations pack into whole pages
+
+Allocations above the largest cell class (64 KB) go to the large tier,
+which carves its chunks from the buddy grid. On arenas of 256 MB and
+more a large chunk is one whole huge page (2 MB); below that it keeps
+the slab tier's 256 KB granule. The reason is packing: a 256 KB request
+plus its headers does not fit twice in a 512 KB block, so with the small
+granule half of every block stayed dead — measured at 420 MB of idle
+remainders on a million-record node whose cache blobs arrive in 256 KB
+chunks. A 2 MB chunk holds seven of them. `hg_stats` →
+`large_backing` versus `large_live` shows the packing loss directly.
+Measured on the 1M rig: the puller commits 2,272 MB for the same
+1,852 MB of records instead of 2,688 (110 grows instead of 136, all
+ahead of demand), the owners carve 925 MB instead of 1,105, and every
+request figure is unchanged on both host configurations.
+
+### 13.8 The first soak, charted
 
 Two nodes, first 14 hours on v3 (2026-08-14/15), every point taken from
 the arena's own grow/shrink NOTICE lines. The LB ran the section 13.2
@@ -807,7 +986,7 @@ xychart-beta
     line [16, 16, 16, 16, 16, 16]
 ```
 
-*The 12.2 config doing its job unattended: idle 64 shrinks to the 32
+*The 13.2 config doing its job unattended: idle 64 shrinks to the 32
 floor within 20 minutes of boot, morning traffic grows it back to 48,
 and the after-peak shrink releases only what is genuinely empty —
 committed lands on 34, not 32, because 2 MB of the growth still holds a
@@ -840,7 +1019,7 @@ corruption counters 0, tier-1 hugetlb throughout, and the
 
 ## 14. Monitoring and alerting
 
-### 13.1 MI
+### 14.1 MI
 
 ```bash
 opensips-cli -x mi core:hg_stats
@@ -873,11 +1052,63 @@ Field notes:
 | `grow_refused` | refusals, both admin and resource — the magnitude counter behind once-per-episode logging |
 | `grow_blocked` | the latched gauge (resource refusals only) |
 | `shrinks` / `shrink_bytes` | successful releases and their total |
+| `grows_proactive` / `grows_exhaustion` | which path asked for each grow: the profile's tick ahead of demand, or a request that found nothing to carve |
+| `lock` | arena-lock timing (below) |
+
+`lock` is the answer to "what held the arena lock, for how long, and did it
+stall anyone": every `hb->lock` section is tagged with its reason —
+`refill` (class refill: pool pop, chunk carve, a grow on exhaustion),
+`return` (cell return, donate, `gc_class` block returns), `flush`
+(per-process cell-cache flush), `large`, `region`, `policy` (grow/shrink
+tick, profile apply), `stats` — and timed on both sides of the acquire:
+
+```json
+"lock": {
+    "stall_threshold_us": 1000,
+    "stalls": 0,
+    "worst_hold_us": 412,
+    "worst_reason": "refill",
+    "worst_process": 12,
+    "hold": { "refill": { "n": 18213, "mean_us": 3, "max_us": 412, "stalls": 0,
+                          "hist_log2us": [9120, 6011, 2410, 540, 101, 24, 6, 1, 0, ...] },
+              "return": { ... }, "flush": { ... }, "policy": { ... } },
+    "wait": { "refill": { ... }, ... },
+    "commit": { "n": 6, "mean_us": 2870, "max_us": 4102, "stalls": 0, "hist_log2us": [...] },
+    "gc":     { "n": 3310, "mean_us": 2, "max_us": 57, "stalls": 0, "hist_log2us": [...] }
+}
+```
+
+`commit_phases` (present once a grow has happened) splits the commit into
+`meminfo`, `advise`, `mlock_populate`, `verify` and `collapse` — the
+`/proc/meminfo` read, the `MADV_HUGEPAGE`, the populating `mlock`, the
+backing verification (a huge-page counter delta across the populate; it
+used to be a `/proc/self/smaps` walk of the whole mapping, 8–11 ms per
+grow under the lock on a 3 GB arena) and the `MADV_COLLAPSE` retrofit —
+so a slow grow says which part is slow. Measured on the 1M bench, per
+16 MB grow: populate 14–20 ms, collapse 48 ms when the host needs it
+(see 13.5), the rest microseconds.
+`grow_wait` records the unlocked waits of workers that exhausted while
+another worker's grow was populating; `grow_inflight`, `grow_waits` and
+`grow_wait_timeouts` next to `grows` are the two-phase commit's state.
+`hold` is the time the lock was held, `wait` the time spent acquiring it,
+both per reason; `commit` is the `hg_mem_commit()` part of a grow
+(populate + pin + collapse — the part that holds the lock for
+milliseconds) and `gc` every `gc_class()` block-return pass, timed on
+their own because they run *inside* a `refill`/`return`/`policy` hold.
+`hist_log2us` is a log2 histogram in microseconds: bucket 0 is `< 1 us`,
+bucket k is `[2^(k-1), 2^k) us`, the last bucket (index 17) is `>= 64 ms`.
+A hold at or above `hg_lock_stall_us` (config, default 1000) is a *stall*:
+counted per reason and in total, remembered as `worst_*`, logged at most
+once per second per process, and raised as `E_CORE_HG_LOCK_STALL` from
+the sweep timer. Reasons with no samples are omitted. The cost of the
+instrumentation is two `clock_gettime(CLOCK_MONOTONIC)` reads per
+slow-path section (~20 ns each via the vDSO) — the lock-free fast path
+never comes here.
 
 The `pkg` section reports the **answering MI process's own** arena —
 stated honestly rather than pretending fleet-wide pkg visibility.
 
-### 13.2 Statistics (Prometheus-friendly)
+### 14.2 Statistics (Prometheus-friendly)
 
 ```
 hgmem:hg_shm_committed      bytes committed right now
@@ -888,6 +1119,10 @@ hgmem:hg_shm_grow_refused   counter  — rising = demand is hitting a wall
 hgmem:hg_shm_grow_blocked   GAUGE    — the one to alert on
 hgmem:hg_shm_shrinks        counter
 hgmem:hg_shm_shrink_bytes   counter
+hgmem:hg_shm_grows_proactive   counter — grows asked for by the profile tick
+hgmem:hg_shm_grows_exhaustion  counter — grows asked for by an exhausted request
+hgmem:hg_shm_lock_stalls       counter — arena-lock holds >= hg_lock_stall_us
+hgmem:hg_shm_lock_hold_max_us  high-water mark of the longest hold (us)
 ```
 
 Suggested alerts:
@@ -900,12 +1135,23 @@ Suggested alerts:
 * `hg_shm_committed / hg_shm_cap > 0.9` sustained → the cap is close;
   plan a restart with a larger `:CAP` (the reservation cannot be raised
   live).
+* `rate(hg_shm_lock_stalls[5m]) > 0` → a slow path held the arena lock
+  for a millisecond or more; `hg_stats` → `lock.worst_reason` says which
+  (`refill` with `commit.max_us` in the thousands = growth committing
+  under the lock; `return` with `gc.max_us` high = block returns;
+  `flush` = the sweep's cache flush).
 
-### 13.3 The event
+### 14.3 The events
 
 Section 8 — `E_CORE_SHM_GROW_BLOCKED`, params `arena`, `committed_mb`,
 `cap_mb`, `grow_refused`; raised on latch and every 5 minutes while
 held; with no subscriber, a WARN says so and points at the gauge.
+
+`E_CORE_HG_LOCK_STALL`, params `arena`, `reason`, `hold_us`, `process`,
+`stalls` (the running total): the most recent arena-lock hold at or above
+`hg_lock_stall_us`, raised from the sweep timer (never under the lock —
+raising allocates shm), at most once per sweep interval. Silent with no
+subscriber; `hg_shm_lock_stalls` carries the count for pollers.
 
 ---
 
@@ -918,7 +1164,8 @@ All at their exact severities; `%` values are illustrative.
 | `shm arena can grow to N MB (M MB headroom reserved, uncommitted)` | NOTICE | startup: a cap exists |
 | `shm auto-scaling profile 'X'...: A..B MB (start C), up at ...` | NOTICE | profile attached; the one line that proves your config took effect |
 | `... [DRY RUN - advise only]: ...` | NOTICE | ditto, advise-only |
-| `shm arena grew by 16 MB to N MB (8 new pages on <tier>; M MB headroom left)` | NOTICE | growth, with the delta's **verified** backing |
+| `shm arena grew <proactively\|on exhaustion> by 16 MB to N MB (8 new pages on <tier>; commit K us with the lock released; M MB headroom left)` | NOTICE | growth, which path asked, the delta's **verified** backing, and how long the populate took (no longer under the lock) |
+| `shm arena lock held for N us by the <reason> path (threshold hg_lock_stall_us=1000; S stalls so far, worst W us by <reason> in process P)` | WARN | a stall (Section 14.1 `lock`); at most one line per second per process — the counters and the event carry the magnitude |
 | `shm arena shrank by 16 MB to N MB (8 pages released to the <hugetlb pool\|host>; M MB of growth still held)` | NOTICE | shrink, with where the memory went |
 | `at the N MB growth ceiling (the -m/-M reservation \| the profile scale-up target), a K byte request must fail - counting further refusals in hg_shm_grow_refused` | NOTICE | admin limb refusing; once per episode; not an incident |
 | `cannot grow by 16 MB: mlock failed (...)` / `refusing to grow by 16 MB: N MB effective (xP processes) would leave the host under the F MB floor` | WARN | resource limb refusing; once per episode |
@@ -939,7 +1186,7 @@ All at their exact severities; `%` values are illustrative.
    `shm_cap + pkg_cap × workers + ~12% margin` pages.
 2. **A short pool degrades, it no longer kills.** The one arena
    children inherit copy-on-write — the attendant's pkg arena — is kept
-   off hugetlb (12.1), so a pool with zero free pages at fork time
+   off hugetlb (13.1), so a pool with zero free pages at fork time
    pushes late children to THP instead of SIGBUSing them. That SIGBUS
    was measured, twice, before this rule existed.
 3. **pkg caps multiply** — RAM and, on tier 1, pool reservations.
@@ -980,7 +1227,7 @@ All at their exact severities; `%` values are illustrative.
 | `DRY RUN - would grow` but nothing happens | `hg_autoscale_dry_run = 1` | that is the point; set 0 to act |
 | `grow_refused` climbing, gauge 0 | isolated refusals; hysteresis holding | by design — the gauge latches on *sustained* refusal |
 | `failed to initialize child process N` / `cannot fork tcp main` at startup, no arena line for that child | a build predating `HG_INIT_INHERITED`: the last no-script child COW-faulted the parent's hugetlb pkg arena on an empty pool | upgrade; meanwhile leave free pages in the pool at fork time |
-| arena runs unpinned (`continuing unpinned`) | `RLIMIT_MEMLOCK` too low for a tier 2–4 arena | `LimitMEMLOCK=infinity` in the unit |
+| arena runs unpinned (`continuing unpinned`) | `RLIMIT_MEMLOCK` too low for a tier 2–4 arena | `LimitMEMLOCK=infinity` in the unit; until then the arena grows unpinned too (populating write faults instead of `mlock`) rather than refusing every grow |
 | testing under `ulimit -l` shows no refusals | you are root — `CAP_IPC_LOCK` bypasses `RLIMIT_MEMLOCK` entirely | test the mlock leg as an unprivileged user (`setpriv`) |
 | pool numbers "prove" shrink is broken | rule 5 | use the exact object-residency formula |
 
@@ -988,7 +1235,7 @@ All at their exact severities; `%` values are illustrative.
 
 ## 18. Testing — the rig and how to reproduce the proofs
 
-### 17.1 hgstress
+### 18.1 hgstress
 
 `modules/hgstress` is the throwaway stress module. Every block is
 stamped per (pid, slot) in every 8-byte word, so a page served to two
@@ -1003,7 +1250,7 @@ named, not inferred.
 | `again_s` | a timer re-runs one hold/verify/free cycle N seconds in — the regrow-after-shrink proof (timers only run after `child_init` completes, so this is how post-startup cycles are driven) |
 | MI `hgs_hold <mb>` / `hgs_release` | allocate/park and verify/free stamped shm **from a live MI process** — the only way to meet sweep ticks, since `child_init` soaks block every timer |
 
-### 17.2 What each proof arm established
+### 18.2 What each proof arm established
 
 | arm | shape | result |
 |---|---|---|
@@ -1018,7 +1265,7 @@ named, not inferred.
 | J | non-root, `ulimit -l` | init-unpinned path + the growth-mlock refusal root cannot drive + hysteresis in both directions |
 | K | tier-1 lifecycle | pool draw / ceiling / **pool return** / re-draw — plus the instrumentation lesson of rule 5 |
 
-### 17.3 The userspace pre-measurement rigs
+### 18.3 The userspace pre-measurement rigs
 
 `vatest.c`, `growtest.c`, `shrinktest*.c` (session scratchpad) are the
 kernel-behaviour probes that chose the mechanisms before any allocator
@@ -1066,7 +1313,7 @@ re-verified rather than assumed from documentation.
 | `cfg.lex` / `cfg.y` | the four config tokens; the (pre-existing, reused) profile grammar |
 | `evi/evi_core.[ch]` | `E_CORE_SHM_GROW_BLOCKED` publication (id 6; carries the same `#ifdef STATISTICS` id-shift caveat as `SHM_THRESHOLD`) |
 | `mem/shm_mem.c` | the `init_shm_post_yyparse()` attach call |
-| `modules/hgstress/` | the proof driver (17.1) |
+| `modules/hgstress/` | the proof driver (18.1) |
 
 Development notes that cost real time, recorded so they are paid once:
 

@@ -30,6 +30,14 @@
 
 #define HG_LARGE_MIN_FRAG    HG_ROUNDTO
 #define HG_LARGE_DEFAULT_CHUNK (1UL << 20)  /* 1 MB - amortizes future churn */
+/* T22: on an arena this big the large tier carves WHOLE huge pages. The
+ * slab tier's chunk_max (256 KB, its reclaim granule) used to cap the
+ * large chunk too, so a 256 KB request plus its headers landed in a 512 KB
+ * buddy block whose remainder was a few hundred bytes too short for a
+ * second one: half of every block dead - 420 MB on a million-record
+ * puller whose cache blobs come in 256 KB chunks. A 2 MB chunk holds seven
+ * of them. Small arenas (pkg, tiny shm) keep the old sizing. */
+#define HG_LARGE_BIG_ARENA     (256UL << 20)
 
 struct hg_large_chunk {
 	struct hg_large_chunk *next;
@@ -96,7 +104,7 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 	need = (HG_CELL_HDR + size + HG_PAYLOAD_ALIGN - 1)
 	       & ~(unsigned long)(HG_PAYLOAD_ALIGN - 1);
 
-	lock_get(&hb->lock);
+	hg_lock_enter(hb, HG_LK_LARGE);
 
 	/* linear first-fit across ONE shared, unsorted free list (large
 	 * allocations are inherently rare and already slow-path - see the
@@ -121,10 +129,19 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 		 * as chunk_size_for() in hg_arena.c) */
 		{
 			unsigned long floor = HG_LARGE_DEFAULT_CHUNK;
-			if (floor > hb->chunk_max)
-				floor = hb->chunk_max;
-			if (chunk_size < floor)
-				chunk_size = floor;
+			if (hb->size >= HG_LARGE_BIG_ARENA) {
+				/* one whole page, header included, so the buddy hands
+				 * back exactly a page and not a two-page run */
+				floor = hb->hps;
+				if (chunk_size + sizeof(struct hg_large_chunk) < floor)
+					chunk_size = (floor - sizeof(struct hg_large_chunk))
+					             & ~63UL;
+			} else {
+				if (floor > hb->chunk_max)
+					floor = hb->chunk_max;
+				if (chunk_size < floor)
+					chunk_size = floor;
+			}
 		}
 		chunk_size = (chunk_size + 63) & ~63UL;
 
@@ -151,7 +168,7 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 			 * means the grow was refused - fall through to the
 			 * ordinary exhaustion error. */
 			for (attempt = 0; attempt < 2 && !base; attempt++) {
-				if (attempt && hg_buddy_grow(hb, total) != 0)
+				if (attempt && hg_buddy_grow(hb, total, HG_GROW_EXHAUSTION) != 0)
 					break;
 				if (ord >= 0) {
 					base = hg_buddy_alloc(hb, (unsigned int)ord);
@@ -173,7 +190,7 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 			chunk_size &= ~63UL;
 		}
 		if (!base) {
-			lock_release(&hb->lock);
+			hg_lock_leave(hb);
 			LM_ERR("%s: no more HG_MALLOC arena memory for a %lu byte "
 				"large chunk (need %lu bytes for this allocation) - "
 				"increase the arena size\n", hb->name, chunk_size, need);
@@ -248,7 +265,7 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 	 * figure the way hg_slab_recycled() does for the slab tier */
 	hb->large_live += HG_LFRAG_HDR + f->size;
 
-	lock_release(&hb->lock);
+	hg_lock_leave(hb);
 
 	tag = (char *)f + HG_LFRAG_HDR;
 	*(unsigned char *)tag = HG_LARGE_MARKER;
@@ -270,7 +287,7 @@ void hg_large_free(struct hg_block *hb, struct hg_lfrag *frag)
 {
 	struct hg_lfrag *neigh;
 
-	lock_get(&hb->lock);
+	hg_lock_enter(hb, HG_LK_LARGE);
 
 	{
 		struct hg_pstat *ps = hg_pstat_mine(hb);
@@ -342,14 +359,14 @@ void hg_large_free(struct hg_block *hb, struct hg_lfrag *frag)
 			else
 				hg_buddy_free_run(hb, base);
 
-			lock_release(&hb->lock);
+			hg_lock_leave(hb);
 			return;
 		}
 	}
 
 	lfrag_insert_free(hb, frag);
 
-	lock_release(&hb->lock);
+	hg_lock_leave(hb);
 }
 
 unsigned long hg_large_frag_size(const struct hg_lfrag *frag)
@@ -395,14 +412,14 @@ void hg_large_walk_live(struct hg_block *hb,
 	struct hg_large_chunk *ch;
 	struct hg_lfrag *f;
 
-	lock_get(&hb->lock);
+	hg_lock_enter(hb, HG_LK_STATS);
 
 	for (ch = hb->large_chunks; ch; ch = ch->next)
 		for (f = ch->first_frag; f != ch->last_frag; f = HG_LFRAG_NEXT(f))
 			if (!f->prev)   /* live, exact - see hg_large.h */
 				cb((char *)f + HG_LFRAG_HDR + HG_CELL_HDR, ctx);
 
-	lock_release(&hb->lock);
+	hg_lock_leave(hb);
 }
 
 #ifdef SHM_EXTRA_STATS

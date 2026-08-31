@@ -147,7 +147,7 @@ static const unsigned int cell_sizes[HG_NCLASSES] = {
  * its own dead TLS rather than returning them - harmless here, because the
  * IO pool threads live for the lifetime of the process.
  */
-#define HG_MAX_INSTANCES 4
+#define HG_MAX_INSTANCES 8   /* shm, pkg, shm_dbg + module arenas */
 static __thread struct hg_palloc palloc_slots[HG_MAX_INSTANCES];
 
 /*
@@ -368,7 +368,18 @@ static inline struct hg_chunk *cell_block(struct hg_block *hb, int c, void *p)
  *
  * hb->lock must be held.
  */
+static void gc_class_run(struct hg_block *hb, int c);
+
+/* T1: every block-return pass is timed into hb->lk_gc (lock held) */
 static void gc_class(struct hg_block *hb, int c)
+{
+	unsigned long t0 = hg_now_ns();
+
+	gc_class_run(hb, c);
+	hg_lkstat_add(&hb->lk_gc, hg_now_ns() - t0);
+}
+
+static void gc_class_run(struct hg_block *hb, int c)
 {
 	struct hg_chunk *ch;
 	unsigned int freed = 0;
@@ -398,6 +409,7 @@ static void gc_class(struct hg_block *hb, int c)
 		if (ch->next)
 			ch->next->prev = ch->prev;
 		hb->nchunks--;
+		hb->slab_capacity -= (unsigned long)ch->cells * ch->cell_size;
 
 		ord = ch->order;
 		sz = HG_LEAF_SIZE << ord;
@@ -679,7 +691,7 @@ void hg_cache_flush_self(void)
 
 		if (!hb)
 			continue;
-		lock_get(&hb->lock);
+		hg_lock_enter(hb, HG_LK_FLUSH);
 		n = cache_flush_locked(hb, &palloc_slots[i]);
 		hb->cache_flushes++;
 		hb->cells_flushed += n;
@@ -692,7 +704,7 @@ void hg_cache_flush_self(void)
 			hg_grow_tick(hb);
 			hg_shrink_tick(hb);
 		}
-		lock_release(&hb->lock);
+		hg_lock_leave(hb);
 		if (n)
 			LM_DBG("%s: idle sweep returned %u cached cells\n", hb->name, n);
 	}
@@ -857,7 +869,7 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 	 * only - if the arena grew, the freshly published pages satisfy this
 	 * order by construction (they are whole), so a second miss can only
 	 * mean the grow itself was refused and would be refused again. */
-	if (!ch && hg_buddy_grow(hb, size) == 0)
+	if (!ch && hg_buddy_grow(hb, size, HG_GROW_EXHAUSTION) == 0)
 		ch = hg_buddy_alloc(hb, (unsigned int)ord);
 
 	/*
@@ -904,6 +916,7 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 		ch->next->prev = ch;
 	hb->chunks = ch;
 	hb->nchunks++;
+	hb->slab_capacity += (unsigned long)ch->cells * ch->cell_size;
 	hb->blocks_carved++;
 	hb->real_used += size;
 	if (hb->real_used > hb->max_real_used)
@@ -1194,20 +1207,20 @@ void *hg_region_alloc(struct hg_block *hb, unsigned long size)
 	char *aligned;
 	int ord;
 
-	lock_get(&hb->lock);
+	hg_lock_enter(hb, HG_LK_REGION);
 	ord = hg_buddy_order_for(hb, need);
 	rg = ord < 0 ? NULL : hg_buddy_alloc(hb, (unsigned int)ord);
 	if (!rg && ord < 0)
 		rg = hg_buddy_alloc_run(hb,
 			(need + hb->hps - 1) >> hb->hps_shift);
 	/* v3: grow-and-retry, same single-retry contract as carve_chunk() */
-	if (!rg && hg_buddy_grow(hb, need) == 0) {
+	if (!rg && hg_buddy_grow(hb, need, HG_GROW_EXHAUSTION) == 0) {
 		rg = ord < 0
 			? hg_buddy_alloc_run(hb,
 				(need + hb->hps - 1) >> hb->hps_shift)
 			: hg_buddy_alloc(hb, (unsigned int)ord);
 	}
-	lock_release(&hb->lock);
+	hg_lock_leave(hb);
 
 	if (!rg) {
 		LM_ERR("%s: no more HG_MALLOC arena memory for a %lu byte "
@@ -1220,7 +1233,7 @@ void *hg_region_alloc(struct hg_block *hb, unsigned long size)
 	aligned = (char *)(((unsigned long)rg + sizeof(struct hg_region) + 63)
 	                   & ~63UL);
 
-	lock_get(&hb->lock);
+	hg_lock_enter(hb, HG_LK_REGION);
 	rg->next = hb->regions;
 	hb->regions = rg;
 	hb->real_used += need;
@@ -1230,7 +1243,7 @@ void *hg_region_alloc(struct hg_block *hb, unsigned long size)
 		hb->lo = (unsigned long)rg;
 	if ((unsigned long)rg + need > hb->hi)
 		hb->hi = (unsigned long)rg + need;
-	lock_release(&hb->lock);
+	hg_lock_leave(hb);
 
 	return aligned;
 }
@@ -1330,7 +1343,7 @@ void *hg_cell_alloc(struct hg_block *hb, unsigned long size)
 	}
 
 	/* slow path: refill from the global pool, else carve a chunk */
-	lock_get(&hb->lock);
+	hg_lock_enter(hb, HG_LK_REFILL);
 	for (got = 0; got < HG_REFILL_BATCH; got++) {
 		cell_start = gpool_pop(hb, c);
 		if (!cell_start)
@@ -1368,10 +1381,10 @@ void *hg_cell_alloc(struct hg_block *hb, unsigned long size)
 		}
 	}
 	if (!got && carve_chunk(hb, c, pl) < 0) {
-		lock_release(&hb->lock);
+		hg_lock_leave(hb);
 		return NULL;
 	}
-	lock_release(&hb->lock);
+	hg_lock_leave(hb);
 
 	cell_start = pl->cls[c].free_head;
 	if (cell_start) {
@@ -1496,7 +1509,7 @@ void hg_cell_free(struct hg_block *hb, void *p)
 		unsigned int claimed = pl->cls[c].nfree;
 		unsigned int donate  = hb->priv_donate[c];
 
-		lock_get(&hb->lock);
+		hg_lock_enter(hb, HG_LK_RETURN);
 		for (i = 0; i < donate; i++) {
 			d = pl->cls[c].free_head;
 			/* priv_donate is half priv_max, so a chain whose
@@ -1519,7 +1532,7 @@ void hg_cell_free(struct hg_block *hb, void *p)
 		 * on every single call, burying the log. */
 		if (i < donate)
 			pl->cls[c].nfree = 0;
-		lock_release(&hb->lock);
+		hg_lock_leave(hb);
 
 		if (i < donate) {
 			hg_corrupt(hb, HG_C_NFREE_UNDERFLOW);
@@ -1580,9 +1593,9 @@ void hg_cell_free_global(struct hg_block *hb, void *p)
 		ps->cell_live -= cell_sizes[c];
 	}
 
-	lock_get(&hb->lock);
+	hg_lock_enter(hb, HG_LK_RETURN);
 	gpool_push(hb, c, cell_start);
-	lock_release(&hb->lock);
+	hg_lock_leave(hb);
 }
 
 /*
@@ -1605,24 +1618,22 @@ void hg_cell_free_global(struct hg_block *hb, void *p)
  */
 unsigned long hg_slab_recycled(struct hg_block *hb)
 {
-	struct hg_chunk *ch;
-	unsigned long capacity = 0, live;
+	unsigned long capacity, live;
 
 	/*
-	 * Under the lock, which it did not need while chunks were immortal.
-	 * gc_class() now unlinks a chunk and immediately hands the block to
-	 * hg_buddy_free(), whose fl_push() overwrites the first 24 bytes -
-	 * next, prev, cls, cell_size. A reader walking this list lock-free
-	 * (every SHM_GET_RUSED, every stats scrape, from any process at any
-	 * time) would follow a ch->next that is now a free-list pointer or a
-	 * magic value. Reading stats must not be able to walk into a block the
-	 * allocator has already recycled.
+	 * This used to walk the whole chunk registry - lock-free while chunks
+	 * were immortal, then under hb->lock once gc_class() started handing
+	 * chunks back to the buddy (a lock-free walker could follow a ch->next
+	 * that fl_push() had already overwritten). T1's lock histograms put
+	 * that walk at 7 ms mean / 30 ms max per shmem: scrape on a 1.8 GB
+	 * arena, with SIP workers waiting up to 46 ms behind it - a monitoring
+	 * poll was the biggest lock holder in the allocator. The capacity is
+	 * now a running sum maintained where chunks enter and leave the
+	 * registry (carve_chunk / gc_class), read here without the lock: a
+	 * torn read is at worst one chunk off, for a figure that is a sample
+	 * either way.
 	 */
-	lock_get(&hb->lock);
-	for (ch = hb->chunks; ch; ch = ch->next)
-		capacity += (unsigned long)ch->cells * ch->cell_size;
-	lock_release(&hb->lock);
-
+	capacity = hb->slab_capacity;
 	live = hg_cell_live(hb);
 	return capacity > live ? capacity - live : 0;
 }
@@ -1630,10 +1641,10 @@ unsigned long hg_slab_recycled(struct hg_block *hb)
 void hg_arena_stats(struct hg_block *hb, unsigned int *nchunks,
 		unsigned long *bytes)
 {
-	lock_get(&hb->lock);
+	hg_lock_enter(hb, HG_LK_STATS);
 	*nchunks = hb->nchunks;
 	*bytes = hb->real_used;
-	lock_release(&hb->lock);
+	hg_lock_leave(hb);
 }
 
 /*
@@ -1800,7 +1811,7 @@ void hg_arena_walk_live(struct hg_block *hb,
 	unsigned int i, total_free = 0;
 	char *cell_start;
 
-	lock_get(&hb->lock);
+	hg_lock_enter(hb, HG_LK_STATS);
 
 	/*
 	 * Count exactly rather than estimating from gpool_n[]: that counts only
@@ -1812,7 +1823,7 @@ void hg_arena_walk_live(struct hg_block *hb,
 	total_free = hg_free_set_count(hb);
 
 	if (hg_free_set_init(&set, total_free) < 0) {
-		lock_release(&hb->lock);
+		hg_lock_leave(hb);
 		LM_ERR("%s: out of memory building the live-cell diagnostic "
 			"set - skipping the walk\n", hb->name);
 		return;
@@ -1839,7 +1850,7 @@ void hg_arena_walk_live(struct hg_block *hb,
 	}
 
 	hg_free_set_destroy(&set);
-	lock_release(&hb->lock);
+	hg_lock_leave(hb);
 }
 
 #ifdef SHM_EXTRA_STATS
@@ -1877,6 +1888,31 @@ void hg_arena_stats_core_init(struct hg_block *hb, int core_index)
 #include "../statistics.h"
 #include "shm_mem.h"   /* mem_allocator_shm */
 
+/* --- T1: lock-stall bookkeeping (called after the release) ------------- */
+const char * const hg_lk_reason_str[HG_LK_REASONS] = {
+	"refill", "return", "flush", "large", "region", "policy", "stats", "other"
+};
+
+void hg_lock_stall_note(struct hg_block *hb, int reason, unsigned long held_ns)
+{
+	/* once per second per process: a stall storm must not become a log
+	 * storm, the counters and the deferred event carry the magnitude */
+	static unsigned long last_warn_ns;
+	unsigned long now = hg_now_ns();
+
+	if (last_warn_ns && now - last_warn_ns < 1000000000UL)
+		return;
+	last_warn_ns = now;
+	LM_WARN("%s arena lock held for %lu us by the %s path (threshold "
+		"hg_lock_stall_us=%d; %lu stalls so far, worst %lu us by %s in "
+		"process %d)\n", hb->name, held_ns / 1000,
+		reason >= 0 && reason < HG_LK_REASONS ? hg_lk_reason_str[reason] : "?",
+		hg_lock_stall_us, hb->lk_stalls, hb->lk_worst_ns / 1000,
+		hb->lk_worst_reason >= 0 && hb->lk_worst_reason < HG_LK_REASONS ?
+			hg_lk_reason_str[hb->lk_worst_reason] : "?",
+		hb->lk_worst_proc);
+}
+
 enum hg_stat_field {
 	HGS_TIER = 0, HGS_TOTAL, HGS_PINNED_BYTES, HGS_CARVED, HGS_CARVED_PEAK,
 	HGS_CHUNKS, HGS_FREE_TO_CARVE, HGS_LIVE, HGS_LIVE_PEAK, HGS_PAYLOAD,
@@ -1903,6 +1939,8 @@ enum hg_stat_field {
 	/* the alertable gauge: 1 while a RESOURCE refusal is latched (cap
 	 * refusals never latch - an admin ceiling is policy, not incident) */
 	HGS_GROW_BLOCKED,
+	HGS_LOCK_STALLS, HGS_LOCK_HOLD_MAX_US,
+	HGS_GROWS_PROACTIVE, HGS_GROWS_EXHAUSTION,
 };
 
 static unsigned long hg_shm_stat(void *ctx)
@@ -1966,6 +2004,10 @@ static unsigned long hg_shm_stat(void *ctx)
 	case HGS_GROW_BYTES:      return hb->grow_bytes;
 	case HGS_GROW_REFUSED:    return hb->grow_refused;
 	case HGS_GROW_BLOCKED:    return hb->grow_blocked;
+	case HGS_LOCK_STALLS:     return hb->lk_stalls;
+	case HGS_LOCK_HOLD_MAX_US: return hb->lk_worst_ns / 1000;
+	case HGS_GROWS_PROACTIVE: return hb->grows_proactive;
+	case HGS_GROWS_EXHAUSTION: return hb->grows_exhaustion;
 	case HGS_SHRINKS:         return hb->shrinks;
 	case HGS_SHRINK_BYTES:    return hb->shrink_bytes;
 	}
@@ -2012,6 +2054,10 @@ static const struct {
 	{"hg_shm_grow_bytes",      HGS_GROW_BYTES},
 	{"hg_shm_grow_refused",    HGS_GROW_REFUSED},
 	{"hg_shm_grow_blocked",    HGS_GROW_BLOCKED},
+	{"hg_shm_lock_stalls",     HGS_LOCK_STALLS},
+	{"hg_shm_lock_hold_max_us", HGS_LOCK_HOLD_MAX_US},
+	{"hg_shm_grows_proactive", HGS_GROWS_PROACTIVE},
+	{"hg_shm_grows_exhaustion", HGS_GROWS_EXHAUSTION},
 	{"hg_shm_shrinks",         HGS_SHRINKS},
 	{"hg_shm_shrink_bytes",    HGS_SHRINK_BYTES},
 	{NULL, 0}

@@ -231,7 +231,7 @@ int hg_pkg_peak_all(unsigned long *peak, unsigned long *sum, int *nproc)
 #include "mem/hg_arena.h"
 #include "mem/hg_buddy.h"       /* hg_grow_blocked_tick */
 #include "mem/shm_mem.h"        /* shm_block, for the grow-blocked gauge */
-#include "evi/evi_core.h"       /* EVI_SHM_GROW_BLOCKED_ID */
+#include "evi/evi_core.h"       /* EVI_SHM_GROW_BLOCKED_ID, EVI_HG_LOCK_STALL_ID */
 #include "evi/evi_modules.h"    /* evi_probe/get_params/raise */
 
 /*
@@ -291,6 +291,45 @@ static str hg_gb_arena_str     = str_init("arena");
 static str hg_gb_committed_str = str_init("committed_mb");
 static str hg_gb_cap_str       = str_init("cap_mb");
 static str hg_gb_refused_str   = str_init("grow_refused");
+static str hg_ls_reason_str    = str_init("reason");
+static str hg_ls_hold_str      = str_init("hold_us");
+static str hg_ls_proc_str      = str_init("process");
+static str hg_ls_stalls_str    = str_init("stalls");
+
+/*
+ * T1: the deferred half of lock-stall alerting. hg_lock_leave() latches
+ * the most recent stall under the lock; this raises it from the sweep
+ * timer, outside the lock, for the same reason the grow-blocked event is
+ * deferred (raising allocates shm).
+ */
+static void hg_lock_stall_event(unsigned long hold_ns, int reason, int proc,
+                                unsigned long stalls)
+{
+	evi_params_p list;
+	str arena = str_init("shm");
+	str rs;
+	int hold_us = (int)(hold_ns / 1000), stalls_i = (int)stalls;
+
+	rs.s = (char *)(reason >= 0 && reason < HG_LK_REASONS ?
+	                hg_lk_reason_str[reason] : "?");
+	rs.len = strlen(rs.s);
+	if (!evi_probe_event(EVI_HG_LOCK_STALL_ID))
+		return;           /* hg_shm_lock_stalls carries it for pollers */
+	list = evi_get_params();
+	if (!list)
+		return;
+	if (evi_param_add_str(list, &hg_gb_arena_str, &arena) ||
+	    evi_param_add_str(list, &hg_ls_reason_str, &rs) ||
+	    evi_param_add_int(list, &hg_ls_hold_str, &hold_us) ||
+	    evi_param_add_int(list, &hg_ls_proc_str, &proc) ||
+	    evi_param_add_int(list, &hg_ls_stalls_str, &stalls_i)) {
+		LM_ERR("unable to build the lock-stall event parameters\n");
+		evi_free_params(list);
+		return;
+	}
+	if (evi_raise_event(EVI_HG_LOCK_STALL_ID, list))
+		LM_ERR("unable to raise the lock-stall event\n");
+}
 
 static void hg_grow_blocked_event(void)
 {
@@ -298,6 +337,9 @@ static void hg_grow_blocked_event(void)
 	static unsigned int blocked_sweeps;
 	evi_params_p list;
 	int due, committed_mb, cap_mb, refused;
+	unsigned int stall_due;
+	unsigned long stall_ns, stalls;
+	int stall_reason, stall_proc;
 	str arena = str_init("shm");
 
 	if (!hb)
@@ -305,7 +347,7 @@ static void hg_grow_blocked_event(void)
 
 	/* consume the due flag and sample the numbers under the lock; the
 	 * raise itself must happen outside it */
-	lock_get(&hb->lock);
+	hg_lock_enter(hb, HG_LK_POLICY);
 	/* promote (or disarm) an armed episode first, so a latch earns its
 	 * event in the same tick that detects it */
 	hg_grow_blocked_tick(hb);
@@ -313,8 +355,10 @@ static void hg_grow_blocked_event(void)
 	 * the shm arena's once-per-interval policy heartbeat (pkg arenas tick
 	 * themselves from each process's flush path; a private arena has one
 	 * owner) */
-	hg_grow_tick(hb);
-	hg_shrink_tick(hb);
+	if (!hb->maint_active) {        /* T8: else the maintenance process ticks */
+		hg_grow_tick(hb);
+		hg_shrink_tick(hb);
+	}
 	due = hb->grow_event_due;
 	hb->grow_event_due = 0;
 	if (!due && hb->grow_blocked &&
@@ -328,7 +372,16 @@ static void hg_grow_blocked_event(void)
 	committed_mb = (int)(hb->hsize >> 20);
 	cap_mb       = (int)(hb->hcap >> 20);
 	refused      = (int)hb->grow_refused;
-	lock_release(&hb->lock);
+	stall_due    = hb->lk_stall_event_due;
+	hb->lk_stall_event_due = 0;
+	stall_ns     = hb->lk_last_stall_ns;
+	stall_reason = hb->lk_last_stall_reason;
+	stall_proc   = hb->lk_last_stall_proc;
+	stalls       = hb->lk_stalls;
+	hg_lock_leave(hb);
+
+	if (stall_due)
+		hg_lock_stall_event(stall_ns, stall_reason, stall_proc, stalls);
 
 	if (!due)
 		return;

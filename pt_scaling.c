@@ -90,8 +90,9 @@ int create_auto_scaling_profile( char *name,
 	/* a profile is a set of numbers that may drive a process group (counts,
 	 * checked again at create_process_group() time, where a four-digit
 	 * process count is refused) or an HG_MALLOC arena (MB, where 1024 and
-	 * far above are ordinary) - so only the relation is checked here */
-	if (max_procs==0 || max_procs <= min_procs || max_procs >= (1u << 20)) {
+	 * far above are ordinary - or KB when a size suffix was used, where a
+	 * 1 GB target is 1048576) - so only the relation is checked here */
+	if (max_procs==0 || max_procs <= min_procs || max_procs >= (1u << 30)) {
 		LM_ERR("invalid relation or range for MIN/MAX [%d,%d]\n",
 			min_procs, max_procs);
 		return -1;

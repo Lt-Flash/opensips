@@ -458,8 +458,13 @@ int main(int argc, char** argv)
 					 * (-M 512k:16m); a bare number stays megabytes.
 					 */
 					if (tmp && *tmp == ':') {
-						hg_pkg_cap_bytes =
-							(unsigned long)parse_mem_size(tmp + 1, &tmp);
+						long capv = parse_mem_size(tmp + 1, &tmp);
+
+						if (capv <= 0) {
+							LM_ERR("bad -M cap: %s\n", optarg);
+							goto error00;
+						}
+						hg_pkg_cap_bytes = (unsigned long)capv;
 						if ((unsigned long)pkg_mem_size > hg_pkg_cap_bytes) {
 							LM_ERR("-M cap smaller than the initial "
 								"size: %s\n", optarg);
@@ -475,8 +480,13 @@ int main(int argc, char** argv)
 					shm_mem_size=parse_mem_size(optarg, &tmp);
 					/* -m INIT[:CAP], see the -M note above */
 					if (tmp && *tmp == ':') {
-						hg_shm_cap_bytes =
-							(unsigned long)parse_mem_size(tmp + 1, &tmp);
+						long capv = parse_mem_size(tmp + 1, &tmp);
+
+						if (capv <= 0) {
+							LM_ERR("bad -m cap: %s\n", optarg);
+							goto error00;
+						}
+						hg_shm_cap_bytes = (unsigned long)capv;
 						if ((unsigned long)shm_mem_size > hg_shm_cap_bytes) {
 							LM_ERR("-m cap smaller than the initial "
 								"size: %s\n", optarg);

@@ -212,6 +212,39 @@ static long hg_meminfo_kb(const char *key)
  * The huge-page counter a mapping shows up in: shared anonymous memory
  * is shmem (ShmemHugePages), private anonymous memory is AnonHugePages.
  */
+
+/*
+ * Does the host's THP policy forbid an explicit MADV_COLLAPSE for this
+ * mapping kind? MADV_COLLAPSE deliberately bypasses "never" in the kernel
+ * (it is an explicit request), so an admin who disabled THP still gets
+ * collapsed arenas unless WE honor the setting: for shmem, only "deny"
+ * blocks it kernel-side, but we treat "never" as the admin's intent too;
+ * for anon there is no deny at all, so "never" is the only signal there
+ * is. Read once per kind and cached - the setting is a host property.
+ */
+static int hg_thp_collapse_denied(int shared)
+{
+	static int cached[2] = { -1, -1 };
+	char buf[128];
+	FILE *f;
+
+	if (cached[!!shared] >= 0)
+		return cached[!!shared];
+	f = fopen(shared ?
+		"/sys/kernel/mm/transparent_hugepage/shmem_enabled" :
+		"/sys/kernel/mm/transparent_hugepage/enabled", "r");
+	if (!f || !fgets(buf, sizeof buf, f)) {
+		if (f)
+			fclose(f);
+		cached[!!shared] = 0;      /* cannot tell - keep old behavior */
+		return 0;
+	}
+	fclose(f);
+	cached[!!shared] = strstr(buf, "[never]") != NULL ||
+	                   strstr(buf, "[deny]") != NULL;
+	return cached[!!shared];
+}
+
 static long hg_read_huge_kb(int shared)
 {
 	return hg_meminfo_kb(shared ? "ShmemHugePages" : "AnonHugePages");
@@ -445,7 +478,7 @@ static void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 
 	if (hg_delta_is_huge(shmem_kb, hg_read_huge_kb(shared), asize)) {
 		*tier = HG_MEM_THP_ADVISE;
-	} else if (shmem_kb >= 0 &&
+	} else if (shmem_kb >= 0 && !hg_thp_collapse_denied(shared) &&
 	           madvise(base, asize, MADV_COLLAPSE) == 0 &&
 	           hg_read_huge_kb(shared) - shmem_kb >= (long)(asize / 1024)) {
 		*tier = HG_MEM_THP_COLLAPSE;
@@ -643,6 +676,7 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
 			return HG_MEM_THP_ADVISE;
 		HG_CP_TIME(HG_CP_COLLAPSE,
 			collapsed = shmem_kb >= 0 &&
+			    !hg_thp_collapse_denied(hb->shared) &&
 			    madvise(base, delta, MADV_COLLAPSE) == 0 &&
 			    hg_read_huge_kb(hb->shared) - shmem_kb >= (long)(delta / 1024));
 		if (collapsed)

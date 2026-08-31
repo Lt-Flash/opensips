@@ -180,6 +180,12 @@ int create_process_group(enum process_type type,
 	int h_size;
 	str type_s;
 
+	if (prof->mem_kb_units) {
+		LM_ERR("profile <%s> uses k/m/g size units - it sizes a memory "
+			"arena (shm/pkg_auto_scaling_profile), not a process "
+			"group\n", prof->name);
+		return -1;
+	}
 	if (prof->max_procs >= 1000) {
 		LM_ERR("profile <%s>: %u is not a plausible number of processes "
 			"(MB-scale targets belong to shm/pkg_auto_scaling_profile)\n",

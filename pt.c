@@ -675,14 +675,11 @@ int internal_fork(const struct internal_fork_params *ifpp)
 		 * very same shm cells. Left alone, every worker would hand out
 		 * the same cells to different callers.
 		 */
-		if (mem_allocator_shm == MM_HG_MALLOC ||
-		    mem_allocator_shm == MM_HG_MALLOC_DBG) {
-			hg_malloc_child_init((struct hg_block *)shm_block);
-#ifdef DBG_MALLOC
-			if (shm_dbg_block)
-				hg_malloc_child_init((struct hg_block *)shm_dbg_block);
-#endif
-		}
+		/* every SHARED arena, from the registry - shm and shm_dbg when
+		 * the shm allocator is HG, and module arenas under ANY -a (they
+		 * exist independently of the core allocator choice, which is
+		 * why this is no longer gated on mem_allocator_shm) */
+		hg_malloc_child_init_all();
 #endif /* HG_MALLOC */
 
 		/* set uid */

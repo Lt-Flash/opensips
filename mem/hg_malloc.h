@@ -908,6 +908,9 @@ int hg_autoscale_post_cfg(void);
  * inherited private free-stack/bump state must be discarded, not kept or
  * donated (ported from cachedb_perf's pcache_arena_child_init reasoning) */
 void hg_malloc_child_init(struct hg_block *hb);
+/* fork reset for every SHARED arena in the registry (core + module) -
+ * see the definition for why coverage, not per-arena logic, is the fix */
+void hg_malloc_child_init_all(void);
 
 /* sizes the DBG_MALLOC allocation-history pool (shm_hist / struct_hist),
  * same purpose and shape as fm_get_dbg_pool_size() - a HG_CELL_HDR-based

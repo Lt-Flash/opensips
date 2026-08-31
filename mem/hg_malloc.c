@@ -1184,6 +1184,33 @@ void hg_malloc_child_init(struct hg_block *hb)
 		hg_arena_child_init(hb);
 }
 
+/*
+ * Fork reset for EVERY shared arena this process can see - the core shm
+ * block, shm_dbg, and every module arena in the registry. The per-arena
+ * reasoning lives in hg_arena_child_init(); what this adds is coverage:
+ * the reset used to run for shm/shm_dbg only, so a module arena that saw
+ * pre-fork traffic (a cachedb_perf DB load in mod_init is enough - one
+ * refill batch leaves ~31 cells in the parent's private cache) handed
+ * every child an identical COW copy of the parent's cached cell list,
+ * and the children's later flushes pushed the same physical cells onto
+ * the shared pool repeatedly - measured live as a 4M-line
+ * "already has all N cells free" refusal storm. The module whose
+ * child-init taught the lesson was the one the wiring missed.
+ *
+ * Private (pkg) blocks are deliberately skipped: a child's COW copy of
+ * the pre-fork parent pkg arena is self-consistent private memory, and
+ * the child's own fresh pkg arena - created after this runs - must not
+ * have its slots cleared.
+ */
+void hg_malloc_child_init_all(void)
+{
+	int i;
+
+	for (i = 0; i < HG_ARENA_REG_MAX; i++)
+		if (hg_arena_reg[i].hb && hg_arena_reg[i].hb->shared)
+			hg_arena_child_init(hg_arena_reg[i].hb);
+}
+
 #ifdef SHM_EXTRA_STATS
 #include "module_info.h"
 unsigned long hg_stats_get_index(void *ptr)

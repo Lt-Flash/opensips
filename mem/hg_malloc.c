@@ -862,6 +862,20 @@ int hg_autoscale_post_cfg(void)
 		}
 	}
 
+	if (hg_shm_grow_granule && hg_shm && shm_block) {
+		struct hg_block *hb = (struct hg_block *)shm_block;
+
+		hg_lock_enter(hb, HG_LK_POLICY);
+		hb->grow_granule = hg_page_round(hg_shm_grow_granule, hb->hps);
+		hg_lock_leave(hb);
+		LM_NOTICE("shm grow granule set to %lu %s per step (config)\n",
+			HG_SZ_VAL(hb->grow_granule), HG_SZ_UNIT(hb->grow_granule));
+	}
+	if (hg_pkg_grow_granule && hg_pkg)
+		LM_NOTICE("pkg grow granule %lu %s per step will apply to every "
+			"worker arena (config)\n",
+			HG_SZ_VAL(hg_pkg_grow_granule), HG_SZ_UNIT(hg_pkg_grow_granule));
+
 	if (hg_pkg_profile_name) {
 		if (!hg_pkg) {
 			LM_WARN("pkg_auto_scaling_profile ignored: the pkg "
@@ -1050,6 +1064,15 @@ struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 	 * cap. Overridable by config later. */
 	hb->grow_granule = apage < HG_HPS ?
 		apage : HG_HPS_ROUND(16UL << 20);
+	/* config override (shm_grow_granule / pkg_grow_granule): rounded to
+	 * this arena's page, never below one page. The core shm arena exists
+	 * before the config - hg_autoscale_post_cfg() re-applies for it; the
+	 * per-child pkg arenas are created after and take it right here.
+	 * Module arenas keep the default (their own sizing surface). */
+	if (!shared && hg_pkg_grow_granule)
+		hb->grow_granule = hg_page_round(hg_pkg_grow_granule, apage);
+	else if (shared && !strcmp(name, "shm") && hg_shm_grow_granule)
+		hb->grow_granule = hg_page_round(hg_shm_grow_granule, apage);
 	/* the page unit this arena's whole grid runs on: the probed huge page
 	 * size, or the small-mode 64 KB page - hg_arena_init() lays out the
 	 * page grid from this, never re-probing */

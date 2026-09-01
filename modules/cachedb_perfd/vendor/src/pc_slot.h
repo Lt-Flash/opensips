@@ -1,5 +1,10 @@
-/* VENDORED from Lt-Flash/perfcached 7baf2d9 (src/pc_slot.h).
+/* VENDORED from Lt-Flash/perfcached a923c1b (src/pc_slot.h).
  * Do not edit here - run tools/sync-libperfd.sh. */
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Yury Kirsanov
+ * Part of libperfd - see lib/LICENSE.  This file must stay
+ * free of src/core includes; tools/sync-libperfd.sh exports
+ * exactly the MIT set to consumers. */
 /*
  * pc_slot.h — the key -> slot function, shared by the daemon and by
  * libperfd, header-only so the two CANNOT drift.

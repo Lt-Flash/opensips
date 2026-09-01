@@ -1,5 +1,10 @@
-/* VENDORED from Lt-Flash/perfcached 7baf2d9 (src/pc_noise.c).
+/* VENDORED from Lt-Flash/perfcached a923c1b (src/pc_noise.c).
  * Do not edit here - run tools/sync-libperfd.sh. */
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Yury Kirsanov
+ * Part of libperfd - see lib/LICENSE.  This file must stay
+ * free of src/core includes; tools/sync-libperfd.sh exports
+ * exactly the MIT set to consumers. */
 /*
  * pc_noise.c — Noise_NNpsk0_25519_ChaChaPoly_SHA256 over libsodium.
  * See pc_noise.h.  Follows the Noise spec rev 34: the 'e' token with a

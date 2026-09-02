@@ -144,6 +144,23 @@ void *fm_malloc(struct fm_block *fm, unsigned long size,
 			{
 				fm_remove_free(fm, n);
 				frag->size += n->size + FRAG_OVERHEAD;
+				/* The fragment AFTER the merged pair still holds a
+				 * back-pointer to n, which is no longer a header - it
+				 * now sits inside frag's payload.  fm_free() fixes
+				 * this after its own merges; defragmentation did not,
+				 * so a later free of that fragment read a stale pf,
+				 * treated garbage as ->prev, and faulted inside
+				 * fm_remove_free().  last_frag is a real header, so
+				 * this is safe for the final fragment too.
+				 *
+				 * Reproducing it needs a SUSPENDED transaction: a
+				 * synchronous route frees its cell inline, before the
+				 * layout can go wrong, so only a cell left to tm's
+				 * timer (async()) survives long enough for a merge to
+				 * strand the pointer.  A plain t_newtran()/t_reply()
+				 * route takes 47k allocation refusals without ever
+				 * faulting. */
+				FRAG_NEXT(frag)->pf = frag;
 
 				#if defined(DBG_MALLOC) || defined(STATISTICS)
 				//fm->real_used -= FRAG_OVERHEAD;

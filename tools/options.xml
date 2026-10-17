@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<scenario name="OPTIONS ping">
+  <send>
+    <![CDATA[
+
+      OPTIONS sip:ping@example.com SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:bench@example.com>;tag=[call_number]
+      To: <sip:ping@example.com>
+      Call-ID: [call_id]
+      CSeq: 1 OPTIONS
+      Contact: sip:sipp@[local_ip]:[local_port]
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+  <recv response="200" rtd="1">
+  </recv>
+  <ResponseTimeRepartition value="1, 2, 3, 5, 10, 20, 50, 100"/>
+</scenario>

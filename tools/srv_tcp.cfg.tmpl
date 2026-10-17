@@ -1,0 +1,24 @@
+log_level=2
+stderror_enabled=no
+syslog_enabled=yes
+syslog_facility=LOG_LOCAL0
+udp_workers=2
+tcp_workers=4
+socket=udp:__IP__:5060
+socket=tcp:__IP__:5060
+mpath="__MPATH__"
+__EXTRA__
+loadmodule "mi_fifo.so"
+modparam("mi_fifo", "fifo_name", "/tmp/opensips_fifo")
+modparam("mi_fifo", "fifo_mode", 0666)
+loadmodule "proto_udp.so"
+loadmodule "proto_tcp.so"
+loadmodule "sl.so"
+loadmodule "sipmsgops.so"
+route {
+	if (is_method("OPTIONS")) {
+		sl_send_reply(200, "OK");
+		exit;
+	}
+	exit;
+}

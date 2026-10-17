@@ -1,0 +1,30 @@
+log_level=3
+stderror_enabled=no
+syslog_enabled=yes
+syslog_facility=LOG_LOCAL0
+auto_scaling_profile = PROFILE_UDP
+	scale up to 6 on 3% for 2 cycles within 3
+	scale down to 2 on 1% for 4 cycles
+auto_scaling_profile = PROFILE_TCP
+	scale up to 4 on 30% for 2 cycles within 3
+	scale down to 2 on 1% for 4 cycles
+udp_workers=2 use_auto_scaling_profile PROFILE_UDP
+tcp_workers=2 use_auto_scaling_profile PROFILE_TCP
+socket=udp:__IP__:5060
+socket=tcp:__IP__:5060
+mpath="__MPATH__"
+__EXTRA__
+loadmodule "mi_fifo.so"
+modparam("mi_fifo", "fifo_name", "/tmp/opensips_fifo")
+modparam("mi_fifo", "fifo_mode", 0666)
+loadmodule "proto_udp.so"
+loadmodule "proto_tcp.so"
+loadmodule "sl.so"
+loadmodule "sipmsgops.so"
+route {
+	if (is_method("OPTIONS")) {
+		sl_send_reply(200, "OK");
+		exit;
+	}
+	exit;
+}

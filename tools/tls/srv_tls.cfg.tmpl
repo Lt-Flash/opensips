@@ -1,0 +1,64 @@
+log_level=1
+stderror_enabled=yes
+syslog_enabled=no
+udp_workers=8
+tcp_workers=8
+socket=udp:__IP__:5060
+socket=tls:__IP__:5061
+socket=wss:__IP__:7443
+mpath="__MPATH__"
+__EXTRA__
+loadmodule "proto_udp.so"
+loadmodule "tls_mgm.so"
+loadmodule "tls_openssl.so"
+loadmodule "proto_tls.so"
+loadmodule "proto_wss.so"
+# TLS/WSS tuning as on the staging SBCs (131-133)
+modparam("proto_tls", "tls_max_msg_chunks", 32)
+modparam("proto_tls", "tls_handshake_timeout", 1500)
+modparam("proto_tls", "tls_send_timeout", 1500)
+modparam("proto_wss", "wss_max_msg_chunks", 32)
+modparam("proto_wss", "wss_handshake_timeout", 1500)
+modparam("proto_wss", "wss_tls_handshake_timeout", 1500)
+modparam("proto_wss", "wss_send_timeout", 1500)
+modparam("tls_mgm", "server_domain", "srv")
+modparam("tls_mgm", "match_ip_address", "[srv]*")
+modparam("tls_mgm", "match_sip_domain", "[srv]*")
+modparam("tls_mgm", "certificate", "[srv]/tmp/udpbal/certs/cert.pem")
+modparam("tls_mgm", "private_key", "[srv]/tmp/udpbal/certs/key.pem")
+modparam("tls_mgm", "verify_cert", "[srv]0")
+modparam("tls_mgm", "require_cert", "[srv]0")
+modparam("tls_mgm", "tls_method", "[srv]TLSv1_2-TLSv1_3")
+loadmodule "tm.so"
+loadmodule "sl.so"
+loadmodule "rr.so"
+loadmodule "maxfwd.so"
+loadmodule "sipmsgops.so"
+loadmodule "mi_fifo.so"
+modparam("mi_fifo", "fifo_name", "/tmp/opensips_fifo")
+modparam("mi_fifo", "fifo_mode", 0666)
+route {
+	if (!mf_process_maxfwd_header(10)) {
+		sl_send_reply(483, "Too Many Hops");
+		exit;
+	}
+	if (has_totag()) {
+		if (loose_route() || is_method("ACK|BYE")) {
+			t_relay();
+			exit;
+		}
+		sl_send_reply(404, "Not here");
+		exit;
+	}
+	if (is_method("CANCEL")) {
+		if (t_check_trans())
+			t_relay();
+		exit;
+	}
+	t_check_trans();
+	if (is_method("INVITE"))
+		record_route();
+	if (!t_relay())
+		sl_reply_error();
+	exit;
+}

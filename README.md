@@ -199,6 +199,116 @@ syscall dominates, not absolute context-switch rates (the ladder cells are the r
 those). The completed rate is successful calls divided by 30 s; a datagram-based rate inflates near
 overload because of retransmissions and was not used for the verdicts.
 
+### 4.7 Call-rate capacity over TLS and WSS
+
+**Question:** the same as 4.6, with the calls arriving over TLS or secure WebSocket, where the
+receive mode in use is `tcp_dispatch_mode` (one shared socketpair versus one per TCP worker)
+rather than the UDP sockets.
+
+**Setup.** Same server, build, proxy script and allocator settings as in 4.6, with
+`udp_workers=8`, `tcp_workers=8` and listeners `tls:5061` and `wss:7443`
+(`tools/tls/srv_tls.cfg.tmpl`). sipp cannot drive TLS or WSS at these rates, so every client host
+runs a local OpenSIPS gateway (`tools/tls/gw.cfg.tmpl`, HG_MALLOC): the eight sipp UACs on the
+host send UDP to eight gateway sockets, and each gateway socket relays over its own TLS (or WSS)
+connection to the server. The server relays the call to the UAS over UDP, so every call puts
+three requests and four replies through the server's TLS or WSS connections. Each client host
+therefore holds 8 long-lived TLS or WSS connections, 24 in all: few connections, many calls on
+each.
+
+Two sets of `proto_tls` / `proto_wss` settings were used, on both ends:
+
+* **defaults**, for the first two TLS runs;
+* **the settings of our staging SBCs**, for everything else:
+  `tls_max_msg_chunks` / `wss_max_msg_chunks` 32, handshake and send timeouts 1,500 ms, TLS 1.2
+  to 1.3. The gateways also need `tls_async_max_postponed_chunks` 1024, or their own write queue
+  overflows first.
+
+WSS did not connect at all with the default `wss_max_msg_chunks` (4): an OpenSIPS WSS client
+writes its upgrade request as 16 TLS records, one per iovec element, and the server gives up
+after 4 read attempts. All WSS results are therefore with the staging settings.
+
+**Method.** As in 4.6 (30-second cells, interleaved modes, two repetitions at the rates that held,
+mode verified on the live server in every cell), starting at 10,000 calls/s and stepping down
+through 8,000, 6,000 and 5,000. The UDP receive mode stays `auto` on the server in every cell;
+only `tcp_dispatch_mode` changes: `shared` (one socketpair for all TCP workers, as before),
+`auto` (one socketpair per TCP worker) and `exclusive` (the one shared socketpair, with every TCP
+worker registered on it with `EPOLLEXCLUSIVE`). Each cell checked the socketpair count and the
+eight exclusive registrations on the live server.
+
+**Highest sustained rate (calls/s):**
+
+| transport, settings | allocator | shared (before) | auto = per-worker | exclusive |
+|---|---|---|---|---|
+| TLS, defaults | F_MALLOC | 6,000 | 6,000 | 6,000 |
+| TLS, defaults | HG_MALLOC | 6,000 | **8,000** | 6,000 |
+| TLS, staging | HG_MALLOC | 6,000 | 6,000 (8,000 failed once, held once) | 6,000 |
+| WSS, staging | F_MALLOC | 6,000 | 5,000 | 6,000 (failed at 5,000 once) |
+| WSS, staging | HG_MALLOC | 5,000 | 5,000 (6,000 held in 3 of 5 cells) | 5,000 |
+
+The steps are 2,000 calls/s apart above 6,000, so these figures are coarse. Three of them sit on
+an edge: TLS staging `auto` failed at 8,000 in the ladder and held in a later cell with the same
+build, WSS HG_MALLOC `auto` held 6,000 in 3 of 5 cells, and WSS F_MALLOC `exclusive` held 6,000
+twice but failed at 5,000. Within this resolution the dispatch mode does not move the ceiling.
+
+**Cost per call at a rate every mode holds:**
+
+| | shared (before) | auto = per-worker | exclusive |
+|---|---|---|---|
+| TLS F_MALLOC, 6,000/s: CPU % per 1,000 calls/s | 128.9 | 119.3 (-7%) | 113.6 (-12%) |
+| TLS F_MALLOC, 6,000/s: context switches per call | 28.6 | 22.4 (-22%) | 21.5 (-25%) |
+| TLS HG_MALLOC, 6,000/s: CPU % per 1,000 calls/s | 116.1 | 106.0 (-9%) | 103.5 (-11%) |
+| TLS HG_MALLOC, 6,000/s: context switches per call | 28.7 | 21.0 (-27%) | 21.1 (-27%) |
+| TLS HG_MALLOC, 6,000/s: TCP main CPU % | 358 | 333 (-7%) | 336 (-6%) |
+| WSS F_MALLOC, 5,000/s: CPU % per 1,000 calls/s | 160.6 | 149.2 (-7%) | (cell failed) |
+| WSS F_MALLOC, 5,000/s: context switches per call | 36.4 | 29.0 (-20%) | (cell failed) |
+| WSS HG_MALLOC, 5,000/s: CPU % per 1,000 calls/s | 149.4 | 137.3 (-8%) | 130.8 (-12%) |
+| WSS HG_MALLOC, 5,000/s: context switches per call | 36.1 | 28.5 (-21%) | 27.8 (-23%) |
+| WSS HG_MALLOC, 5,000/s: TCP main CPU % | 446 | 424 (-5%) | 404 (-9%) |
+| all rows above: empty reads (`EAGAIN`) per call | 1.2-1.4 | 0 | 0.19-0.24 |
+| all rows above: TCP worker CPU spread, coefficient of variation | 24-29% | 0-1% | 62-74% |
+
+The `exclusive` ranges leave out the failed WSS F_MALLOC cell. The TLS rows are from the runs with default settings; with the staging settings the HG_MALLOC
+TLS figures are within 3% of these. The WSS HG_MALLOC figures for `shared` and `auto` come from
+one repetition each, because the `/proc` sampler returned nothing in the other.
+
+**What limits TLS and WSS.**
+
+* TCP main, not the workers. TCP main (with its I/O threads) runs at 3.3-5.1 CPUs at these rates,
+  while each TCP worker stays at 3-57% of one CPU. Above the TLS ceiling there are no dispatch
+  drops at all; instead the server's log fills with `no TLS client domain found` from TCP main.
+  TCP main is trying to open new outgoing TLS connections, which means replies to the client
+  gateways no longer found the connections their requests came in on. In the one failed WSS
+  cell whose full server log was kept (6,000/s), the sequence starts with the gateways resetting
+  their connections (64 `Connection reset by peer`, 75 failed writes), followed by 26,624 replies
+  that found no connection. Whether a gateway gave up because it was itself overloaded or because
+  the server read too slowly (the gateways' send timeout is 1,500 ms) was not established; the
+  gateways' logs were not kept.
+* WSS additionally overflows the hand-off from TCP main to the workers (`failed to dispatch TCP
+  message to worker socket: Resource temporarily unavailable`). The hand-off is an AF_UNIX
+  datagram socket whose queue is capped by `net.unix.max_dgram_qlen` (512 here), and a message
+  that finds it full is dropped. With the one shared queue this already happens in cells that
+  still hold: 243-1,400 dropped messages per cell in `shared` and `exclusive` at 6,000/s with
+  F_MALLOC, 54 in one `exclusive` cell at 5,000/s with HG_MALLOC (the clients' retransmissions
+  recover them). `auto` dropped nothing in any cell that held. One of its two failed cells at
+  6,000/s (HG_MALLOC) dropped 8,659 messages on individual workers' queues, the other none, and
+  above 6,000 every mode drops tens of thousands.
+
+**Reading.** Over TLS and WSS the dispatch mode changes the cost, not the ceiling. One socketpair
+per TCP worker (`auto`) removes the empty reads, cuts context switches per call by 20-27% and CPU
+per call by 7-9%, spreads the work evenly over the TCP workers, and is the only mode that
+dropped no WSS messages below its ceiling. Some of the saving is in TCP main itself (5-7%),
+consistent with the sender paying for waking every idle worker on the shared socketpair.
+`exclusive` costs as little or less (11-12% below `shared`) but loads the workers in a fixed
+order (one worker at 50%, the last at 3%) and still drops WSS messages from its one queue. The
+ceiling is set by TCP main and, for WSS, by the dispatch queue. HG_MALLOC lowers the cost per
+call here too (section 6) without raising the ceiling, apart from the one TLS `auto` result at
+8,000.
+
+**Caveats.** As in 4.6, plus: the client side is itself OpenSIPS, so a gateway limit can look like
+a server limit. The gateways' busiest process used 1.5-1.8 CPUs, but their logs were not
+collected. Connections are few and long-lived, so TLS handshake cost is
+not measured. Driver and analysis: `tools/tls/`.
+
 ## 5. Trade-off
 
 Per-worker queues are not work-conserving: a worker blocked in a slow synchronous step keeps its
@@ -206,3 +316,69 @@ Per-worker queues are not work-conserving: a worker blocked in a slow synchronou
 worker take them. `udp_rx_mode = shared` keeps the old behaviour; `exclusive` (6.0+ kernels)
 removes the herd while keeping the shared queue, at the price of a first-idle-in-fixed-order
 distribution.
+
+## 6. HG_MALLOC vs F_MALLOC (data for the HG_MALLOC pull request, #4327)
+
+Every allocator comparison made while measuring the receive modes, gathered in one place. Same
+server (KVM guest, 16 vCPU Xeon E5-2699 v4, Debian 13, Linux 6.12), same build (the 4.1 tree that
+carries #4327, plus this patch), same proxy script and load as in 4.6/4.7, so the allocator is the
+only difference between the arms. HG_MALLOC ran as `-a HG_MALLOC -m 512:4096 -M 64:512` with
+`ulimit -l unlimited`; the host has no hugetlb pool, so HG used its transparent-huge-page tier
+(about 940 MB of THP in use under load). F_MALLOC ran as `-a F_MALLOC -m 2048 -M 32`.
+
+**Highest sustained calls/s (stateful proxy, 8 workers per transport):**
+
+| transport (receive buffers / tuning) | allocator | shared | auto | exclusive |
+|---|---|---|---|---|
+| UDP, default buffers | F_MALLOC | 10,000 | 10,000 | 10,000 |
+| UDP, default buffers | HG_MALLOC | **20,000** | **22,000** | **18,000** |
+| UDP, 4 MB buffers | F_MALLOC | 10,000 | 13,000 | 12,000 |
+| TLS, default proto_tls settings | F_MALLOC | 6,000 | 6,000 | 6,000 |
+| TLS, default proto_tls settings | HG_MALLOC | 6,000 | 8,000 | 6,000 |
+| TLS, staging tuning (see 4.7) | HG_MALLOC | 6,000 | 6,000 | 6,000 |
+| WSS, staging tuning | F_MALLOC | 6,000 | 5,000 | 6,000 (failed once at 5,000) |
+| WSS, staging tuning | HG_MALLOC | 5,000 | 5,000 | 5,000 |
+
+**Same offered rate, F_MALLOC -> HG_MALLOC:**
+
+| | shared | auto | exclusive |
+|---|---|---|---|
+| UDP 12,000/s: failed calls (2 x 30 s) | 4,116 -> 0 | 1,238 -> 0 | 4,990 -> 0 |
+| UDP 12,000/s: UDP receive-buffer drops | 56,100 -> 7,351 | 43,041 -> 9,856 | 76,754 -> 6,486 |
+| UDP 12,000/s: CPU % per 1,000 calls/s | 48.2 -> 36.2 (-25%) | 44.1 -> 29.9 (-32%) | 47.4 -> 32.7 (-31%) |
+| UDP 12,000/s: syscalls per call | 92.3 -> 29.0 (-69%) | 76.2 -> 23.4 (-69%) | 97.6 -> 27.1 (-72%) |
+| TLS 6,000/s: CPU % per 1,000 calls/s | 128.9 -> 116.1 (-10%) | 119.3 -> 106.0 (-11%) | 113.6 -> 103.5 (-9%) |
+| TLS 6,000/s: syscalls per call | 119.0 -> 99.3 (-17%) | 123.9 -> 98.9 (-20%) | 117.8 -> 101.4 (-14%) |
+| TLS 6,000/s: `sched_yield` per call | 29.7 -> 9.5 (-68%) | 36.7 -> 11.2 (-69%) | 30.1 -> 13.7 (-54%) |
+| WSS 5,000/s: CPU % per 1,000 calls/s | 160.6 -> 149.4 (-7%) | 149.2 -> 137.3 (-8%) | n/a (F_MALLOC cell failed) |
+| WSS 5,000/s: syscalls per call | 152.8 -> 137.5 (-10%) | 158.5 -> 139.1 (-12%) | n/a |
+| WSS 5,000/s: `sched_yield` per call | 23.0 -> 9.4 (-59%) | 30.7 -> 11.0 (-64%) | n/a |
+
+The UDP rows compare F_MALLOC already past its limit with HG_MALLOC still holding at the same
+rate. In the TLS rows (both with default `proto_tls` settings) and the WSS rows both allocators
+hold, except WSS `exclusive`: its F_MALLOC cell at 5,000/s failed although it held 6,000 twice,
+so there is no valid pair for it. Context switches per call are left out of the UDP rows on
+purpose: overloaded F_MALLOC workers stop sleeping, which makes that count look lower.
+
+**Why.** A per-syscall count of the OpenSIPS processes (every syscall tracepoint, separate cells)
+shows where F_MALLOC's extra syscalls come from: `sched_yield`, 45 / 43 / 70 per call
+(shared / auto / exclusive) out of 65 / 62 / 89 in total at 10,000 UDP calls/s - the shared-memory
+lock's adaptive wait yielding under contention. With HG_MALLOC it is 6.8 / 5.1 / 5.9 per call out
+of 26 / 24 / 25 at 14,000 calls/s. With F_MALLOC the syscalls per call also grow with load
+(57 -> 80 -> 92 for `shared` at 5,000 -> 10,000 -> 12,000 calls/s); with HG_MALLOC they stay flat
+(28-30 from 12,000 to 20,000). The lock-free fast path removes the contention, the workers drain
+their sockets faster, and the same default receive buffer stops overflowing - hence the doubled UDP
+ceiling. TLS and WSS add the TCP I/O threads to the contending set, so the `sched_yield` saving is
+just as large there (54-69%). Their ceilings are set elsewhere, though: by TCP main and, for WSS,
+by the dispatch queue between TCP main and the workers (see 4.7). So HG_MALLOC lowers the cost per
+call there without raising the ceiling, apart from TLS `auto`, which held 8,000 calls/s only with
+HG_MALLOC.
+
+**Observation to look at.** The one server log read in full (a TLS cell at 8,000 calls/s,
+HG_MALLOC) contained one HG warning: `hg_lock_stall_note: shm arena lock held for 1014 us by the
+refill path (threshold hg_lock_stall_us=1000; 1 stalls so far, worst 1014 us by refill in
+process 22)`. The other cells' logs were only summarised for errors, so how often this occurs is
+not known.
+
+The drivers are in `tools/cps/` (UDP) and `tools/tls/` (TLS/WSS); per-cell raw data (sipp
+screens, `perf stat` counters, `/proc` samples) is kept with the author.

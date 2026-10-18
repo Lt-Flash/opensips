@@ -1,0 +1,77 @@
+# client-side gateway: sipp UDP on 5080+i  ->  __PROTO__ connection i to the server (8 connections per gateway)
+log_level=1
+stderror_enabled=no
+syslog_enabled=yes
+syslog_facility=LOG_LOCAL0
+udp_workers=8
+tcp_workers=8
+socket=udp:__IP__:5080
+socket=udp:__IP__:5081
+socket=udp:__IP__:5082
+socket=udp:__IP__:5083
+socket=udp:__IP__:5084
+socket=udp:__IP__:5085
+socket=udp:__IP__:5086
+socket=udp:__IP__:5087
+socket=tls:__IP__:5100
+socket=tls:__IP__:5101
+socket=tls:__IP__:5102
+socket=tls:__IP__:5103
+socket=tls:__IP__:5104
+socket=tls:__IP__:5105
+socket=tls:__IP__:5106
+socket=tls:__IP__:5107
+socket=wss:__IP__:7100
+socket=wss:__IP__:7101
+socket=wss:__IP__:7102
+socket=wss:__IP__:7103
+socket=wss:__IP__:7104
+socket=wss:__IP__:7105
+socket=wss:__IP__:7106
+socket=wss:__IP__:7107
+mpath="__MPATH__"
+loadmodule "proto_udp.so"
+loadmodule "tls_mgm.so"
+loadmodule "tls_openssl.so"
+loadmodule "proto_tls.so"
+loadmodule "proto_wss.so"
+modparam("proto_tls", "tls_async_max_postponed_chunks", 1024)
+# TLS/WSS tuning as on the staging SBCs (131-133)
+modparam("proto_tls", "tls_max_msg_chunks", 32)
+modparam("proto_tls", "tls_handshake_timeout", 1500)
+modparam("proto_tls", "tls_send_timeout", 1500)
+modparam("proto_wss", "wss_max_msg_chunks", 32)
+modparam("proto_wss", "wss_handshake_timeout", 1500)
+modparam("proto_wss", "wss_tls_handshake_timeout", 1500)
+modparam("proto_wss", "wss_send_timeout", 1500)
+modparam("tls_mgm", "server_domain", "gwsrv")
+modparam("tls_mgm", "match_ip_address", "[gwsrv]*")
+modparam("tls_mgm", "match_sip_domain", "[gwsrv]*")
+modparam("tls_mgm", "certificate", "[gwsrv]/tmp/udpbal/certs/cert.pem")
+modparam("tls_mgm", "private_key", "[gwsrv]/tmp/udpbal/certs/key.pem")
+modparam("tls_mgm", "client_domain", "gwcli")
+modparam("tls_mgm", "match_ip_address", "[gwcli]*")
+modparam("tls_mgm", "match_sip_domain", "[gwcli]*")
+modparam("tls_mgm", "certificate", "[gwcli]/tmp/udpbal/certs/cert.pem")
+modparam("tls_mgm", "private_key", "[gwcli]/tmp/udpbal/certs/key.pem")
+modparam("tls_mgm", "verify_cert", "[gwcli]0")
+modparam("tls_mgm", "require_cert", "[gwcli]0")
+modparam("tls_mgm", "tls_method", "[gwcli]TLSv1_2-TLSv1_3")
+route {
+	if ($socket_in(port) < 5080 || $socket_in(port) > 5087) {
+		exit;
+	}
+	$var(i) = $socket_in(port) - 5080;
+	$var(proto) = "__PROTO__";
+	if ($var(proto) == "wss") {
+		$var(p) = 7100 + $var(i);
+		$socket_out = "wss:__IP__:" + $var(p);
+		$du = "sip:__SRV__:7443;transport=wss";
+	} else {
+		$var(p) = 5100 + $var(i);
+		$socket_out = "tls:__IP__:" + $var(p);
+		$du = "sip:__SRV__:5061;transport=tls";
+	}
+	forward();
+	exit;
+}

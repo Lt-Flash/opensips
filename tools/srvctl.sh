@@ -10,7 +10,14 @@ t = open('/tmp/udpbal/' + __import__('os').environ.get('TMPL', 'srv.cfg.tmpl')).
 print(t.replace('__IP__', ip).replace('__MPATH__', mpath).replace('__EXTRA__', extra.replace(';', '\n')))
 PY
   $PREFIX/sbin/opensips -C -f $CFG >/dev/null 2>$RUN/check.err || { echo "CFG CHECK FAILED"; cat $RUN/check.err; exit 1; }
-  ulimit -n 65536; [ "${ALLOC:-F_MALLOC}" = HG_MALLOC ] && ulimit -l unlimited; $PREFIX/sbin/opensips -f $CFG -P $PID ${MEM:--m 64 -M 8} -a ${ALLOC:-F_MALLOC} ${OPTS:-} 2>$RUN/start.err || { echo "START FAILED"; cat $RUN/start.err; exit 1; }
+  ulimit -n 65536; [ "${ALLOC:-F_MALLOC}" = HG_MALLOC ] && ulimit -l unlimited
+  if [ -n "${LOGFG:-}" ]; then
+    # foreground with stderr to a file (hosts where syslog is not stored)
+    setsid $PREFIX/sbin/opensips -F -f $CFG -P $PID ${MEM:--m 64 -M 8} -a ${ALLOC:-F_MALLOC} ${OPTS:-} > $RUN/opensips.log 2>&1 < /dev/null &
+    echo $! > $PID.fg; sleep 1; [ -s $PID ] || cp $PID.fg $PID
+  else
+    $PREFIX/sbin/opensips -f $CFG -P $PID ${MEM:--m 64 -M 8} -a ${ALLOC:-F_MALLOC} ${OPTS:-} 2>$RUN/start.err || { echo "START FAILED"; cat $RUN/start.err; exit 1; }
+  fi
   for i in $(seq 1 50); do sleep 0.2; ss -ulnp 2>/dev/null | grep -q ":5060 " && break; done
   sleep 1
   echo "STARTED pid=$(cat $PID) procs=$(pgrep -x opensips | wc -l) udpsocks=$(ss -uln | grep -c ':5060 ') rev=$($PREFIX/sbin/opensips -V 2>&1 | grep -i -m1 'git revision')"

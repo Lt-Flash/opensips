@@ -169,7 +169,7 @@ within the cell with at most 0.1% failed calls. Driver and analysis: `tools/cps/
 **What limits each configuration.**
 
 * F_MALLOC with the default buffer: UDP receive-buffer overflow rather than CPU. At 12,000/s the
-  workers ran at 63-78% while the kernel dropped tens of thousands of datagrams per 15-second
+  workers ran at 63-84% while the kernel dropped tens of thousands of datagrams per 15-second
   window, and the dropped datagrams are the failed calls. `auto` failed the fewest calls (0.17% versus
   0.57-0.69%), but no mode held 12,000.
 * With 4 MB buffers the modes separate: `auto` holds 13,000/s (37 failed calls out of 780,000),

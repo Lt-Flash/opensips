@@ -1,7 +1,7 @@
 # tcpab_srv.sh <MODE> <CELL> <OUT>  - on 225: start server in MODE, sample 10 s (roles via fifo), strace -c TCP main 8 s, stop
 set -u
 MODE=$1 CELL=$2 OUT=$3; mkdir -p $OUT
-ACTION=start TMPL=srv_tcp.cfg.tmpl PREFIX=/opt/opensips-udpbal IP=10.22.20.225 EXTRA="tcp_dispatch_mode=\"$MODE\"" bash /tmp/udpbal/srvctl.sh | grep -E 'STARTED|FAILED'
+ACTION=start TMPL=srv_tcp.cfg.tmpl PREFIX=/opt/opensips-udpbal IP=192.0.2.11 EXTRA="tcp_dispatch_mode=\"$MODE\"" bash /tmp/udpbal/srvctl.sh | grep -E 'STARTED|FAILED'
 sleep 7
 FIFO=/tmp/opensips_fifo python3 -u /tmp/udpbal/probe4.py 10 > $OUT/probe.txt 2>&1
 TM=$(FIFO=/tmp/opensips_fifo python3 - <<'PY'

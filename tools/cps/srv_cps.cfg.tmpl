@@ -1,0 +1,42 @@
+log_level=1
+stderror_enabled=no
+syslog_enabled=yes
+syslog_facility=LOG_LOCAL0
+udp_workers=8
+socket=udp:__IP__:5060
+mpath="__MPATH__"
+__EXTRA__
+loadmodule "proto_udp.so"
+loadmodule "tm.so"
+loadmodule "sl.so"
+loadmodule "rr.so"
+loadmodule "maxfwd.so"
+loadmodule "sipmsgops.so"
+loadmodule "mi_fifo.so"
+modparam("mi_fifo", "fifo_name", "/tmp/opensips_fifo")
+modparam("mi_fifo", "fifo_mode", 0666)
+route {
+	if (!mf_process_maxfwd_header(10)) {
+		sl_send_reply(483, "Too Many Hops");
+		exit;
+	}
+	if (has_totag()) {
+		if (loose_route() || is_method("ACK|BYE")) {
+			t_relay();
+			exit;
+		}
+		sl_send_reply(404, "Not here");
+		exit;
+	}
+	if (is_method("CANCEL")) {
+		if (t_check_trans())
+			t_relay();
+		exit;
+	}
+	t_check_trans();
+	if (is_method("INVITE"))
+		record_route();
+	if (!t_relay())
+		sl_reply_error();
+	exit;
+}

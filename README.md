@@ -2,7 +2,9 @@
 
 Companion to the OpenSIPS pull request "core: udp_rx_mode / tcp_dispatch_mode - one wakeup per
 packet instead of a thundering herd". Everything here was measured in October 2026 on
-OpenSIPS 4.1.0-dev (master ee74a3123e plus the patch); the tools are in `tools/`.
+OpenSIPS 4.1.0-dev builds of this patch on a 4.1 tree that merges upstream master ee74a3123e with
+other work in progress (notably the HG_MALLOC allocator of #4327); on Linux the receive-path code
+under test is the same as in the pull request. The tools are in `tools/`.
 
 ## 1. What was observed in production
 
@@ -120,6 +122,82 @@ socket (epoll target fd -> distinct UDP inodes), ripped back to 2 when idle; aft
 of 32 x 50 datagrams got 1600/1600 replies and all six socket queues were empty (no stranded
 datagrams). Static and dynamic workers share evenly (4.0-5.2% each, 275-285 wakeups/s each at
 8000/s). Q_MALLOC_DBG, HP_MALLOC_DBG and F_MALLOC_DBG start and serve with the per-worker sockets.
+
+### 4.6 Call-rate capacity (CPS) through a stateful proxy
+
+**Question:** how many calls per second does OpenSIPS sustain in each mode, and do the saved
+context switches and syscalls turn into capacity?
+
+**Setup.** Server: KVM guest, 16 vCPU (Xeon E5-2699 v4), Debian 13, Linux 6.12 (so `exclusive` is
+genuinely available). OpenSIPS 4.1 with this patch, built from a 4.1 tree that also carries the
+HG_MALLOC allocator proposed in #4327 (not in master), as a stateful record-routing proxy (`tm`,
+`rr`, `t_relay()` for every request; `tools/cps/srv_cps.cfg.tmpl`), 8 UDP workers, `log_level=1`.
+Each call is INVITE / 100 / 180 / 200 / ACK / BYE / 200 through the proxy: 6 datagrams in and 7
+out per call. Load: sipp on three hosts, four UAC/UAS pairs each; every UAC calls its own host's
+UAS through the proxy (`-rsa`), with 100 ms between ACK and BYE (`tools/cps/uac_rr.xml`). Late
+180s and late ACKs are ignored (`-default_behaviors all,-abortunexp`), because a multi-worker
+proxy may legally forward back-to-back messages out of order. Client sipp CPU stayed below 40%.
+
+**Method.** 30-second cells; at each rate the three modes are interleaved, ABC then CBA (two
+repetitions), with a server restart per cell, and the mode is verified on the live server in every
+cell (sockets on the port, `EPOLLEXCLUSIVE` registrations, socket buffer sizes, allocator).
+A 15-second window in the middle of each cell records per-process CPU and wakeups from `/proc`,
+and `perf stat` on all OpenSIPS tasks (context switches, all syscalls, `recvfrom` returning
+`EAGAIN`). A rate **holds** when both repetitions complete at least 98% of the offered calls
+within the cell with at most 0.1% failed calls. Driver and analysis: `tools/cps/`.
+
+**Highest sustained rate (calls/s):**
+
+| configuration | shared (before) | auto = reuseport | exclusive |
+|---|---|---|---|
+| F_MALLOC (`-m 2048 -M 32`), default `maxbuffer` (256 KB) | 10,000 | 10,000 | 10,000 |
+| F_MALLOC, `maxbuffer` 4 MB (8 MB socket buffers) | 10,000 | **13,000 (+30%)** | 12,000 (+20%) |
+| HG_MALLOC (`-m 512:4096 -M 64:512`, transparent huge pages), default `maxbuffer` | 20,000 | **22,000 (+10%)** | 18,000 (-10%) |
+
+**Cost per call at a rate every mode holds:**
+
+| | shared (before) | auto = reuseport | exclusive |
+|---|---|---|---|
+| HG_MALLOC, 14,000/s: CPU % per 1,000 calls/s | 34.4 | 30.3 (-12%) | 31.8 (-8%) |
+| HG_MALLOC, 14,000/s: context switches per call | 5.54 | 1.86 (-66%) | 2.46 (-56%) |
+| HG_MALLOC, 14,000/s: syscalls per call | 28.4 | 24.1 (-15%) | 25.9 (-9%) |
+| HG_MALLOC, 14,000/s: `recvfrom` returning `EAGAIN`, per call | 0.94 | 0 | 0.34 |
+| F_MALLOC, 10,000/s: CPU % per 1,000 calls/s | 49.3 | 45.1 (-9%) | 46.1 (-6%) |
+| F_MALLOC, 10,000/s: context switches per call | 6.50 | 1.97 (-70%) | 2.83 (-56%) |
+| F_MALLOC, 10,000/s: syscalls per call | 79.7 | 64.4 (-19%) | 79.7 (0%) |
+
+**What limits each configuration.**
+
+* F_MALLOC with the default buffer: UDP receive-buffer overflow rather than CPU. At 12,000/s the
+  workers ran at 63-78% while the kernel dropped tens of thousands of datagrams per 15-second
+  window, and the dropped datagrams are the failed calls. `auto` failed the fewest calls (0.17% versus
+  0.57-0.69%), but no mode held 12,000.
+* With 4 MB buffers the modes separate: `auto` holds 13,000/s (37 failed calls out of 780,000),
+  `shared` already misses at 12,000 (0.20% failed) and `exclusive` at 13,000 (1.1%). At 14,000/s
+  every mode is CPU-bound: context switches per call fall to almost zero because the workers never
+  sleep.
+* Under F_MALLOC most syscalls are `sched_yield` from contention on the shared-memory lock (a
+  per-syscall count at 10,000/s: 45 per call in `shared`, 43 in `auto`, 70 in `exclusive`, out of
+  62-89 in total). HG_MALLOC's lock-free fast path brings that down to 5-7 per call, which is why it
+  doubles capacity and also drains the default buffer fast enough.
+* `exclusive` hands work to the first idle workers in a fixed order (per-worker CPU spread with a
+  coefficient of variation of 11-22% versus 2-5% for `auto`), so its busiest workers contend more
+  (+53% `sched_yield` under F_MALLOC) and it saturates first under HG_MALLOC.
+
+**Reading.** Fewer context switches and syscalls do turn into capacity: `auto` (one SO_REUSEPORT
+socket per worker) sustains the most calls per second in every configuration tested, +30% over
+`shared` with F_MALLOC and large buffers and +10% with HG_MALLOC, and it costs 9-17% less CPU per
+call wherever all modes hold. `exclusive` saves wakeups but loses capacity to its uneven
+distribution. The allocator matters more than the receive mode: HG_MALLOC alone takes `shared` from
+10,000 to 20,000 calls/s on the same server.
+
+**Caveats.** One server class with a single virtio NIC, and 30-second cells, so this measures
+sustained short-run capacity, not an hours-long soak. Rates were stepped 1,000-2,000 calls/s apart,
+so each figure means "holds here, fails at the next step". The per-syscall counts come from
+separate cells with every syscall tracepoint enabled, which slows the workers; they show which
+syscall dominates, not absolute context-switch rates (the ladder cells are the reference for
+those). The completed rate is successful calls divided by 30 s; a datagram-based rate inflates near
+overload because of retransmissions and was not used for the verdicts.
 
 ## 5. Trade-off
 

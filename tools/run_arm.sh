@@ -5,7 +5,7 @@ set -u
 ARM=$1; SRV=$2; PREFIX=$3; EXTRA=$4; RATE=${5:-4000}; TCPRATE=${6:-1000}
 R=$HOME/udp-rx-mode-rig
 RES=${RES:-$R/results}; OUT=$RES/$ARM; mkdir -p $OUT; cd $OUT
-SIPP=/dn/sipp/sipp; ME=10.22.20.222
+SIPP=sipp; ME=192.0.2.21
 srv() { if [ "$SRV" = "$ME" ]; then bash -s; else timeout 120 ssh -o BatchMode=yes root@$SRV 'bash -s'; fi; }
 srvpy() { if [ "$SRV" = "$ME" ]; then python3 -u - "$@"; else timeout 120 ssh -o BatchMode=yes root@$SRV "python3 -u - $*"; fi; }
 log() { echo "$(date +%H:%M:%S) $*" | tee -a $OUT/log.txt; }

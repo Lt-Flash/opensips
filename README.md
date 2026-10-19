@@ -152,7 +152,7 @@ within the cell with at most 0.1% failed calls. Driver and analysis: `tools/cps/
 |---|---|---|---|
 | F_MALLOC (`-m 2048 -M 32`), default `maxbuffer` (256 KB) | 10,000 | 10,000 | 10,000 |
 | F_MALLOC, `maxbuffer` 4 MB (8 MB socket buffers) | 10,000 | **13,000 (+30%)** | 12,000 (+20%) |
-| HG_MALLOC (`-m 512:4096 -M 64:512`, transparent huge pages), default `maxbuffer` | 20,000 | **22,000 (+10%)** | 18,000 (-10%) |
+| HG_MALLOC (`-m 512:4096 -M 64:512`; shared arena on 4 KB pages, private arenas on THP), default `maxbuffer` | 20,000 | **22,000 (+10%)** | 18,000 (-10%) |
 
 **Cost per call at a rate every mode holds:**
 
@@ -323,16 +323,18 @@ Every allocator comparison made while measuring the receive modes, gathered in o
 server (KVM guest, 16 vCPU Xeon E5-2699 v4, Debian 13, Linux 6.12), same build (the 4.1 tree that
 carries #4327, plus this patch), same proxy script and load as in 4.6/4.7, so the allocator is the
 only difference between the arms. HG_MALLOC ran as `-a HG_MALLOC -m 512:4096 -M 64:512` with
-`ulimit -l unlimited`; the host has no hugetlb pool, so HG used its transparent-huge-page tier
-(about 940 MB of THP in use under load). F_MALLOC ran as `-a F_MALLOC -m 2048 -M 32`.
+`ulimit -l unlimited`. The host has no hugetlb pool and its THP `shmem_enabled` is `never`, so
+HG_MALLOC's shared arena ran on plain 4 KB pages, like F_MALLOC's shared memory, and only its
+private arenas on THP (about 940 MB right after startup), as its startup log on this host states.
+F_MALLOC ran as `-a F_MALLOC -m 2048 -M 32`.
 
 **Highest sustained calls/s (stateful proxy, 8 workers per transport):**
 
 | transport (receive buffers / tuning) | allocator | shared | auto | exclusive |
 |---|---|---|---|---|
-| UDP, default buffers | F_MALLOC | 10,000 | 10,000 | 10,000 |
-| UDP, default buffers | HG_MALLOC | **20,000** | **22,000** | **18,000** |
-| UDP, 4 MB buffers | F_MALLOC | 10,000 | 13,000 | 12,000 |
+| UDP, default buffers (512 KB) | F_MALLOC | 10,000 | 10,000 | 10,000 |
+| UDP, default buffers (512 KB) | HG_MALLOC | **20,000** | **22,000** | **18,000** |
+| UDP, 8 MB buffers (`maxbuffer` 4 MB) | F_MALLOC | 10,000 | 13,000 | 12,000 |
 | TLS, default proto_tls settings | F_MALLOC | 6,000 | 6,000 | 6,000 |
 | TLS, default proto_tls settings | HG_MALLOC | 6,000 | 8,000 | 6,000 |
 | TLS, staging tuning (see 4.7) | HG_MALLOC | 6,000 | 6,000 | 6,000 |
@@ -374,11 +376,32 @@ by the dispatch queue between TCP main and the workers (see 4.7). So HG_MALLOC l
 call there without raising the ceiling, apart from TLS `auto`, which held 8,000 calls/s only with
 HG_MALLOC.
 
+**UDP drops with 8 MB socket buffers (measured 2026-10-19).** The #4327 benchmarks, INVITEs answered
+by tm with 8 MB socket buffers, found no HG_MALLOC drops up to 60,000 INVITEs/s; this checks the
+same buffer on relayed calls. Same proxy, load and host as above, the build of 4.7, `maxbuffer`
+4 MB (8 MB on the socket, read back in every cell), receive-buffer errors counted over the whole
+cell (`/proc/net/snmp` before the load and after sipp exits), six cells per rate (three modes, two
+repetitions); driver `tools/cps/cps_run_8m.sh`.
+
+| relayed calls/s | HG_MALLOC cells without a drop | drops per cell | failed calls per cell |
+|---|---|---|---|
+| 12,000 | 6 of 6 | 0 | 0 |
+| 16,000 | 6 of 6 | 0 | 0 |
+| 18,000 | 3 of 6 | 0-6,661 | 0 |
+| 20,000 | 0 of 6 | 793-42,174 | 0 |
+| 22,000 | 0 of 6 | 51,303-221,282 | 2-667; one cell completed 92% of its calls |
+
+Controls in the same run, same binary: F_MALLOC with the same 8 MB buffer dropped 57,198 and
+230,321 datagrams at 12,000/s (`shared`; 0 and 1,525 failed calls), and HG_MALLOC with the default
+512 KB buffer dropped 9,827 (0 failed). With 8 MB, HG_MALLOC drops nothing up to 16,000 relayed
+calls/s (about 96,000 datagrams in per second) and starts to drop at 18,000, where F_MALLOC already
+drops at 12,000; up to 20,000 the retransmissions recover every drop.
+
 **Observation to look at.** The one server log read in full (a TLS cell at 8,000 calls/s,
 HG_MALLOC) contained one HG warning: `hg_lock_stall_note: shm arena lock held for 1014 us by the
 refill path (threshold hg_lock_stall_us=1000; 1 stalls so far, worst 1014 us by refill in
 process 22)`. The other cells' logs were only summarised for errors, so how often this occurs is
 not known.
 
-The drivers are in `tools/cps/` (UDP) and `tools/tls/` (TLS/WSS); per-cell raw data (sipp
+The drivers are in `tools/cps/` (UDP; `cps_run_8m.sh` for the 8 MB check) and `tools/tls/` (TLS/WSS); per-cell raw data (sipp
 screens, `perf stat` counters, `/proc` samples) is kept with the author.

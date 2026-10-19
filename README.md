@@ -37,8 +37,9 @@ inherited, non-blocking listen socket in its private epoll with plain `EPOLLIN`.
   patch only allows `exclusive` from 6.0.
 * The TCP workers share `tcp_dispatch_sock` (a SOCK_DGRAM socketpair) the same way.
 
-The kernel sources checked: v5.4 and v6.12 `fs/eventpoll.c` (and, for its `ep_poll()` waiter handling, v5.5-v5.10, v5.15, v5.19 and v6.0) (`ep_ptable_queue_proc`,
+The kernel sources checked: v5.4 and v6.12 `fs/eventpoll.c` (`ep_ptable_queue_proc`,
 `ep_poll_callback`, `ep_poll`) and `kernel/sched/wait.c` (`add_wait_queue`, `__wake_up_common`).
+The waiter handling in `ep_poll()` was also compared at v5.5-v5.10, v5.15, v5.19 and v6.0.
 
 ## 3. How it was measured
 

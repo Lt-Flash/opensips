@@ -27,12 +27,17 @@ inherited, non-blocking listen socket in its private epoll with plain `EPOLLIN`.
   every idle worker wakes, one wins `recvfrom()`, the others get EAGAIN. That is the herd.
 * The wakeups happen head-to-tail, so the last-forked worker usually wins; when it is busy the
   next one wins, and so on - the geometric ladder.
-* `EPOLLEXCLUSIVE` was tried upstream (e51a5f067d) and disabled (3596efdc00): before Linux 6.0
-  (`ep_autoremove_wake_function`, fs/eventpoll.c) a woken but not yet running worker keeps
-  absorbing the following events, so bursts serialize on one worker.
+* `EPOLLEXCLUSIVE` was tried upstream (e51a5f067d) and disabled (3596efdc00): a woken but not
+  yet running worker stayed on its epoll's wait queue until it ran, so `ep_poll_callback()` still
+  saw a waiter and ended the exclusive wake-up there, and the following events kept landing on
+  that worker. Linux 5.7 (412895f03cbf, "epoll: atomically remove wait entry on wake up") removes
+  the waiter when the wake-up succeeds; 6.0 (a16ceb139610, `ep_autoremove_wake_function`) removes
+  it even when the wake-up fails. Bursts serialize on 5.4 (4.2); on 6.12, bursts of 32 datagrams
+  had the same p99 reply latency in every mode (934-995 us). 5.7 to 5.19 were not tested, so the
+  patch only allows `exclusive` from 6.0.
 * The TCP workers share `tcp_dispatch_sock` (a SOCK_DGRAM socketpair) the same way.
 
-The kernel sources checked: v5.4 and v6.12 `fs/eventpoll.c` (`ep_ptable_queue_proc`,
+The kernel sources checked: v5.4 and v6.12 `fs/eventpoll.c` (and, for its `ep_poll()` waiter handling, v5.5-v5.10, v5.15, v5.19 and v6.0) (`ep_ptable_queue_proc`,
 `ep_poll_callback`, `ep_poll`) and `kernel/sched/wait.c` (`add_wait_queue`, `__wake_up_common`).
 
 ## 3. How it was measured
@@ -79,7 +84,7 @@ Bursts of 32 simultaneous datagrams (200 bursts), reply latency / burst completi
 | mode | p50 / p99 / max | completion p50 / p90 |
 |---|---|---|
 | shared | 258 / 1343 / 1954 | 578 / 1427 |
-| exclusive | 205 / 438 / 634 | 500 / 612 (the burst is served by ONE worker - pre-6.0 epoll) |
+| exclusive | 205 / 438 / 634 | 500 / 612 (the burst is served by ONE worker - pre-5.7 epoll) |
 | reuseport | 125 / 314 / 470 | 321 / 423 |
 
 ### 4.3 Six-node test cluster with the real configurations (3 SBC: 2 vCPU KVM, kernel 5.4; 3 registrars: LXC on a 7.0 kernel)

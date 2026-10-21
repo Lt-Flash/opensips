@@ -3,6 +3,37 @@ title: "CLUSTERER_CONTROLLER Module"
 description: "Zero-config high availability for the clusterer module: nodes discover each other over encrypted UDP multicast, elect a master, receive node IDs and BIN addresses, and fail sharing tags over automatically."
 ---
 
+> This is the **clusterer_controller** branch of my OpenSIPS fork: the module's admin guide, then its [design](#design) - protocol diagrams, failure detection, the papers behind it - and its [measurements](#measurements). The module is proposed upstream as [OpenSIPS#4074](https://github.com/OpenSIPS/opensips/pull/4074); the code on this branch is that series on top of OpenSIPS master (4.1.0-dev).
+
+## When to use it
+
+*clusterer_controller* replaces the static *clusterer* topology (*my_node_info* / *neighbor_node_info*, or the clusterer database) with nodes that find each other over IP multicast. It suits clusters whose membership changes - nodes replaced, scaled, rebuilt - and where one node at a time must hold the active sharing tag.
+
+**Use it when:**
+
+- the nodes can reach each other by **IPv4 multicast** - one L2 segment or VLAN (with IGMP snooping), or a routed network with PIM;
+- you want **one configuration for every node**: a multicast group, a cluster id and a password, no node ids or neighbour addresses;
+- nodes come and go (VMs or containers rebuilt, addresses reassigned) and the cluster should take them in and drop them without configuration changes;
+- one node at a time must hold the active sharing tag, with the tag following failover and a maintenance mode for rolling restarts.
+
+**Do not use it - configure *clusterer* with its own modparams or database - when:**
+
+- the network has **no multicast** between the nodes: most public clouds by default, overlays without BUM replication, NAT between nodes. The module has no unicast discovery;
+- the nodes are not on Linux (it needs *timerfd* and *SO_BINDTODEVICE*), or the cluster network is IPv6-only;
+- you need **consensus or fencing**: this is not a quorum protocol. A partitioned cluster elects a master on each side and, by default, both hold the active tag until the partition heals (*release_tag_when_isolated* makes a cut-off master give it up);
+- nodes must authenticate individually: every holder of the cluster password is a member;
+- the nodes are far apart (WAN): the timers are tuned for a LAN (keepalives every second, failover in seconds).
+
+| Pros | Cons |
+|---|---|
+| Same configuration on every node; node ids, BIN addresses and sharing tags handled automatically | Needs IPv4 multicast; Linux only; IPv6 not yet |
+| Deterministic master (highest IP, sticky); failover in about 5 s, a graceful handover in under 1 s | Not a consensus protocol: a partition has two masters until it heals |
+| Encrypted, authenticated control plane (XChaCha20-Poly1305, Argon2id); foreign and mismatched clusters refused | One shared secret per cluster, no per-node identity |
+| Learns its timing from the network, asks the cluster before electing, and heals partitions to the larger side | A wire-version change needs a whole-cluster upgrade |
+| Maintenance mode (this node or any member) for rolling restarts; capability bits for rolling upgrades | Requires libsodium; MEMBER_LIST fragments beyond about 80 nodes at a 1500-byte MTU |
+| Stock *clusterer* is unchanged unless the module is built (build-time flag) | |
+
+
 ## Admin Guide
 
 
@@ -1296,6 +1327,466 @@ The following features are planned for future releases:
 
 Read-only script variables for cluster state (*$cl_ctr_role*, *$cl_ctr_is_master*, and the rest) are already available - see [Exported Pseudo-Variables](#exported-pseudo-variables).
 
+
+## Design
+
+### Control plane at a glance
+
+Encrypted UDP on the cluster's multicast group. Only a small cleartext header is visible on the wire - magic, cluster id, cluster identity and nonce - and it is the AEAD's associated data; everything else is sealed with **XChaCha20-Poly1305**, keys derived with **Argon2id**, the join handshake **Noise_NNpsk0**.
+
+```text
+[magic 2B][cluster_id 2B][cluster uuid 16B][nonce 24B] [type 1B][seq 4B][incarnation 8B][payload] [tag 16B]
+ '---------------- cleartext, AAD ----------------'      '------------- encrypted ------------------'
+```
+
+The first magic byte is the wire version (`0xCB` + version, now **2**); the second selects the key tier:
+
+| Tier | Magic | Key | Packets |
+|------|-------|-----|---------|
+| **bootstrap** | `0xCD01` | Argon2id(password) | `JOIN_REQ`, `KEY_GRANT`, `ACK`, `JOIN_REJECT`, `MASTER_BEACON` |
+| **session** | `0xCD00` | per-cluster session key | `MASTER_ALIVE`, `ALIVE`, `NODE_ASSIGN`, `MEMBER_LIST`, `RESYNC`, `GOODBYE`, `KEY_HANDOFF`, `MASTER_PROBE`, `MASTER_PROBE_ACK`, `MAINT_SET` |
+| **consumer** | `0xCD02` | per-cluster session key | messaging API traffic, rate-limited on its own budget |
+
+Within one wire version, fields are only ever appended and read behind a length check, and a build drops a packet type it does not know; what a node's build implements is advertised as capability bits (see [Upgrading](#upgrading)).
+
+Legend for the diagrams below: **`-->>` unicast (1:1)**, **`-)` multicast (group)**.
+
+### 1. Cluster formation (cold start)
+
+Nodes start together, discover over multicast, and converge on the **highest-IP**
+node as master with no split brain — lower-IP nodes *defer* self-promotion while
+a higher-IP peer is still joining.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant N1 as .191
+    participant N2 as .192
+    participant N3 as .193 highest IP
+    Note over N1,N3: simultaneous cold start, no master yet
+    N1-)N3: JOIN_REQ (mcast, Noise msg1)
+    N2-)N3: JOIN_REQ (mcast, Noise msg1)
+    N3-)N1: JOIN_REQ (mcast, Noise msg1)
+    Note over N1,N2: higher-IP peer still joining -> defer self-promotion
+    Note over N3: highest IP -> self-promote, mint session key
+    N3-->>N2: KEY_GRANT (unicast, Noise msg2 + salt)
+    N2-->>N3: ACK
+    N3-->>N1: KEY_GRANT (unicast)
+    N1-->>N3: ACK
+    N3-->>N2: NODE_ASSIGN + MEMBER_LIST (unicast)
+    N3-->>N1: NODE_ASSIGN + MEMBER_LIST (unicast)
+    Note over N1,N3: converged - .193 master, .192 backup, .191 member
+```
+
+### 2. Member join into a running cluster
+
+The join is **unicast to the joiner**: only the newcomer needs the full peer
+list, so the master sends it 1:1 instead of multicasting N packets that every
+member would decrypt and discard. Only the *newcomer's own* assignment is
+multicast, so existing members learn it. A lost `KEY_GRANT` is recovered by
+**ACK + retransmit** (§5), a lost snapshot by the `JOIN_REQ` retry.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant J as .191 joiner
+    participant E as .192 member
+    participant M as .193 master
+    J-)M: JOIN_REQ (mcast, Noise msg1 + BIN socket)
+    M-->>J: KEY_GRANT (unicast, session key)
+    J-->>M: ACK (unicast)
+    M-)E: NODE_ASSIGN newcomer .191=id3 (mcast -> all learn it)
+    M-->>J: NODE_ASSIGN .193=id1, .192=id2 (unicast, peers)
+    M-->>J: MEMBER_LIST 3 members (unicast, snapshot)
+    J-)M: ALIVE (joiner now participates)
+    Note over J,M: per join the group sees ONE packet, not N
+```
+
+> Captured live on the test cluster (staged stop→rejoin of `.191`): JOIN_REQ →
+> unicast KEY_GRANT + ACK → mcast NODE_ASSIGN announce → unicast NODE_ASSIGN×2 +
+> MEMBER_LIST, all sub-second.
+
+### 3. Steady-state liveness — master-mediated (O(N²) → O(N))
+
+Previously every node multicast an `ALIVE` every `query_time` and every node ran
+an election off every one — O(N²) packets and cluster-wide decrypts. Now a settled
+member **unicasts its ALIVE to the master**; the master folds all peers' liveness
+into a **per-node-id bitmap** on its `MASTER_ALIVE`, and members trust that bitmap
+to keep their election windows populated. The same `MASTER_ALIVE` also carries the
+master's term, the maintenance state of every node, the number of members it hears
+and the capabilities every live member shares.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as .191 member
+    participant B as .192 backup
+    participant M as .193 master
+    A-->>M: ALIVE (unicast, ~query_time)
+    B-->>M: ALIVE (unicast, ~query_time)
+    M-)A: MASTER_ALIVE (mcast, ~1/s) + liveness bitmap + membership digest
+    M-)B: MASTER_ALIVE (mcast) + bitmap + digest
+    Note over A,B: refresh last_seen from the master's bitmap - no peer-to-peer ALIVE
+```
+
+### 4. Anti-entropy — membership digest → RESYNC
+
+Every `MASTER_ALIVE` carries a **digest** = active-peer count + order-independent
+XOR of `FNV-1a(node_id, ip)`. A member whose computed digest differs has missed a
+`NODE_ASSIGN` (whole peer, or just a node-id) and pulls a **rate-limited RESYNC**;
+the master coalesces a burst into one re-broadcast. This is the multicast
+counterpart to the 1:1 ACK path.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Mem as .192 member
+    participant M as .193 master
+    M-)Mem: MASTER_ALIVE + digest = count + XOR hash
+    Note over Mem: local digest != master's, missed a NODE_ASSIGN
+    Mem-->>M: RESYNC (unicast, rate-limited)
+    M-)Mem: NODE_ASSIGN (all peers) + MEMBER_LIST (re-broadcast)
+    Note over Mem: digests match again
+```
+
+### 5. Reliable handshake — ACK + bounded retransmit
+
+The 1:1 handshake rides unreliable UDP. A lost `KEY_GRANT` used to cost the joiner
+its whole join window; now the master retransmits until ACKed (bounded), so a
+single loss heals in **milliseconds**.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant J as .191 joiner
+    participant M as .193 master
+    J-)M: JOIN_REQ
+    M-->>J: KEY_GRANT (unicast) x lost
+    Note over M: no ACK within retransmit timeout
+    M-->>J: KEY_GRANT (retransmit)
+    J-->>M: ACK
+    Note over J,M: recovered in ms, not a full join window
+```
+
+### 6. Graceful leave (GOODBYE)
+
+A departing node multicasts `GOODBYE`. Survivors **re-elect locally** off the same
+event — no MEMBER_LIST re-broadcast (that O(N), fragmenting packet was dropped from
+the failover path); `MASTER_ALIVE` re-asserts and the digest reconciles stragglers.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant D as .191 leaving
+    participant B as .192 backup
+    participant M as .193 master
+    D-)M: GOODBYE (mcast)
+    D-)B: GOODBYE (mcast)
+    Note over B,M: local re-election off the same GOODBYE - no re-broadcast
+    Note over M: still master, 2 members - no role change
+    M-)B: MASTER_ALIVE + digest (count now 2)
+```
+
+### 7. Master failover (crash)
+
+The master goes silent. Each member's watchdog is **learned**, not fixed: the mean
+and deviation of the gaps between `MASTER_ALIVE`s (3 s floor, 15 s cap). When it
+fires, the member **asks the cluster** in one multicast `MASTER_PROBE` whether
+anyone still hears the master: anyone who does makes it **hold** the election (a
+fault between it and the master, not a dead master); **two peers confirming the
+silence** (every peer, when there are fewer) let it elect at once; nobody answering means it may be the one cut off,
+so it waits one more period. A confirmed election raises the term (**PreVote**);
+an unconfirmed one keeps it. The new master takes the active sharing tag
+**at once**.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Me as .191 member
+    participant B as .192 backup
+    participant M as .193 master
+    Note over M: master crashes x
+    Note over Me,B: no MASTER_ALIVE for the learned timeout (>= 3 s)
+    B-)Me: MASTER_PROBE "who still hears .193?" (mcast)
+    Me-->>B: MASTER_PROBE_ACK "silent here too" (unicast)
+    Note over B: silence confirmed -> elect, raise the term
+    Note over Me,B: identical local election -> highest-IP survivor wins
+    Note over B: .192 promotes, takes the active tag
+    B-)Me: MASTER_ALIVE (new master, new term) + bitmap + digest
+    Me-->>B: ALIVE (unicast to new master)
+    Note over Me,B: converged - .192 master, .191 member
+```
+
+### 8. Graceful master handoff (KEY_HANDOFF)
+
+On a *planned* master shutdown the outgoing master hands the session key to its
+successor sealed to the successor's long-lived X25519 pubkey (`crypto_box_seal`,
+learned from ALIVE) — so the successor takes over **without a rejoin**.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as .192 successor
+    participant M as .193 master leaving
+    Note over M: planned shutdown
+    M-->>S: KEY_HANDOFF (unicast, session key sealed to S's pubkey)
+    M-)S: GOODBYE (mcast)
+    Note over S: already holds the key -> promotes with no rejoin
+    S-)S: MASTER_ALIVE (asserts as master)
+```
+
+### 9. Wrong-password rejection
+
+A node with the wrong password cannot produce a bootstrap-valid `JOIN_REQ`. After
+repeated failures from one source the master emits an authenticated `JOIN_REJECT`;
+independently, a genuinely-wrong-password joiner self-terminates after its defer
+budget rather than forming a lone split-brain master.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as .200 wrong password
+    participant M as .193 master
+    R-)M: JOIN_REQ (bootstrap AEAD fails to authenticate)
+    Note over M: repeated bootstrap-decrypt failures from .200
+    M-->>R: JOIN_REJECT (unicast, sealed with the bootstrap key)
+    Note over R: in NODE_NEW state -> exit(-1), no split brain
+```
+
+### 10. Split-brain merge (MASTER_BEACON)
+
+If a partition heals and two masters exist, each periodically emits a
+bootstrap-keyed `MASTER_BEACON` (readable across different session keys). Two
+masters that share a key also hear each other's `MASTER_ALIVE`. **Both paths
+rank by one ordering**, so the two ends always agree on who stands down - before
+this, the keepalive path yielded to the higher IP while the beacon path ranked by
+member count, and two masters could each yield to the other:
+
+1. **members it hears** - the live count each master announces in its
+   `MASTER_ALIVE` and beacon (table counts when the other side is an older
+   build): the larger partition wins, disturbing the fewest nodes;
+2. **term** - the newer mastership wins. A node raises the term only when its
+   election was confirmed (peers confirmed the silence, the master said
+   GOODBYE or handed over for maintenance), which is how a takeover beats the
+   master it replaces;
+3. **IP** - total tiebreak.
+
+Members deliberately precede term: a node that is cut off still elects itself
+eventually, and ranking on term first would hand the cluster (and its sharing
+tags) to the least reliable node.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as .191 master, 1 member
+    participant B as .193 master, 3 members
+    Note over A,B: partition heals - two masters
+    B-)A: MASTER_BEACON (bootstrap-keyed, hears 3 members)
+    A-)B: MASTER_BEACON (hears 1 member)
+    Note over A: inferior (fewer members) -> demote
+    A-)B: JOIN_REQ (rejoin the superior master)
+    B-->>A: KEY_GRANT + NODE_ASSIGN + MEMBER_LIST (unicast)
+    Note over A,B: single cluster, one master
+```
+
+### 11. Shared-port unicast demux (multi-cluster on one node)
+
+When several controller clusters on one node share a multicast *port* (distinct
+groups), multicast reaches only the socket that joined the group - once
+`IP_MULTICAST_ALL` is cleared, which Linux does not do by default - but unicast is
+demultiplexed by port alone, so a 1:1 reply can land on the wrong sibling's socket. The receiver recovers it: on a
+`cluster_id` mismatch it forwards the *still-encrypted* datagram to the correct
+local cluster's worker via `ipc_send_rpc()`, which decrypts it with its own key.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as peer (cluster 2)
+    participant W1 as worker cluster 1
+    participant W2 as worker cluster 2
+    P-->>W1: unicast reply for cluster 2 (arrives on wrong socket)
+    Note over W1: cleartext cluster_id=2 != 1
+    W1->>W2: ipc_send_rpc(still-encrypted datagram)
+    Note over W2: decrypt with cluster-2 key, process normally
+    Note over W1,W2: forwarded once, never re-forwarded - no loop
+```
+
+### 12. A restarted node is recognised by its first packet (incarnation)
+
+Every packet carries the sender's *incarnation* (its start time), inside the AEAD.
+Replay windows are kept per (sender, incarnation): a higher incarnation means the
+peer restarted and numbers from 1 again, so its windows restart on that packet; a
+lower one is a replay from a previous life and is refused. Before, a restarted
+node's low sequence numbers were "older than the replay window" to every peer
+until a `MEMBER_LIST` reset them (the 10-hour black hole fixed earlier by
+announcing every join) - and that reset, done on every list, re-admitted one
+replayed packet per peer. The master also carries the incarnation it admitted a
+node at in `NODE_ASSIGN`, which covers a node whose clock stepped back across its
+restart.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as .191 restarted (inc B)
+    participant N as .192 backup (holds .191 at inc A)
+    participant M as .193 master
+    R-)M: JOIN_REQ (inc B)
+    M-)N: NODE_ASSIGN .191 id=2 inc=B (announce)
+    Note over N: B > A -> .191 restarted, its windows start afresh
+    R-)N: consumer traffic seq 1, 2, 3... (inc B) - accepted
+```
+
+### 13. Partitions with different settings never merge - and nobody dies for trying
+
+The beacon now carries the master's consistency-critical settings and MTU. A
+master compares them with its own **before** ranking: if they differ (settings
+under `on_config_mismatch=reject`, MTU always), neither master merges and both log
+which values differ. Previously the inferior master merged, the superior one
+refused its `JOIN_REQ`, and the merging node called `exit(-1)` - which takes down
+the *correctly* configured nodes whenever the misconfigured side is the larger
+partition. As a backstop, an established node refused during a merge no longer
+exits: it re-elects within its own partition and ignores that master for 60 s.
+A node that has not joined anything yet still shuts down on a refusal.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as .194 master, stickiness=0
+    participant B as .193 master, 3 members, stickiness=1
+    Note over A,B: partition heals - two masters, different settings
+    B-)A: MASTER_BEACON (count 3, term, settings, MTU)
+    A-)B: MASTER_BEACON (count 1, term, settings, MTU)
+    Note over A,B: settings differ -> neither merges, both WARN with the diff
+
+### 14. A founded cluster identity - two deployments never merge
+
+`cluster_id` is a configured number, so a lab cloned from production onto the
+same VLAN (same group, password and `cluster_id`) used to merge into production -
+and with `manage_shtags`, could take its sharing tags. Now the node that founds a
+cluster mints a 16-byte UUID v7; joiners adopt it from the master's `KEY_GRANT`;
+every packet carries it in the AAD-bound cleartext header. It is *provisional* for
+30 s (a simultaneous cold start with two founders still settles into one cluster),
+then *established*: packets stamped with any other identity are refused before
+decryption and logged once a minute. Packets with no identity (a joiner, every
+`JOIN_REQ`) always pass, so new and restarted nodes join normally, and a partition
+of one cluster still heals (both halves hold the same identity). Nothing persists:
+a whole-cluster restart founds a new identity; `uuid=` in the `cluster` string pins
+one (a UUID, or any name hashed into a v8 UUID) for fleets that want it stable.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant L as lab .194 (uuid L, established)
+    participant P as prod .193 master (uuid P, established)
+    L-)P: MASTER_BEACON (header uuid L)
+    Note over P: uuid L != P -> refused before decryption, logged
+    P-)L: MASTER_BEACON (header uuid P)
+    Note over L: uuid P != L -> refused, logged - nobody merges
+```
+
+### Failure detection and elections
+
+A fixed timeout either fires late or fires wrongly; the module learns from the network instead, and asks before it acts:
+
+| Mechanism | What it does | Based on |
+|---|---|---|
+| Learned master watchdog | every member keeps the mean and deviation of the gaps between the master's keepalives and suspects the master only past mean + 4 deviations + a margin (3 s floor, 15 s cap); each false suspicion widens the margin, which then decays | Chen, Toueg and Aguilera, *On the Quality of Service of Failure Detectors* (DSN 2000); Hayashibara et al., *The φ Accrual Failure Detector* (SRDS 2004); TCP's estimator - Jacobson, *Congestion Avoidance and Control* (SIGCOMM 1988), RFC 6298 |
+| Asking before electing | one multicast question, "who still hears the master?": anyone who does holds the election, two confirmations (every peer, when fewer) elect, silence means "maybe I am the one cut off" and one more period | Lifeguard's suspicion (next row) and the multi-observer agreement of Suresh et al., *Stable and Consistent Membership at Scale with Rapid* (USENIX ATC 2018) |
+| Local health | a node in trouble - its own process stalled, timers late, the kernel dropping its packets, questions unanswered - counts 0..8 and multiplies its own watchdog and purge window by that count plus one (watchdog cap 30 s) | Dadgar, Phillips and Currey, *Lifeguard: Local Health Awareness for More Accurate Failure Detection* (arXiv:1707.00788) |
+| PreVote | the term rises only on a confirmed election, a GOODBYE, a maintenance handover or a founding; a node that elected itself while cut off keeps its term and cannot take over the cluster at the heal | Ongaro, *Consensus: Bridging Theory and Practice* (PhD dissertation, Stanford, 2014), section 9.6 |
+| Heal to the majority | masters are ranked on the members they hear, then term, then IP | - |
+| Stall check | a node whose own process was paused does not judge its peers by the time it lost; a master that was paused stands down | - |
+| Optional tag release | a master hearing fewer than half of its members for a whole election window gives up the active tag (*release_tag_when_isolated*, off by default) | Alquraan et al., *An Analysis of Network-Partitioning Failures in Cloud Systems* (OSDI 2018) |
+
+### Complexity
+
+| Path | before | after |
+|------|--------|-------|
+| steady-state liveness | O(N²) packets + decrypts | **O(N)** (member→master unicast + one MASTER_ALIVE bitmap) |
+| join into N-node cluster | O(N) group packets, O(N²) decrypts | **O(1)** group + O(N) unicast to the joiner only |
+| failover | +O(N) MEMBER_LIST re-broadcast (fragments >~80 nodes) | local re-election, **no re-broadcast** |
+| lost handshake packet | whole join window (~seconds) | ACK + retransmit (**ms**) |
+| missed NODE_ASSIGN | silently incomplete BIN mesh | digest-driven **RESYNC** repair |
+
+
+## Measurements
+
+### Network-namespace suite
+
+*test/netns_tests.sh* (see [Automated tests](#automated-tests)) runs four nodes in network namespaces on one host, every node a member of two clusters that share one port; faults are real - iptables cuts that must show dropped packets, SIGSTOP/SIGCONT pauses, SIGKILL, netem loss and jitter. On the current head it runs 120 checks, T1 to T27; all pass, built with gcc 13 and *-Werror* on the module.
+
+Every change was first shown to fail without itself - the same suite against the build before it:
+
+| Change | Check | Build before the change | With the change |
+|---|---|---|---|
+| A paused node does not judge its peers | T13: a member paused 15 s | elects itself, purges its peers | neither |
+| | T14: the master paused 15 s | purges its peers | one master once it wakes |
+| Learned master watchdog | T19: the master killed | - | new master in 5.4 s |
+| | T20: 25% loss and 300 ± 300 ms jitter into one member for 90 s | - | no election; its wait rises to about 5.5 s and back to 3 s |
+| Asking before electing | T16 / T21: a member that alone stops hearing the master | - | holds the election; the master logs which member cannot hear it |
+| PreVote | T22: a member cut off for 25 s | - | elects itself, keeps the term; the cluster's term unchanged |
+| Local health | T23: 1.3 s pause bursts | - | health peaks at 8, no election, no purge, back to 0 |
+| Kernel drops counted | T15: a flood into one member | - | 3094 drops counted |
+| Re-deriving the same key keeps the sequence | T20 | 108 packets refused as replays | none |
+| The new master takes the tag at once | T17 / T19 | the tag stays on backup after a maintenance handover; after a failover it waits for the purge | taken at the election |
+| clusterer drops packets before identity | T26: the master killed and restarted at once | the restarted node segfaults | survives |
+| Remote maintenance, full level | T25 | 4 of 7 checks fail | all pass |
+| Capability bits | T27: a member on a build without the master probe, the master killed | survivors wait for answers: failover 9.5 s after four "may be the one cut off" waits | elect at once: 3.0 s |
+
+### Test cluster
+
+Two clusters of three nodes on the test network, one VLAN with multicast: cluster 1 is three SBCs (KVM virtual machines), cluster 2 three registrar nodes (LXC containers), all Ubuntu 20.04 running their normal SIP configuration with *use_controller=1* and *manage_shtags=1*. *test/rtests.sh* drives the faults from another host over SSH and checks every node over *mi_http*:
+
+| Test | Fault | Checked |
+|---|---|---|
+| R0 | - | one master named by every node, every member has a node_id, the cluster identity, the master holds the active tag |
+| R1 | a member restarted | back with the same node_id; master unchanged |
+| R2 | a member paused 35 s (past the purge window) | does not elect itself or purge, reports the stall, keeps its node_id |
+| R3 | the master paused 20 s | the others elect; the woken master stands down; the tag moves |
+| R4 | a member stops hearing the master only (10 s) | holds the election; the master logs which member cannot hear it |
+| R5 | a member cut off both ways for 25 s | suspects itself first, keeps the term, heals to the cluster's master |
+| R6 | the master killed (SIGKILL) | replaced on its peers' confirmation; the new master holds the tag at once; back with its node_id |
+| R6b | the master stopped | a new master without the watchdog |
+| R6c | the master killed and restarted at once | the restarted node survives the new master's first tag announcement |
+| R7 | maintenance: the backup, then the master | out of election and tags, the master hands over at once, a pin is refused, back in service |
+| R8 | 30% of the master's packets into one member lost for 90 s | its learned wait rises above 3 s; no election |
+| R9 | another node put into full maintenance | every node lists it, the others disable it in clusterer, then enable it again |
+| - | logs | no packet refused as a replay, no crash |
+
+| Build | SBC cluster | Registrar cluster | |
+|---|---|---|---|
+| first wire-v2 build | 40 of 41 | 40 of 41 | R7: after a maintenance handover the new master never took the tag - fixed |
+| + the tag fix | 43 of 43 | 42 of 43 | a restarted registrar segfaulted on the new master's tag announcement - fixed in clusterer |
+| + the clusterer fix | 45 of 45 | 45 of 45 | |
+| + remote maintenance, full level | 51 of 51 | 51 of 51 | |
+| OpenSIPS 4.1 build with the module | 51 of 51 | 51 of 51 | latest run, below |
+
+Latest run: the killed master was replaced in 6.2 s (SBC) and 4.9 s (registrar); a stopped master handed over in 0.5 s; under 30% loss the member's learned wait peaked at 8.7 s and 9.4 s without an election; in R6c the restarted registrar dropped 3 packets that reached it before its identity and kept running.
+
+```bash title="real-cluster tests - on a test cluster only, it takes masters down on purpose"
+MI_ROOT=mi ./test/rtests.sh 1 10.0.0.11 10.0.0.12 10.0.0.13
+```
+
+### Under CPU load
+
+The four-node rig on a 16-core host, 300 s per level, busy loops at normal priority on none, twice and eight times the cores: **no** master timeout, probe, held election, self-stall, role change or purge at any level. The controller's worker does little, and scheduling delay under CPU saturation stays far below the 3 s floor; a paused process - not CPU load - is the real false-failover risk, which the stall check covers.
+
+### Earlier revision
+
+Before wire version 2, the same rig against the build before it (36 checks: 36 pass, 16 on the earlier build):
+
+| Check | previous build | this build |
+|---|---|---|
+| two clusters on one port: duplicate/foreign multicast warnings | 140 | **0** |
+| node that left cleanly, then a newcomer joins: newcomer takes its id | yes (id 3) | **no** |
+| ... the node returns with its old id | no (got 4) | **yes** |
+| heal between masters with different settings: nodes still alive | 3 of 4 (one `exit`ed) | **4 of 4**, both warn, no merge |
+| SIGKILL restart after >1024 messages: non-master receives the restarted node's traffic | 30/30 | **30/30** |
+| node on the previous wire version | - | refused, named in the log; cluster unaffected |
+| separate deployment, *identical* settings, same group/password/`cluster_id`, healed after 36 s | **absorbed** (4 members) | **refused**, both sides log the other's uuid, 3 + 1 |
+| partition of the *same* cluster (member isolated past the purge window), healed | heals | **heals**, same uuid, one master |
+| cold start: one uuid on every node; restarted node adopts it; `uuid=` pin = the name's v8 UUID on every node | - | yes / yes / yes |
+| crashes / CRITICAL lines (excluding a pre-existing core TCP_main message on BIN reconnect, present in both builds) | 2 | **0** |
 
 ## HA Behaviour Tests
 

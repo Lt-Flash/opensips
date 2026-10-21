@@ -1,0 +1,13 @@
+[clusterer_controller](../README.md) / Tests
+
+# Tests
+
+## Automated tests
+
+*test/netns_tests.sh* runs the module end to end on one host: four network namespaces on a private bridge, every node in two clusters that share one port. It covers cold start, consumer delivery, restart and node_id reuse, partition heal, refusal of a foreign or mismatched cluster, a pinned cluster identity, recorded traffic sent again (while the sender runs and after it restarts), a MEMBER_LIST that arrives after a newer one, the *tm* anycast Via cid before and after the node has an id, a member and the master paused past every timeout, a receive buffer overflowed by a flood, a member that alone stops hearing the master, maintenance (a backup and then the master taken out of election and tags, and back), cuts one-sided and both ways and the heals after them, a killed master (also one restarted at once), a lossy and jittery link, a stuttering member, a cut-off master releasing the active tag, another node put into full maintenance, and a member on the previous build. It needs root, iproute2, iptables and python3:
+
+```bash title="netns tests"
+NEW=/usr/local OLD=/opt/opensips-wire1 PREV=/opt/opensips-prev ./test/netns_tests.sh
+```
+
+*NEW* is the install prefix under test; *OLD*, a build speaking wire version 1, and *PREV*, a build of this wire version from before the capability bits, are optional - only the test that needs one is skipped without it. Every cut a test makes with iptables must show dropped packets before it is removed, so a test cannot pass on a fault that never happened. To run two suites at once, start each under its own *unshare -n* with a distinct *RIG_NS_PREFIX* and *RIG_DIR*.

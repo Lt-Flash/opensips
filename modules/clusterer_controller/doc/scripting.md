@@ -1,0 +1,417 @@
+[clusterer_controller](../README.md) / Scripting
+
+# Scripting
+
+## Exported Pseudo-Variables
+
+These read-only pseudo-variables expose live cluster state to the routing script, so a decision such as "only the master runs this job" can be made without an MI call. They read directly from shared memory and are therefore available in every process (SIP workers included).
+
+Each variable optionally takes a cluster id as its argument, e.g. *$cl_ctr_role(2)*. The bare form (*$cl_ctr_role*) resolves to the only configured cluster; when several clusters are defined the bare form returns NULL and logs a one-time warning, so the cluster must be named explicitly. An unknown cluster id, or a value that is not currently known (e.g. no master yet), returns NULL. All of them are read-only - assigning to them fails.
+
+- **$cl_ctr_role** — this node's role in the cluster: *master*, *backup*, *maintenance* (see *clusterer_controller:maintenance*), *member*, or *joining* (still authenticating / before the first election).
+- **$cl_ctr_is_master** — 1 if this node is the cluster master, 0 otherwise. A fast path for the most common check.
+- **$cl_ctr_master_ip** — IP of the current master (NULL if none is elected yet).
+- **$cl_ctr_backup_ip** — IP of the current backup / standby master (NULL if none).
+- **$cl_ctr_node_id** — this node's *node_id* within that cluster (NULL until assigned). A node may hold different ids in different clusters.
+- **$cl_ctr_my_ip** — the controller identity IP of this node.
+- **$cl_ctr_members** — number of live members currently in the cluster.
+- **$cl_ctr_shtag_mode** — *auto* (tags follow the elected master) or *forced* (an operator pinned them with *clusterer_controller:shtag_force*).
+- **$cl_ctr_forced_node** — the *node_id* the active sharing tag is pinned to (NULL when in *auto* mode).
+- **$cl_ctr_maintenance** — this node's maintenance state: *none*, *evicted* or *full* (see *clusterer_controller:maintenance*).
+
+```opensips title="Using $cl_ctr_* in the script"
+# single cluster: run a periodic job only on the master
+if ($cl_ctr_is_master)
+    route(do_master_only_work);
+
+# several clusters: name the one you mean
+xlog("cluster 2 master is $cl_ctr_master_ip(2), I am $cl_ctr_role(2)\n");
+```
+
+## Exported Functions
+
+
+Per-peer lookups take two arguments *(cluster_id, node_id)* and are therefore script functions rather than pseudo-variables: a comma inside a variable's parentheses is ambiguous when the variable is itself a function argument.
+
+
+### cl_ctr_set_maintenance(cluster_id, state)
+
+
+Puts this node in or out of maintenance from the routing logic - the script counterpart of the *clusterer_controller:maintenance* MI command, with the same effect.
+
+
+Meaning of the parameters is as follows:
+
+
+- *cluster_id* (int) - the cluster;
+- *state* (string) - *evicted* (or *on*) or *full* to enter maintenance, *none* (or *off*) to leave it.
+
+
+Returns *1* on success, *-1* if the state is not recognised, the cluster is unknown or the controller worker is not running yet.
+
+
+This function can be used from any route.
+
+
+```opensips title="cl_ctr_set_maintenance() usage"
+...
+# drain this node: no mastership, no sharing tags
+cl_ctr_set_maintenance(1, "evicted");
+...
+```
+
+
+### cl_ctr_node_is_master(cluster_id, node_id)
+
+
+Checks whether a node is the current master of a cluster.
+
+
+Meaning of the parameters is as follows:
+
+
+- *cluster_id* (int) - the cluster;
+- *node_id* (int) - the node.
+
+
+Returns *1* if that node is the master, *-1* otherwise.
+
+
+This function can be used from any route.
+
+
+```opensips title="cl_ctr_node_is_master() usage"
+...
+if (cl_ctr_node_is_master(1, 3))
+    xlog("node 3 leads cluster 1\n");
+...
+```
+
+
+### cl_ctr_node_present(cluster_id, node_id)
+
+
+Checks whether a node id is a live member of a cluster.
+
+
+Meaning of the parameters is as follows:
+
+
+- *cluster_id* (int) - the cluster;
+- *node_id* (int) - the node.
+
+
+Returns *1* if the node is a live member, *-1* otherwise.
+
+
+This function can be used from any route.
+
+
+```opensips title="cl_ctr_node_present() usage"
+...
+if (!cl_ctr_node_present(1, $var(peer)))
+    xlog("node $var(peer) is not in cluster 1\n");
+...
+```
+
+
+### cl_ctr_get_node_role(cluster_id, node_id, role_var)
+
+
+Writes a node's role - *master*, *backup*, *maintenance* or *member* - into a variable.
+
+
+Meaning of the parameters is as follows:
+
+
+- *cluster_id* (int) - the cluster;
+- *node_id* (int) - the node;
+- *role_var* (var) - receives the role.
+
+
+Returns *1* on success, *-1* if the node is not a member.
+
+
+This function can be used from any route.
+
+
+```opensips title="cl_ctr_get_node_role() usage"
+...
+if (cl_ctr_get_node_role(1, 3, $var(role)))
+    xlog("node 3 is $var(role)\n");
+...
+```
+
+
+### cl_ctr_get_node_maint(cluster_id, node_id, maint_var)
+
+
+Writes a node's maintenance state - *none*, *evicted* or *full* - into a variable.
+
+
+Meaning of the parameters is as follows:
+
+
+- *cluster_id* (int) - the cluster;
+- *node_id* (int) - the node;
+- *maint_var* (var) - receives the state.
+
+
+Returns *1* on success, *-1* if the node is not a member.
+
+
+This function can be used from any route.
+
+
+```opensips title="cl_ctr_get_node_maint() usage"
+...
+if (cl_ctr_get_node_maint(1, 3, $var(m)) && $var(m) != "none")
+    xlog("node 3 is in maintenance ($var(m))\n");
+...
+```
+
+
+### cl_ctr_get_node_ip(cluster_id, node_id, ip_var)
+
+
+Writes a node's controller IP into a variable.
+
+
+Meaning of the parameters is as follows:
+
+
+- *cluster_id* (int) - the cluster;
+- *node_id* (int) - the node;
+- *ip_var* (var) - receives the IP.
+
+
+Returns *1* on success, *-1* if the node is not a member.
+
+
+This function can be used from any route.
+
+
+```opensips title="cl_ctr_get_node_ip() usage"
+...
+if (cl_ctr_node_present(1, 3) && cl_ctr_node_is_master(1, 3)) {
+    cl_ctr_get_node_ip(1, 3, $var(ip));
+    xlog("node 3 ($var(ip)) leads cluster 1\n");
+}
+...
+```
+
+
+### cl_ctr_broadcast_req(cluster_id, msg, [tag], [reliable])
+
+
+Sends a request to every other member of the cluster as one multicast packet, over the controller's encrypted plane (see [Messaging Between Nodes](#messaging-between-nodes)). The sender does not receive its own broadcast. Receivers raise [E_CL_CTR_REQ_RECEIVED](#e_cl_ctr_req_received).
+
+
+Meaning of the parameters is as follows:
+
+
+- *cluster_id* (int) - the cluster;
+- *msg* (string) - the message payload;
+- *tag* (string, optional) - carried through to the receiving event route, where it can be used to correlate a reply;
+- *reliable* (int, optional) - *1* asks every member to acknowledge the message, and repairs a member that does not with up to [consumer_retries](parameters.md#consumer_retries-int) retransmissions.
+
+
+Returns *1* when the message was accepted for sending, *-1* on bad arguments, a message too large for one datagram, or a cluster that has not formed yet.
+
+
+This function can be used from any route.
+
+
+```opensips title="cl_ctr_broadcast_req() usage"
+...
+# to everyone, cheaply
+cl_ctr_broadcast_req(1, "cache flushed");
+
+# to everyone, with a tag, and ask to be told it arrived
+cl_ctr_broadcast_req(1, "config changed", "cfg", 1);
+...
+```
+
+
+### cl_ctr_send_req(cluster_id, node_id, msg, [tag], [reliable])
+
+
+Sends a request to one node. Parameters and return values are as for [cl_ctr_broadcast_req()](#cl_ctr_broadcast_reqcluster_id-msg-tag-reliable), plus:
+
+
+- *node_id* (int) - the destination node.
+
+
+This function can be used from any route.
+
+
+```opensips title="cl_ctr_send_req() usage"
+...
+cl_ctr_send_req(1, 3, "check user $fU", "q1");
+...
+```
+
+
+### cl_ctr_send_req_list(cluster_id, nodes_avp, msg, [tag], [sent_var])
+
+
+Sends a request to the nodes named in an AVP, one unicast each - deliberately not a multicast that every member would decrypt only to discard.
+
+
+Meaning of the parameters is as follows:
+
+
+- *cluster_id* (int) - the cluster;
+- *nodes_avp* (var) - an AVP holding the destination node ids;
+- *msg* (string) - the message payload;
+- *tag* (string, optional) - as for [cl_ctr_broadcast_req()](#cl_ctr_broadcast_reqcluster_id-msg-tag-reliable);
+- *sent_var* (var, optional) - receives how many nodes the message was sent to. Entries naming a node that is no longer a member are skipped rather than failing the send for the rest.
+
+
+Returns *1* if the message was sent to at least one node, *-1* otherwise.
+
+
+The count comes back in a variable and the function itself is only true or false, because OpenSIPS stops the route when a function returns zero - a function returning the count would halt the script on the day it reached nobody, which is an answer a script must be able to see. And the count is how many nodes the message was *sent to*: how many *acknowledged* is only known later, so for a reliable send it is reported to the log as it completes.
+
+
+This function can be used from any route.
+
+
+```opensips title="cl_ctr_send_req_list() usage"
+...
+# Assigning to the same AVP again adds a value rather than replacing it, so
+# this names two nodes (stored newest first: read back 5, then 2).
+$avp(nodes) = 2;
+$avp(nodes) = 5;
+if (cl_ctr_send_req_list(1, $avp(nodes), "just for you", "mytag", $var(sent)))
+    xlog("sent to $var(sent) node(s)\n");
+...
+```
+
+
+### cl_ctr_send_rpl(cluster_id, node_id, msg, [tag])
+
+
+Sends a reply to a node, normally from inside an [E_CL_CTR_REQ_RECEIVED](#e_cl_ctr_req_received) route back to *$param(src_id)*. The receiver raises [E_CL_CTR_RPL_RECEIVED](#e_cl_ctr_rpl_received).
+
+
+Meaning of the parameters is as follows:
+
+
+- *cluster_id* (int) - the cluster;
+- *node_id* (int) - the destination node;
+- *msg* (string) - the reply payload;
+- *tag* (string, optional) - normally the *tag* of the request being answered.
+
+
+Returns *1* when the reply was accepted for sending, *-1* otherwise.
+
+
+This function can be used from any route.
+
+
+```opensips title="cl_ctr_send_rpl() usage"
+...
+event_route[E_CL_CTR_REQ_RECEIVED] {
+    cl_ctr_send_rpl($param(cluster_id), $param(src_id), "ack", $param(tag));
+}
+...
+```
+
+
+## Exported Events
+
+
+### E_CL_CTR_REQ_RECEIVED
+
+
+Raised when a request sent by another node's script (*cl_ctr_broadcast_req()*, *cl_ctr_send_req()* or *cl_ctr_send_req_list()*) is received.
+
+
+Parameters:
+
+
+- *cluster_id* - the cluster the message was sent on;
+- *src_id* - the node id of the sender (*0* if the sender had not been assigned one yet);
+- *msg* - the message payload;
+- *tag* - the sender's tag, to be passed back to *cl_ctr_send_rpl()* when replying.
+
+
+### E_CL_CTR_RPL_RECEIVED
+
+
+Raised when a reply sent with *cl_ctr_send_rpl()* is received.
+
+
+Parameters:
+
+
+- *cluster_id* - the cluster the reply was sent on;
+- *src_id* - the node id of the sender;
+- *msg* - the reply payload;
+- *tag* - the tag the reply carries, matching the request it answers.
+
+
+### E_CL_CTR_MAINTENANCE
+
+
+Raised on every node that learns that a member's maintenance state changed - this node's own included - so an *event_route* can react (e.g. shift dispatcher weights away from it).
+
+
+Parameters:
+
+
+- *cluster_id* - the cluster;
+- *node_id* - the node whose state changed;
+- *state* - its new state: *none* or *evicted*.
+
+
+## Messaging Between Nodes
+
+The channel the controller keeps for its own membership traffic is also available to carry other people's messages: a script can talk to its peers, and so can another module. The surface deliberately mirrors the generic messaging the *clusterer* module offers - the same shapes, the same event parameters - so moving between them is familiar. What differs is underneath, and it differs in both directions: one multicast packet instead of a send per peer, over an encrypted channel rather than a plaintext one, but by datagram rather than over a stream, which is the subject of [What delivery guarantees](#what-delivery-guarantees) below.
+
+A message must fit one datagram, so its size limit follows the cluster interface's MTU: 1365 bytes on a standard 1500-byte link, more with jumbo frames, and the value in force is logged at startup. A channel name is limited to 31 characters. The module reserves the channel it uses for script traffic during startup, before any consumer can register, so a module cannot claim it by accident.
+
+### From the script
+
+
+The script sends with [cl_ctr_broadcast_req()](#cl_ctr_broadcast_reqcluster_id-msg-tag-reliable), [cl_ctr_send_req()](#cl_ctr_send_reqcluster_id-node_id-msg-tag-reliable), [cl_ctr_send_req_list()](#cl_ctr_send_req_listcluster_id-nodes_avp-msg-tag-sent_var) and [cl_ctr_send_rpl()](#cl_ctr_send_rplcluster_id-node_id-msg-tag), and arriving messages are raised as [E_CL_CTR_REQ_RECEIVED](#e_cl_ctr_req_received) and [E_CL_CTR_RPL_RECEIVED](#e_cl_ctr_rpl_received):
+
+
+```opensips title="Talking to the other nodes"
+event_route[E_CL_CTR_REQ_RECEIVED] {
+    xlog("node $param(src_id) says: $param(msg)\n");
+    cl_ctr_send_rpl($param(cluster_id), $param(src_id), "ack", $param(tag));
+}
+
+event_route[E_CL_CTR_RPL_RECEIVED] {
+    xlog("node $param(src_id) answered $param(tag): $param(msg)\n");
+}
+
+route[announce] {
+    cl_ctr_broadcast_req(1, "config changed", "cfg", 1);
+}
+```
+
+
+### From another module
+
+A module binds the API with *load_clctr()* and gets *register_channel()* to claim a name and receive what arrives on it, *send_mcast()* to reach every member, *send_ucast()* to reach one, *send_list()* to reach a named set, and *get_my_node_id()*. Sends are handed to the controller's worker, so any process may call them.
+
+Two flags. *CLCTR_SEND_TO_SELF* also delivers the message to this node, without putting a packet on the wire, so a consumer can treat itself the same as its peers. *CLCTR_SEND_RELIABLE* is described next.
+
+### What delivery guarantees
+
+By default: best effort, unordered, and at most once. A message is sent and not spoken of again. That suits anything the sender can afford to repeat - a cache that will be asked a second time, a hint that is worth having and not worth waiting for - and it is the cheapest thing the network can do.
+
+It is also weaker than what *clusterer* gives you over a stream, and that is worth saying plainly rather than leaving to be discovered: a script moved across without further thought has quietly traded reliable, ordered delivery for neither.
+
+*CLCTR_SEND_RELIABLE*, or a 1 in the last argument of *cl_ctr_broadcast_req()*, asks for the message to be acknowledged and sent again while it is not, up to [consumer_retries (int)](parameters.md#consumer_retries-int) times at [consumer_retry_ms (int)](parameters.md#consumer_retry_ms-int) intervals. It is chosen per send rather than per channel, because most messages are better off cheap and the ones that are not know who they are.
+
+What that buys is at-most-once delivery, on any channel - including one carrying several messages to the same peer at the same time. The receiver accepts each sequence number exactly once and keeps a window of the recent ones, so it can tell a repair (never delivered: accept it, acknowledge it) from a duplicate (already delivered: acknowledge again, because our first answer evidently went missing, but do not hand the payload up twice). Consumers are not asked to deduplicate.
+
+The window spans a fixed number of messages rather than a fixed time, so a peer sending faster than that window divided by its retransmit horizon - [consumer_retries (int)](parameters.md#consumer_retries-int) multiplied by [consumer_retry_ms (int)](parameters.md#consumer_retry_ms-int) - can outrun it. A repair that arrives that late is dropped and deliberately *not* acknowledged, because at that point the receiver genuinely cannot say whether it ever had the message, and an acknowledgement it cannot justify is worse than none. Both ends log it. With the default timings the ceiling is around 12,800 messages a second from any one peer, and the module reports the figure in force at startup.
+
+The cost is one acknowledgement per recipient. On a large cluster a reliable broadcast is therefore one packet out and one back from every member, where an ordinary one is a single packet and no answer at all. It remains a multicast - sending it as one unicast per member would be roughly twice the packets for the same delivery - and only the members that fail to answer are then repaired individually.
+
+Addressing a set of nodes is the other way round: those go out as one unicast each, because a multicast is decrypted by every member, so a message "addressed" to three of them over a multicast would still be handed to all the others. Filtering after decryption is not addressing.

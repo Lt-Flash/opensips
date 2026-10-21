@@ -1,0 +1,313 @@
+[clusterer_controller](../README.md) / Parameters
+
+# Parameters
+
+## Exported Parameters
+
+### cluster (string)
+
+Define a cluster to participate in. The value is a comma-separated key=value string with the following fields:
+
+- **id** (required) — positive integer cluster identifier, must match the *cluster_id* used by clusterer consumers (dialog, usrloc, dispatcher, etc.).
+- **multicast** (required) — IPv4 multicast address and UDP port in the form *A.B.C.D:PORT*. The address must be in the 224.0.0.0/4 range.
+- **password** (optional) — XChaCha20-Poly1305 encryption key material. All nodes in the same cluster must use the same password. Falls back to the global *password* modparam if not set.
+- **bin_socket** (optional) — BIN socket to advertise for this cluster, in the form *bin:IP:PORT*. Required when multiple clusters are defined (so the controller knows which listener to advertise), but it need *not* be distinct — several clusters may share the same BIN socket. When only one cluster is defined and only one BIN socket exists, the socket is auto-detected from the *proto_bin* listeners.
+- **manage_shtags** (optional) — per-cluster override for the global *manage_shtags* modparam. Set to *1* to enable automatic sharing tag failover for this cluster, or *0* to disable it. When omitted, the global *manage_shtags* value applies, regardless of the order in which *cluster* and *manage_shtags* modparams appear in the config file.
+- **master_stickiness**, **consumer_rate_limit**, **consumer_retries**, **consumer_retry_ms** (optional) — per-cluster overrides of the global parameters of the same names.
+- **uuid** (optional) — pins this cluster's *identity* (see [Cluster identity](how-it-works.md#cluster-identity)): a UUID as written, or any other string, which is hashed into a UUID, so a readable name works (*uuid=billing-prod*). Every node of the cluster must pin the same value. Without it, the node that founds the cluster mints the identity at runtime.
+
+This parameter may be set multiple times to participate in multiple clusters simultaneously. Each cluster runs its own independent worker process.
+
+*No default value. At least one cluster must be defined.*
+
+```opensips title="Set cluster parameter — single cluster"
+...
+modparam("clusterer_controller", "cluster",
+    "id=1,multicast=239.0.90.1:3333")
+...
+```
+
+```opensips title="Set cluster parameter — multiple clusters on separate networks (one BIN socket per network)"
+...
+modparam("clusterer_controller", "cluster",
+    "id=1,multicast=239.0.90.1:3333,bin_socket=bin:10.0.1.10:5566")
+modparam("clusterer_controller", "cluster",
+    "id=2,multicast=239.0.90.2:3333,bin_socket=bin:10.0.2.10:5566")
+...
+```
+
+```opensips title="Set cluster parameter — multiple clusters sharing a single BIN socket (recommended default)"
+...
+# one proto_bin listener serves both clusters; the cluster_id in each
+# BIN packet keeps their replication traffic separate
+modparam("clusterer_controller", "cluster",
+    "id=1,multicast=239.0.90.1:3333,bin_socket=bin:10.0.0.10:5566")
+modparam("clusterer_controller", "cluster",
+    "id=2,multicast=239.0.90.2:3333,bin_socket=bin:10.0.0.10:5566")
+...
+```
+
+> **Note:** **One BIN socket can serve any number of clusters.** Every clusterer BIN packet carries its *cluster_id*, so a single *proto_bin* listener demultiplexes traffic for all clusters. Unless you specifically want different clusters on different interfaces or networks, set the *same* *bin_socket* value on every *cluster* entry (it is mandatory once more than one cluster is defined, but need not be distinct). Using multiple BIN sockets is for network/interface segregation, *not* throughput: the replication data plane runs over BIN (TCP) and scales with the shared TCP worker pool (*tcp_children*) and IPC dispatch, independent of the number of BIN sockets. What does scale with the number of clusters is the controller's own worker set — it spawns one lightweight control worker (UDP multicast: discovery, election, keepalives) per cluster — so it is the *cluster count*, not the BIN-socket count, that adds processes.
+
+> **Note:** **Each cluster needs a distinct multicast endpoint, but clusters may share one BIN socket.** The two sockets play opposite roles. The controller's *multicast* endpoint is its control plane: every cluster defined in one instance must use a *different* multicast address:port — two *cluster* entries with the same *multicast* value are rejected at startup (*duplicate multicast*). Use a different port (e.g. `:3333` and `:3334`) or a different group per cluster. The *bin_socket* is the replication data plane and is the opposite: it may be freely shared across clusters, since every BIN packet carries its *cluster_id*. (The *cluster_id* filter on the multicast wire header is for a different purpose: letting *separate* deployments coexist on a shared multicast group, not two clusters inside one instance.)
+
+### my_ip (string)
+
+Explicitly set the local IPv4 address used by the controller for its own node identity and master election. This is the IP that the controller advertises to peers in JOIN_REQ and NODE_ASSIGN packets and uses for the highest-IP master election algorithm.
+
+Note: this parameter controls the controller's identity only. The BIN socket address advertised to clusterer peers is discovered separately from the *proto_bin* listener list and is independent of this setting. Do not confuse *my_ip* with the BIN socket IP defined by the *socket=bin:IP:PORT* core parameter.
+
+When set, the module walks the interface list to find which local interface owns this address and uses that interface for multicast traffic. Startup fails if no local interface owns the given address.
+
+The module supports three identity resolution modes depending on which modparams are provided:
+
+**Mode 1 — my_ip set:** The given IP is used directly. The owning interface is resolved automatically from the system interface list. Use this mode on multi-homed hosts where you want to pin the controller identity to a specific IP.
+
+**Mode 2 — interface set, my_ip not set:** The first IPv4 address on the named interface is used as the controller identity IP. A warning is logged if the interface has multiple IPv4 addresses.
+
+**Mode 3 — neither set (default):** A throw-away UDP socket is connected to the multicast group and *getsockname()* is called to determine which source IP the kernel would select. The interface name is resolved from the returned IP. Suitable for single-homed hosts.
+
+*Default: auto-detected (Mode 3).*
+
+```opensips title="Set my_ip parameter"
+...
+modparam("clusterer_controller", "my_ip", "10.22.23.191")
+...
+```
+
+### interface (string)
+
+Explicitly set the network interface name to use for multicast traffic (e.g. *eth0*, *enp6s18*). The module takes the first IPv4 address assigned to this interface as the controller's identity IP. This corresponds to Mode 2 described in the *my_ip* parameter documentation above.
+
+Like *my_ip*, this parameter affects the controller's own identity only and has no effect on the BIN socket addresses advertised to clusterer peers.
+
+If the interface has more than one IPv4 address, a warning is logged and the first address (in the order returned by the kernel) is used. Set *my_ip* explicitly to avoid ambiguity on multi-address interfaces.
+
+Ignored if *my_ip* is also set — *my_ip* takes precedence.
+
+*Default: auto-detected (Mode 3 — see *my_ip*).*
+
+```opensips title="Set interface parameter"
+...
+modparam("clusterer_controller", "interface", "eth0")
+...
+```
+
+### query_time (integer)
+
+How often (in seconds) each active node sends an ALIVE heartbeat to the multicast group. This value also controls the election window (*3 × query_time*) and the peer purge window (*6 × query_time*).
+
+Smaller values mean faster failure detection but higher multicast traffic. Valid range: 1–60.
+
+*Default value is "5".*
+
+```opensips title="Set query_time parameter"
+...
+modparam("clusterer_controller", "query_time", 5)
+...
+```
+
+### password (string)
+
+Global default encryption password for all clusters. All nodes in a cluster must use the same password. The password serves two purposes:
+
+- **Bootstrap key** — the password is stretched with *Argon2id* (memory-hard, per-cluster salt); it is the pre-shared key for the Noise join handshake (JOIN_REQ / KEY_GRANT) and the AEAD key for bootstrap traffic before a session key exists.
+- **Session key material** — the password is fed into HKDF-SHA256 together with the master salt to derive the session key used for all normal cluster traffic.
+
+Can be overridden per cluster using the *password=* key in the *cluster* parameter.
+
+*Default value is "3eCrEt*5629". Change this in production.* Use a long, high-entropy secret rather than a memorable phrase — Argon2id raises the cost of an offline guess, but only a strong secret removes the risk. A generated key is ideal, e.g. `openssl rand -base64 32`. The module logs a startup warning if the configured password is the default or has an estimated entropy below 80 bits.
+
+```opensips title="Set password parameter"
+...
+modparam("clusterer_controller", "password", "MyStr0ngPassw0rd!")
+...
+```
+
+### manage_shtags (integer)
+
+When set to **1** (the default), the controller master node automatically manages sharing tag failover for all clusters. The controller becomes the single decision point for which node holds the active tag, eliminating races between nodes and requiring no script-level event routes or MI commands to handle failover. While active, the *clusterer_set_tag_active* MI command and the *$shtag()* script variable setter are blocked for controller-managed clusters, returning an error to the caller.
+
+Behaviour when *manage_shtags=1*:
+
+**Startup:** all local sharing tags are forced to *backup* state during module initialisation, regardless of the *=active* value in the clusterer *sharing_tag* modparam. The deferred BIN broadcast flag is also cleared so no *SHTAG_ACTIVE* packet is ever sent at startup. This ensures that no node can steal the active tag from an existing cluster member simply by restarting.
+
+**Bootstrap:** when the first node starts alone and no existing master responds within *query_time* seconds (join deadline), it elects itself master and activates all local backup tags exactly once. Nodes that join an existing cluster are never eligible for this bootstrap path and never self-activate.
+
+**Failover:** when any node departs (graceful shutdown via GOODBYE packet, or timeout-based removal), the controller master activates its own backup tags for that cluster. This covers all departure scenarios: last node standing, master still present, and post re-election.
+
+**Rejoin:** a node rejoining an existing cluster always starts in backup state and never reclaims the active tag from the current holder, even if *=active* appears in its config.
+
+When set to **0**, the controller does not touch sharing tag state at all. The *=active* config value, *seed_fallback_interval*, and external MI/event-route scripts behave exactly as in stock clusterer without the controller. Use this when you have existing tag management scripts and want to opt out of automatic failover.
+
+*Default value is "1".*
+
+**Global vs per-cluster scope:** This modparam sets a global default that applies to every cluster defined via the *cluster* modparam. Individual clusters can override it by including *manage_shtags=0* or *manage_shtags=1* directly in the cluster string. The global default is resolved at startup after all modparams are processed, so the order of *manage_shtags* and *cluster* lines in the config file does not matter.
+
+```opensips title="Global manage_shtags — applies to all clusters"
+...
+# clusters 1 and 2 registered as controller-managed on the clusterer side
+modparam("clusterer", "cluster_options", "cluster_id=1, use_controller=1")
+modparam("clusterer", "cluster_options", "cluster_id=2, use_controller=1")
+
+# Enable automatic failover for every cluster (this is also the default)
+modparam("clusterer_controller", "manage_shtags", 1)
+modparam("clusterer_controller", "cluster", "id=1,multicast=239.0.90.1:3333")
+modparam("clusterer_controller", "cluster", "id=2,multicast=239.0.90.2:3333")
+...
+```
+
+```opensips title="Per-cluster override — opt one cluster out of automatic failover"
+...
+# clusters 1 and 2 registered as controller-managed on the clusterer side
+modparam("clusterer", "cluster_options", "cluster_id=1, use_controller=1")
+modparam("clusterer", "cluster_options", "cluster_id=2, use_controller=1")
+
+# manage_shtags=1 globally, but cluster 2 uses its own MI/event-route scripts
+modparam("clusterer_controller", "manage_shtags", 1)
+modparam("clusterer_controller", "cluster",
+    "id=1,multicast=239.0.90.1:3333")
+modparam("clusterer_controller", "cluster",
+    "id=2,multicast=239.0.90.2:3333,manage_shtags=0")
+...
+```
+
+```opensips title="Global opt-out with one cluster opting in"
+...
+# clusters 1 and 2 registered as controller-managed on the clusterer side
+modparam("clusterer", "cluster_options", "cluster_id=1, use_controller=1")
+modparam("clusterer", "cluster_options", "cluster_id=2, use_controller=1")
+
+# Disable automatic failover globally; enable it only for cluster 1
+modparam("clusterer_controller", "manage_shtags", 0)
+modparam("clusterer_controller", "cluster",
+    "id=1,multicast=239.0.90.1:3333,manage_shtags=1")
+modparam("clusterer_controller", "cluster",
+    "id=2,multicast=239.0.90.2:3333")
+...
+```
+
+```opensips title="Typical full configuration with manage_shtags=1 (default)"
+# All nodes use identical config — only the BIN socket IP differs per node.
+# The =active tag value in sharing_tag is ignored by the controller;
+# it is kept in the config only for compatibility with manage_shtags=0.
+
+socket=bin:10.22.23.191:3857
+
+loadmodule "proto_bin.so"
+
+loadmodule "clusterer.so"
+modparam("clusterer", "cluster_options", "cluster_id=1, use_controller=1")
+modparam("clusterer", "sharing_tag",   "vip1/1=active")
+modparam("clusterer", "ping_interval", 4)
+modparam("clusterer", "ping_timeout",  1500)
+
+loadmodule "clusterer_controller.so"
+modparam("clusterer_controller", "cluster",  "id=1,multicast=239.0.90.1:3333")
+modparam("clusterer_controller", "password", "MyStr0ngPassw0rd!")
+# manage_shtags defaults to 1 — no need to set it explicitly
+```
+
+### master_stickiness (integer)
+
+Controls whether a live master keeps its role when a higher-IP node joins. Default *1* (sticky).
+
+The module recognises three roles per cluster: **master** (the active coordinator), **backup** (the standby that takes over when the master fails), and **member** (all other nodes). The backup is always the highest-IP node that is not the master.
+
+- **master_stickiness=1** (default): the master is *sticky* — a live master keeps the role and is not displaced when a higher-IP node joins. The newly joined node becomes the backup (replacing the previous backup if it has a higher IP); the master only changes when the current master actually fails, at which point the backup is promoted. This minimises the number of master handovers.
+- **master_stickiness=0**: pure highest-IP election — a higher-IP node takes over as master as soon as it appears. This produces more handovers but always keeps the highest-IP node as master.
+
+In both modes a split-brain (two nodes each believing they are master, e.g. after a network partition heals) is resolved deterministically: the lower-IP master yields to the higher-IP one.
+
+**Global vs per-cluster scope:** like *manage_shtags*, this sets a global default that individual clusters can override with *master_stickiness=0* or *master_stickiness=1* in the *cluster* string. Resolution happens at startup regardless of modparam order.
+
+```opensips title="Set master_stickiness parameter"
+...
+# both clusters registered as controller-managed on the clusterer side
+modparam("clusterer", "cluster_options", "cluster_id=1, use_controller=1")
+modparam("clusterer", "cluster_options", "cluster_id=2, use_controller=1")
+
+# Global default (sticky) — omit entirely for the same effect
+modparam("clusterer_controller", "master_stickiness", 1)
+
+# Per-cluster override: cluster 2 always promotes the highest-IP node
+modparam("clusterer_controller", "cluster",
+    "id=1,multicast=239.0.90.1:3333")
+modparam("clusterer_controller", "cluster",
+    "id=2,multicast=239.0.90.2:3333,master_stickiness=0")
+...
+```
+
+### release_tag_when_isolated (integer)
+
+When set to *1*, a master that hears strictly fewer than half of the members it last held steadily, for a whole election window (*query_time* x 3 seconds), gives up the active sharing tag - it stays master for the control plane - and takes it back as soon as it hears a majority again. The rest of the cluster is then elsewhere and has most likely elected a master of its own, and two masters holding the active tag at once (the most common failure of leader election under network partitions) is avoided. The membership it compares against grows at once and shrinks only when a smaller membership of at least half has lasted three rounds (members that left or were purged), so being cut off never lowers it. A two-node cluster never releases: one of two is not fewer than half. *clusterer_controller:list_config* reports the setting and *tag_released*.
+
+Off by default: availability first - a master cut off from everyone else keeps serving with the tag. Turn it on where a duplicate active tag is worse than none for the length of a partition.
+
+*Default value is 0.*
+
+```opensips title="Set release_tag_when_isolated parameter"
+...
+modparam("clusterer_controller", "release_tag_when_isolated", 1)
+...
+```
+
+### on_config_mismatch (string)
+
+Policy applied when a node's consistency-critical settings (*manage_shtags*, *master_stickiness*, *query_time*) differ from those of the running cluster. All nodes of a cluster are expected to use identical values; this parameter decides what happens when they do not. One of:
+
+- *reject* (default) - the master refuses the join with a JOIN_REJECT and the joining node shuts down after logging which settings differ. Two partitions whose masters' settings differ are not merged (see *Split-brain handling*).
+- *warn* - the node is allowed to join; a single *CONFIG MISMATCH* warning is logged per mismatching peer.
+- *adopt* - the joining node adopts the running cluster's settings at runtime and continues.
+
+Global only (not per-cluster). Default: *reject*.
+
+```opensips title="Set on_config_mismatch parameter"
+...
+modparam("clusterer_controller", "on_config_mismatch", "reject")
+...
+```
+
+### consumer_rate_limit (int)
+
+How many packets a second this node accepts from any one source address on the messaging API described in [Messaging Between Nodes](scripting.md#messaging-between-nodes), before it starts dropping them. Separate from the control plane's own much smaller budget, which a busy consumer would otherwise exhaust: the two are counted apart so neither can starve the other.
+
+Set it per cluster in the *cluster* string to override this default for that cluster alone.
+
+*Default value is "1000".*
+
+### consumer_retries (int)
+
+How many times a message sent with acknowledgement ([What delivery guarantees](scripting.md#what-delivery-guarantees)) is sent again while it has not been acknowledged. Zero disables retransmission and leaves only the acknowledgement itself, which is still worth having: it is how the sender learns the message arrived.
+
+Set it per cluster in the *cluster* string. A node can belong to several clusters and they are not alike - one may run over a quiet management network where a lost packet is a curiosity, another across a link where it is routine - so one number for all of them is rarely right.
+
+When a reliable send finishes, the log says how much of this budget it actually needed, so the configured value can be judged against what the network does:
+
+```text
+broadcast seq 41 acknowledged by all 3 member(s) after 0 of the 2 retries
+configured for this cluster
+```
+
+and when it gives up, how far it got:
+
+```text
+broadcast seq 44 reached 2 of 3 member(s), giving up after 2 of the 2 retries
+configured for this cluster
+```
+
+*Default value is "2".*
+
+### consumer_retry_ms (int)
+
+Milliseconds between those attempts. Accepted range is 5 to 5000. Set it per cluster in the *cluster* string, for the same reason as [consumer_retries (int)](#consumer_retries-int).
+
+*Default value is "40".*
+
+### enable_reliable_send (int)
+
+Whether the *CLCTR_SEND_RELIABLE* flag is honoured. On by default. Set it to 0 to turn the acknowledge-and-retransmit machinery off fleet-wide: a send that asks for reliability then gets an ordinary best-effort one - the payload still goes out, it is simply not acknowledged and not repeated if it is lost - and the module logs one rate-limited warning.
+
+The reason to want that is cost rather than doubt. A reliable broadcast draws one acknowledgement back from every member, so on a large cluster one message becomes an event; a fleet that would rather not pay for it can decline here without editing the consumers that ask.
+
+*Default value is "1".*

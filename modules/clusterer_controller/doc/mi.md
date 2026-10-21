@@ -1,0 +1,155 @@
+[clusterer_controller](../README.md) / MI commands
+
+# MI commands
+
+## Exported MI Functions
+
+### clusterer_controller:list_members
+
+List all current cluster members with their node_id, status, maintenance state, capabilities and BIN socket addresses. Status is one of *master*, *backup* (the standby that will be promoted if the master fails) or *member*; *maintenance* is *none*, *evicted* or *full* (see *clusterer_controller:maintenance*); *capabilities* are the optional mechanisms the member's build implements, as it advertises them (see [Upgrading](deployment.md#upgrading)) - empty for a build older than the field. They are listed where known first-hand: for every member on the master, which every member's ALIVE reaches, and for itself and the master on a member. Only peers within the current election window are shown.
+
+Parameters: *none*
+
+```bash title="clusterer_controller:list_members usage"
+opensips-cli -x mi clusterer_controller:list_members
+[
+    {
+        "cluster_id": 1,
+        "members": [
+            {
+                "ip": "10.22.23.191",
+                "node_id": 1,
+                "status": "master",
+                "maintenance": "none",
+                "capabilities": [ "probe", "maint_set", "maint_full" ],
+                "bin_sockets": [ "bin:10.22.23.191:3857" ]
+            },
+            {
+                "ip": "10.22.23.193",
+                "node_id": 2,
+                "status": "backup",
+                "maintenance": "none",
+                "capabilities": [ "probe", "maint_set", "maint_full" ],
+                "bin_sockets": [ "bin:10.22.23.193:3857" ]
+            },
+            {
+                "ip": "10.22.23.192",
+                "node_id": 3,
+                "status": "member",
+                "maintenance": "none",
+                "capabilities": [ "probe", "maint_set", "maint_full" ],
+                "bin_sockets": [ "bin:10.22.23.192:3857" ]
+            }
+        ]
+    }
+]
+```
+
+### clusterer_controller:node_info
+
+Return full information for a specific node identified by its allocated node_id.
+
+Parameters:
+
+- *node_id* — the integer node_id to look up.
+
+```bash title="clusterer_controller:node_info usage"
+opensips-cli -x mi clusterer_controller:node_info node_id=2
+{
+    "node_id": 2,
+    "ip": "10.22.23.192",
+    "cluster_id": 1,
+    "status": "backup",
+    "bin_sockets": [ "bin:10.22.23.192:3857" ]
+}
+```
+
+### clusterer_controller:list_config
+
+List all configured clusters and their resolved settings — the effective values actually in use after global defaults and per-cluster overrides have been applied. Useful for confirming that a per-cluster *master_stickiness* or *manage_shtags* override took effect. The cluster password is never exposed.
+
+The *shtag_mode* field reports the current sharing-tag allocation policy: *auto* when the active tag follows the master automatically, or *override:<node_id>* when an operator has pinned a fixed holder with *clusterer_controller:shtag_force*. *term* is the term of the current mastership (see *Split-brain handling*), *mtu* the cluster-plane MTU this node joined at, and *cluster_uuid*, *cluster_uuid_state* and *foreign_packets* describe the [cluster identity](how-it-works.md#cluster-identity). *peer_capacity* is the size of the peer table and *peers_refused* the number of times a new address was turned away because the table was full. *self_stalls* counts the times this node found its own worker had not run for over 2 seconds (the process was paused or starved of CPU) and *self_stall_max_ms* is the longest such gap; *election_holds* counts elections this node held because peers still heard a master it could not; *local_health* is this node's own trouble count (0-8, see below), which multiplies its timeouts; *master_timeout_ms* is how long this node now waits for the master's keepalive before suspecting it, learned from *master_ka_mean_ms* and *master_ka_dev_ms* (the smoothed gap between keepalives and its deviation) plus *master_ka_margin_ms*, which grows with each of *master_false_suspicions*; *terms_refused* counts announced terms refused as implausible jumps; *rcvbuf_bytes* is the receive buffer the kernel granted the cluster socket and *rx_kernel_drops* the datagrams it dropped because that buffer was full. *foreign_clusters* lists the other clusters (by uuid) heard on the group, with the last address heard from, when, and how many packets.
+
+Parameters: *none*
+
+```bash title="clusterer_controller:list_config usage"
+opensips-cli -x mi clusterer_controller:list_config
+[
+    {
+        "cluster_id": 1,
+        "multicast": "239.0.90.1:3333",
+        "my_ip": "10.22.23.191",
+        "bin_socket": "bin:10.22.23.191:3857",
+        "mtu": 1500,
+        "interface": "eth0",
+        "query_time": 5,
+        "master_stickiness": 1,
+        "manage_shtags": 1,
+        "shtag_mode": "auto",
+        "member_count": 3,
+        "term": 4,
+        "cluster_uuid": "019a1f3c-7b2e-7d41-9c55-3e8f0a6b21d4",
+        "cluster_uuid_state": "established",
+        "foreign_packets": 0,
+        "peer_capacity": 256,
+        "peers_refused": 0,
+        "self_stalls": 0,
+        "self_stall_max_ms": 0,
+        "terms_refused": 0,
+        "election_holds": 0,
+        "rcvbuf_bytes": 212992,
+        "rx_kernel_drops": 0,
+        "cluster_capabilities": [ "probe", "maint_set", "maint_full" ],
+        "foreign_clusters": []
+    }
+]
+```
+
+*cluster_capabilities* are the capabilities every live member shares, as the master works them out and relays them in its MASTER_ALIVE - during a rolling upgrade a mechanism appears here once the last node without it is gone (see [Upgrading](deployment.md#upgrading)).
+
+### clusterer_controller:shtag_force
+
+Force a specific node to hold the active sharing tag, overriding the normal master-driven allocation. This is useful for planned maintenance or manual traffic steering: the chosen node becomes the sole active shtag holder cluster-wide while every other node — including the master — is put into backup for that tag.
+
+The command must be issued on the current *master* (it returns an error otherwise). The override is propagated to all members in the MEMBER_LIST and *survives master fail-over*: a newly elected master keeps honouring it rather than reclaiming the tag. Automatic allocation stays suspended until *clusterer_controller:shtag_auto* is called. If the forced node leaves the cluster or times out, the override is cleared automatically and automatic allocation resumes.
+
+Parameters:
+
+- *cluster_id* — the target cluster.
+- *node_id* — the node that must hold the active tag; it must be a current member of the cluster.
+
+```bash title="clusterer_controller:shtag_force usage"
+opensips-cli -x mi clusterer_controller:shtag_force cluster_id=1 node_id=3
+```
+
+### clusterer_controller:shtag_auto
+
+Clear any override set by *clusterer_controller:shtag_force* and resume automatic, master-driven sharing-tag allocation — the active tag follows the master again. Must be issued on the current master.
+
+Parameters:
+
+- *cluster_id* — the target cluster.
+
+```bash title="clusterer_controller:shtag_auto usage"
+opensips-cli -x mi clusterer_controller:shtag_auto cluster_id=1
+```
+
+### clusterer_controller:maintenance
+
+Put this node - or, with *node_id*, any member - in or out of maintenance, e.g. for a rolling upgrade. A node in maintenance (*evicted* or *full*) stays a member - it keeps its node_id, its BIN links and its place in *clusterer_controller:list_members* - but it is never master or backup and holds no sharing tag. If it is the master, it hands over at once: its last keepalive carries the new state, and every member elects the successor as soon as it reads it, without waiting for the master watchdog. A *clusterer_controller:shtag_force* pin is refused for a node in maintenance, and a pin already on a node that goes into maintenance is cleared (automatic allocation resumes). Only when every node in the election window is in maintenance does the cluster take one of them as master anyway - a cluster must have a master.
+
+At *full*, every other node also disables it in its *clusterer* (as *clusterer:set_status* would), so they take their link to it down and stop sending it replication; leaving *full* enables it again and *clusterer* resumes pinging it. A node never disables itself - its peers do.
+
+The state is announced by the node itself and relayed by the master, so every node agrees on it and it survives a master failover. A request for another node is multicast to the cluster and that node applies it to itself, so it takes effect only while that node is reachable. During a rolling upgrade the command refuses (409) a request for another node, and the *full* level, while not every live member's build supports it; on the master the reason names a member that lacks it (see [Upgrading](deployment.md#upgrading)). The state is runtime-only: a restart brings the node back in service.
+
+Parameters:
+
+- *cluster_id* — the target cluster.
+- *state* — *evicted* (or *on*) or *full* to enter maintenance, *none* (or *off*) to leave it.
+- *node_id* (optional) — the member to act on; this node when omitted.
+
+```bash title="clusterer_controller:maintenance usage"
+opensips-cli -x mi clusterer_controller:maintenance cluster_id=1 state=evicted
+opensips-cli -x mi clusterer_controller:maintenance cluster_id=1 state=full node_id=3
+opensips-cli -x mi clusterer_controller:maintenance cluster_id=1 state=none node_id=3
+```

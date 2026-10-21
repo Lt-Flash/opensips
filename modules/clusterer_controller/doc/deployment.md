@@ -1,0 +1,222 @@
+[clusterer_controller](../README.md) / Deployment
+
+# Deployment
+
+## Multiple Clusters
+
+A single OpenSIPS instance can participate in multiple clusters simultaneously by repeating the *cluster* modparam. Each cluster runs an independent worker process with its own multicast socket, peer table, master election, and node_id space.
+
+Clusters are distinguished by the combination of their multicast IP address and UDP port. Two useful topologies are possible:
+
+- **Different ports, same multicast IP** — convenient when all clusters share the same L2 segment. The port number alone separates traffic for each cluster. Each cluster's *password* should also differ to provide an additional encryption barrier.
+- **Different multicast IPs** — useful when clusters span different network segments or when multicast routing is scoped differently per cluster. The clusters may also share one UDP port: each socket receives only the group it joined (the module clears Linux's default *IP_MULTICAST_ALL*, which would otherwise deliver every group joined on that port to every socket bound to it), and a unicast reply the kernel delivers to the wrong cluster's socket is handed to the right one internally.
+
+When multiple clusters are defined and the node has more than one BIN socket, the *bin_socket=* key must be specified in each cluster string to indicate which BIN socket to advertise for that cluster. If only one BIN socket exists, it is used for all clusters automatically.
+
+Each cluster has its own independent clusterer *cluster_id*, allowing different OpenSIPS subsystems to replicate on different clusters:
+
+```opensips title="Multiple clusters — dialog on cluster 1, usrloc on cluster 2"
+# Two BIN sockets, one per cluster
+socket=bin:10.0.1.10:5566
+socket=bin:10.0.2.10:5566
+
+loadmodule "proto_bin.so"
+
+loadmodule "clusterer.so"
+modparam("clusterer", "cluster_options", "cluster_id=1, use_controller=1")
+modparam("clusterer", "cluster_options", "cluster_id=2, use_controller=1")
+
+loadmodule "clusterer_controller.so"
+# Cluster 1 — dialog replication group, LAN segment 10.0.1.0/24
+modparam("clusterer_controller", "cluster",
+    "id=1,multicast=239.0.90.1:3333,bin_socket=bin:10.0.1.10:5566")
+# Cluster 2 — usrloc replication group, LAN segment 10.0.2.0/24
+modparam("clusterer_controller", "cluster",
+    "id=2,multicast=239.0.90.1:3334,bin_socket=bin:10.0.2.10:5566")
+
+loadmodule "dialog.so"
+modparam("dialog", "dialog_replication_cluster", 1)
+
+loadmodule "usrloc.so"
+modparam("usrloc", "cluster_id", 2)
+```
+
+```opensips title="Multiple clusters — same multicast IP, different ports"
+socket=bin:10.22.23.191:3857
+
+loadmodule "proto_bin.so"
+
+loadmodule "clusterer.so"
+modparam("clusterer", "cluster_options", "cluster_id=1, use_controller=1")
+modparam("clusterer", "cluster_options", "cluster_id=2, use_controller=1")
+
+loadmodule "clusterer_controller.so"
+modparam("clusterer_controller", "cluster",
+    "id=1,multicast=239.0.90.1:3333,password=ClusterOneSecret")
+modparam("clusterer_controller", "cluster",
+    "id=2,multicast=239.0.90.1:3334,password=ClusterTwoSecret")
+
+loadmodule "dialog.so"
+modparam("dialog", "dialog_replication_cluster", 1)
+
+loadmodule "dispatcher.so"
+modparam("dispatcher", "cluster_id", 2)
+```
+
+## Hybrid Topologies (native + controller clusters)
+
+A single OpenSIPS instance can run *native* clusterer clusters (defined in the database or statically via *my_node_info*/*neighbor_node_info*) and *controller-managed* clusters side by side. This allows, for example, a fixed, DB-provisioned replication cluster to coexist with a zero-config controller-driven HA cluster on the same node.
+
+Which kind a cluster is follows from how it is declared:
+
+- **Controller-managed** — every *cluster_id* registered with the clusterer module via *modparam("clusterer", "cluster_options", "cluster_id=N, use_controller=1")* (and matched by a *cluster* entry in this module). Its topology and this node's *node_id* are driven at runtime by the controller; it never touches the database and always behaves as *db_mode=0*, regardless of the global *db_mode*.
+- **Native** — every cluster loaded from the clusterer database (*db_mode!=0*) or provisioned statically. It behaves exactly as classic clusterer: fixed *my_node_id*, DB persistence (when DB-backed), script/MI-managed sharing tags.
+
+The rules that keep the two kinds apart:
+
+- A *cluster_id* is *exclusively* controller-managed or native — declaring the same id both ways is rejected at startup.
+- *my_node_id* identifies this node in its *native* clusters only and is required only when native clusters exist; controller clusters get their node id assigned at runtime, and this node may well hold *different* node ids in different clusters.
+- *db_url*/*db_mode* apply to native clusters only. A controller-only deployment needs neither.
+- Sharing tags: only tags of controller-managed clusters are forced to backup at startup and driven by the controller master; tags of native clusters keep their configured state (*=active* included) and stay script/MI-managed.
+- Native and controller clusters may share the same BIN socket - the *cluster_id* carried in every BIN packet keeps their traffic apart.
+
+```opensips title="Hybrid — DB-native cluster 10 + controller cluster 1"
+socket=bin:10.0.0.10:5566
+
+loadmodule "db_mysql.so"
+loadmodule "proto_bin.so"
+
+loadmodule "clusterer.so"
+# native side: cluster 10 is defined entirely by rows in the clusterer DB
+# table (one row per node, including a row whose node_id = my_node_id below
+# for THIS node) - there is no cluster_id modparam for native clusters.
+modparam("clusterer", "db_mode", 1)
+modparam("clusterer", "db_url", "mysql://opensips:pass@localhost/opensips")
+modparam("clusterer", "my_node_id", 5)      # this node's id in its native/DB clusters (global)
+# controller side: cluster 1 is dynamic (no DB, no static rows)
+modparam("clusterer", "cluster_options", "cluster_id=1, use_controller=1")
+
+loadmodule "clusterer_controller.so"
+modparam("clusterer_controller", "cluster",
+    "id=1,multicast=239.0.90.1:3333,bin_socket=bin:10.0.0.10:5566,password=S3cret")
+
+loadmodule "dialog.so"
+modparam("dialog", "dialog_replication_cluster", 1)   # controller-managed
+
+loadmodule "dispatcher.so"
+modparam("dispatcher", "cluster_id", 10)              # DB-native
+```
+
+```opensips title="Hybrid, no DB — static native cluster 7 + controller cluster 1"
+socket=bin:10.0.0.10:5566
+
+loadmodule "proto_bin.so"
+
+loadmodule "clusterer.so"
+# native side: cluster 7 is provisioned statically (no DB).
+# db_mode=0 is REQUIRED, otherwise my_node_info/neighbor_node_info are ignored.
+modparam("clusterer", "db_mode", 0)
+modparam("clusterer", "my_node_id", 5)               # this node's id in native cluster 7
+modparam("clusterer", "my_node_info",       "cluster_id=7, url=bin:10.0.0.10:5566")
+modparam("clusterer", "neighbor_node_info", "cluster_id=7, node_id=6, url=bin:10.0.0.11:5566")
+# controller side: cluster 1 is dynamic
+modparam("clusterer", "cluster_options", "cluster_id=1, use_controller=1")
+
+loadmodule "clusterer_controller.so"
+modparam("clusterer_controller", "cluster",
+    "id=1,multicast=239.0.90.1:3333,bin_socket=bin:10.0.0.10:5566,password=S3cret")
+
+loadmodule "dialog.so"
+modparam("dialog", "dialog_replication_cluster", 1)   # controller-managed (cluster 1)
+
+loadmodule "dispatcher.so"
+modparam("dispatcher", "cluster_id", 7)              # native (cluster 7)
+```
+
+Here *my_node_id=5* is this node's id in the native cluster 7; in cluster 1 the controller assigns an id at runtime, which may differ.
+
+## Configuration Example
+
+The following example shows a minimal two-module configuration for zero-config HA clustering with dialog replication. The *loadmodule* order does not matter — the dependency system enforces correct initialization order automatically.
+
+```opensips title="Minimal HA cluster configuration"
+# Each node needs an explicit BIN socket (no wildcard)
+socket=bin:10.22.23.191:3857
+
+loadmodule "proto_bin.so"
+
+loadmodule "clusterer.so"
+modparam("clusterer", "cluster_options", "cluster_id=1, use_controller=1")
+modparam("clusterer", "sharing_tag",   "vip1/1=active")
+modparam("clusterer", "ping_interval", 4)
+modparam("clusterer", "ping_timeout",  1500)
+
+loadmodule "clusterer_controller.so"
+modparam("clusterer_controller", "cluster",
+    "id=1,multicast=239.0.90.1:3333")
+modparam("clusterer_controller", "password", "MyStr0ngPassw0rd!")
+
+loadmodule "tm.so"
+modparam("tm", "tm_replication_cluster", 1)
+
+loadmodule "dialog.so"
+modparam("dialog", "dialog_replication_cluster", 1)
+modparam("dialog", "cluster_auto_sync", 1)
+
+loadmodule "dispatcher.so"
+modparam("dispatcher", "cluster_id",           1)
+modparam("dispatcher", "cluster_probing_mode", "distributed")
+```
+
+The same configuration file (with the node-specific *socket=bin:IP:PORT* line changed per node) is used on every node. No other per-node customization is required.
+
+## Upgrading
+
+This version of the module speaks **wire version 2**: every packet carries the cluster identity and its sender's incarnation, and the master's announcements carry its term, settings and MTU. Nodes on different wire versions do not understand each other, so the module refuses the other version's packets before decrypting them, and logs one warning a minute naming the sender, for example:
+
+```text
+clusterer_controller: [cluster 1] 10.0.0.14 speaks wire version 1, this node
+speaks 2 - refused (12 packet(s) from other versions so far). Every member of a
+cluster must run the same clusterer_controller wire version; upgrade the
+cluster as a whole.
+```
+
+Upgrade a cluster **as a whole**: stop every node, upgrade them, start them again. A rolling upgrade across a wire-version change does not work. While both versions run, each side sees the other as absent, both sides elect a master, and with *manage_shtags=1* both masters hold the active sharing tags.
+
+Within one wire version, builds are kept compatible in both directions, so they can be rolled node by node: a new field is only ever appended to the end of a packet and every reader checks the length before reading it (an older build ignores what it does not know, a newer one treats a missing field as its default), and a new packet type is simply dropped by a build that does not know it, with a warning at most once a minute.
+
+Each node also advertises on its ALIVE which optional mechanisms its build implements - its **capabilities** (a build older than the field advertises none). The master, which every member's ALIVE reaches, works out what every live member shares and relays it in its MASTER_ALIVE (an older master relays nothing, which reads as none), and a mechanism that needs the other members' part is used only while every live member has it:
+
+- *probe* - a member that stops hearing the master asks the others whether they still hear it (*election_holds*) only while every live member's build answers; otherwise it elects at once, as before the question existed, instead of waiting for answers that will not come;
+- *maint_set* - *clusterer_controller:maintenance* with a *node_id* is refused while not every live member's build can apply it;
+- *maint_full* - the *full* maintenance level is refused while not every live member acts on it, since otherwise replication would stop towards the node from only some of them.
+
+*clusterer_controller:list_config* shows the *cluster_capabilities* every live member shares, and *clusterer_controller:list_members* on the master each member's *capabilities*: during a rolling upgrade a mechanism becomes available as soon as the last node without it is gone. A change that alters an existing field, or that a node must not act without, needs a new wire version.
+
+## Limitations
+
+- IPv4 only. IPv6 multicast is not currently supported.
+- The module pre-allocates approximately 240 KB of shared memory (*-m*) per cluster and 6 KB of private memory (*-M*) per worker process at startup. If either allocation fails, OpenSIPS will refuse to start with an error in the log.
+- Wildcard BIN sockets (`bin:*:PORT`) are rejected at startup. An explicit IP address must be used in the *socket=* line.
+- Node IDs are not persistent across a full cluster restart (all nodes down simultaneously). IDs are reallocated starting from 1 when the cluster reforms. This has no operational impact as long as at least one node remains up during rolling restarts.
+- The multicast network must support IP multicast routing between all cluster nodes. Nodes on different L3 segments require PIM or similar multicast routing.
+- **PIM-DM networks:** PIM Dense Mode periodically re-floods multicast traffic (prune state typically expires every 3 minutes). On slow or congested networks this brief re-flood/prune cycle could cause a gap in MASTER_ALIVE delivery and trigger a spurious master re-election. If this occurs, increase the effective timeout by raising *CL_CTR_MASTER_KA_MISSED* in the source from 3 to 5 or higher. PIM Sparse Mode (PIM-SM) or networks with IGMP snooping do not have this issue.
+- **L2 overlay tunnels (Geneve, VXLAN, GRE):** if the overlay presents a flat L2 segment with multicast support, the controller works transparently. However, some VXLAN deployments disable multicast entirely (no underlay multicast group, no BUM replication) — in that case the controller will not function, as it has no unicast fallback. Encapsulation overhead also adds latency and jitter; on high-latency overlays consider raising *CL_CTR_MASTER_KA_MISSED* to avoid spurious re-elections.
+- **IPsec-protected links:** native IPsec multicast requires GDOI/GET VPN (RFC 6407), which is rarely deployed. The recommended approach is to run multicast inside an inner tunnel (GRE-over-IPsec, Geneve-over-IPsec) that presents a multicast-capable interface. Running the controller over such a setup results in double encryption (application-layer XChaCha20-Poly1305 plus IPsec ESP), which is harmless but adds minor CPU overhead. IPsec ESP tunnel mode also reduces the effective MTU by approximately 50 bytes, which compounds the MEMBER_LIST fragmentation issue described below.
+- **MEMBER_LIST fragmentation:** the MEMBER_LIST packet grows with cluster size and reaches approximately 4.4 KB at the maximum of 256 nodes. This exceeds the 1472-byte UDP payload budget of a standard 1500-byte MTU Ethernet link and requires IP fragmentation:
+
+  - Standard Ethernet (1500 MTU): 3 fragments
+  - IPsec ESP tunnel (~1400 MTU): 4 fragments
+  - GRE-over-IPsec (~1350 MTU): 4–5 fragments
+
+  All other packet types (ALIVE, JOIN_REQ, KEY_GRANT, GOODBYE, etc.) fit comfortably within a single datagram on any of these links. Because every member runs at the same MTU (see the uniform-MTU rule above), the fragment count is the same on every node, and a host on a narrower link is refused admission rather than left fragmenting differently from the rest. The socket sets no *IP_MTU_DISCOVER* option, so Linux's default (*IP_PMTUDISC_WANT*) applies and DF *is* set - on multicast as well as unicast, verified on the wire. What lets MEMBER_LIST through is that it exceeds the LOCAL MTU: a datagram the kernel must fragment locally is not also doing path-MTU discovery, so those fragments leave with DF clear. A datagram that fits the local MTU goes out with DF set, and if it later meets a narrower routed hop it is dropped with an ICMP "fragmentation needed" that is routinely filtered. This is left as it is deliberately: the module's contract is the interface it runs on, not how the operator chose to carry multicast between segments. However, firewalls or stateless middleboxes that silently drop fragmented UDP will prevent new nodes from joining, since MEMBER_LIST is required to complete the join sequence. Verify that fragmented UDP is permitted on all paths between cluster nodes, particularly over VPN tunnels and across datacenter firewalls.
+
+## Planned Features
+
+The following features are planned for future releases:
+
+- **Statistics** — module statistics (current role, member count, master changes, nodes joined/left, JOIN_REJECTs, decrypt failures, config mismatches, split-brain merges) exposed via *get_statistics* and monitoring exporters.
+- **Events** — events raised on state transitions (became master, demoted, node joined/left, split-brain merged, config mismatch, authentication reject), named `E_CL_CTR_*` and consumable from an *event_route* or any event subscriber transport.
+- **IPv6 multicast** — the control plane currently uses IPv4 multicast (groups in *224.0.0.0/4*). Add IPv6 multicast support (*ff00::/8* groups, *AF_INET6* sockets and membership) so the controller can run on IPv6-only or dual-stack deployments.
+
+Read-only script variables for cluster state (*$cl_ctr_role*, *$cl_ctr_is_master*, and the rest) are already available - see [Exported Pseudo-Variables](scripting.md#exported-pseudo-variables).

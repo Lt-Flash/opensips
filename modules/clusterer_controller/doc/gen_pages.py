@@ -22,6 +22,7 @@ import re
 import sys
 
 TITLES = {
+    'guarantees.md':   'Guarantees',
     'how-it-works.md': 'How it works',
     'installation.md': 'Installation',
     'parameters.md':   'Parameters',
@@ -38,6 +39,7 @@ ROUTE = {   # admin-guide heading -> page (None: dropped here)
     '### Discovery Protocol': 'how-it-works.md',
     '### Cluster identity': 'how-it-works.md',
     '### Master Election': 'how-it-works.md',
+    '### Guarantees': 'guarantees.md',
     '### Security Architecture': 'how-it-works.md',
     '### Dependencies': 'installation.md',
     '### Building the Module': 'installation.md',
@@ -51,6 +53,8 @@ ROUTE = {   # admin-guide heading -> page (None: dropped here)
     '### Multiple Clusters': 'deployment.md',
     '### Hybrid Topologies (native + controller clusters)': 'deployment.md',
     '### Configuration Example': 'deployment.md',
+    '### Network requirements': 'deployment.md',
+    '### Changing the password': 'deployment.md',
     '### Upgrading': 'deployment.md',
     '### Limitations': 'deployment.md',
     '### Planned Features': 'deployment.md',

@@ -53,9 +53,10 @@ Two clusters of three nodes on the test network, one VLAN with multicast: cluste
 | + the tag fix | 43 of 43 | 42 of 43 | a restarted registrar segfaulted on the new master's tag announcement - fixed in clusterer |
 | + the clusterer fix | 45 of 45 | 45 of 45 | |
 | + remote maintenance, full level | 51 of 51 | 51 of 51 | |
-| OpenSIPS 4.1 build with the module | 51 of 51 | 51 of 51 | latest run, below |
+| OpenSIPS 4.1 build with the module | 51 of 51 | 51 of 51 | |
+| the same 4.1 build with the module at the PR head 9c6f01644f (capability bits, statistics, events) | 51 of 51 | 51 of 51 | latest run, below |
 
-Latest run: the killed master was replaced in 6.2 s (SBC) and 4.9 s (registrar); a stopped master handed over in 0.5 s; under 30% loss the member's learned wait peaked at 8.7 s and 9.4 s without an election; in R6c the restarted registrar dropped 3 packets that reached it before its identity and kept running.
+Latest run, on the module exactly as in the PR: the killed master was replaced in 5.8 s (SBC) and 6.3 s (registrar); a stopped master handed over in 0.5 s; under 30% loss the member's learned wait peaked at 8.6 s and 5.9 s without an election; in R6c the restarted registrar dropped 2 packets that reached it before its identity and kept running.
 
 ```bash title="real-cluster tests - on a test cluster only, it takes masters down on purpose"
 MI_ROOT=mi ./test/rtests.sh 1 10.0.0.11 10.0.0.12 10.0.0.13

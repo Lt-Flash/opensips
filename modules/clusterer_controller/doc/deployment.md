@@ -172,6 +172,18 @@ modparam("dispatcher", "cluster_probing_mode", "distributed")
 
 The same configuration file (with the node-specific *socket=bin:IP:PORT* line changed per node) is used on every node. No other per-node customization is required.
 
+## Network requirements
+
+- **IPv4 multicast between every pair of nodes**, on each cluster's *multicast=A.B.C.D:PORT*. The module joins the group on the interface that carries *my_ip* and sends with a multicast TTL of 32, so a routed network works where its routers forward the group (PIM). On a switched network with IGMP snooping, the VLAN needs an IGMP querier - without one, many switches stop forwarding the group a few minutes after the nodes join, and the cluster splits.
+- **The same UDP port, unicast**: settled members send their keepalives to the master's address on the cluster's port, and the join handshake answers to the joiner's address on it.
+- **The BIN socket** of every node (TCP) reachable from every other: *clusterer* replicates over it.
+- **A firewall** has to let in, from the cluster's nodes: UDP to the group and to the node's own address on the cluster's port, IGMP (IP protocol 2) where IGMP is filtered, and TCP to the BIN port.
+- **One MTU** on every node of a cluster (see *Uniform cluster MTU* under *Security Architecture*); a node whose MTU differs is refused.
+
+## Changing the password
+
+Every node of a cluster must use the same password. A node started with a different one cannot authenticate: it keeps re-joining for a few rounds, then logs a CRITICAL line ("cannot authenticate ... wrong password") and shuts down, so a rolling change does not work. To change the password, stop every node of the cluster, change it on all of them, and start them again. The restarted cluster founds a new cluster identity unless *uuid=* pins one. A password that leaked lets its holder join the cluster - see the trust model under *Security Architecture* - so change it as soon as it may have leaked.
+
 ## Upgrading
 
 This version of the module speaks **wire version 2**: every packet carries the cluster identity and its sender's incarnation, and the master's announcements carry its term, settings and MTU. Nodes on different wire versions do not understand each other, so the module refuses the other version's packets before decrypting them, and logs one warning a minute naming the sender, for example:

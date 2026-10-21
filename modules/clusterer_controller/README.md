@@ -9,7 +9,7 @@ Self-forming high availability for the *clusterer* module. Nodes that share an I
 
 **Needs** Linux, IPv4 multicast between the nodes, and libsodium. Without multicast, configure *clusterer* with its own *my_node_info* / *neighbor_node_info* or its database instead - see [When to use it](doc/when-to-use.md).
 
-> This is the *clusterer_controller* branch of my OpenSIPS fork, on top of OpenSIPS master (4.1.0-dev); the module is proposed upstream as [OpenSIPS#4074](https://github.com/OpenSIPS/opensips/pull/4074). The design, protocol diagrams and measurements are on their own pages - see [Documentation](#documentation) below. The pages that come from the admin guide are generated from the module README on the PR branch by [doc/gen_pages.py](doc/gen_pages.py); the quick start, when-to-use, protocol, failure-detection and measurement pages are written here.
+> This is the *clusterer_controller* branch of my OpenSIPS fork, on top of OpenSIPS master (4.1.0-dev); the module is proposed upstream as [OpenSIPS#4074](https://github.com/OpenSIPS/opensips/pull/4074). The guarantees, design, protocol diagrams and measurements are on their own pages - see [Documentation](#documentation) below. The pages that come from the admin guide are generated from the module README on the PR branch by [doc/gen_pages.py](doc/gen_pages.py); the quick start, when-to-use, protocol, failure-detection and measurement pages are written here.
 
 ## Quick start
 
@@ -146,6 +146,7 @@ A master put into maintenance hands over at once. Maintenance is runtime-only: a
 ## Documentation
 
 - [When to use it](doc/when-to-use.md) - and when to configure *clusterer* statically instead
+- [Guarantees](doc/guarantees.md) - what it promises in a connected cluster, a partition and a heal, and the tests behind each property
 - [Installation](doc/installation.md) - dependencies, building, what changes in *clusterer*
 - [Parameters](doc/parameters.md) - every parameter, with examples
 - [Statistics](doc/statistics.md) - one set per cluster, for *statistics:get* and Prometheus

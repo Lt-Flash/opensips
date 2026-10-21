@@ -13,3 +13,9 @@ NEW=/usr/local OLD=/opt/opensips-wire1 PREV=/opt/opensips-prev ./test/netns_test
 ```
 
 *NEW* is the install prefix under test; *OLD*, a build speaking wire version 1, and *PREV*, a build of this wire version from before the capability bits, are optional - only the test that needs one is skipped without it. Every cut a test makes with iptables must show dropped packets before it is removed, so a test cannot pass on a fault that never happened. To run two suites at once, start each under its own *unshare -n* with a distinct *RIG_NS_PREFIX* and *RIG_DIR*.
+
+*test/rtests.sh* runs the real-cluster tests R0 to R9 from another host against a test cluster: a member restarted and paused past the purge window, the master paused, killed, killed and restarted at once, and stopped, a one-sided and a two-sided cut, maintenance of this node and of another at the full level, and 30% loss into one member - every fault undone on exit. Nodes are given by IP; *MI_PORT*, *MI_ROOT* (the *mi_http* root), *PORT*, *LOG*, *UNIT* and *SSH_USER* set the rest. It takes masters down on purpose: run it only on a test cluster.
+
+```bash title="real-cluster tests"
+MI_ROOT=mi ./test/rtests.sh 1 10.0.0.11 10.0.0.12 10.0.0.13
+```

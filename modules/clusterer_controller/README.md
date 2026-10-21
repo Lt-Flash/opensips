@@ -1657,6 +1657,7 @@ sequenceDiagram
     B-)A: MASTER_BEACON (count 3, term, settings, MTU)
     A-)B: MASTER_BEACON (count 1, term, settings, MTU)
     Note over A,B: settings differ -> neither merges, both WARN with the diff
+```
 
 ### 14. A founded cluster identity - two deployments never merge
 

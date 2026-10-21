@@ -365,7 +365,89 @@ Parameters:
 
 - *cluster_id* - the cluster;
 - *node_id* - the node whose state changed;
-- *state* - its new state: *none* or *evicted*.
+- *state* - its new state: *none*, *evicted* or *full*.
+
+
+The cluster-state events below, and *E_CL_CTR_MAINTENANCE*, are raised by the controller's worker process once it has finished handling the packet or timer that changed the state - so an *event_route* may read *$cl_ctr_** freely. They are raised only while someone subscribes to them.
+
+
+### E_CL_CTR_ROLE
+
+
+Raised when this node's own role changes.
+
+
+Parameters:
+
+
+- *cluster_id* - the cluster;
+- *role* - the new role: *master*, *backup* or *member*;
+- *old_role* - the role it had.
+
+
+### E_CL_CTR_MASTER
+
+
+Raised when the cluster's master changes, as this node sees it - on every node, at each election that names a different master.
+
+
+Parameters:
+
+
+- *cluster_id* - the cluster;
+- *master_ip* - the new master's controller IP;
+- *node_id* - its node id.
+
+
+### E_CL_CTR_MEMBER
+
+
+Raised when a node enters or leaves this node's peer table.
+
+
+Parameters:
+
+
+- *cluster_id* - the cluster;
+- *node_id* - the node; *0* when it joins, since its id is assigned afterwards;
+- *ip* - its controller IP;
+- *state* - *joined* or *left*;
+- *reason* - for *left*: *goodbye* (it stopped), *timeout* (it went silent past the purge window) or *dropped* (removed after a refusal); *new* for *joined*.
+
+
+### E_CL_CTR_REFUSED
+
+
+Raised on the master when it refuses a node's join, at most once a minute per address and reason.
+
+
+Parameters:
+
+
+- *cluster_id* - the cluster;
+- *ip* - the refused node;
+- *reason* - *config* (different settings, with *on_config_mismatch=reject*), *mtu* (a different MTU) or *refused* (a wrong password, or a full peer table).
+
+
+### E_CL_CTR_MERGE
+
+
+Raised when this node leaves its partition for a superior master after a partition heals.
+
+
+Parameters:
+
+
+- *cluster_id* - the cluster;
+- *master_ip* - the master it now follows;
+- *was_master* - *1* if this node was a master itself.
+
+
+```opensips title="E_CL_CTR_MASTER usage"
+event_route[E_CL_CTR_MASTER] {
+    xlog("cluster $param(cluster_id): master is now $param(master_ip) (node $param(node_id))\n");
+}
+```
 
 
 ## Messaging Between Nodes

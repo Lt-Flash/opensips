@@ -105,6 +105,12 @@ opensips-cli -x mi clusterer_controller:list_config
 "cluster_capabilities": [ "probe", "maint_set", "maint_full" ]
 ```
 
+The same state, for monitoring, is in the statistics - one set per cluster (*members-1*, *role-1*, *master_changes-1*, ...), which the *prometheus* module can export:
+
+```bash
+opensips-cli -x mi statistics:get clusterer_controller:
+```
+
 ### 5. Operate
 
 ```bash
@@ -142,8 +148,9 @@ A master put into maintenance hands over at once. Maintenance is runtime-only: a
 - [When to use it](doc/when-to-use.md) - and when to configure *clusterer* statically instead
 - [Installation](doc/installation.md) - dependencies, building, what changes in *clusterer*
 - [Parameters](doc/parameters.md) - every parameter, with examples
+- [Statistics](doc/statistics.md) - one set per cluster, for *statistics:get* and Prometheus
 - [MI commands](doc/mi.md)
-- [Scripting](doc/scripting.md) - pseudo-variables, functions, events, messaging between nodes
+- [Scripting](doc/scripting.md) - pseudo-variables, functions, cluster-state events, messaging between nodes
 - [Deployment](doc/deployment.md) - several clusters, native and controller clusters together, a full example, upgrading, limitations
 - [How it works](doc/how-it-works.md) - discovery, the cluster identity, the master election, security
 - [Wire protocol](doc/protocol.md) - packets and sequence diagrams

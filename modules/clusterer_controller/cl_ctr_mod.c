@@ -23,6 +23,8 @@
  */
 
 #include "cl_ctr.h"
+#include "cl_ctr_stats.h"
+#include "cl_ctr_events.h"
 
 static int mod_init(void);
 static int cl_ctr_child_init(int rank);
@@ -593,6 +595,8 @@ static int mod_init(void)
         LM_ERR("clusterer_controller: cannot set up script messaging\n");
         return -1;
     }
+    if (cl_ctr_events_init() < 0)
+        return -1;
 
 
     LM_INFO("clusterer_controller: initialising\n");
@@ -970,6 +974,8 @@ static int mod_init(void)
 	    cl->peers = NULL;
 	    return -1;
 	}
+	if (cl_ctr_stats_register(cl) < 0)
+	    return -1;
 
 	LM_INFO("clusterer_controller: cluster %d: multicast=%s:%d bin=%s\n",
 	        cl->cluster_id, cl->multicast_address, cl->multicast_port,

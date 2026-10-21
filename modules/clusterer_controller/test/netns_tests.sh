@@ -98,7 +98,7 @@ check "main partition intact: 3 members, n3 master" $([ "$(echo $MM | wc -w)" = 
 echo "=== T6 a wire-version-1 node on the group ==="
 stop_graceful 4; rm -f $R/n4.pid; sleep 2
 if [ -n "$OLD" ]; then
-start 4 $OLD; sleep 10
+RIG_EVENTS=0 start 4 $OLD; sleep 10
 check "new nodes name the v1 peer" $(grep -aq "10.74.0.14 speaks wire version 1, this node speaks 2" $R/n3.log && echo 1 || echo 0) ""
 MM=$(members 3 741)
 check "main partition unaffected: 3 members" $([ "$(echo $MM | wc -w)" = 3 ] && echo 1 || echo 0) "$MM"
@@ -469,6 +469,14 @@ echo "=== T22 a member cut off for 25 s does not raise the term ==="
 # the cluster's master leads.
 MIP=$(members 2 741 | tr ' ' '\n' | grep ':master:' | cut -d: -f1); MN=${MIP##*.}; MN=${MN#1}
 for x in 1 2 3 4; do [ "$(ip4 $x)" != "$MIP" ] && break; done
+# a rested node: after T21's cut its local health and learned margin stay
+# raised for a while, and a watchdog stretched past the 25 s cut never gets
+# as far as electing itself
+for k in $(seq 1 60); do
+  [ "$(cfgval $x 741 local_health)" = 0 ] && [ "$(cfgval $x 741 master_timeout_ms)" -le 5000 ] 2>/dev/null && break
+  sleep 2
+done
+echo "    n$x before the cut: local health $(cfgval $x 741 local_health), watchdog $(cfgval $x 741 master_timeout_ms) ms"
 TB=$(cfgval $MN 741 term); MX=$(wc -l < $R/n$x.log)
 nx $x iptables -I INPUT -p udp --dport $PORT -j DROP
 nx $x iptables -I OUTPUT -p udp --dport $PORT -j DROP
@@ -590,7 +598,7 @@ for x in 4 3 2 1; do [ $x != $MN ] && break; done
 for y in 1 2 3 4; do [ $y != $MN ] && [ $y != $x ] && break; done
 XIP=$(ip4 $x); YIP=$(ip4 $y)
 echo "    n$x on the previous build; asking from n$y; master $MIP"
-stop_graceful $x; start $x $PREV 1 2 fleet-a; sleep 10
+stop_graceful $x; RIG_EVENTS=0 start $x $PREV 1 2 fleet-a; sleep 10
 check "n$x rejoined on the previous build" $(alive $x && members $y 741 | tr ' ' '\n' | grep -q "^$XIP:" && echo 1 || echo 0) "$(members $y 741)"
 check "the master lists no capabilities for n$x, all three for n$y" $([ -z "$(capsof $MN $XIP)" ] && [ "$(capsof $MN $YIP)" = "$ALL" ] && echo 1 || echo 0) "n$x '$(capsof $MN $XIP)' n$y '$(capsof $MN $YIP)'"
 check "the cluster's shared capabilities are none while n$x runs it (master and n$y)" $([ -z "$(clcaps $MN)" ] && [ -z "$(clcaps $y)" ] && echo 1 || echo 0) "master '$(clcaps $MN)' n$y '$(clcaps $y)'"
@@ -621,6 +629,56 @@ fi
 stop_graceful $x; start $x $NEW 1 2 fleet-a; sleep 10
 check "all on this build again: the cluster shares every capability" $([ "$(clcaps $y)" = "$ALL" ] && echo 1 || echo 0) "'$(clcaps $y)'"
 fi
+
+echo "=== T28 statistics, one set per cluster ==="
+# stats <node> -> "name=value ..." of the clusterer_controller group
+stats() { mi $1 statistics:get 'statistics=["clusterer_controller:"]' | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin).get("result",{})
+except Exception: d={}
+print(" ".join("%s=%s" % (k.split(":",1)[1], v) for k,v in sorted(d.items()) if k.startswith("clusterer_controller:")))'; }
+cstat() { stats $1 | tr ' ' '\n' | grep "^$2=" | cut -d= -f2; }
+MIP=$(members 2 741 | tr ' ' '\n' | grep ':master:' | cut -d: -f1); MN=${MIP##*.}; MN=${MN#1}
+for x in 4 3 2 1; do [ $x != $MN ] && break; done
+N741=$(stats $MN | tr ' ' '\n' | grep -c -- '-741='); N742=$(stats $MN | tr ' ' '\n' | grep -c -- '-742=')
+check "every statistic, once per cluster (23 each for 741 and 742)" $([ "$N741" = 23 ] && [ "$N742" = 23 ] && echo 1 || echo 0) "741: $N741, 742: $N742"
+M=""; for i in 1 2 3 4; do M="$M $(cstat $i members-741)/$(cfgval $i 741 member_count)"; done
+check "members-741 is the live count on every node" $(echo $M | tr ' ' '\n' | awk -F/ '$1!=4{b=1} END{print b?0:1}') "$M (stat/table)"
+check "the master: role 2, is_master 1; n$x: is_master 0" $([ "$(cstat $MN role-741)" = 2 ] && [ "$(cstat $MN is_master-741)" = 1 ] && [ "$(cstat $x is_master-741)" = 0 ] && echo 1 || echo 0) "role $(cstat $MN role-741) is_master $(cstat $MN is_master-741) / $(cstat $x is_master-741)"
+check "term-741 matches clusterer_controller:list_config" $([ "$(cstat $MN term-741)" = "$(cfgval $MN 741 term)" ] && echo 1 || echo 0) "$(cstat $MN term-741) vs $(cfgval $MN 741 term)"
+check "every node counted at least one master change" $(for i in 1 2 3 4; do [ "$(cstat $i master_changes-741)" -ge 1 ] 2>/dev/null || { echo 0; exit; }; done; echo 1) "$(for i in 1 2 3 4; do echo -n "$(cstat $i master_changes-741) "; done)"
+J0=$(cstat $MN members_joined-741); L0=$(cstat $MN members_left-741)
+stop_graceful $x; sleep 2; start $x $NEW 1 2 fleet-a; sleep 8
+J1=$(cstat $MN members_joined-741); L1=$(cstat $MN members_left-741)
+check "n$x restarted: the master counted it leaving and joining" $([ "${L1:-0}" -gt "${L0:-0}" ] && [ "${J1:-0}" -gt "${J0:-0}" ] && echo 1 || echo 0) "left $L0 -> $L1, joined $J0 -> $J1"
+
+echo "=== T29 events: role, master, members, maintenance ==="
+# the rig's event routes log every cluster-state event as an "EVT ..." line
+MIP=$(members 2 741 | tr ' ' '\n' | grep ':master:' | cut -d: -f1); MN=${MIP##*.}; MN=${MN#1}
+for i in 1 2 3 4; do eval V$i=$(wc -l < $R/n$i.log); done
+stop_hard $MN; rm -f $R/n$MN.pid
+NEWM=""; for k in $(seq 1 60); do
+  MS=""; for i in 1 2 3 4; do [ $i = $MN ] && continue; MS="$MS $(members $i 741 | tr ' ' '\n' | grep ':master:' | cut -d: -f1)"; done
+  U=$(echo $MS | tr ' ' '\n' | sort -u)
+  if [ "$(echo $MS | wc -w)" = 3 ] && [ "$(echo "$U" | wc -l)" = 1 ] && [ "$U" != "$MIP" ]; then NEWM=$U; break; fi
+  sleep 0.25
+done
+NN=${NEWM##*.}; NN=${NN#1}; sleep 2
+eval VN=\$V$NN
+check "the new master raised E_CL_CTR_ROLE, to master" $(since $NN $VN | grep -aq "EVT ROLE 741 master " && echo 1 || echo 0) "$(since $NN $VN | grep -a 'EVT ROLE' | tail -1)"
+EM=""; for i in 1 2 3 4; do [ $i = $MN ] && continue; eval m=\$V$i; EM="$EM $(since $i $m | grep -a "EVT MASTER 741 $NEWM " | grep -c .)"; done
+check "every survivor raised E_CL_CTR_MASTER naming $NEWM" $(echo $EM | tr ' ' '\n' | awk '$1<1{b=1} END{print b?0:1}') "$EM"
+check "the event route read \$cl_ctr_role while it ran - no deadlock" $(since $NN $VN | grep -aq "EVT MASTER 741 $NEWM [0-9]* now=master" && echo 1 || echo 0) "$(since $NN $VN | grep -a 'EVT MASTER' | tail -1)"
+for k in $(seq 1 40); do since $NN $VN | grep -aq "EVT MEMBER 741 [0-9]* $MIP left timeout" && break; sleep 0.5; done
+check "the new master raised E_CL_CTR_MEMBER for $MIP: left, timeout" $(since $NN $VN | grep -aq "EVT MEMBER 741 [0-9]* $MIP left timeout" && echo 1 || echo 0) "$(since $NN $VN | grep -a 'EVT MEMBER' | tail -2 | tr '\n' ' ')"
+start $MN $NEW 1 2 fleet-a; sleep 8
+check "... and for $MIP joining again" $(since $NN $VN | grep -aq "EVT MEMBER 741 0 $MIP joined new" && echo 1 || echo 0) ""
+for x in 1 2 3 4; do [ $x != $NN ] && [ $x != $MN ] && break; done
+for i in 1 2 3 4; do eval V$i=$(wc -l < $R/n$i.log); done
+mi $x clusterer_controller:maintenance cluster_id=741 state=evicted >/dev/null; sleep 4
+EV=""; for i in 1 2 3 4; do eval m=\$V$i; EV="$EV $(since $i $m | grep -a "EVT MAINT 741 [0-9]* evicted" | grep -c .)"; done
+check "E_CL_CTR_MAINTENANCE on every node, n$x's own included" $(echo $EV | tr ' ' '\n' | awk '$1<1{b=1} END{print b?0:1}') "$EV"
+mi $x clusterer_controller:maintenance cluster_id=741 state=none >/dev/null; sleep 4
 
 echo "=== replays after T12: none ==="
 RPN=0; for i in 1 2 3 4; do eval m=\$RP$i; RPN=$((RPN + $(since $i $m | grep -ac "already accepted, dropping\|older than the replay window, dropping"))); done

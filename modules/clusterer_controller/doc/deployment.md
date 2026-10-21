@@ -217,8 +217,6 @@ Each node also advertises on its ALIVE which optional mechanisms its build imple
 
 The following features are planned for future releases:
 
-- **Statistics** — module statistics (current role, member count, master changes, nodes joined/left, JOIN_REJECTs, decrypt failures, config mismatches, split-brain merges) exposed via *get_statistics* and monitoring exporters.
-- **Events** — events raised on state transitions (became master, demoted, node joined/left, split-brain merged, config mismatch, authentication reject), named `E_CL_CTR_*` and consumable from an *event_route* or any event subscriber transport.
 - **IPv6 multicast** — the control plane currently uses IPv4 multicast (groups in *224.0.0.0/4*). Add IPv6 multicast support (*ff00::/8* groups, *AF_INET6* sockets and membership) so the controller can run on IPv6-only or dual-stack deployments.
 
 Read-only script variables for cluster state (*$cl_ctr_role*, *$cl_ctr_is_master*, and the rest) are already available - see [Exported Pseudo-Variables](scripting.md#exported-pseudo-variables).

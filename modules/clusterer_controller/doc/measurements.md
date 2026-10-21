@@ -4,7 +4,7 @@
 
 ## Network-namespace suite
 
-*test/netns_tests.sh* (see [Automated tests](testing.md#automated-tests)) runs four nodes in network namespaces on one host, every node a member of two clusters that share one port; faults are real - iptables cuts that must show dropped packets, SIGSTOP/SIGCONT pauses, SIGKILL, netem loss and jitter. On the current head it runs 120 checks, T1 to T27; all pass, built with gcc 13 and *-Werror* on the module.
+*test/netns_tests.sh* (see [Automated tests](testing.md#automated-tests)) runs four nodes in network namespaces on one host, every node a member of two clusters that share one port; faults are real - iptables cuts that must show dropped packets, SIGSTOP/SIGCONT pauses, SIGKILL, netem loss and jitter. On the current head it runs 132 checks, T1 to T29; all pass, built with gcc 13 and *-Werror* on the module.
 
 Every change was first shown to fail without itself - the same suite against the build before it:
 
@@ -23,6 +23,9 @@ Every change was first shown to fail without itself - the same suite against the
 | clusterer drops packets before identity | T26: the master killed and restarted at once | the restarted node segfaults | survives |
 | Remote maintenance, full level | T25 | 4 of 7 checks fail | all pass |
 | Capability bits | T27: a member on a build without the master probe, the master killed | survivors wait for answers: failover 9.5 s after four "may be the one cut off" waits | elect at once: 3.0 s |
+| Statistics | T28 | all 6 checks fail - no statistics | all pass |
+| Events | T29: the master killed, a member put into maintenance | 5 of 6 checks fail - no role, master or member events | all pass; the event route reads $cl_ctr_role while it runs |
+| A joining node announces its master | T28: a member restarted by T27 | it counted no master change, and raised no master event | counts and raises it |
 
 ## Test cluster
 

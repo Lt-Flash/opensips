@@ -357,18 +357,6 @@ static inline long long cl_ctr_now_ms(void)
  * only the node named applies it, to itself, and announces it as usual */
 #define CL_CTR_PKT_MAINT_SET        0x11
 
-/* Capability bits (CC-11, cl_ctr_caps.c): what this build implements of the
- * optional mechanisms, advertised on ALIVE after the maintenance byte.  A
- * mechanism that needs the other side's part is used only towards nodes -
- * or, cluster-wide, only while every live member - advertising its bit.
- * Append new bits; never reuse or renumber one. */
-#define CL_CTR_CAP_PROBE            0x00000001u /* answers MASTER_PROBE       */
-#define CL_CTR_CAP_MAINT_SET        0x00000002u /* applies MAINT_SET to itself */
-#define CL_CTR_CAP_MAINT_FULL       0x00000004u /* acts on the full level      */
-#define CL_CTR_CAPS_MINE            (CL_CTR_CAP_PROBE | CL_CTR_CAP_MAINT_SET | \
-                                     CL_CTR_CAP_MAINT_FULL)
-#define CL_CTR_CAPS_SZ              4
-
 /* Consumer messaging (api.h): plaintext payload layout after type+seq is
  * [src_node_id u16 BE][chan_len u8][channel bytes][consumer payload].
  * Bounded to one comfortably-under-MTU datagram; bulk data is the
@@ -1491,6 +1479,16 @@ struct cl_ctr_peers_ {
      * relayed in MASTER_ALIVE; a member keeps the last relayed value (0
      * from an older master, which relays none) - cl_ctr_caps.c */
     uint32_t        cluster_caps;
+    /* counters for the statistics (cl_ctr_stats.c); the worker is their
+     * one writer, through the cl_ctr_note_*() calls */
+    unsigned long   st_master_changes;  /* the master changed, as this node saw it */
+    unsigned long   st_role_changes;    /* this node's own role changed      */
+    unsigned long   st_members_joined;  /* nodes entering this node's table  */
+    unsigned long   st_members_left;    /* ... and leaving it                */
+    unsigned long   st_joins_refused;   /* JOIN_REJECTs sent as master       */
+    unsigned long   st_config_mismatches;
+    unsigned long   st_auth_failures;   /* packets failing authentication    */
+    unsigned long   st_merges;          /* partitions left for a superior one */
 };
 
 #define cl_ctr_send_alive(sock, cl)    cl_ctr_send_pkt_with_ip((sock), CL_CTR_PKT_ALIVE, (cl), NULL, 0)
@@ -1645,13 +1643,6 @@ void cl_ctr_cid_found(cl_ctr_cluster_t *cl);
 void cl_ctr_cid_tick(cl_ctr_cluster_t *cl);
 void cl_ctr_membership_digest(cl_ctr_cluster_t *cl, uint16_t *count, uint64_t *hash);
 uint16_t cl_ctr_live_count(cl_ctr_cluster_t *cl);
-/* capability bits (cl_ctr_caps.c) */
-uint32_t cl_ctr_table_caps(cl_ctr_cluster_t *cl);
-uint32_t cl_ctr_cluster_caps(cl_ctr_cluster_t *cl);
-int  cl_ctr_mi_add_caps(mi_item_t *obj, const char *name, int name_len,
-                        uint32_t caps);
-int  cl_ctr_maint_supported(cl_ctr_cluster_t *cl, int remote, int st,
-                            char *why, int why_sz);
 void cl_ctr_build_alive_bitmap(cl_ctr_cluster_t *cl, unsigned char *bm);
 void cl_ctr_apply_alive_bitmap(cl_ctr_cluster_t *cl, const unsigned char *bm);
 void cl_ctr_drop_peer_locked(const char *ip, cl_ctr_cluster_t *cl);
@@ -1672,7 +1663,6 @@ int  cl_ctr_apply_maint_bitmap(cl_ctr_cluster_t *cl, const unsigned char *bm,
                                const unsigned char *bm_full,
                                const char *master_ip);
 void cl_ctr_build_maint_full_bitmap(cl_ctr_cluster_t *cl, unsigned char *bm);
-void cl_ctr_raise_maint_event(cl_ctr_cluster_t *cl, int node_id, int st);
 void cl_ctr_maint_peer_changed(cl_ctr_cluster_t *cl, uint16_t node_id, int st);
 void cl_ctr_maint_changed(cl_ctr_cluster_t *cl, uint16_t node_id, int old_st,
                           int st);

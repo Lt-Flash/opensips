@@ -23,6 +23,7 @@
  */
 
 #include "cl_ctr.h"
+#include "cl_ctr_stats.h"
 
 /* -------------------------------------------------------------------------
  * Per-peer lookups: query a *specific* node in a cluster.  These are script
@@ -98,6 +99,7 @@ void cl_ctr_prune_stale(cl_ctr_cluster_t *cl)
 	    LM_INFO("clusterer_controller: purging timed-out peer %s\n",
 	            cl->peers->entries[i].ip);
 	    cl_ctr_reserve_id_locked(cl, cl->peers->entries[i].ip, pruned_id);
+	    cl_ctr_note_member(cl, cl->peers->entries[i].ip, pruned_id, 0, "timeout");
 	    cl->peers->count--;
 	    if (i < cl->peers->count)
 		cl->peers->entries[i] = cl->peers->entries[cl->peers->count];
@@ -132,11 +134,13 @@ void cl_ctr_prune_stale(cl_ctr_cluster_t *cl)
  */
 void cl_ctr_apply_master_from_list_locked(const char *master_ip, cl_ctr_cluster_t *cl)
 {
-    int i;
+    int      i;
+    uint16_t master_id = 0;
 
     for (i = 0; i < cl->peers->count; i++) {
 	if (strcmp(cl->peers->entries[i].ip, master_ip) == 0) {
 	    cl->peers->entries[i].is_master = 1;
+	    master_id = cl->peers->entries[i].node_id;
 	} else {
 	    cl->peers->entries[i].is_master = 0;
 	}
@@ -146,6 +150,10 @@ void cl_ctr_apply_master_from_list_locked(const char *master_ip, cl_ctr_cluster_
     if (strcmp(cl->peers->last_master, master_ip) != 0) {
 	cl->peers->list_term_seen = 0;
 	cl->peers->list_seq_seen  = 0;
+	/* a node joining a running cluster learns its master here, not from
+	 * an election of its own */
+	if (master_ip[0])
+	    cl_ctr_note_master(cl, master_ip, master_id);
     }
     memcpy(cl->peers->last_master, master_ip,
            strnlen(master_ip, CL_CTR_MAX_IP_LEN));
@@ -247,6 +255,8 @@ void cl_ctr_upsert_peer_locked(const char *src_ip, cl_ctr_cluster_t *cl)
 	cl->peers->count++;
 	LM_INFO("clusterer_controller: new peer %s (total=%d)\n",
 	        src_ip, cl->peers->count);
+	if (strcmp(src_ip, my_ip) != 0)
+	    cl_ctr_note_member(cl, src_ip, 0, 1, "new");
     }
 }
 
@@ -600,6 +610,7 @@ void cl_ctr_drop_peer_locked(const char *ip, cl_ctr_cluster_t *cl)
         if (strcmp(cl->peers->entries[i].ip, ip) != 0)
             continue;
         dropped_id = cl->peers->entries[i].node_id;
+        cl_ctr_note_member(cl, ip, dropped_id, 0, "dropped");
         cl->peers->count--;
         if (i < cl->peers->count)
             cl->peers->entries[i] = cl->peers->entries[cl->peers->count];

@@ -219,7 +219,11 @@ budget rather than forming a lone split-brain master.
 Every `JOIN_REJECT` echoes the nonce of the packet it refuses, and a joiner acts
 only on one that refuses one of its own last `JOIN_REQ`s: bootstrap packets have
 no replay window, so this is what keeps a refusal recorded once from being sent
-again to stop the node at a later start.
+again to stop the node at a later start. A `JOIN_REQ` or `MASTER_BEACON` whose
+header nonce was seen lately, or that comes from a previous life of a node still
+heard, is dropped the same way; a master answers a `JOIN_REQ` at the joiner's own
+address, and a `MASTER_PROBE` or `RESYNC` is answered for members only - never at
+a datagram's source, which anyone can set.
 
 ```mermaid
 sequenceDiagram

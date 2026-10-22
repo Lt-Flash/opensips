@@ -4,7 +4,7 @@
 
 ## Network-namespace suite
 
-*test/netns_tests.sh* (see [Automated tests](testing.md#automated-tests)) runs four nodes in network namespaces on one host, every node a member of two clusters that share one port; faults are real - iptables cuts that must show dropped packets, SIGSTOP/SIGCONT pauses, SIGKILL, netem loss and jitter. On the current head it runs 164 checks, T1 to T33; all pass, built with gcc 13 and *-Werror* on the module.
+*test/netns_tests.sh* (see [Automated tests](testing.md#automated-tests)) runs four nodes in network namespaces on one host, every node a member of two clusters that share one port; faults are real - iptables cuts that must show dropped packets, SIGSTOP/SIGCONT pauses, SIGKILL, netem loss and jitter. On the current head it runs 168 checks, T1 to T34; all pass, built with gcc 13 and *-Werror* on the module.
 
 Every change was first shown to fail without itself - the same suite against the build before it:
 
@@ -35,6 +35,7 @@ Every change was first shown to fail without itself - the same suite against the
 | A JOIN_REJECT is bound to the request it refuses | T32: a recorded refusal sent to a member joining with the right password | it stopped | it joins; a refusal it earns still stops it |
 | - | T31: three members started at once, five times; all four cold at once, three times | passed on the build before - no change needed | one master, distinct node ids, every time |
 | The sender is what a packet seals (wire version 3) | T33: a member's stop recorded, the member started again, the record sent from the bridge's address | its old GOODBYE removed it | refused as packets from its previous life; it stays |
+| JOIN_REQs and beacons sent again refused; replies to the node itself | T34: a member's JOIN_REQ recorded as it rejoins, sent again from a listening socket on the bridge | the master admitted it again, twice, and sent 16 datagrams to the bridge | not admitted again, nothing sent, its node_id kept |
 
 The unit tests (*test/test.c*, 30 checks) cover what a cluster of four never reaches. The build before these changes fails 12 of them:
 
@@ -75,9 +76,10 @@ Two clusters of three nodes on the test network, one VLAN with multicast: cluste
 | the same 4.1 build with the module at 9c6f01644f (capability bits, statistics, events) | 51 of 51 | 51 of 51 | |
 | the same 4.1 build with the module at 9b9846c5d2 (*release_tag_when_isolated* also covers a member cut off alone) | 51 of 51 | 51 of 51 | |
 | the same 4.1 build with the module at e39633277d (input checks, JOIN_REJECT bound to its request) | 51 of 51 | 51 of 51 | |
-| the same 4.1 build with the module at the PR head 7f88b8ebe7 (wire version 3, replay windows anchored afresh) | 51 of 51 | 51 of 51 | latest run, below; both clusters switched as a whole |
+| the same 4.1 build with the module at 7f88b8ebe7 (wire version 3, replay windows anchored afresh) | 51 of 51 | 51 of 51 | both clusters switched as a whole |
+| the same 4.1 build with the module at the PR head bc2c8ace43 (replies to the node itself, JOIN_REQs and beacons sent again refused) | 51 of 51 | 51 of 51 | latest run, below |
 
-Latest run, on the module exactly as in the PR: the killed master was replaced in 6.0 s (SBC) and 6.3 s (registrar); a stopped master handed over in 0.5 s; under 30% loss the member's learned wait peaked at 4.7 s and 5.1 s without an election; in R6c the restarted registrar dropped 3 packets that reached it before its identity and kept running. The only refusals in any node's log were the wire-version warnings of the half minute while each cluster switched from version 2 to 3; none during the tests.
+Latest run, on the module exactly as in the PR: the killed master was replaced in 5.3 s (SBC) and 5.0 s (registrar); a stopped master handed over as soon as its GOODBYE arrived - 0.5 s on the registrars, 3.5 s on the SBCs, whose shutdown took that long to reach the GOODBYE; under 30% loss the member's learned wait peaked at 5.9 s and 6.4 s without an election; in R6c the restarted registrar dropped 3 packets that reached it before its identity and kept running; no refusal of any kind in any node's log.
 
 ```bash title="real-cluster tests - on a test cluster only, it takes masters down on purpose"
 MI_ROOT=mi ./test/rtests.sh 1 10.0.0.11 10.0.0.12 10.0.0.13

@@ -59,5 +59,6 @@ Each property is checked by the network-namespace suite (*test/netns_tests.sh*, 
 | Several nodes joining at once, and a whole cluster starting cold at once, get one master and distinct node ids | T31 | - |
 | A JOIN_REJECT recorded and sent again does not stop a joining node; one it earns still does | T32 | - |
 | A node's packets recorded and sent again from another address meet that node's replay window: its old GOODBYE removes nothing | T33 | - |
+| A JOIN_REQ recorded and sent again from another address admits nobody again and draws no reply there | T34 | - |
 
 Not tested yet: a full peer table; a static *clusterer* cluster beside controller clusters on one node.

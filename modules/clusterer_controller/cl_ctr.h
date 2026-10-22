@@ -283,7 +283,8 @@ static inline long long cl_ctr_now_ms(void)
 /* 2-byte wire magic - a cleartext key-selector at the start of every packet
  * (it must be readable before decryption to choose bootstrap vs session key).
  * The first byte carries the WIRE VERSION (0xCB + version: 0xCC was version 1,
- * 0xCD is version 2); the second byte distinguishes the key tier.  Only a
+ * 0xCD version 2, 0xCE is version 3); the second byte distinguishes the key
+ * tier.  Only a
  * sanity/routing tag on a dedicated multicast group:port - the real
  * confidentiality and integrity come from the XChaCha20-Poly1305 payload, and
  * the magic is part of the AEAD's associated data, so it cannot be re-stamped.
@@ -298,9 +299,13 @@ static inline long long cl_ctr_now_ms(void)
  *   1  0xCC  header [magic][cluster_id 2B][nonce 24B]
  *            plaintext [type 1B][seq 4B]
  *   2  0xCD  header [magic][cluster_id 2B][cluster uuid 16B][nonce 24B]
- *            plaintext [type 1B][seq 4B][incarnation 8B]                     */
+ *            plaintext [type 1B][seq 4B][incarnation 8B]
+ *   3  0xCE  header as 2
+ *            plaintext [type 1B][seq 4B][incarnation 8B][sender 4B]: the
+ *            sender's IPv4 address, sealed - it, not the datagram's source,
+ *            names who sent a packet and keys its replay window             */
 #define CL_CTR_MAGIC_SZ          2
-#define CL_CTR_WIRE_VERSION      2
+#define CL_CTR_WIRE_VERSION      3
 #define CL_CTR_MAGIC_BASE        0xCB
 #define CL_CTR_WIRE_MAGIC0       (CL_CTR_MAGIC_BASE + CL_CTR_WIRE_VERSION)
 /* highest key-tier byte in use - lets the gate recognise another version's
@@ -475,7 +480,14 @@ static inline long long cl_ctr_now_ms(void)
 #define CL_CTR_CID_ESTABLISHED    2
 #define CL_CTR_CID_PINNED         3
 #define CL_CTR_CID_GRACE_SECS    30
-#define CL_CTR_PLAIN_HDR_SZ      (1 + CL_CTR_SEQ_SZ + CL_CTR_INC_SZ) /* type + seq + incarnation = 13 */
+/* The sender's IPv4 address in network order, after the incarnation: the
+ * datagram's source is not authenticated, so a packet captured from one
+ * member and sent again from another address used to meet that address's
+ * replay window, or none - and every handler took the source for the sender.
+ * Sealed, it cannot be changed, and it is what a receiver goes by. */
+#define CL_CTR_SENDER_SZ          4
+#define CL_CTR_SENDER_OFF        (CL_CTR_WIRE_HDR_SZ + 1 + CL_CTR_SEQ_SZ + CL_CTR_INC_SZ)
+#define CL_CTR_PLAIN_HDR_SZ      (1 + CL_CTR_SEQ_SZ + CL_CTR_INC_SZ + CL_CTR_SENDER_SZ) /* type + seq + incarnation + sender = 17 */
 
 /* Bootstrap-key hardening: the join/admission key (also the Noise PSK) is
  * derived from the shared password with Argon2id (memory-hard) instead of a
@@ -1257,8 +1269,8 @@ struct cl_ctr_consumer_job {
  * jump is bounded as well - a step of CL_CTR_REPLAY_MAX_JUMP or more is
  * refused as implausible rather than believed.  Real gaps stay far below it
  * (it is 16.7M messages, ~22 minutes of one peer's output at that ceiling),
- * and a peer that somehow exceeds it is recovered by the window reset that
- * already runs when it re-joins or reappears in a MEMBER_LIST.
+ * and a peer that somehow exceeds it is recovered by CL_CTR_REPLAY_REANCHOR
+ * jumps in a row (see cl_ctr_replay_check()).
  *
  * What remains, and is inherent to a 32-bit counter: a packet held across a
  * FULL 2^32 cycle lands back inside the window and is accepted. That needs
@@ -1273,9 +1285,17 @@ struct cl_ctr_consumer_job {
  * apart. */
 #define CL_CTR_REPLAY_MAX_JUMP   (1u << 24)
 
+/* Forward jumps in a row, each within a window of the one before, that move
+ * the window onto them: a sender's live stream, not a replay (captured
+ * packets are older, and land behind the mark). */
+#define CL_CTR_REPLAY_REANCHOR   3
+
 typedef struct {
     uint32_t last;                            /* highest seq accepted so far  */
     uint64_t win[CL_CTR_REPLAY_WIN_WORDS];    /* circular, slot = seq % BITS  */
+    int      anchored;                        /* 0: the next packet sets last */
+    uint32_t jump_seq;                        /* the last refused forward jump */
+    int      jumps;                           /* ... and how many in a row     */
 } cl_ctr_replay_t;
 
 #define CL_CTR_RP_WORD(s)  ((((uint32_t)(s)) % CL_CTR_REPLAY_WIN_BITS) / 64)
@@ -1295,10 +1315,20 @@ typedef struct {
 #define CL_CTR_SEQ_STALE (-4) /* from an EARLIER incarnation of the sender:   */
                               /* a replay from before it restarted - refuse   */
 
+/*
+ * Start a window afresh: for a sender that restarted, one first learned, or
+ * on a new key.  It is not reset to 0 but left unanchored - the next
+ * authenticated packet sets the mark, whatever its sequence number.  A sender
+ * that has been up long enough to number past CL_CTR_REPLAY_MAX_JUMP would
+ * otherwise be refused as an implausible jump from 0, packet after packet,
+ * for as long as it runs.
+ */
 static inline void cl_ctr_replay_reset(cl_ctr_replay_t *r)
 {
-    r->last = 0;
+    r->last     = 0;
     memset(r->win, 0, sizeof r->win);
+    r->anchored = 0;
+    r->jumps    = 0;
 }
 
 /*
@@ -1310,10 +1340,34 @@ static inline int cl_ctr_replay_check(cl_ctr_replay_t *r, uint32_t seq)
     int32_t  fwd = (int32_t)(seq - r->last);   /* serial-number difference */
     uint32_t d, s;
 
+    if (!r->anchored) {                  /* first packet since a reset        */
+        memset(r->win, 0, sizeof r->win);
+        r->last     = seq;
+        r->anchored = 1;
+        r->jumps    = 0;
+        r->win[CL_CTR_RP_WORD(seq)] |= CL_CTR_RP_MASK(seq);
+        return CL_CTR_SEQ_OK;
+    }
+
     if (fwd > 0) {                       /* forward: the common case          */
         d = (uint32_t)fwd;
-        if (d >= CL_CTR_REPLAY_MAX_JUMP)
-            return CL_CTR_SEQ_JUMP;
+        if (d >= CL_CTR_REPLAY_MAX_JUMP) {
+            /* Refused - unless it is the sender's live stream and the mark
+             * is what is wrong, e.g. set by a replayed old packet that
+             * arrived first after a reset: CL_CTR_REPLAY_REANCHOR jumps in a
+             * row, each close after the last, move the window onto them. */
+            if (r->jumps > 0 && (uint32_t)(seq - r->jump_seq) - 1
+                                    < CL_CTR_REPLAY_WIN_BITS)
+                r->jumps++;
+            else
+                r->jumps = 1;
+            r->jump_seq = seq;
+            if (r->jumps < CL_CTR_REPLAY_REANCHOR)
+                return CL_CTR_SEQ_JUMP;
+            r->anchored = 0;
+            return cl_ctr_replay_check(r, seq);
+        }
+        r->jumps = 0;
         if (d >= CL_CTR_REPLAY_WIN_BITS) {
             memset(r->win, 0, sizeof r->win);
         } else {
@@ -1330,10 +1384,7 @@ static inline int cl_ctr_replay_check(cl_ctr_replay_t *r, uint32_t seq)
     }
 
     /* At or below the mark.  Unsigned subtraction gives the exact backward
-     * distance even across a wrap, and avoids negating INT32_MIN.  Note
-     * seq == last == 0 with an empty window is the untouched state and falls
-     * out here as a legitimate first accept - it costs nothing to allow, and
-     * every sender in fact starts at 1 (++my_seq). */
+     * distance even across a wrap, and avoids negating INT32_MIN. */
     d = r->last - seq;
     if (d >= CL_CTR_REPLAY_WIN_BITS)
         return CL_CTR_SEQ_OLD;
@@ -1724,7 +1775,7 @@ void cl_ctr_adopt_config(cl_ctr_cluster_t *cl, int new_manage, int new_stick,
                             int new_qt, int is_active);
 void cl_ctr_handle_join_req(int sock, const char *payload, int payload_len,
                                uint64_t pkt_inc, const unsigned char *req_nonce,
-                               cl_ctr_cluster_t *cl,
+                               const char *sender_ip, cl_ctr_cluster_t *cl,
                                const struct sockaddr *src, socklen_t src_len);
 void cl_ctr_handle_member_list(const char *payload, int payload_len,
                                   const char *sender_ip, cl_ctr_cluster_t *cl);

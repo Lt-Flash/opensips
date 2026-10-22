@@ -239,7 +239,7 @@ static void cl_ctr_cfg_note_reject(const char *src_ip, cl_ctr_cluster_t *cl)
  */
 void cl_ctr_handle_join_req(int sock, const char *payload, int payload_len,
                                uint64_t pkt_inc, const unsigned char *req_nonce,
-                               cl_ctr_cluster_t *cl,
+                               const char *sender_ip, cl_ctr_cluster_t *cl,
                                const struct sockaddr *src, socklen_t src_len)
 {
     const char    *p         = payload;
@@ -268,12 +268,14 @@ void cl_ctr_handle_join_req(int sock, const char *payload, int payload_len,
     if (strcmp(src_ip, my_ip) == 0)
 	return;
     if (!cl_ctr_ip_valid(src_ip)) {
-	char from[INET_ADDRSTRLEN] = "?";
-	if (src && src->sa_family == AF_INET)
-	    inet_ntop(AF_INET, &((const struct sockaddr_in *)src)->sin_addr,
-	              from, sizeof(from));
 	LM_WARN("clusterer_controller: [cluster %d] JOIN_REQ from %s names no "
-	        "valid address, dropping\n", cl->cluster_id, from);
+	        "valid address, dropping\n", cl->cluster_id, sender_ip);
+	return;
+    }
+    /* a node asks to be admitted for itself, and no other */
+    if (strcmp(src_ip, sender_ip) != 0) {
+	LM_DBG("clusterer_controller: [cluster %d] JOIN_REQ for %s sealed by "
+	       "%s, dropping\n", cl->cluster_id, src_ip, sender_ip);
 	return;
     }
 
@@ -284,11 +286,17 @@ void cl_ctr_handle_join_req(int sock, const char *payload, int payload_len,
 	if (bin_cnt > CL_CTR_MAX_BIN_SOCKETS)
 	    bin_cnt = CL_CTR_MAX_BIN_SOCKETS;
 	for (i = 0; i < (int)bin_cnt && p < end; i++) {
-	    int slen = (int)strnlen(p, CL_CTR_MAX_BIN_SOCK_LEN - 1);
+	    /* bounded by the payload too, and the NUL must lie inside it */
+	    int room = (int)(end - p);
+	    int slen = (int)strnlen(p, room < CL_CTR_MAX_BIN_SOCK_LEN - 1
+	                               ? (size_t)room : CL_CTR_MAX_BIN_SOCK_LEN - 1);
+	    if (slen >= room)
+		break;
 	    memcpy(bin_socks[i], p, slen);
 	    bin_socks[i][slen] = '\0';
 	    p += slen + 1;
 	}
+	bin_cnt = (uint8_t)i;
     }
 
     /* --- Parse the Noise msg 1 (appended after BIN info) --- */
@@ -656,7 +664,8 @@ void cl_ctr_handle_member_list(const char *payload, int payload_len,
      * applied from the same term.  The record is per master and is cleared
      * when the master changes or restarts (its MASTER_ALIVE then carries a
      * lower term).  A node still joining takes whatever it is given.  Lists
-     * without a stamp (none exist on wire version 2) are applied as before. */
+     * without a stamp (no build of this wire version sends one) are applied
+     * as before. */
     {
 	const char *st = p + (int)count * CL_CTR_IP_ENTRY_SZ;
 	if (payload_len >= (int)(st - payload) + CL_CTR_LIST_STAMP_SZ) {
@@ -855,16 +864,41 @@ void cl_ctr_handle_node_assign(const char *payload, int payload_len,
 	if (bin_cnt > CL_CTR_MAX_BIN_SOCKETS)
 	    bin_cnt = CL_CTR_MAX_BIN_SOCKETS;
 	for (i = 0; i < (int)bin_cnt && p < end; i++) {
-	    int slen = (int)strnlen(p, CL_CTR_MAX_BIN_SOCK_LEN - 1);
+	    /* bounded by the payload too, and the NUL must lie inside it */
+	    int room = (int)(end - p);
+	    int slen = (int)strnlen(p, room < CL_CTR_MAX_BIN_SOCK_LEN - 1
+	                               ? (size_t)room : CL_CTR_MAX_BIN_SOCK_LEN - 1);
+	    if (slen >= room)
+		break;
 	    memcpy(bin_socks[i], p, slen);
 	    bin_socks[i][slen] = '\0';
 	    p += slen + 1;
 	}
+	bin_cnt = (uint8_t)i;
     }
     /* the incarnation the master admitted that node at */
     if (p + CL_CTR_INC_SZ <= end)
 	for (i = 0; i < CL_CTR_INC_SZ; i++)
 	    inc = (inc << 8) | (unsigned char)*p++;
+
+    /* Our own entry: before anything is written */
+    if (strcmp(ip, my_ip) == 0) {
+	int follow;
+	lock_start_read(cl->peers->lock);
+	follow = cl->peers->node_state == CL_CTR_NODE_NEW || cl->join_pending
+	         || strcmp(sender_ip, my_ip) == 0
+	         || strcmp(sender_ip, cl->peers->last_master) == 0;
+	lock_stop_read(cl->peers->lock);
+	/* Who we are is the master's to say, and only while we ask or follow
+	 * it: anything else - a NODE_ASSIGN from another node, or one recorded
+	 * and sent again - must not re-identify this node. */
+	if (!follow) {
+	    LM_DBG("clusterer_controller: [cluster %d] NODE_ASSIGN for this node "
+	           "from %s, which is not the master it follows - ignored\n",
+	           cl->cluster_id, sender_ip);
+	    return;
+	}
+    }
 
     lock_start_write(cl->peers->lock);
     /* Membership, not liveness - the same distinction cl_ctr_learn_peer_locked()
@@ -884,6 +918,25 @@ void cl_ctr_handle_node_assign(const char *payload, int payload_len,
      * than the author still learn membership here as before. */
     if (strcmp(sender_ip, my_ip) != 0)
 	cl_ctr_learn_peer_locked(ip, cl);
+    {
+	/* two addresses on one id can only come from a confusion upstream -
+	 * say so, once a minute; the assignment still applies */
+	static time_t dup_warned_at;
+	int k;
+	for (k = 0; k < cl->peers->count; k++) {
+	    cl_ctr_peer_t *o = &cl->peers->entries[k];
+	    if (o->node_id == node_id && strcmp(o->ip, ip) != 0) {
+		time_t now = cl_ctr_now();
+		if (dup_warned_at == 0 || now - dup_warned_at >= CL_CTR_WIRE_WARN_IVL) {
+		    dup_warned_at = now;
+		    LM_WARN("clusterer_controller: [cluster %d] %s assigned "
+		            "node_id %u to %s, which %s holds\n", cl->cluster_id,
+		            sender_ip, node_id, ip, o->ip);
+		}
+		break;
+	    }
+	}
+    }
     cl_ctr_update_peer_bin_locked(ip, node_id, bin_cnt,
                                (const char (*)[CL_CTR_MAX_BIN_SOCK_LEN])bin_socks,
                                cl);
@@ -959,6 +1012,7 @@ void cl_ctr_handle_key_grant(const char *payload, int payload_len,
     const char    *end       = payload + payload_len;
     char           target_ip[CL_CTR_MAX_IP_LEN + 1];
     unsigned char  new_salt[CL_CTR_MASTER_SALT_SZ];
+    cl_ctr_symstate_t hs;
     int            ip_len;
 
     /* Parse target_ip */
@@ -996,8 +1050,12 @@ void cl_ctr_handle_key_grant(const char *payload, int payload_len,
      * when we sent the JOIN_REQ.  Its AEAD payload is the master_salt.  A stale
      * KEY_GRANT (for a superseded JOIN_REQ) fails here and is dropped - this
      * subsumes the old join_nonce echo check. */
+    /* On a copy: reading msg 2 mixes it into the handshake state before the
+     * tag can tell a stale or replayed one apart, and a spoiled state would
+     * fail the genuine KEY_GRANT that follows. */
+    hs = cl->noise_hs;
     if (!cl->noise_hs_valid ||
-        cl_ctr_noise_read2(&cl->noise_hs, cl->noise_e_priv,
+        cl_ctr_noise_read2(&hs, cl->noise_e_priv,
                        (const unsigned char *)p, CL_CTR_NOISE_MSG2_SZ, new_salt) < 0) {
         LM_DBG("clusterer_controller: KEY_GRANT from %s did not complete the "
                "Noise handshake (stale or wrong key) - dropping\n", sender_ip);

@@ -7,17 +7,17 @@
 Encrypted UDP on the cluster's multicast group. Only a small cleartext header is visible on the wire - magic, cluster id, cluster identity and nonce - and it is the AEAD's associated data; everything else is sealed with **XChaCha20-Poly1305**, keys derived with **Argon2id**, the join handshake **Noise_NNpsk0**.
 
 ```text
-[magic 2B][cluster_id 2B][cluster uuid 16B][nonce 24B] [type 1B][seq 4B][incarnation 8B][payload] [tag 16B]
+[magic 2B][cluster_id 2B][cluster uuid 16B][nonce 24B] [type 1B][seq 4B][incarnation 8B][sender 4B][payload] [tag 16B]
  '---------------- cleartext, AAD ----------------'      '------------- encrypted ------------------'
 ```
 
-The first magic byte is the wire version (`0xCB` + version, now **2**); the second selects the key tier:
+The first magic byte is the wire version (`0xCB` + version, now **3**); the second selects the key tier:
 
 | Tier | Magic | Key | Packets |
 |------|-------|-----|---------|
-| **bootstrap** | `0xCD01` | Argon2id(password) | `JOIN_REQ`, `KEY_GRANT`, `ACK`, `JOIN_REJECT`, `MASTER_BEACON` |
-| **session** | `0xCD00` | per-cluster session key | `MASTER_ALIVE`, `ALIVE`, `NODE_ASSIGN`, `MEMBER_LIST`, `RESYNC`, `GOODBYE`, `KEY_HANDOFF`, `MASTER_PROBE`, `MASTER_PROBE_ACK`, `MAINT_SET` |
-| **consumer** | `0xCD02` | per-cluster session key | messaging API traffic, rate-limited on its own budget |
+| **bootstrap** | `0xCE01` | Argon2id(password) | `JOIN_REQ`, `KEY_GRANT`, `ACK`, `JOIN_REJECT`, `MASTER_BEACON` |
+| **session** | `0xCE00` | per-cluster session key | `MASTER_ALIVE`, `ALIVE`, `NODE_ASSIGN`, `MEMBER_LIST`, `RESYNC`, `GOODBYE`, `KEY_HANDOFF`, `MASTER_PROBE`, `MASTER_PROBE_ACK`, `MAINT_SET` |
+| **consumer** | `0xCE02` | per-cluster session key | messaging API traffic, rate-limited on its own budget |
 
 The tier is checked against the type after decryption: a session or consumer type that arrives sealed with the bootstrap key is dropped before it is parsed, since the bootstrap key belongs to the password, which a node no master admitted holds as well.
 
@@ -292,8 +292,15 @@ sequenceDiagram
 
 ## 12. A restarted node is recognised by its first packet (incarnation)
 
-Every packet carries the sender's *incarnation* (its start time), inside the AEAD.
-Replay windows are kept per (sender, incarnation): a higher incarnation means the
+Every packet carries the sender's *incarnation* (its start time) and, since wire
+version 3, the sender's own address, both inside the AEAD. The sealed address,
+not the datagram's source - which anyone can set - is the sender: a packet
+recorded from one node and sent again from another address meets the window of
+the node that sealed it. A window that starts afresh - a sender restarted, first
+learned, or a new key - is anchored by the next authenticated packet, whatever
+its number, so a sender that has been up for months is heard at once; three
+forward jumps in a row from a live stream move a window a replayed packet
+anchored. Replay windows are kept per (sender, incarnation): a higher incarnation means the
 peer restarted and numbers from 1 again, so its windows restart on that packet; a
 lower one is a replay from a previous life and is refused. Before, a restarted
 node's low sequence numbers were "older than the replay window" to every peer

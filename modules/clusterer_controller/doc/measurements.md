@@ -4,7 +4,7 @@
 
 ## Network-namespace suite
 
-*test/netns_tests.sh* (see [Automated tests](testing.md#automated-tests)) runs four nodes in network namespaces on one host, every node a member of two clusters that share one port; faults are real - iptables cuts that must show dropped packets, SIGSTOP/SIGCONT pauses, SIGKILL, netem loss and jitter. On the current head it runs 162 checks, T1 to T32; all pass, built with gcc 13 and *-Werror* on the module.
+*test/netns_tests.sh* (see [Automated tests](testing.md#automated-tests)) runs four nodes in network namespaces on one host, every node a member of two clusters that share one port; faults are real - iptables cuts that must show dropped packets, SIGSTOP/SIGCONT pauses, SIGKILL, netem loss and jitter. On the current head it runs 164 checks, T1 to T33; all pass, built with gcc 13 and *-Werror* on the module.
 
 Every change was first shown to fail without itself - the same suite against the build before it:
 
@@ -34,6 +34,16 @@ Every change was first shown to fail without itself - the same suite against the
 | JOIN_REQ and NODE_ASSIGN refuse what is not an address or a node_id | T30: JOIN_REQs naming an empty or binary address | the master processed them, answering with assignments and member lists or with refusals | dropped |
 | A JOIN_REJECT is bound to the request it refuses | T32: a recorded refusal sent to a member joining with the right password | it stopped | it joins; a refusal it earns still stops it |
 | - | T31: three members started at once, five times; all four cold at once, three times | passed on the build before - no change needed | one master, distinct node ids, every time |
+| The sender is what a packet seals (wire version 3) | T33: a member's stop recorded, the member started again, the record sent from the bridge's address | its old GOODBYE removed it | refused as packets from its previous life; it stays |
+
+The unit tests (*test/test.c*, 30 checks) cover what a cluster of four never reaches. The build before these changes fails 12 of them:
+
+| Change | Check | Build before the change | With the change |
+|---|---|---|---|
+| A replay window starts from the first packet after a reset | a sender numbered past 16.7M, newly learned or after a reset | refused for as long as it runs | heard at once |
+| | a replayed old packet taking the mark first | the live stream refused | through within three packets |
+| A node that knows no term takes no absurd one | term 0xFFFFFFFF on a fresh node | accepted | refused |
+| Node ids stay within 1..256 | every id in use or held | 257 handed out | a held id reused; none when all 256 are in use |
 
 ## Test cluster
 
@@ -64,9 +74,10 @@ Two clusters of three nodes on the test network, one VLAN with multicast: cluste
 | OpenSIPS 4.1 build with the module | 51 of 51 | 51 of 51 | |
 | the same 4.1 build with the module at 9c6f01644f (capability bits, statistics, events) | 51 of 51 | 51 of 51 | |
 | the same 4.1 build with the module at 9b9846c5d2 (*release_tag_when_isolated* also covers a member cut off alone) | 51 of 51 | 51 of 51 | |
-| the same 4.1 build with the module at the PR head e39633277d (input checks, JOIN_REJECT bound to its request) | 51 of 51 | 51 of 51 | latest run, below |
+| the same 4.1 build with the module at e39633277d (input checks, JOIN_REJECT bound to its request) | 51 of 51 | 51 of 51 | |
+| the same 4.1 build with the module at the PR head 7f88b8ebe7 (wire version 3, replay windows anchored afresh) | 51 of 51 | 51 of 51 | latest run, below; both clusters switched as a whole |
 
-Latest run, on the module exactly as in the PR: the killed master was replaced in 4.7 s (SBC) and 5.8 s (registrar); a stopped master handed over in 0.5 s; under 30% loss the member's learned wait peaked at 4.4 s and 7.5 s without an election; in R6c the restarted registrar dropped 5 packets that reached it before its identity and kept running; none of the new refusals appeared in any node's log.
+Latest run, on the module exactly as in the PR: the killed master was replaced in 6.0 s (SBC) and 6.3 s (registrar); a stopped master handed over in 0.5 s; under 30% loss the member's learned wait peaked at 4.7 s and 5.1 s without an election; in R6c the restarted registrar dropped 3 packets that reached it before its identity and kept running. The only refusals in any node's log were the wire-version warnings of the half minute while each cluster switched from version 2 to 3; none during the tests.
 
 ```bash title="real-cluster tests - on a test cluster only, it takes masters down on purpose"
 MI_ROOT=mi ./test/rtests.sh 1 10.0.0.11 10.0.0.12 10.0.0.13

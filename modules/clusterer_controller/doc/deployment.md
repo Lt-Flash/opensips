@@ -186,11 +186,11 @@ Every node of a cluster must use the same password. A node started with a differ
 
 ## Upgrading
 
-This version of the module speaks **wire version 2**: every packet carries the cluster identity and its sender's incarnation, and the master's announcements carry its term, settings and MTU. Nodes on different wire versions do not understand each other, so the module refuses the other version's packets before decrypting them, and logs one warning a minute naming the sender, for example:
+This version of the module speaks **wire version 3**: every packet carries the cluster identity, its sender's incarnation and its sender's address, sealed, and the master's announcements carry its term, settings and MTU. Version 3 added the sealed sender to version 2; nodes on 2 and 3 do not interoperate. Nodes on different wire versions do not understand each other, so the module refuses the other version's packets before decrypting them, and logs one warning a minute naming the sender, for example:
 
 ```text
-clusterer_controller: [cluster 1] 10.0.0.14 speaks wire version 1, this node
-speaks 2 - refused (12 packet(s) from other versions so far). Every member of a
+clusterer_controller: [cluster 1] 10.0.0.14 speaks wire version 2, this node
+speaks 3 - refused (12 packet(s) from other versions so far). Every member of a
 cluster must run the same clusterer_controller wire version; upgrade the
 cluster as a whole.
 ```

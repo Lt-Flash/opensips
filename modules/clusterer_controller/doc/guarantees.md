@@ -58,5 +58,6 @@ Each property is checked by the network-namespace suite (*test/netns_tests.sh*, 
 | Malformed, unauthenticated, or sealed by a holder of the password that was never admitted: no node stops or changes its view, and the log takes a line per kind of refusal | T30 | - |
 | Several nodes joining at once, and a whole cluster starting cold at once, get one master and distinct node ids | T31 | - |
 | A JOIN_REJECT recorded and sent again does not stop a joining node; one it earns still does | T32 | - |
+| A node's packets recorded and sent again from another address meet that node's replay window: its old GOODBYE removes nothing | T33 | - |
 
 Not tested yet: a full peer table; a static *clusterer* cluster beside controller clusters on one node.

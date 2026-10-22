@@ -555,6 +555,23 @@ void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	    return;
 	}
 
+	/* Who sent it is what it sealed, not the datagram's source address,
+	 * which anyone can set: from here on sender_ip_buf is the sealed sender
+	 * (wire version 3).  The replay window below is kept per sealed sender,
+	 * so a packet sent again from any address meets the window of the node
+	 * that sealed it; replies still go to the datagram's source. */
+	{
+	    struct in_addr a;
+
+	    memcpy(&a.s_addr, buf + CL_CTR_SENDER_OFF, CL_CTR_SENDER_SZ);
+	    if (a.s_addr == 0 || a.s_addr == htonl(INADDR_BROADCAST)) {
+		LM_DBG("clusterer_controller: [cluster %d] packet from %s seals no "
+		       "sender, dropping\n", cl->cluster_id, sender_ip_buf);
+		return;
+	    }
+	    inet_ntop(AF_INET, &a, sender_ip_buf, sizeof(sender_ip_buf));
+	}
+
 	/* The key that sealed a packet says who can have sent it: the bootstrap
 	 * key belongs to the password, which anyone holding it has, admitted or
 	 * not; the session key only to the members a master admitted.  Only the
@@ -635,12 +652,14 @@ void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 			 * operator can act on - hence a warning, not a debug
 			 * line, rate limited per process because a burst that
 			 * outruns the window outruns it for many packets. */
-			static unsigned int last_old_warn;
+			/* one throttle per line: the jump and the fall
+			 * behind the window are different news */
+			static unsigned int last_warn[2];
 			unsigned int now_t = get_ticks();
+			unsigned int *lw = &last_warn[_seq_rc == CL_CTR_SEQ_JUMP];
 
-			if (last_old_warn == 0 ||
-			    now_t - last_old_warn >= CL_CTR_RELIABLE_WARN_IVL) {
-			    last_old_warn = now_t;
+			if (*lw == 0 || now_t - *lw >= CL_CTR_RELIABLE_WARN_IVL) {
+			    *lw = now_t;
 			    if (_seq_rc == CL_CTR_SEQ_JUMP)
 				LM_WARN("clusterer_controller: reliable message "
 				        "from %s seq=%u is implausibly far ahead "
@@ -727,6 +746,12 @@ void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 		              + CL_CTR_CONFIG_SZ + CL_CTR_MTU_SZ + 1, CL_CTR_CAPS_SZ);
 		p_caps = ntohl(c_be);
 	    }
+	    /* a node announces itself, and no other */
+	    if (strcmp(ip_buf, sender_ip_buf) != 0) {
+		LM_DBG("clusterer_controller: [cluster %d] ALIVE for %s sealed "
+		       "by %s, dropping\n", cl->cluster_id, ip_buf, sender_ip_buf);
+		break;
+	    }
 	    cl_ctr_handle_alive(ip_buf, pubkey, cfg_present, p_manage, p_stick, p_qt,
 	                        p_mtu, p_maint, p_caps, cl);
 	    break;
@@ -749,7 +774,8 @@ void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 
 	case CL_CTR_PKT_JOIN_REQ:
 	    cl_ctr_handle_join_req(sock, payload, payload_len, pkt_inc,
-	                       (const unsigned char *)buf + CL_CTR_NONCE_OFF, cl,
+	                       (const unsigned char *)buf + CL_CTR_NONCE_OFF,
+	                       sender_ip_buf, cl,
 	                       (const struct sockaddr *)&src_addr, src_len);
 	    break;
 
@@ -762,6 +788,12 @@ void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	    int  ip_len = payload_len > CL_CTR_MAX_IP_LEN ? CL_CTR_MAX_IP_LEN : payload_len;
 	    memcpy(ip_buf, payload, ip_len);
 	    ip_buf[ip_len] = '\0';
+	    /* a node takes leave for itself, and no other */
+	    if (strcmp(ip_buf, sender_ip_buf) != 0) {
+		LM_DBG("clusterer_controller: [cluster %d] GOODBYE for %s sealed "
+		       "by %s, dropping\n", cl->cluster_id, ip_buf, sender_ip_buf);
+		break;
+	    }
 	    cl_ctr_handle_goodbye(sock, ip_buf, cl);
 	    break;
 	}

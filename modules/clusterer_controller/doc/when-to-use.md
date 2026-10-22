@@ -15,7 +15,7 @@
 
 - the network has **no multicast** between the nodes: most public clouds by default, overlays without BUM replication, NAT between nodes. The module has no unicast discovery;
 - the nodes are not on Linux (it needs *timerfd* and *SO_BINDTODEVICE*), or the cluster network is IPv6-only;
-- you need **consensus or fencing**: this is not a quorum protocol. A partitioned cluster elects a master on each side and, by default, both hold the active tag until the partition heals (*release_tag_when_isolated* makes a cut-off master give it up);
+- you need **consensus or fencing**: this is not a quorum protocol. A partitioned cluster elects a master on each side and, by default, both hold the active tag until the partition heals (*release_tag_when_isolated* makes a master that hears fewer than half of the cluster it knew give it up - the master cut off, or a member cut off alone that elected itself);
 - nodes must authenticate individually: every holder of the cluster password is a member;
 - the nodes are far apart (WAN): the timers are tuned for a LAN (keepalives every second, failover in seconds).
 

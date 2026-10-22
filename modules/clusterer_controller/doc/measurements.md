@@ -4,7 +4,7 @@
 
 ## Network-namespace suite
 
-*test/netns_tests.sh* (see [Automated tests](testing.md#automated-tests)) runs four nodes in network namespaces on one host, every node a member of two clusters that share one port; faults are real - iptables cuts that must show dropped packets, SIGSTOP/SIGCONT pauses, SIGKILL, netem loss and jitter. On the current head it runs 132 checks, T1 to T29; all pass, built with gcc 13 and *-Werror* on the module.
+*test/netns_tests.sh* (see [Automated tests](testing.md#automated-tests)) runs four nodes in network namespaces on one host, every node a member of two clusters that share one port; faults are real - iptables cuts that must show dropped packets, SIGSTOP/SIGCONT pauses, SIGKILL, netem loss and jitter. On the current head it runs 134 checks, T1 to T29; all pass, built with gcc 13 and *-Werror* on the module.
 
 Every change was first shown to fail without itself - the same suite against the build before it:
 
@@ -26,6 +26,7 @@ Every change was first shown to fail without itself - the same suite against the
 | Statistics | T28 | all 6 checks fail - no statistics | all pass |
 | Events | T29: the master killed, a member put into maintenance | 5 of 6 checks fail - no role, master or member events | all pass; the event route reads $cl_ctr_role while it runs |
 | A joining node announces its master | T28: a member restarted by T27 | it counted no master change, and raised no master event | counts and raises it |
+| A new master counts from the membership it knew (*release_tag_when_isolated*) | T24: a member cut off alone for 25 s, the option on | it elects itself and keeps the tag active - two holders | releases the tag; a member again after the heal, holding no released state |
 
 ## Test cluster
 
@@ -56,7 +57,7 @@ Two clusters of three nodes on the test network, one VLAN with multicast: cluste
 | OpenSIPS 4.1 build with the module | 51 of 51 | 51 of 51 | |
 | the same 4.1 build with the module at the PR head 9c6f01644f (capability bits, statistics, events) | 51 of 51 | 51 of 51 | latest run, below |
 
-Latest run, on the module exactly as in the PR: the killed master was replaced in 5.8 s (SBC) and 6.3 s (registrar); a stopped master handed over in 0.5 s; under 30% loss the member's learned wait peaked at 8.6 s and 5.9 s without an election; in R6c the restarted registrar dropped 2 packets that reached it before its identity and kept running.
+Latest run, on the module at 9c6f01644f (since then only *release_tag_when_isolated*, off by default, changed; the namespace suite covers it in T24): the killed master was replaced in 5.8 s (SBC) and 6.3 s (registrar); a stopped master handed over in 0.5 s; under 30% loss the member's learned wait peaked at 8.6 s and 5.9 s without an election; in R6c the restarted registrar dropped 2 packets that reached it before its identity and kept running.
 
 ```bash title="real-cluster tests - on a test cluster only, it takes masters down on purpose"
 MI_ROOT=mi ./test/rtests.sh 1 10.0.0.11 10.0.0.12 10.0.0.13

@@ -139,7 +139,7 @@ A master put into maintenance hands over at once. Maintenance is runtime-only: a
 | *manage_shtags* | 1 | the master holds the active sharing tags |
 | *master_stickiness* | 1 | a live master keeps the role when a higher IP joins |
 | *on_config_mismatch* | reject | a joining node with different settings: *reject*, *warn* or *adopt* |
-| *release_tag_when_isolated* | 0 | a master cut off from most of its members gives up the active tag |
+| *release_tag_when_isolated* | 0 | a master cut off from most of its members - or a member cut off alone that elects itself - gives up the active tag |
 
 ---
 

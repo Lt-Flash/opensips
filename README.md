@@ -10,7 +10,7 @@ A memory allocator for [OpenSIPS](https://github.com/OpenSIPS/opensips), for bot
 - **Less memory under overload:** with no drops, transactions are released on time instead of waiting in memory for retransmissions - at 60k INVITEs/s HG_MALLOC peaked at 1.5 GB against 2.0-2.5 GB for HP_MALLOC and F_MALLOC, and stayed within a 2 GB arena that F_MALLOC and F_PARALLEL_MALLOC ran out of.
 - **Tight latency:** 1.2 million registrations at 60k per second with a p99 of 4 ms, against 15-28 s for the others.
 - **No more guessing `-m`:** `-m 128:1024` starts at 128 MB, grows as traffic arrives, and gives memory back when it goes quiet.
-- **Safe and observable:** double frees that reach the shared pool and corrupted free-list links are caught and counted instead of followed; every grow, shrink and lock hold is visible through MI, statistics and events.
+- **Safe and observable:** double frees - a cell freed twice in a row, any that reaches the shared pool, a large fragment freed twice - and corrupted free-list links are caught and counted instead of followed; every grow, shrink and lock hold is visible through MI, statistics and events.
 - **Runs anywhere:** huge pages when the host has them, plain 4 KB pages when it does not; builds on x86 and ARM, 32-bit and 64-bit, glibc and musl.
 
 Two benchmark setups, each running every allocator from one binary: INVITEs answered by tm on master plus HG_MALLOC (setup A, rates in INVITEs/s), and calls relayed by a stateful proxy over UDP, TLS and WSS on a 4.1 build with other pending patches (setup B, rates in relayed calls/s, 13 datagrams each). Their rates do not compare with each other - see [what was measured where](docs/benchmarks.md#what-was-measured-where). In production since August 2026, now on 19 SIP nodes: billing gateways and load balancers since August, SBCs and registrars since October.
@@ -35,7 +35,7 @@ Everything lives in the [Lt-Flash/opensips](https://github.com/Lt-Flash/opensips
 | [`feature/hg-malloc-v3-4.0`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-4.0) | the same commit on the 4.0 branch; also applies to the 4.0.1 and 4.0.2 releases |
 | [`hg_malloc`](https://github.com/Lt-Flash/opensips/tree/hg_malloc) | this documentation |
 
-The commit adds the allocator (`mem/hg_*`), elastic-arena and autoscaling configuration, MI commands, statistics and events, and `modules/hgstress`, a soak and fault-injection test module excluded from the default build. Clone a branch and build it as any OpenSIPS tree, or add the commit to an existing tree:
+The branch adds the allocator (`mem/hg_*`), elastic-arena and autoscaling configuration, MI commands, statistics and events, and `modules/hgstress`, a soak and fault-injection test module excluded from the default build. Clone a branch and build it as any OpenSIPS tree, or add the commit to an existing tree:
 
 ```bash
 git remote add lt-flash https://github.com/Lt-Flash/opensips.git
@@ -109,7 +109,7 @@ Events: `E_CORE_SHM_GROW_BLOCKED` (growth refused for a sustained period), `E_CO
 
 - Memory per object: a little more than the other allocators, from size-class rounding - +2% live memory on 400k registrations (usrloc insert-only, measured in September 2026 on an earlier HG_MALLOC build), 5-13% on tm's 1-4 KB objects at rates with no drops (setup A). Under overload the total is lower: see [memory under load](docs/benchmarks.md#memory-under-load).
 - The committed arena is pinned, so it shows as resident from the start.
-- The huge-page tiers are Linux-only; elsewhere the arena is plain pinned memory.
+- The huge-page tiers and giving memory back to the OS are Linux-only; elsewhere the arena is plain pinned memory that grows but does not shrink.
 
 ## Status
 

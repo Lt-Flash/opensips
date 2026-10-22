@@ -81,6 +81,45 @@ static int cl_ctr_consumer_src_known(cl_ctr_cluster_t *cl, uint32_t src_ip)
     return known;
 }
 
+/* Count one more refusal on @w; when a report is due - the first at once,
+ * then at most one per CL_CTR_WIRE_WARN_IVL - return how many refusals it
+ * stands for, else 0. */
+static unsigned long cl_ctr_warn_due(cl_ctr_warn_t *w)
+{
+    time_t        now = cl_ctr_now();
+    unsigned long n;
+
+    w->pkts++;
+    if (w->reported_at && now - w->reported_at < CL_CTR_WIRE_WARN_IVL)
+        return 0;
+    n = w->pkts - w->pkts_reported;
+    w->pkts_reported = w->pkts;
+    w->reported_at   = now;
+    return n;
+}
+
+/* A bootstrap packet from @ip that did not decrypt: counted by the caller
+ * (auth_failures), reported here once a minute. */
+static void cl_ctr_warn_bootstrap(cl_ctr_cluster_t *cl, const char *ip)
+{
+    unsigned long k = cl_ctr_warn_due(&cl->warn_bootstrap);
+
+    if (k)
+        LM_WARN("clusterer_controller: [cluster %d] %lu bootstrap packet(s) "
+                "did not decrypt since the last report, the latest from %s - "
+                "wrong password, foreign cluster, or tampered packet\n",
+                cl->cluster_id, k, ip);
+}
+
+/* The types a sender seals with the bootstrap key: the admission handshake
+ * (JOIN_REQ, KEY_GRANT and its ACK, JOIN_REJECT) and the master's beacon. */
+static int cl_ctr_bootstrap_type(unsigned char t)
+{
+    return t == CL_CTR_PKT_JOIN_REQ || t == CL_CTR_PKT_KEY_GRANT ||
+           t == CL_CTR_PKT_ACK || t == CL_CTR_PKT_JOIN_REJECT ||
+           t == CL_CTR_PKT_MASTER_BEACON;
+}
+
 static int cl_ctr_rate_check(cl_ctr_cluster_t *cl, uint32_t src_ip,
                              int is_consumer)
 {
@@ -116,14 +155,21 @@ static int cl_ctr_rate_check(cl_ctr_cluster_t *cl, uint32_t src_ip,
                 return 0;
             }
             if (++(*cnt) > limit) {
-                /* Say so, once per window per source: a silent drop here
-                 * looks exactly like packet loss to whatever was sending,
-                 * which is a miserable thing to debug. */
-                if (*cnt == limit + 1)
+                /* Say so: a silent drop here looks exactly like packet loss
+                 * to whatever was sending, which is a miserable thing to
+                 * debug.  Once a minute, with the count: a flood, from one
+                 * address or many, is what this limit is for, and must not
+                 * turn into a flood of the log. */
+                unsigned long k = cl_ctr_warn_due(&cl->warn_rate[is_consumer ? 1 : 0]);
+                if (k) {
+                    char ip[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &src_ip, ip, sizeof ip);
                     LM_WARN("clusterer_controller: [cluster %d] %s rate "
-                        "limit of %d/s exceeded by a peer - dropping\n",
-                        cl->cluster_id,
-                        is_consumer ? "consumer" : "control", limit);
+                        "limit of %d/s exceeded - %lu packet(s) dropped since "
+                        "the last report, the latest from %s\n",
+                        cl->cluster_id, is_consumer ? "consumer" : "control",
+                        limit, k, ip);
+                }
                 return -1;
             }
             return 0;
@@ -142,6 +188,42 @@ static int cl_ctr_rate_check(cl_ctr_cluster_t *cl, uint32_t src_ip,
         oldest->consumer_count = 1;
     else
         oldest->count = 1;
+    return 0;
+}
+
+/*
+ * cl_ctr_foreign_authentic() - does a packet stamped with a cluster uuid not
+ * ours really come from another cluster?
+ *
+ * The uuid is cleartext, so anyone can stamp any.  What proves another
+ * cluster is a packet that authenticates: a deployment that shares our group,
+ * password and cluster_id seals its beacons - and KEY_GRANTs and JOIN_REJECTs
+ * - with the same bootstrap key we hold, and stamps its uuid on them (a
+ * JOIN_REQ carries none).  A bootstrap packet that does not decrypt is counted
+ * as an authentication failure, like any other; a session packet stamped so
+ * cannot be checked at all.  Only an authenticated one may be recorded in
+ * foreign_clusters and raise the alarm - garbage must not fill the one or
+ * sound the other.  Charged to the rate limiter first, since it costs a
+ * decryption.
+ */
+static int cl_ctr_foreign_authentic(const char *buf, ssize_t n,
+                                    const struct sockaddr_in *src,
+                                    cl_ctr_cluster_t *cl)
+{
+    static char   tmp[CL_CTR_LIST_PKT_MAX_SZ];   /* worker-local, like buf */
+    char          ip[INET_ADDRSTRLEN];
+
+    if (memcmp(buf, CL_CTR_BOOTSTRAP_MAGIC, CL_CTR_MAGIC_SZ) != 0)
+        return 0;
+    if (n > (ssize_t)sizeof(tmp) ||
+            cl_ctr_rate_check(cl, src->sin_addr.s_addr, 0) < 0)
+        return 0;
+    memcpy(tmp, buf, (size_t)n);
+    inet_ntop(AF_INET, &src->sin_addr, ip, sizeof ip);
+    if (cl_ctr_decrypt_pkt(tmp, n, ip, cl->key, 1) == 0)
+        return 1;
+    cl_ctr_note_auth_failure(cl, ip);
+    cl_ctr_warn_bootstrap(cl, ip);
     return 0;
 }
 
@@ -224,8 +306,15 @@ void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
     /* Minimum: wire header magic(2)+cluster_id(2)+uuid(16)+nonce(24), plaintext
      * header type(1)+seq(4)+incarnation(8), tag(16) = 73 bytes */
     if (n < CL_CTR_WIRE_HDR_SZ + CL_CTR_PLAIN_HDR_SZ + CL_CTR_TAG_SZ) {
-	LM_WARN("clusterer_controller: short packet (%zd bytes), dropping\n",
-	        n);
+	/* before any filter, so anyone can send these: once a minute */
+	unsigned long k = cl_ctr_warn_due(&cl->warn_short);
+	if (k) {
+	    char ip[INET_ADDRSTRLEN];
+	    inet_ntop(AF_INET, &src_addr.sin_addr, ip, sizeof ip);
+	    LM_WARN("clusterer_controller: [cluster %d] %lu datagram(s) too short "
+	            "to be a packet dropped since the last report, the latest "
+	            "%zd bytes from %s\n", cl->cluster_id, k, n, ip);
+	}
 	return;
     }
 
@@ -299,6 +388,13 @@ void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	        && !cl_ctr_cid_is_zero(pc)
 	        && memcmp(pc, cl->peers->cid, CL_CTR_CID_SZ) != 0) {
 	    time_t now = cl_ctr_now();
+
+	    if (!cl_ctr_foreign_authentic(buf, n, &src_addr, cl)) {
+		LM_DBG("clusterer_controller: [cluster %d] unauthenticated "
+		       "packet stamped with another cluster uuid, dropping\n",
+		       cl->cluster_id);
+		return;
+	    }
 	    cl->peers->foreign_pkts++;
 	    {
 		/* which foreign cluster: remember it for clusterer_controller:list_config */
@@ -403,6 +499,8 @@ void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	    lock_stop_read(cl->peers->lock);
 	    if (strcmp(sender_ip_buf, my_ip) != 0)
 		cl_ctr_note_auth_failure(cl, sender_ip_buf);
+	    if (is_bootstrap && strcmp(sender_ip_buf, my_ip) != 0)
+		cl_ctr_warn_bootstrap(cl, sender_ip_buf);
 
 	    /* A packet from another peer we cannot decrypt, seen while still
 	     * joining, means a cluster (or rogue) whose key we do not share is
@@ -426,7 +524,8 @@ void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 		 * the correct password can read it.  Forgeries are impossible without
 		 * the bootstrap key.                                                  */
 		if (_im && cl_ctr_join_fail_check(sender_ip_buf, cl))
-		    cl_ctr_send_join_reject(sock, sender_ip_buf, cl, CL_CTR_REJECT_GENERIC);
+		    cl_ctr_send_join_reject(sock, sender_ip_buf, cl, CL_CTR_REJECT_GENERIC,
+		        (const unsigned char *)buf + CL_CTR_NONCE_OFF);
 
 		/* Joiner fallback: count bootstrap decrypt failures during CL_CTR_NODE_NEW
 		 * only when the packet came from the known master.  This filters out
@@ -453,6 +552,19 @@ void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 		    cl_ctr_send_join_req(cl->sock, cl);
 		}
 	    }
+	    return;
+	}
+
+	/* The key that sealed a packet says who can have sent it: the bootstrap
+	 * key belongs to the password, which anyone holding it has, admitted or
+	 * not; the session key only to the members a master admitted.  Only the
+	 * admission handshake and the master's beacon travel under the bootstrap
+	 * key - any other type sealed with it comes from a holder of the password
+	 * that no master admitted, and its parser never sees it. */
+	if (is_bootstrap && !cl_ctr_bootstrap_type((unsigned char)buf[CL_CTR_WIRE_HDR_SZ])) {
+	    LM_DBG("clusterer_controller: [cluster %d] packet type 0x%02x from %s "
+	           "sealed with the bootstrap key, dropping\n", cl->cluster_id,
+	           (unsigned char)buf[CL_CTR_WIRE_HDR_SZ], sender_ip_buf);
 	    return;
 	}
 
@@ -567,7 +679,10 @@ void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 
 	case CL_CTR_PKT_ALIVE: {
 	    char           ip_buf[CL_CTR_MAX_IP_LEN + 1];
-	    int            ip_len = (int)strnlen(payload, CL_CTR_MAX_IP_LEN);
+	    /* bounded by the payload too: past it lie the tag and stale bytes */
+	    int            ip_len = (int)strnlen(payload,
+	                               payload_len < CL_CTR_MAX_IP_LEN
+	                               ? (size_t)payload_len : CL_CTR_MAX_IP_LEN);
 	    const unsigned char *pubkey = NULL;
 	    int            cfg_present = 0, p_manage = 0, p_stick = 0, p_qt = 0;
 	    int            p_mtu = 0, p_maint = 0;
@@ -629,15 +744,12 @@ void cl_ctr_recv_one(int sock, cl_ctr_cluster_t *cl,
 	    break;
 
 	case CL_CTR_PKT_CONSUMER:
-	    /* session-key only: a consumer message under the bootstrap key
-	     * would come from a node that has not even joined - drop it */
-	    if (is_bootstrap)
-		break;
 	    cl_ctr_handle_consumer(payload, payload_len, sender_ip_buf, cl);
 	    break;
 
 	case CL_CTR_PKT_JOIN_REQ:
-	    cl_ctr_handle_join_req(sock, payload, payload_len, pkt_inc, cl,
+	    cl_ctr_handle_join_req(sock, payload, payload_len, pkt_inc,
+	                       (const unsigned char *)buf + CL_CTR_NONCE_OFF, cl,
 	                       (const struct sockaddr *)&src_addr, src_len);
 	    break;
 

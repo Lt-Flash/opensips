@@ -26,6 +26,11 @@ What the module promises, and what it does not. It is failure detection and lead
 - the masters rank by the members they hear, then term, then IP, and the cluster converges on the larger group's master as soon as the two masters hear each other: their keepalives every second, or a beacon every 5 s when they no longer share a session key. Nodes dropped during the partition rejoin with their node ids;
 - groups whose settings differ never merge: each keeps its master and both log which settings differ. Fix the configuration on the wrong side and restart those nodes.
 
+**Against input that is not the cluster's**:
+
+- a datagram that is no authenticated packet of this cluster - too short, another wire version, a body that does not decrypt, another cluster's identity - is dropped without changing what any running member holds (members, master, term, tags), and each kind is logged at most once a minute per cluster with the count it stands for; *auth_failures* counts every one that fails authentication;
+- the password admits, and no more: under the bootstrap key a node accepts only the admission handshake and the master's beacon, and checks what they carry - a JOIN_REQ's address must be a dotted quad, a beacon must carry every field its build sends and a member count in range - before they change anything. Everything else needs the session key a master hands to the nodes it admitted, and a NODE_ASSIGN under it must still name a dotted quad and a node_id in range. A JOIN_REJECT is acted on only if it refuses one of this node's own requests, so one recorded and sent again stops nobody.
+
 **Not guaranteed - exclusive ownership.** Failure detection and elections cannot stop two nodes from acting as the tag holder during a partition, and no node holds it for the seconds of a failover. A resource that must have exactly one writer at all times needs fencing outside this module - for example, the downstream system refusing a second writer.
 
 ### Properties and their tests
@@ -50,5 +55,8 @@ Each property is checked by the network-namespace suite (*test/netns_tests.sh*, 
 | A master cut off from most of its members releases the tag, and so does a member cut off alone that elects itself (*release_tag_when_isolated*) | T24 | - |
 | A member on an older build: the newer mechanisms wait until every member has them | T27 | - |
 | Statistics and events | T28, T29 | - |
+| Malformed, unauthenticated, or sealed by a holder of the password that was never admitted: no node stops or changes its view, and the log takes a line per kind of refusal | T30 | - |
+| Several nodes joining at once, and a whole cluster starting cold at once, get one master and distinct node ids | T31 | - |
+| A JOIN_REJECT recorded and sent again does not stop a joining node; one it earns still does | T32 | - |
 
-Not tested yet: several nodes joining a running cluster at once; a full peer table; a static *clusterer* cluster beside controller clusters on one node; malformed datagrams.
+Not tested yet: a full peer table; a static *clusterer* cluster beside controller clusters on one node.

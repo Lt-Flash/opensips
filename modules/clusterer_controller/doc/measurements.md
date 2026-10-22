@@ -4,7 +4,7 @@
 
 ## Network-namespace suite
 
-*test/netns_tests.sh* (see [Automated tests](testing.md#automated-tests)) runs four nodes in network namespaces on one host, every node a member of two clusters that share one port; faults are real - iptables cuts that must show dropped packets, SIGSTOP/SIGCONT pauses, SIGKILL, netem loss and jitter. On the current head it runs 134 checks, T1 to T29; all pass, built with gcc 13 and *-Werror* on the module.
+*test/netns_tests.sh* (see [Automated tests](testing.md#automated-tests)) runs four nodes in network namespaces on one host, every node a member of two clusters that share one port; faults are real - iptables cuts that must show dropped packets, SIGSTOP/SIGCONT pauses, SIGKILL, netem loss and jitter. On the current head it runs 162 checks, T1 to T32; all pass, built with gcc 13 and *-Werror* on the module.
 
 Every change was first shown to fail without itself - the same suite against the build before it:
 
@@ -27,6 +27,13 @@ Every change was first shown to fail without itself - the same suite against the
 | Events | T29: the master killed, a member put into maintenance | 5 of 6 checks fail - no role, master or member events | all pass; the event route reads $cl_ctr_role while it runs |
 | A joining node announces its master | T28: a member restarted by T27 | it counted no master change, and raised no master event | counts and raises it |
 | A new master counts from the membership it knew (*release_tag_when_isolated*) | T24: a member cut off alone for 25 s, the option on | it elects itself and keeps the tag active - two holders | releases the tag; a member again after the heal, holding no released state |
+| Refusals anyone can provoke, once a minute | T30: a 20 s flood from one address, no password | 848 to 940 log lines on every node | within the budget of 30 |
+| A cluster uuid names another cluster only when authenticated | T30: garbage stamped with random uuids | all 16 foreign_clusters slots filled, the alarm logged | nothing recorded or logged |
+| Only the handshake and the beacon under the bootstrap key | T30: sealed MASTER_ALIVEs from 20 addresses that are no member | 8 of them taken as members, with node_id 0 | none |
+| A beacon must carry what every build sends | T30: short or out-of-range beacons, sealed | the master demoted itself into a merge with an address that runs nothing | dropped before ranking |
+| JOIN_REQ and NODE_ASSIGN refuse what is not an address or a node_id | T30: JOIN_REQs naming an empty or binary address | the master processed them, answering with assignments and member lists or with refusals | dropped |
+| A JOIN_REJECT is bound to the request it refuses | T32: a recorded refusal sent to a member joining with the right password | it stopped | it joins; a refusal it earns still stops it |
+| - | T31: three members started at once, five times; all four cold at once, three times | passed on the build before - no change needed | one master, distinct node ids, every time |
 
 ## Test cluster
 
@@ -56,9 +63,10 @@ Two clusters of three nodes on the test network, one VLAN with multicast: cluste
 | + remote maintenance, full level | 51 of 51 | 51 of 51 | |
 | OpenSIPS 4.1 build with the module | 51 of 51 | 51 of 51 | |
 | the same 4.1 build with the module at 9c6f01644f (capability bits, statistics, events) | 51 of 51 | 51 of 51 | |
-| the same 4.1 build with the module at the PR head 9b9846c5d2 (*release_tag_when_isolated* also covers a member cut off alone) | 51 of 51 | 51 of 51 | latest run, below |
+| the same 4.1 build with the module at 9b9846c5d2 (*release_tag_when_isolated* also covers a member cut off alone) | 51 of 51 | 51 of 51 | |
+| the same 4.1 build with the module at the PR head e39633277d (input checks, JOIN_REJECT bound to its request) | 51 of 51 | 51 of 51 | latest run, below |
 
-Latest run, on the module exactly as in the PR: the killed master was replaced in 5.1 s (SBC) and 6.1 s (registrar); a stopped master handed over in 0.5 s; under 30% loss the member's learned wait peaked at 5.7 s and 4.5 s without an election; in R6c the restarted registrar dropped 1 packet that reached it before its identity and kept running.
+Latest run, on the module exactly as in the PR: the killed master was replaced in 4.7 s (SBC) and 5.8 s (registrar); a stopped master handed over in 0.5 s; under 30% loss the member's learned wait peaked at 4.4 s and 7.5 s without an election; in R6c the restarted registrar dropped 5 packets that reached it before its identity and kept running; none of the new refusals appeared in any node's log.
 
 ```bash title="real-cluster tests - on a test cluster only, it takes masters down on purpose"
 MI_ROOT=mi ./test/rtests.sh 1 10.0.0.11 10.0.0.12 10.0.0.13

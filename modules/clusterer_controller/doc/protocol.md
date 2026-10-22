@@ -19,6 +19,8 @@ The first magic byte is the wire version (`0xCB` + version, now **2**); the seco
 | **session** | `0xCD00` | per-cluster session key | `MASTER_ALIVE`, `ALIVE`, `NODE_ASSIGN`, `MEMBER_LIST`, `RESYNC`, `GOODBYE`, `KEY_HANDOFF`, `MASTER_PROBE`, `MASTER_PROBE_ACK`, `MAINT_SET` |
 | **consumer** | `0xCD02` | per-cluster session key | messaging API traffic, rate-limited on its own budget |
 
+The tier is checked against the type after decryption: a session or consumer type that arrives sealed with the bootstrap key is dropped before it is parsed, since the bootstrap key belongs to the password, which a node no master admitted holds as well.
+
 Within one wire version, fields are only ever appended and read behind a length check, and a build drops a packet type it does not know; what a node's build implements is advertised as capability bits (see [Upgrading](deployment.md#upgrading)).
 
 Legend for the diagrams below: **`-->>` unicast (1:1)**, **`-)` multicast (group)**.
@@ -213,6 +215,11 @@ A node with the wrong password cannot produce a bootstrap-valid `JOIN_REQ`. Afte
 repeated failures from one source the master emits an authenticated `JOIN_REJECT`;
 independently, a genuinely-wrong-password joiner self-terminates after its defer
 budget rather than forming a lone split-brain master.
+
+Every `JOIN_REJECT` echoes the nonce of the packet it refuses, and a joiner acts
+only on one that refuses one of its own last `JOIN_REQ`s: bootstrap packets have
+no replay window, so this is what keeps a refusal recorded once from being sent
+again to stop the node at a later start.
 
 ```mermaid
 sequenceDiagram

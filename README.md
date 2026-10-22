@@ -31,22 +31,28 @@ Everything lives in the [Lt-Flash/opensips](https://github.com/Lt-Flash/opensips
 
 | branch | what |
 |---|---|
-| [`feature/hg-malloc-v3-final`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-final) | OpenSIPS master (as of 2026-10-09) plus one commit; proposed upstream as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327) |
-| [`feature/hg-malloc-v3-4.0`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-4.0) | the same commit on the 4.0 branch; also applies to the 4.0.1 and 4.0.2 releases |
+| [`feature/hg-malloc-v3-final`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-final) | OpenSIPS master (as of 2026-10-09) plus four commits - the allocator, its review fixes, unit tests and a section for reviewers; proposed upstream as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327) |
+| [`feature/hg-malloc-v3-4.0`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-4.0) | the allocator and its review fixes on the 4.0 branch; also applies to the 4.0.1 and 4.0.2 releases |
 | [`hg_malloc`](https://github.com/Lt-Flash/opensips/tree/hg_malloc) | this documentation |
 
-The branch adds the allocator (`mem/hg_*`), elastic-arena and autoscaling configuration, MI commands, statistics and events, and `modules/hgstress`, a soak and fault-injection test module excluded from the default build. Clone a branch and build it as any OpenSIPS tree, or add the commit to an existing tree:
+The branch adds the allocator (`mem/hg_*`), elastic-arena and autoscaling configuration, MI commands, statistics and events, and `modules/hgstress`, a soak and fault-injection test module excluded from the default build. Clone a branch and build it as any OpenSIPS tree, or add its commits to an existing tree:
 
 ```bash
 git remote add lt-flash https://github.com/Lt-Flash/opensips.git
-git fetch lt-flash feature/hg-malloc-v3-final    # feature/hg-malloc-v3-4.0 for a 4.0 tree
-git cherry-pick FETCH_HEAD
+
+# a master tree
+git fetch lt-flash feature/hg-malloc-v3-final
+git cherry-pick 31d1c970dd^..FETCH_HEAD
+
+# a 4.0 tree
+git fetch lt-flash feature/hg-malloc-v3-4.0
+git cherry-pick be2e5d9018^..FETCH_HEAD
 ```
 
-In an unpacked 4.0.x release tarball:
+In an unpacked 4.0.x release tarball, both 4.0 commits as one patch:
 
 ```bash
-curl -L https://github.com/Lt-Flash/opensips/commit/be2e5d9018a982fc8439b7c6419256ab119f6d7f.patch | patch -p1
+curl -L 'https://github.com/Lt-Flash/opensips/compare/be2e5d9018a982fc8439b7c6419256ab119f6d7f%5E...7a18398adbfbe288f698a473ae874134ff62fc9c.patch' | patch -p1
 ```
 
 ## Quick start

@@ -5,7 +5,7 @@
 | option | meaning |
 |---|---|
 | `-a HG_MALLOC` | use HG_MALLOC for shared and private memory (`-s` / `-k` select them separately) |
-| `-a HG_MALLOC_DBG` | the same, recording file, function and line for every allocation, which `mem:pkg_dump` and `mem:shm_dump` print per site |
+| `-a HG_MALLOC_DBG` | the same, recording file, function and line for every allocation, which `mem:pkg_dump` and `mem:shm_dump` print per site; it also puts a red zone after every request, checked at free and realloc, and holds freed cells poisoned in a per-thread quarantine, checked when they leave it - see [Integrity checks](design.md#1-allocation) |
 | `-m INIT[:CAP]` | shared arena: initial size, and the cap it may grow to |
 | `-M INIT[:CAP]` | private (per-process) arena, same form |
 
@@ -58,7 +58,7 @@ All optional.
 | `pkg_auto_scaling_profile` | none | profile that drives each process's private arena |
 | `shm_grow_granule` | 16m (one page on a small arena) | size of one grow step of the shared arena, rounded to the arena page |
 | `pkg_grow_granule` | 16m (one page on a small arena) | the same for every process's private arena |
-| `hg_ram_floor_mb` | 0 = max(256 MB, MemTotal/20) | host free memory no commit may take the host below: checked at startup, before each new process is forked, and on every grow |
+| `hg_ram_floor_mb` | 0 = MemTotal/20, at least the smaller of 256 MB and MemTotal/8 (16 MB on a 128 MB host, 128 MB on 1 GB, 256 MB from 2 GB to 5 GB) | host free memory no commit may take the host below: checked at startup, before each new process is forked, and on every grow. The two arenas created before the config is read (the shared arena and the first process's private arena) are checked against the default |
 | `hg_autoscale_dry_run` | 0 | 1 = advise only: no growth of any kind and no shrink; logs what it would have done once per episode and counts suppressed grows in `hg_shm_grow_refused`. Allocations beyond the initial size fail |
 | `hg_grow_ahead` | 1 | keep free headroom by growing one step before an allocation has to |
 | `hg_scaling_cycle` | 30 | seconds per policy cycle of shared arenas (the profile's "cycles"); private arenas use the fixed 30 s sweep |
@@ -170,7 +170,7 @@ Note that `shmem:free_size` counts only memory not yet carved into size-class bl
 
 ## Host memory checks
 
-The shared arena commits its `-m` INIT at startup, and every process then creates its own private arena and commits its `-M` INIT, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`, and memory on hugetlb pages against the pool. The shared arena is checked first (against the default floor - the config is not read yet), and every later check counts what is left after it.
+The shared arena commits its `-m` INIT at startup, and every process then creates its own private arena and commits its `-M` INIT, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`, and memory on hugetlb pages against the pool. A process in a memory-limited cgroup - a container started with a memory limit, a systemd unit with `MemoryMax` - is also held to its cgroup: the tightest limit on its own cgroup or any ancestor, less what that cgroup holds (its inactive file cache counted as free, as `MemAvailable` counts it on the host), must stay above the same floor computed on that limit (cgroup v1 and v2). `/proc/meminfo` shows the whole host inside such a container, so without this an arena would grow until the cgroup's OOM killer stepped in. The shared arena is checked first (against the default floor - the config is not read yet), and every later check counts what is left after it.
 
 - **Shared arena:** its INIT is refused if the host cannot hold it; its growth is refused at the floor (GROW-BLOCKED, `hg_shm_grow_blocked`).
 - **Private arenas at startup, before anything forks:** every process's private arena is simulated against RAM above the floor, after whatever the hugetlb pool (if the host has one) can take. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.

@@ -1,6 +1,6 @@
 # HG_MALLOC
 
-A memory allocator for shared and private memory, selected at runtime with `-a HG_MALLOC`. This document covers how it works, how to configure, run and monitor it. Measurements: https://github.com/Lt-Flash/hg_malloc/blob/main/docs/benchmarks.md
+A memory allocator for shared and private memory, selected at runtime with `-a HG_MALLOC`. This document covers how it works, how to configure, run and monitor it. Measurements: https://github.com/Lt-Flash/opensips/blob/hg_malloc/docs/benchmarks.md
 
 ## 1. Allocation
 
@@ -135,7 +135,7 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 3. **Private caps multiply:** `-M 16:64` on 30 processes is up to 1.9 GB of potential pinned growth.
 4. **Tier 1 releases go back to the pool,** not to general memory; shrink `vm.nr_hugepages` to give them to the host.
 5. **Measuring the pool:** `HugePages_Free` alone also moves with private hugetlb use; the shared arena's pages are `(HugePages_Total - HugePages_Free) - sum of Private_Hugetlb over all processes`.
-6. **Memory per object:** a little more than the other allocators, from size-class rounding - +2% live memory on 400k registrations, 5-13% on tm's 1-4 KB objects at rates with no drops. Under overload the total is lower, because nothing waits in memory for retransmissions: see [memory under load](https://github.com/Lt-Flash/hg_malloc/blob/main/docs/benchmarks.md#memory-under-load). `used_size` counts each object at its class size, so it reads higher than the bytes requested.
+6. **Memory per object:** a little more than the other allocators, from size-class rounding - +2% live memory on 400k registrations, 5-13% on tm's 1-4 KB objects at rates with no drops. Under overload the total is lower, because nothing waits in memory for retransmissions: see [memory under load](https://github.com/Lt-Flash/opensips/blob/hg_malloc/docs/benchmarks.md#memory-under-load). `used_size` counts each object at its class size, so it reads higher than the bytes requested.
 
 ## 8. Troubleshooting
 

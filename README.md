@@ -160,6 +160,8 @@ within the cell with at most 0.1% failed calls. Driver and analysis: `tools/cps/
 | F_MALLOC, `maxbuffer` 4 MB (8 MB socket buffers) | 10,000 | **13,000 (+30%)** | 12,000 (+20%) |
 | HG_MALLOC (`-m 512:4096 -M 64:512`; shared arena on 4 KB pages, private arenas on THP), default `maxbuffer` | 20,000 | **22,000 (+10%)** | 18,000 (-10%) |
 
+A re-run on 2026-10-23 with a newer build, F_MALLOC only and with a load balancer added, is in [f_malloc-2026-10-23.md](f_malloc-2026-10-23.md): with 8 MB buffers `shared` held 13,000 there, so `auto`'s lead (14,000) is 8% rather than 30%.
+
 **Cost per call at a rate every mode holds:**
 
 | | shared (before) | auto = reuseport | exclusive |

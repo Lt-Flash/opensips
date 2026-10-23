@@ -52,7 +52,7 @@ git cherry-pick be2e5d9018^..FETCH_HEAD
 In an unpacked 4.0.x release tarball (checked on 4.0.1 and 4.0.2), all 4.0 commits as one patch:
 
 ```bash
-curl -L 'https://github.com/Lt-Flash/opensips/compare/be2e5d9018a982fc8439b7c6419256ab119f6d7f%5E...11453d76c9e9bef36411e510e3e7749816d77f44.patch' | patch -p1
+curl -L 'https://github.com/Lt-Flash/opensips/compare/be2e5d9018a982fc8439b7c6419256ab119f6d7f%5E...7741fe7e9809bf5ddfb5ed2a379fe03a5a46886e.patch' | patch -p1
 ```
 
 ## Quick start
@@ -114,7 +114,7 @@ Events: `E_CORE_SHM_GROW_BLOCKED` (growth refused for a sustained period), `E_CO
 ## Costs
 
 - Memory per object: a little more than the other allocators, from size-class rounding - +2% live memory on 400k registrations (usrloc insert-only, measured in September 2026 on an earlier HG_MALLOC build), 5-13% on tm's 1-4 KB objects at rates with no drops (setup A). Under overload the total is lower: see [memory under load](docs/benchmarks.md#memory-under-load).
-- The integrity checks (header state and checksum, in every build): 0.1-2.6% more CPU for the whole server at 20k-60k INVITEs/s answered by tm (setup A, 3 runs per rate), and 1-2% per call at 12k-16k relayed calls/s over UDP (4 runs per rate) - within the run-to-run spread at most rates. The CPU figures above were measured before they were added.
+- The integrity checks (header state and checksum, in every build): 0.1-2.6% more CPU for the whole server at 20k-60k INVITEs/s answered by tm (setup A, 3 runs per rate), and 0.8-2.3% per call at 12k-22k relayed calls/s over UDP (setup B, 4 runs per rate) - within the run-to-run spread at every rate but 60k INVITEs/s; drops and failed calls do not tell the two builds apart. The CPU figures above were measured before they were added: [cost of the integrity checks](docs/benchmarks.md#cost-of-the-integrity-checks).
 - The committed arena is pinned, so it shows as resident from the start.
 - The huge-page tiers and giving memory back to the OS are Linux-only; elsewhere the arena is plain pinned memory that grows but does not shrink.
 

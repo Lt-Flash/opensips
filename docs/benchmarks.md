@@ -188,6 +188,36 @@ In the same run F_MALLOC with the same 8 MB buffer dropped 57,198 and 230,321 da
 
 Full tables, per-syscall counts and the rig: [udp-rx-mode-measurements, section 6](https://github.com/Lt-Flash/opensips/blob/udp-rx-mode-measurements/README.md#6-hg_malloc-vs-f_malloc-data-for-the-hg_malloc-pull-request-4327).
 
+## Cost of the integrity checks
+
+Round 3 of the review gave every cell header a state and a checksum, and a free now changes that state atomically; the CPU figures above were measured before. The two setups again, on 2026-10-22, HG_MALLOC alone: *before* is `bec2c23960`, the pull request before round 3; *round 3* is `82db4baa8d` in setup A and `96f536bc48` in setup B. Between those commits, and after them, only startup and grow checks changed (the memory cgroup's limit, counting above 4 GB on 32-bit builds), not the allocation path. The two builds of a table were built the same way with the same toolchain on their host, optimised, and alternate run by run.
+
+**Setup A**, INVITEs answered by tm, with the settings of the hugetlb tier in [Backing tiers](#backing-tiers) (`-m 128:4096 -M 16:32`, 8 MB socket buffers), 60 s per point, three runs per rate:
+
+| INVITEs/s | build | CPU, cores: mean (min-max) | vs before | failed INVITEs | UDP drops | sipp retransmissions, mean | INVITE p99 (probe), mean |
+|---|---|---|---|---|---|---|---|
+| 20,000 | before | 2.113 (2.046-2.153) | | 0 | 0 | 0 | 0.76 ms |
+| | round 3 | 2.155 (2.110-2.227) | +2.0% | 0 | 0 | 0 | 0.68 ms |
+| 45,000 | before | 3.832 (3.722-3.938) | | 0 | 0 | 30 | 1.28 ms |
+| | round 3 | 3.836 (3.777-3.890) | +0.1% | 0 | 0 | 10 | 1.37 ms |
+| 60,000 | before | 4.602 (4.573-4.640) | | 0 | 0 | 442 | 3.43 ms |
+| | round 3 | 4.720 (4.649-4.763) | +2.6% | 0 | 0 | 64 | 3.30 ms |
+
+**Setup B**, relayed calls over UDP: the proxy, load and 30 s cells of [setup B](#setup-b-relayed-calls-over-udp-tls-and-wss), HG_MALLOC `-m 512:4096 -M 64:512`, the 8 MB socket buffer (read back from the live socket in every cell), four runs per rate. The build is the pull request's own tree - OpenSIPS master plus HG_MALLOC, so the current receive path, without PR #4365. CPU is that of every OpenSIPS process over 15 s of each cell, per 1,000 calls/s relayed in those 15 s, in percent of one core; drops are counted over the whole cell. The load generators split each rate over 12 instances, so the offered total is rounded.
+
+| relayed calls/s | build | CPU per 1,000 calls/s: mean (min-max) | vs before | calls completed per run (offered) | failed calls per run | UDP drops per run |
+|---|---|---|---|---|---|---|
+| 12,000 | before | 34.15% (33.84-34.54) | | 360,000 of 360,000 | 0 | 0 |
+| | round 3 | 34.42% (34.05-34.71) | +0.8% | 360,000 | 0 | 0 |
+| 16,000 | before | 31.62% (31.40-31.91) | | 479,880 of 479,880 | 0 | 0 |
+| | round 3 | 32.02% (31.75-32.31) | +1.3% | 479,880 | 0 | 0 |
+| 20,000 | before | 29.78% (29.64-29.94) | | 600,120 of 600,120 | 0 | 0-6,231 |
+| | round 3 | 30.17% (29.75-30.79) | +1.3% | 600,120 | 0 | 0-29,903 |
+| 22,000 | before | 29.17% (28.39-29.69) | | 659,765-659,880 of 659,880 | 0-115 | 40,176-107,225 |
+| | round 3 | 29.85% (29.22-30.20) | +2.3% | 659,767-659,880 | 0-113 | 43,371-96,785 |
+
+The checks cost 0.1-2.6% of the server's CPU. The two builds' ranges overlap at every rate but 60,000 INVITEs/s. Neither build drops a datagram or fails a call up to 16,000 relayed calls/s. At 20,000, past the 18,000 where this proxy starts to drop with an 8 MB buffer (above), drops vary from run to run in both builds: the two builds' third runs, back to back, dropped the most (6,231 and 29,903), the others 0-2,011 and 0-233. At 22,000 both are past the buffer's limit and drop alike. Four runs per rate do not separate the two builds on drops.
+
 ## Integrity
 
 - **Soak:** hgstress, 9 workers each doing 2 million stamped alloc/free pairs across every size class and the large tier, verifying stamps while the others churn: 0 torn words, 0 corruption, under fixed and elastic arenas.

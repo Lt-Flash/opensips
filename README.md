@@ -279,6 +279,8 @@ The `exclusive` ranges leave out the failed WSS F_MALLOC cell. The TLS rows are 
 TLS figures are within 3% of these. The WSS HG_MALLOC figures for `shared` and `auto` come from
 one repetition each, because the `/proc` sampler returned nothing in the other.
 
+A re-run on 2026-10-23 with a newer build, F_MALLOC only, is in [f_malloc-2026-10-23.md](f_malloc-2026-10-23.md): there WSS `exclusive` held 5,000/s in both runs, and the TCP workers' load is shown in fork order for each mode (`shared` rising, `exclusive` falling from 55% to 3%, `auto` flat at 25%).
+
 **What limits TLS and WSS.**
 
 * TCP main, not the workers. TCP main (with its I/O threads) runs at 3.3-5.1 CPUs at these rates,

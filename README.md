@@ -52,7 +52,7 @@ git cherry-pick be2e5d9018^..FETCH_HEAD
 In an unpacked 4.0.x release tarball (checked on 4.0.1 and 4.0.2), all 4.0 commits as one patch:
 
 ```bash
-curl -L 'https://github.com/Lt-Flash/opensips/compare/be2e5d9018a982fc8439b7c6419256ab119f6d7f%5E...3753d1f1fcb90713020c20dae60e1560ccdfbdb2.patch' | patch -p1
+curl -L 'https://github.com/Lt-Flash/opensips/compare/be2e5d9018a982fc8439b7c6419256ab119f6d7f%5E...6ba0d6feaec326635a9a1b0a4bbc9bba850f28ba.patch' | patch -p1
 ```
 
 ## Quick start

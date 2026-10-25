@@ -115,6 +115,7 @@ Events: `E_CORE_SHM_GROW_BLOCKED` (growth refused for a sustained period), `E_CO
 
 - Memory per object: a little more than the other allocators, from size-class rounding - +2% live memory on 400k registrations (usrloc insert-only, measured in September 2026 on an earlier HG_MALLOC build), 5-13% on tm's 1-4 KB objects at rates with no drops (setup A). Under overload the total is lower: see [memory under load](docs/benchmarks.md#memory-under-load).
 - The integrity checks (header state and checksum, in every build): 0.1-2.6% more CPU for the whole server at 20k-60k INVITEs/s answered by tm (setup A, 3 runs per rate), and 0.8-2.3% per call at 12k-22k relayed calls/s over UDP (setup B, 4 runs per rate) - within the run-to-run spread at every rate but 60k INVITEs/s; drops and failed calls do not tell the two builds apart. The CPU figures above were measured before they were added: [cost of the integrity checks](docs/benchmarks.md#cost-of-the-integrity-checks).
+- The optional tail guard (`hg_mem_check = 1`, off by default; `0` costs nothing measurable): 4.5 ns per allocation or free, within the run-to-run spread for INVITEs answered by tm, 2.0-3.4% more CPU per call for a load balancer with topology hiding ([measurements](docs/benchmarks-hg-mem-check.md)).
 - The committed arena is pinned, so it shows as resident from the start.
 - The huge-page tiers and giving memory back to the OS are Linux-only; elsewhere the arena is plain pinned memory that grows but does not shrink.
 

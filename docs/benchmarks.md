@@ -4,6 +4,8 @@ Re-measured on 2026-10-23 after the review fixes, against F_MALLOC, F_PARALLEL_M
 
 A load balancer with topology hiding (state in an external cache or in process memory) and with dialog tracking alone, F_MALLOC against HG_MALLOC: [load balancer with topology hiding, and with dialogs](lb-topology-hiding.md).
 
+The optional tail guard `hg_mem_check` and the fix to the pkg shrink decision, measured on 2026-10-25, every table: [`hg_mem_check` and the pkg shrink decision](benchmarks-hg-mem-check.md).
+
 The figures on this page come from two setups that count different things. On setup A one unit is an INVITE answered by the server itself; on setup B it is a whole call relayed through the server, with more than four times as many datagrams and two transactions. 60,000 per second on setup A and 20,000 per second on setup B are therefore not comparable rates: compare allocators within a table, not rates across setups.
 
 ## What was measured where
@@ -234,7 +236,7 @@ The checks cost 0.1-2.6% of the server's CPU. The two builds' ranges overlap at 
 | load balancer (dispatcher, dialog, topology_hiding, t_relay), 4,000 calls/s, µs CPU per call | 274.3 (272.9-276.8) | 274.2 (270.6-277.8) | 283.6 (276.0-290.7) |
 | load balancer, 8,000 calls/s, µs CPU per call | 272.2 (269.4-274.8) | 273.0 (260.6-283.1) | 277.6 (268.7-291.8) |
 
-With `0` the knob costs nothing measurable. With `1` the guard costs about 4.5 ns per allocation or free (hgstress counts each as one operation); that is within the run-to-run spread of the tm test, and 2.0-3.4% CPU per call for the load balancer, which allocates more per call. No call failed and no datagram was dropped below saturation. Beyond saturation (tm at 60,000 calls/s, the load balancer at 15,000) runs of the same arm differed by up to 15% in completed calls, more than the arms differed from each other: 34.4k / 34.1k / 32.1k and 12.4k / 11.8k / 12.0k calls/s. With one-byte overruns injected through hgstress (shm cell, large fragment, pkg cell, realloc in place), `0` found none, `1` found all four at the exact byte, and `2` logged the overrun and aborted.
+With `0` the knob costs nothing measurable. With `1` the guard costs about 4.5 ns per allocation or free (hgstress counts each as one operation); that is within the run-to-run spread of the tm test, and 2.0-3.4% CPU per call for the load balancer, which allocates more per call. No call failed and no datagram was dropped below saturation. Beyond saturation (tm at 60,000 calls/s, the load balancer at 15,000) runs of the same arm differed by up to 15% in completed calls, more than the arms differed from each other: 34.4k / 34.1k / 32.1k and 12.4k / 11.8k / 12.0k calls/s. With one-byte overruns injected through hgstress (shm cell, large fragment, pkg cell, realloc in place), `0` found none, `1` found all four at the exact byte, and `2` logged the overrun and aborted. Every table, the per-run values and the method: [`hg_mem_check` and the pkg shrink decision](benchmarks-hg-mem-check.md).
 
 ## Integrity
 

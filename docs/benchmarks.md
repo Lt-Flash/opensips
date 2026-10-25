@@ -222,6 +222,20 @@ Round 3 of the review gave every cell header a state and a checksum, and a free 
 
 The checks cost 0.1-2.6% of the server's CPU. The two builds' ranges overlap at every rate but 60,000 INVITEs/s. Neither build drops a datagram or fails a call up to 16,000 relayed calls/s. At 20,000, past the 18,000 where this proxy starts to drop with an 8 MB buffer (above), drops vary from run to run in both builds: the two builds' third runs, back to back, dropped the most (6,231 and 29,903), the others 0-2,011 and 0-233. At 22,000 both are past the buffer's limit and drop alike. Four runs per rate do not separate the two builds on drops.
 
+### The optional tail guard (`hg_mem_check`)
+
+`hg_mem_check = 1` adds a guard after every allocation ([configuration](configuration.md#global-parameters)). Measured on 2026-10-25 on one 16-vCPU host, the default `-O9` build: the SIP tests with sipp on the same host, opensips (`-a HG_MALLOC -m 4096 -M 64`, 2 UDP workers) pinned to 6 vCPUs and sipp to the other 10; hgstress (`-m 1024 -M 64`, 9 workers) pinned to 9 vCPUs; the build without the knob against the same build with the knob at `0` and at `1`, the three in rotating order, 3 runs per point (5 for the first row); mean (min-max):
+
+| test | no knob | `hg_mem_check = 0` | `hg_mem_check = 1` |
+|---|---|---|---|
+| alloc/free only (hgstress, no stamps, 8-1031 bytes), ns CPU per operation | 56.9 (56.1-57.3) | 56.6 (55.8-58.6) | 61.4 (60.1-62.3) |
+| tm replying 486, 10,000 calls/s, µs CPU per call | 51.6 (50.9-52.6) | 53.1 (52.4-54.2) | 52.8 (51.6-53.9) |
+| tm replying 486, 20,000 calls/s, µs CPU per call | 45.9 (44.8-46.9) | 45.2 (44.5-46.4) | 45.9 (43.5-47.3) |
+| load balancer (dispatcher, dialog, topology_hiding, t_relay), 4,000 calls/s, µs CPU per call | 274.3 (272.9-276.8) | 274.2 (270.6-277.8) | 283.6 (276.0-290.7) |
+| load balancer, 8,000 calls/s, µs CPU per call | 272.2 (269.4-274.8) | 273.0 (260.6-283.1) | 277.6 (268.7-291.8) |
+
+With `0` the knob costs nothing measurable. With `1` the guard costs about 4.5 ns per allocation or free (hgstress counts each as one operation); that is within the run-to-run spread of the tm test, and 2.0-3.4% CPU per call for the load balancer, which allocates more per call. No call failed and no datagram was dropped below saturation. Beyond saturation (tm at 60,000 calls/s, the load balancer at 15,000) runs of the same arm differed by up to 15% in completed calls, more than the arms differed from each other: 34.4k / 34.1k / 32.1k and 12.4k / 11.8k / 12.0k calls/s. With one-byte overruns injected through hgstress (shm cell, large fragment, pkg cell, realloc in place), `0` found none, `1` found all four at the exact byte, and `2` logged the overrun and aborted.
+
 ## Integrity
 
 - **Soak:** hgstress, 9 workers each doing 2 million stamped alloc/free pairs across every size class and the large tier, verifying stamps while the others churn: 0 torn words, 0 corruption, under fixed and elastic arenas.

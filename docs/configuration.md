@@ -65,6 +65,7 @@ All optional.
 | `hg_shrink_step` | 64m | most a shared arena releases from its top per maintenance tick (plus up to as much again from inside with `hg_interior_release`); a private arena releases one step per quiet window |
 | `hg_interior_release` | 0 | 1 = give back whole free pages from anywhere in the arena, not only the top |
 | `hg_lock_stall_us` | 1000 | an arena-lock hold at or above this is a stall: counted per arena, and raises `E_CORE_HG_LOCK_STALL` for the shared arena; 0 disables |
+| `hg_mem_check` | 0 | 1 = a guard after every new allocation, checked at free and realloc (see [Integrity checks](design.md#1-allocation)); 2 = the same, and abort on the first corruption any check finds. Ignored by HG_MALLOC_DBG arenas, whose red zone covers more |
 
 Example:
 

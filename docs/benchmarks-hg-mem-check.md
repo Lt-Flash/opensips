@@ -1,6 +1,6 @@
 # `hg_mem_check` and the pkg shrink decision: measurements
 
-Measured on 2026-10-25 for the HG_MALLOC pull request, [OpenSIPS#4327](https://github.com/OpenSIPS/opensips/pull/4327): the tail guard and abort level `hg_mem_check` (commit 52ac3f3306) and the fix to the pkg shrink decision (a148e3e4e6). The parameter is described in [configuration](configuration.md#global-parameters) and the checks in [design](design.md#1-allocation); the summary row is in [benchmarks](benchmarks.md#the-optional-tail-guard-hg_mem_check).
+Measured on 2026-10-25 for the HG_MALLOC pull request, [OpenSIPS#4327](https://github.com/OpenSIPS/opensips/pull/4327): the tail guard and abort level `hg_mem_check` (commit 52ac3f3306) and the fix to the pkg shrink decision (a148e3e4e6); on 2026-10-26 also the fix for a child's copy of the parent's pkg arena (acc93fa0fe). The parameter is described in [configuration](configuration.md#global-parameters) and the checks in [design](design.md#1-allocation); the summary row is in [benchmarks](benchmarks.md#the-optional-tail-guard-hg_mem_check).
 
 ## Summary
 
@@ -8,6 +8,7 @@ Measured on 2026-10-25 for the HG_MALLOC pull request, [OpenSIPS#4327](https://g
 * **With `hg_mem_check = 1`** the guard costs 4.5 ns per allocation or free in the alloc/free-only test (+7.9%), stays within the run-to-run spread of the tm test, and costs 2.0-3.4% CPU per call in the load balancer, which allocates more per call. No call failed and no datagram was dropped below saturation, with or without it. Beyond saturation, runs of the same build differed by up to 15% in completed calls, more than the builds differed from each other.
 * **The checks work:** of four one-byte overruns injected, `0` found none, `1` found all four at the exact byte, `2` logged the overrun and aborted. The guard helpers pass on all three header layouts the builds select (64-bit, and both 32-bit ones under qemu).
 * **The shrink fix works:** two SIP workers whose pkg arenas grew once (2 to 18 MB) and were then emptied kept 18 MB committed for six minutes with the old decision, and went back to 2 MB two minutes in with the new one.
+* **The inherited-arena fix works:** with the parent's pkg arena grown to 18 MB and nearly full at fork, the old code grew four children's copies of it by 14 MB each, to 32 MB, for up to 14 MB more anonymous memory per process; with the fix no child grew one.
 
 ## Setup
 
@@ -411,9 +412,34 @@ The header sizes are the ones each configuration had before the change.
 
 ¹ The first worker's statistic was read before that process had published it.
 
+## A child's copy of the parent's pkg arena
+
+`-m 1024 -M 2:32`, the tm config with 2 UDP workers and hgstress loaded, sipp offering 200 calls/s for 100 s. The parent takes `parent_pkg_kb` of pkg in `mod_init`, in 16 KB pieces that take 32 KB of the arena each, and keeps it, so its arena grows once, from 2 MB to 18 MB, and every child forks with a copy of it under its headroom line (free space below twice the reserve floor, the floor being 1/16 of the arena: 2,304 KB at 18 MB). A probe on the old build tried ten holds from 5,120 to 9,728 KB: up to 8,704 KB the parent stayed at 18 MB; from 9,216 KB it grew a second time, to the 32 MB cap, where no copy can grow. The two holds below are the ones that left the parent at 18 MB with less than 2,304 KB free. *Old* = the branch with the hgstress `parent_pkg_kb` parameter only (62f60d0676), *new* = with the fix (acc93fa0fe); the binaries were built from earlier versions of these two commits that differ from them only in README text.
+
+| hold | parent's pkg after it | build | pkg grows logged by the children |
+|---|---|---|---|
+| 8,192 KB | 18,432 KB, 1,464 KB free | old | 4: MI FIFO, both SIP workers and the timer handler, each "grew proactively by 14 MB to 32 MB" |
+| | | new | 0 |
+| 8,704 KB | 18,432 KB, 440 KB free | old | 4: the same processes |
+| | | new | 0 |
+
+In both builds the parent logged one grow, on exhaustion, to 18 MB, and nothing else. Anonymous memory per process at the end, KB (`smaps_rollup`):
+
+| process | old, 8,192 KB | new, 8,192 KB | old, 8,704 KB | new, 8,704 KB |
+|---|---|---|---|---|
+| attendant (the parent) | 19,060 | 19,056 | 19,056 | 19,056 |
+| MI FIFO | 35,444 (grew) | 21,104 | 35,440 (grew) | 21,104 |
+| time_keeper | 21,108 | 21,104 | 21,104 | 21,104 |
+| timer | 21,108 | 21,104 | 21,104 | 21,104 |
+| SIP worker 1 | 23,164 (grew) | 21,112 | 35,448 (grew) | 21,112 |
+| SIP worker 2 | 35,452 (grew) | 21,112 | 35,448 (grew) | 21,112 |
+| timer handler | 35,444 (grew) | 21,104 | 35,440 (grew) | 21,104 |
+
 ## Build checks
 
 On the pull request's branch and on the 4.0 port, with `-O9 -Werror` and gcc 14.2: the unit-test build, the default build (hgstress included) and a build with HG_MALLOC compiled out, 0 warnings each. On the pull request's tree also the HG objects with gcc and clang, for x86-64 and 32-bit ARM, in all four combinations of DBG_MALLOC and SHM_EXTRA_STATS: 32 compiles, 0 diagnostics, none new against the head before the change.
+
+On 2026-10-26, for the three later commits (hgstress `parent_pkg_kb`, the inherited arena, the unit tests' wait for a child), with `-O9 -Werror`: the unit-test build on the pull request's branch and on the 4.0 port, 0 warnings; and `mem/test/test_hg_malloc.c` with gcc, clang and 32-bit ARM gcc, each with and without HG_MALLOC_DBG, 0 diagnostics.
 
 ## Limits of these numbers
 

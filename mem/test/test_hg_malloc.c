@@ -388,6 +388,53 @@ static void test_hg_free_past_init(void)
 			mem_arena_free(a, p[i]);
 }
 
+/*
+ * A size no arena could hold is refused: near ULONG_MAX the size arithmetic
+ * used to wrap and hand out a small cell, and a realloc to one kept the
+ * cell. In the parent, pkg and shm, and the arenas serve normally after.
+ */
+static void test_hg_size_bound(void)
+{
+	static const unsigned long sizes[] = {
+		~0UL, ~0UL - 1, ~0UL / 2 + 1, ~0UL - 64 * 1024,
+	};
+	unsigned char *p, *q;
+	unsigned int i, refused = 0, intact = 0, served = 0;
+
+	for (i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+		if (!(q = shm_malloc(sizes[i])))
+			refused++;
+		else
+			shm_free(q);
+		if (!(q = pkg_malloc(sizes[i])))
+			refused++;
+		else
+			pkg_free(q);
+	}
+	p = shm_malloc(100);
+	if (p) {
+		hgt_fill(p, 100, 0x5a);
+		q = shm_realloc(p, ~0UL);
+		if (!q) {
+			refused++;
+			intact = hgt_check(p, 100, 0x5a);
+		} else {
+			p = q;
+		}
+		shm_free(p);
+	}
+	p = pkg_malloc(100);
+	if (p) {
+		served = 1;
+		pkg_free(p);
+	}
+	ok(refused == 2 * sizeof sizes / sizeof sizes[0] + 1 && intact && served,
+		"sizes near ULONG_MAX are refused by pkg and shm malloc and by a "
+		"shm realloc, which leaves the allocation intact (%u of %u "
+		"refused), and the arenas serve normally after",
+		refused, (unsigned int)(2 * sizeof sizes / sizeof sizes[0] + 1));
+}
+
 /* an elastic shm arena (-m INIT:CAP) grows past INIT on demand */
 #define HGT_GROW_CHUNK  (1024 * 1024)
 #define HGT_GROW_MAX    256
@@ -1116,6 +1163,7 @@ void test_hg_malloc(void)
 	test_hg_large();
 	test_hg_grow();
 	test_hg_free_past_init();
+	test_hg_size_bound();
 	test_hg_pkg_shrink();
 	test_hg_inherited();
 	test_hg_grow_refusal_cause();

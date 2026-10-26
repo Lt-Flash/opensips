@@ -903,6 +903,20 @@ void *hg_cell_alloc(struct hg_block *hb, unsigned long size)
 	unsigned int guard = hb->guard;
 	int c;
 
+	/* a request the whole reservation could not hold is refused before
+	 * any arithmetic on it: near ULONG_MAX the additions below wrap, and
+	 * pick a small class or a short large fragment the caller then writes
+	 * past (a negative length cast to size_t is enough to get here) */
+	if (size > hb->hcap) {
+		hg_lock_enter(hb, HG_LK_REFILL);
+		if (hg_oom_first(hb, size))
+			LM_ERR("%s: a %lu byte request exceeds the arena's %lu byte "
+				"cap - refused; further failures are summarised every "
+				"30 s\n", hb->name, size, hb->hcap);
+		hg_lock_leave(hb);
+		return NULL;
+	}
+
 	if (hb->dbg)
 		want += HG_DBG_TAIL;     /* room for the DBG trailer */
 	else if (guard)

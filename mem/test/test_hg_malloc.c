@@ -49,6 +49,7 @@
 #include "../../mem/hg_malloc.h"
 #include "../../mem/hg_arena.h"   /* hg_quarantine_drain() */
 #include "../../mem/hg_buddy.h"   /* hg_buddy_grow_unlocks() */
+#include "../../mem/mem_arena.h"  /* shm_arena_create() */
 
 /* a fuzz seed has taken from 10 to over 30 s under an emulator (the qemu
  * cross-builds in CI); a child that dies is noticed as it exits, not here */
@@ -340,6 +341,50 @@ static void test_hg_large(void)
 	ok(good == 2 * sizeof sz / sizeof sz[0],
 		"large pkg and shm allocations (128 KB - 8 MB) keep their content "
 		"across realloc");
+}
+
+/*
+ * An INIT that is not a page multiple: the page grid covers the rounded-up
+ * span, so the arena carves past INIT, and its size is the span - "free"
+ * (size - carved) must not wrap once the carve passes INIT
+ */
+#define HGT_FPI_INIT   (3UL << 20)
+#define HGT_FPI_PIECE  (96 << 10)    /* the large tier, past 64 KB */
+#define HGT_FPI_MAX    64
+
+static void test_hg_free_past_init(void)
+{
+	static struct hg_block *a;
+	struct mem_info mi;
+	void *p[HGT_FPI_MAX];
+	int n, i;
+
+	if (!a)
+		a = shm_arena_create("hgfpi", HGT_FPI_INIT, HGT_FPI_INIT);
+	if (!a) {
+		ok(0, "a %lu MB module arena", HGT_FPI_INIT >> 20);
+		return;
+	}
+	if (a->span_end <= HGT_FPI_INIT) {
+		diag("a %lu MB INIT is a page multiple here (%lu KB pages), "
+			"nothing to carve past", HGT_FPI_INIT >> 20, a->hps >> 10);
+		return;
+	}
+
+	for (n = 0; n < HGT_FPI_MAX && a->real_used <= HGT_FPI_INIT; n++)
+		if (!(p[n] = mem_arena_malloc(a, HGT_FPI_PIECE)))
+			break;
+	hg_info(a, &mi);
+	ok(a->real_used > HGT_FPI_INIT && a->size == a->span_end &&
+		mi.total_size == a->span_end && mi.free <= mi.total_size &&
+		mi.free == a->span_end - a->real_used,
+		"an arena with a %lu MB INIT on %lu KB pages carves past INIT "
+		"(%lu KB carved), and its size is the %lu KB span, with free "
+		"what is left of it", HGT_FPI_INIT >> 20, a->hps >> 10,
+		a->real_used >> 10, a->span_end >> 10);
+	for (i = 0; i < n; i++)
+		if (p[i])
+			mem_arena_free(a, p[i]);
 }
 
 /* an elastic shm arena (-m INIT:CAP) grows past INIT on demand */
@@ -1020,6 +1065,7 @@ void test_hg_malloc(void)
 	test_hg_cross_process_shm();
 	test_hg_large();
 	test_hg_grow();
+	test_hg_free_past_init();
 	test_hg_pkg_shrink();
 	test_hg_inherited();
 	test_hg_grow_refusal_cause();

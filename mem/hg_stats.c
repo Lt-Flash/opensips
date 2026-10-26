@@ -205,7 +205,7 @@ static unsigned long hg_shm_stat(void *ctx)
 	case HGS_CARVED:        return hb->real_used;
 	case HGS_CARVED_PEAK:   return hb->max_real_used;
 	case HGS_CHUNKS:        return hb->nchunks;
-	case HGS_FREE_TO_CARVE: return hb->size - hb->real_used;
+	case HGS_FREE_TO_CARVE: return hg_free_to_carve(hb);
 	/* live: handed out right now. The gap to carved is free cells,
 	 * reusable only within their class - slab behaviour, not a leak */
 	case HGS_LIVE:          return hg_get_real_used(hb);

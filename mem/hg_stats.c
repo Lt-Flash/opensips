@@ -37,20 +37,14 @@
 #include "../globals.h"
 #include "hg_arena_int.h"
 
-/*
- * Slab bytes carved into chunks but not handed out - on a private free stack,
- * in the global pool, or never bumped; fully reusable. hg_get_real_used()
- * subtracts it from real_used, so free cells read as free, as a fragment on
- * a q_malloc/f_malloc free list does.
- */
+/* slab bytes carved into chunks but not handed out, fully reusable;
+ * hg_get_real_used() subtracts it so free cells read as free */
 unsigned long hg_slab_recycled(struct hg_block *hb)
 {
 	unsigned long capacity, live;
 
-	/* no registry walk, which would need hb->lock (hg_gc_class() returns
-	 * chunks to the buddy): slab_capacity is a running sum kept by
-	 * carve_chunk()/hg_gc_class(), read unlocked - a torn read is at worst
-	 * one chunk off, for a figure that is a sample either way */
+	/* slab_capacity is a running sum read unlocked (a registry walk needs
+	 * hb->lock); a torn read is at worst one chunk off */
 	capacity = hb->slab_capacity;
 	live = hg_cell_live(hb);
 	return capacity > live ? capacity - live : 0;
@@ -80,14 +74,8 @@ void hg_arena_stats_core_init(struct hg_block *hb, int core_index)
 
 
 
-/* =========================================================================
- * Statistics (registered by hg_register_stats() below)
- *
- * The hg_stats figures as core statistics, so a dashboard can attribute
- * huge-page use to the allocator. Named hg_shm_* under "hgmem", apart from a
- * caching module's own huge-page statistics, which describe that module's
- * own reservation - different memory.
- * ========================================================================= */
+/* ==== Statistics: the hg_stats figures as core statistics, hg_shm_* in
+ * "hgmem", registered by hg_register_stats() below ==== */
 
 #include "../statistics.h"
 #include "shm_mem.h"   /* mem_allocator_shm */
@@ -98,11 +86,8 @@ __thread int hg_pstat_slot = -1;
 
 int hg_pstat_shared;
 
-/*
- * Process process_no writes slot (process_no + 1) % HG_STAT_SLOTS, so more
- * processes than slots share some, and two processes adding to one slot
- * lose updates. Atomic adds keep the sums right then, at a small cost.
- */
+/* processes beyond HG_STAT_SLOTS share slots ((process_no + 1) % slots);
+ * shared slots switch to atomic adds so concurrent updates are not lost */
 void hg_pstat_slots_check(unsigned int nprocs)
 {
 	if (nprocs <= HG_STAT_SLOTS)
@@ -123,8 +108,7 @@ void hg_thread_stats_init(void)
 	if (hg_pstat_slot >= 0)
 		return;
 	/* the shared counter when shm is HG_MALLOC, else a per-process one
-	 * (threads exist in one process today; a second kind would collide only
-	 * on a pkg arena, which is private anyway) */
+	 * (a collision could only hit a pkg arena, which is private) */
 	next = (hb && (mem_allocator_shm == MM_HG_MALLOC ||
 	               mem_allocator_shm == MM_HG_MALLOC_DBG)) ?
 	       &hb->thread_slot_next : &local_next;
@@ -134,10 +118,8 @@ void hg_thread_stats_init(void)
 		counted_max_processes : HG_STAT_SLOTS / 4;
 	s = __atomic_fetch_sub(next, 1, __ATOMIC_ACQ_REL);
 	if (s <= floor || s >= HG_STAT_SLOTS) {
-		/* out of thread slots: share the process slot, which now has two
-		 * writers - from here on this process adds atomically. Updates
-		 * the other thread makes before it sees the flag may still be
-		 * lost; the sums drift by those few at most. */
+		/* out of thread slots: share the process slot, so it has
+		 * two writers and this process adds atomically from now on */
 		hg_pstat_shared = 1;
 		if (!said) {
 			said = 1;
@@ -227,9 +209,8 @@ static unsigned long hg_shm_stat(void *ctx)
 	/* bytes rather than the MB the MI reports, so it composes with the
 	 * other byte-valued statistics and with node_exporter's page counts */
 	case HGS_PINNED_BYTES:  return (unsigned long)hb->locked_mb << 20;
-	/* carved: slab blocks plus whole large-tier chunks, what free_to_carve
-	 * counts down from. Not monotonic: hg_gc_class() subtracts a returned
-	 * block, so carved below carved_peak means reclaim is working */
+	/* carved: slab blocks plus whole large-tier chunks; not monotonic, as
+	 * hg_gc_class() subtracts returned blocks (reclaim at work) */
 	case HGS_CARVED:        return hb->real_used;
 	case HGS_CARVED_PEAK:   return hb->max_real_used;
 	case HGS_CHUNKS:        return hb->nchunks;

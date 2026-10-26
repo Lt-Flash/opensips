@@ -85,9 +85,8 @@ enum osips_mm {
 #include "hg_malloc.h"
 #endif
 
-/* the allocator's own name for itself; see mem/hg_version.h.  Included
- * unconditionally so that mm_str() below spells MM_HG_MALLOC the same way in
- * every build, including the ones that did not compile the arena in. */
+/* included unconditionally so mm_str() spells MM_HG_MALLOC the same way
+ * even in builds without the HG arena compiled in */
 #include "hg_version.h"
 
 extern int mem_warming_enabled;

@@ -149,13 +149,8 @@ int rpm_use_global_lock;
 #endif
 
 #if !defined INLINE_ALLOC && defined HG_MALLOC
-/*
- * The rpm pool is a file mapped at a fixed address, and its allocator must be
- * initialised INSIDE that mapping. HG_MALLOC reserves and backs its own arenas
- * (see hg_malloc_init()) and cannot be placed into a caller's pool, so it
- * cannot back rpm. When rpm merely inherits the global allocator (-a), take
- * F_MALLOC (or its DBG variant) instead; an explicit -e HG_MALLOC is refused.
- */
+/* HG_MALLOC cannot live in rpm's fixed-address file pool: an inherited
+ * HG choice falls back to F_MALLOC/Q_MALLOC; an explicit -e is refused */
 static int rpm_resolve_allocator(void)
 {
 	if (mem_allocator_rpm == MM_HG_MALLOC ||

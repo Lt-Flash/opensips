@@ -20,7 +20,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-/* HG_MALLOC cell header: rounding, size classes, the per-cell header and its state; included by hg_malloc.h, not on its own */
+/* HG_MALLOC cell header: rounding, size classes, the per-cell header and its
+ * state; included by hg_malloc.h, not on its own */
 
 #ifndef HG_CELL_H
 #define HG_CELL_H
@@ -46,24 +47,8 @@ enum hg_mem_tier {
 
 const char *hg_mem_tier_str(enum hg_mem_tier tier);
 
-/*
- * Cell header, hidden before every returned pointer (like FM_FRAG(p) in
- * f_malloc): pointers go to arbitrary callers via shm_malloc()/pkg_malloc(),
- * so the class can NOT live in-band in the payload. DBG_MALLOC and
- * SHM_EXTRA_STATS are independent build flags; each adds its own slice:
- *
- *   offset 0                          : class id (stamped at carve, immutable)
- *   offset HG_ROUNDTO           (DBG) : file
- *   offset HG_ROUNDTO*2         (DBG) : func
- *   offset HG_ROUNDTO*3         (DBG) : line
- *   offset HG_ROUNDTO+HG_CELL_HDR_DBG
- *          (SHM_EXTRA_STATS)          : statistic_index (mem-group index)
- *   a spare word, where one is left   : the size a guarded cell was asked
- *                                       for (hg_mem_check, see HG_REQ_*)
- *   offset HG_CELL_HDR                : payload; while the cell is FREE its
- *                                       first pointer is the free-list link
- *                                       (cell_next() in hg_arena.c)
- */
+/* cell header before every returned pointer (like FM_FRAG()): the payload is
+ * the caller's, but a FREE cell's first pointer is the free-list link */
 #ifdef DBG_MALLOC
 #define HG_CELL_HDR_DBG (HG_ROUNDTO * 3)  /* file ptr + func ptr + line */
 #else
@@ -76,22 +61,12 @@ const char *hg_mem_tier_str(enum hg_mem_tier tier);
 #define HG_CELL_HDR_STATS 0
 #endif
 
-/*
- * Payload alignment: 8 covers uint64_t/double. HG_ROUNDTO does not imply it:
- * it is 4 on 32-bit ARM, and with cells 32-byte aligned a 4-byte header puts
- * every payload at 4 mod 8 - a fault for the LDREXD/STREXD of gen_lock_t
- * and 64-bit atomics. The padding goes at the END of the header, so no
- * field offset moves.
- */
+/* 8, not HG_ROUNDTO (4 on 32-bit ARM): LDREXD/STREXD and 64-bit atomics fault
+ * on a 4 mod 8 payload; the padding ends the header, so no field moves */
 #define HG_PAYLOAD_ALIGN 8
 
-/*
- * Where a guarded cell keeps the size asked for, without growing the header:
- * HG_REQ_SLOT0 in the unused half of the first HG_ROUNDTO bytes (every
- * 64-bit build), HG_REQ_PAD in the payload padding at the header's end (a
- * 32-bit build with both DBG_MALLOC and SHM_EXTRA_STATS, or neither), else
- * HG_REQ_TAIL in the cell's last 4 bytes, after the guard.
- */
+/* where a guarded cell keeps its requested size: the spare half of the first
+ * word (64-bit), the header's alignment pad, else the cell's last 4 bytes */
 #if defined(__CPU_sparc64) || defined(__CPU_sparc) || defined(__LP64__) || \
 	defined(_LP64) || (defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8)
 #define HG_REQ_SLOT0 1
@@ -105,11 +80,8 @@ const char *hg_mem_tier_str(enum hg_mem_tier tier);
 #endif
 #define HG_REQ_TAIL  (!HG_REQ_SLOT0 && !HG_REQ_PAD)
 
-/*
- * The header as a struct, so sites name a field instead of computing
- * HG_ROUNDTO * n. The _Static_asserts below pin it to the layout above on
- * every ABI and build configuration.
- */
+/* the header as a struct, so sites name a field; the _Static_asserts below
+ * pin it to the layout on every ABI and build configuration */
 struct hg_cell_hdr {
 	/* the first HG_ROUNDTO bytes: class, state and a checksum over both
 	 * and the cell's address (hg_hdr_set()) */
@@ -185,27 +157,8 @@ HG_STATIC_ASSERT(offsetof(struct hg_cell_hdr, stat_idx) == HG_CELL_STATS_OFF,
 #define HG_CELL_AT(cs) ((struct hg_cell_hdr *)(void *)(cs))
 #define HG_CLASS(p) (HG_CELL(p)->cls)
 
-/*
- * Cell state, in the header and covered by its checksum: whether a CALLER
- * holds the cell, not where the allocator keeps it.
- *
- *   carve                 -> FRESH   (hg_arena.c carve_chunk())
- *   FRESH or FREE -> LIVE            an allocation, the only way in
- *   LIVE          -> FREE            a free, by any process - the only way out
- *
- * LIVE_G is LIVE with a tail guard (hg_mem_check, hg_guard_set()): the mark
- * is the cell's own, so the setting may change while cells of both kinds
- * are live. Every rule below for LIVE holds for LIVE_G (hg_st_live()).
- *
- * Moving a cell between private list, shared pool, quarantine (HG_MALLOC_DBG)
- * or exit drain leaves it FREE (or FRESH). A free requires LIVE and an
- * allocation FRESH or FREE, so a double free is always refused and no cell
- * is handed out twice. A small cell's LIVE -> FREE is one CAS of the header
- * word (hg_hdr_claim_free()): of two racing frees exactly one wins; a large
- * fragment's runs under the arena lock. The values differ from 0x00/0xff
- * and each other, so a zeroed or scribbled header is caught even before the
- * checksum.
- */
+/* cell state, whether a CALLER holds the cell: a free needs LIVE or LIVE_G
+ * (guarded), an allocation FRESH or FREE; none is 0x00/0xff, so wipes fail */
 #define HG_ST_FRESH  0x3c
 #define HG_ST_FREE   0x5a
 #define HG_ST_LIVE   0xa5
@@ -220,20 +173,14 @@ static inline int hg_st_live(int st)
  * arena is created (so it is the same in every process) */
 extern unsigned long long hg_hdr_secret;
 
-/*
- * 16-bit check over the cell's address, class and state. Not cryptographic:
- * it catches a neighbour's overflow, a pointer into the middle of a cell and
- * a header copied to another address. base(address, class) XOR key(state)
- * costs one multiply per alloc or free (the hottest path): a state change is
- * a constant XOR, and a checked header is re-stamped from the check's base.
- */
+/* not cryptographic (catches overflows, interior pointers, moved headers):
+ * base(address, class) ^ key(state), so a state change costs no multiply */
 #define HG_ST_KEY(st)  ((unsigned short)((st) * 0x0101u))
 
 static inline unsigned short hg_hdr_base(const void *cs, unsigned int cls)
 {
-	/* cells are at least 32-aligned, so the class lands in bits the
-	 * address leaves to the secret; the multiply carries every input bit
-	 * into the top 16 */
+	/* cells are at least 32-aligned, so the class takes the low address
+	 * bits; the multiply carries every input bit into the top 16 */
 	unsigned long long x = ((unsigned long long)(unsigned long)cs ^
 		hg_hdr_secret ^ cls) * 0x9e3779b97f4a7c15ULL;
 
@@ -283,10 +230,8 @@ static inline void hg_hdr_set(void *cs, unsigned int cls, unsigned int st)
 	hg_hdr_set_base(cs, cls, st, hg_hdr_base(cs, cls));
 }
 
-/*
- * Read the header word once (never torn) and check it: the state, or -1 if
- * it fails. @w and @base come back for re-stamping without hashing again.
- */
+/* read the header word once and check it: the state, or -1 if it fails;
+ * @w and @base come back for re-stamping without hashing again */
 static inline int hg_hdr_read(const void *cs, union hg_hdr_w *w,
                               unsigned short *base)
 {
@@ -306,22 +251,8 @@ static inline int hg_hdr_state(const void *cs)
 	return hg_hdr_read(cs, &w, &base);
 }
 
-/*
- * LIVE -> FREE in one compare-and-swap, from the @live word and @base that
- * hg_hdr_read() returned: 1 if this free took the cell, 0 if another free
- * got there first - the caller must then touch nothing (no list, no counter).
- *
- * Relaxed is enough, by the protocol rather than by any CPU's ordering:
- *   1. the CAS alone decides the winner; the loser writes nothing;
- *   2. the winner's later writes (free-list link, HG_MALLOC_DBG poison) go
- *      to its private list or quarantine, read only by its own thread;
- *   3. a FREE cell becomes visible to another process or thread only in
- *      gpool_push(), which always runs with hb->lock held;
- *   4. hb->lock (in the shared mapping) orders, by its release/acquire,
- *      this word and the link before the next owner's gpool_pop().
- * Past this point exactly-once needs no CAS: private lists and quarantine
- * have one owning thread each, and the shared pool is under the lock.
- */
+/* LIVE -> FREE in one CAS: 1 if this free won, 0 if not (then touch nothing);
+ * relaxed is enough: only gpool_push(), under hb->lock, shares a FREE cell */
 static inline int hg_hdr_claim_free(void *cs, unsigned int live,
                                     unsigned int cls, unsigned short base)
 {
@@ -330,14 +261,8 @@ static inline int hg_hdr_claim_free(void *cs, unsigned int live,
 		__ATOMIC_RELAXED);
 }
 
-/*
- * hg_mem_check's tail guard, on a LIVE_G cell: the size asked for is kept
- * (HG_REQ_*), keyed by the header's base so a scribbled one reads as no size
- * at all, and the HG_GUARD_LEN bytes after the request - fewer where the
- * cell ends sooner, never none: the allocation is sized HG_GUARD_ROOM bytes
- * up - are HG_GUARD_BYTE. A write past the request changes them; the free
- * and the realloc see it.
- */
+/* hg_mem_check tail guard: up to HG_GUARD_LEN bytes past the request, at least
+ * one (HG_GUARD_ROOM); the size is kept keyed, so scribbling voids it */
 #define HG_GUARD_BYTE 0xcc
 #define HG_GUARD_LEN  8
 #define HG_GUARD_WORD 0xccccccccccccccccULL
@@ -400,9 +325,8 @@ static inline int hg_guard_ok(void *cs, unsigned short base,
 #define HG_STATS_IDX(p) (HG_CELL(p)->stat_idx)
 #endif
 
-/* class byte of a large-tier fragment (hg_large.c): the first value past the
- * valid classes [0, HG_NCLASSES), so any other out-of-range byte is still
- * corruption */
+/* class byte of a large-tier fragment (hg_large.c): just past the valid
+ * classes, so any other out-of-range byte is still corruption */
 #define HG_LARGE_MARKER HG_NCLASSES
 
 #endif /* HG_CELL_H */

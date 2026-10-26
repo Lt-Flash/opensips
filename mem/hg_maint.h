@@ -17,11 +17,8 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-/*
- * HG_MALLOC maintenance process: grows an elastic shm arena ahead of demand,
- * so no SIP worker waits on a populate, and runs the profile and shrink
- * policy on its own clock rather than in whichever worker takes the sweep.
- */
+/* HG_MALLOC maintenance process: grows elastic shm arenas ahead of demand,
+ * so no SIP worker waits on a populate, and runs the shrink policy */
 #ifndef hg_maint_h
 #define hg_maint_h
 

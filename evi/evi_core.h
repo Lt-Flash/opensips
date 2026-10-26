@@ -34,10 +34,8 @@
 #define EVI_PKG_THRESHOLD_ID	3
 #define EVI_PROC_AUTO_SCALE_ID	4
 #define EVI_TCP_DISCONNECT	5
-/* carries the same #ifdef STATISTICS fragility as SHM_THRESHOLD above
- * (see the FIXME) - with statistics off, the table skips an entry and
- * every later hardcoded id is one too high. The raise site is itself
- * statistics-gated, so the pairing stays consistent. */
+/* same #ifdef STATISTICS fragility as SHM_THRESHOLD (ids shift without it);
+ * the raise site is statistics-gated too, so the pairing stays consistent */
 #define EVI_SHM_GROW_BLOCKED_ID	6
 /* an hb->lock hold at or above hg_lock_stall_us, raised from the
  * sweep timer with the most recent stall's reason/duration/process */

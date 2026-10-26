@@ -20,32 +20,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-/*
- * A throwaway stress module (not for production) that hammers the *shared*
- * memory allocator from every forked worker at once and detects the failure
- * mode that unit-style tests miss: the same cell being handed to two
- * different processes.
- *
- * Method - each worker, after fork:
- *   1. allocates a block and stamps EVERY 8-byte word of it with a value
- *      derived from its own pid and the block's slot/size;
- *   2. keeps the block live in a slot table and, on later passes, re-reads
- *      those words and checks they are still its own stamp.
- *
- * If two processes are ever given the same address, the second one's stamp
- * overwrites the first's, and the first detects a foreign pid on its next
- * verify pass. That is reported as a "torn" block - the direct, in-process
- * signature of a double hand-out, rather than waiting for the eventual
- * downstream segfault in unrelated code.
- *
- * Sizes deliberately span the small-cell size classes AND cross the 64K cap
- * into the large/coalescing tier, so both allocator paths are exercised and
- * blocks are freed in a scattered order to force coalescing and reuse.
- *
- * Load with "modparam(hgstress, ...)" tuning and watch for the per-worker
- * PASS/FAIL notice; the run aborts startup with -1 on any failure so a
- * scripted test can just check the exit status.
- */
+/* soak test, not for production: workers stamp every word of their shm
+ * blocks and re-verify, so a cell handed to two processes shows as "torn" */
 
 #include <stdlib.h>
 #include <string.h>
@@ -66,40 +42,19 @@ static int hgs_slots  = 512;      /* live blocks held per worker */
 static int hgs_iters  = 200000;   /* alloc/free ops per worker */
 static int hgs_verify = 2000;     /* full verify sweep every N ops */
 static int hgs_large  = 64;       /* 1-in-N allocations exceed the cell cap */
-static int hgs_fill_on   = 1;     /* 0 = no stamps: the allocator's cost alone */
+static int hgs_fill_on   = 1;     /* 0 = no stamps: the allocator cost alone */
 static int hgs_max_small = 8000;  /* small sizes are 8 .. 8 + max_small - 1 */
 /* KB of pkg the parent takes in mod_init and keeps: forks every child with
  * the parent's pkg arena that full, e.g. under its headroom line */
 static int hgs_parent_pkg_kb = 0;
-/*
- * Growth driver. Each worker first allocates and HOLDS hold_mb MB of
- * stamped 128-512K blocks before the churn starts, and keeps them stamped
- * through it. Size workers x hold_mb past -m and a fixed arena MUST report
- * allocation failures (the fail-first arm), while a capped arena MUST grow
- * to absorb it - with every worker already forked, which is the exact
- * cross-process-visibility property the growth mechanism was chosen for. A
- * worker that SIGSEGVs touching grown space is the failure signature of
- * the broken (per-process page table) growth design.
- */
+/* growth driver: each worker holds hold_mb MB of stamped blocks through the
+ * churn - past -m a fixed arena must fail, a capped one must grow */
 static int hgs_hold_mb = 0;       /* 0 = the classic churn-only soak */
-/*
- * Same driver for the PKG arena. pkg is MAP_PRIVATE and per-process, so
- * there is no cross-process question to prove here - what this arm proves
- * is that the growth path executes for the private arena at all: every
- * worker grows its OWN arena past -M independently, and the stamps verify
- * the grown pages hold data. (The pkg cap multiplies by nproc in real
- * RAM - a rig concern too: 5 workers x the cap.)
- */
+/* the same for the private pkg arena: each worker grows its own past -M
+ * (RAM cost is nproc x the cap) */
 static int hgs_hold_pkg_mb = 0;
-/*
- * Second cycle, for the shrink rig: at again_s seconds after startup a
- * TIMER job re-runs one hold/verify/free cycle of hold_mb - in the timer
- * process, which is fine for shm (the arena is shared; any process can
- * drive it). The window between the workers' child_init soak ending
- * (holds freed) and this cycle is where the shrink gate finds its quiet
- * ticks; the cycle then proves the punched range recommits and serves
- * stamped data again. 0 = off.
- */
+/* shrink rig: again_s seconds after startup a timer job re-runs one hold
+ * cycle, proving punched ranges recommit and serve data; 0 = off */
 static int hgs_again_s = 0;
 
 struct hgs_shared {
@@ -108,7 +63,7 @@ struct hgs_shared {
 	int failed;
 	unsigned long long ops;
 	unsigned long long torn;
-	unsigned long long alloc_failed;   /* shm_malloc refusals, all workers */
+	unsigned long long alloc_failed;   /* shm_malloc NULLs, all workers */
 };
 
 static struct hgs_shared *shared;
@@ -118,19 +73,8 @@ struct hgs_blk {
 	unsigned long len;
 };
 
-/* the stamp is per (pid, slot) so a foreign writer is identifiable, and it is
- * written to EVERY word - a partial overlap is caught as readily as a whole
- * one.
- *
- * uint64_t, not unsigned long. The stamp packs the pid into the high 32 bits
- * and a hash of the slot into the low 32, which needs a 64-bit type to exist
- * at all: on ILP32 "(unsigned long)pid << 32" shifts a 32-bit value by 32,
- * which is UNDEFINED BEHAVIOUR, not a truncation. Whatever gcc emitted, the
- * pid half was gone - so every worker's stamp collapsed to the slot hash
- * alone, the detector could no longer tell a foreign writer from its own
- * data, and the "foreign pid" it printed came from a second UB shift in the
- * diagnostic itself. On LP64, where unsigned long is already 64-bit, this
- * changes nothing whatsoever. */
+/* pid in the high 32 bits, slot hash in the low, written to EVERY word;
+ * uint64_t, as a 32-bit unsigned long << 32 is undefined on ILP32 */
 static inline uint64_t hgs_stamp(int pid, int slot)
 {
 	return ((uint64_t)pid << 32) ^ (uint64_t)(slot * 2654435761u);
@@ -190,16 +134,8 @@ static int hgs_run(int rank)
 	memset(blk, 0, hgs_slots * sizeof *blk);
 	seed = (unsigned int)pid ^ (unsigned int)rank;
 
-	/*
-	 * Hold phase: pile up hold_mb MB of stamped 128-512K blocks and KEEP
-	 * them. This is what pushes total demand past the initial arena while
-	 * every worker is alive, so growth (or, in the fail-first arm, the
-	 * exhaustion it replaces) happens under the exact conditions the
-	 * mechanism is claimed to survive. The blocks stay in the verify
-	 * sweeps: a stamp that survives in a page committed after this
-	 * process forked is the pass criterion, a SIGSEGV here is the
-	 * signature of growth that edited only the grower's page tables.
-	 */
+	/* hold phase: keep hold_mb MB of stamped blocks live with all workers
+	 * up; a SIGSEGV here means growth edited only the grower's tables */
 	if (hgs_hold_mb > 0) {
 		maxhold = hgs_hold_mb * 8 + 8;   /* 128K min -> at most 8/MB */
 		hold = pkg_malloc(maxhold * sizeof *hold);
@@ -218,10 +154,10 @@ static int hgs_run(int rank)
 			if (!hold[nhold].p) {
 				alloc_failed++;
 				hold[nhold].len = 0;
-				break;   /* the arena is done growing or fixed */
+				break;   /* arena done growing, or fixed */
 			}
-			/* the hold table reuses the slot-stamp scheme, offset so
-			 * a hold block and a churn block never share a stamp */
+			/* slot stamps, offset so a hold block and a churn
+			 * block never share a stamp */
 			hgs_fill(&hold[nhold], pid, HGS_MAX_SLOTS + nhold);
 			held += hold[nhold].len;
 			nhold++;
@@ -231,11 +167,8 @@ static int hgs_run(int rank)
 			alloc_failed ? "STOPPED by allocation failure" : "target met");
 	}
 
-	/*
-	 * PKG hold: same idea, per-process arena. Allocate-and-stamp past -M,
-	 * verify at the end, free. Runs before the shm churn so a pkg-side
-	 * crash is attributable at a glance.
-	 */
+	/* pkg hold: the same per process, past -M; before the shm churn so a
+	 * pkg-side crash is attributable at a glance */
 	if (hgs_hold_pkg_mb > 0) {
 		struct hgs_blk *ph;
 		unsigned long pheld = 0;
@@ -299,11 +232,8 @@ static int hgs_run(int rank)
 		}
 		ops++;
 
-		/* full sweep: catches a foreign write to a block this worker is
-		 * holding but has not touched recently - the common case, since a
-		 * double hand-out is usually noticed long after it happened.
-		 * The hold blocks are swept too - they are the ones living in
-		 * grown pages. */
+		/* full sweep, incl. the hold blocks in grown pages: a double
+		 * hand-out is usually noticed long after it happened */
 		if (hgs_fill_on && hgs_verify > 0 && (i % hgs_verify) == 0) {
 			for (slot = 0; slot < hgs_slots; slot++)
 				if (blk[slot].p)
@@ -387,13 +317,8 @@ static void hgs_again(unsigned int ticks, void *param)
 		? "PASS" : (torn ? "FAIL" : "SHORT"));
 }
 
-/*
- * MI-driven persistent hold, for the autoscaling rig: the child_init soak
- * blocks the timer processes (no sweep ticks until every child finishes),
- * so proving PROACTIVE growth needs load applied from a normal running
- * process - an MI worker. hgs_hold allocates and parks stamped blocks
- * until hgs_release; both verify stamps.
- */
+/* MI hold for the autoscaling rig: the child_init soak blocks the timers,
+ * so proactive growth needs load from a running MI worker */
 #define HGS_MI_MAX 4096
 static struct hgs_blk hgs_mi_held[HGS_MI_MAX];
 static int hgs_mi_n;
@@ -444,23 +369,8 @@ static mi_response_t *mi_hgs_release(const mi_params_t *params,
 	              init_mi_result_string(MI_SSTR("OK"));
 }
 
-/*
- * Fault injection, run in the MI worker: the damage sits in this
- * process's private cache until its next sweep flush, which is where the
- * per-block free map (hg_arena.c) sees it.
- *   double_free - one cell freed twice: the second copy reaching the pool is
- *                 an exact double free (corruption.double_free + 1); without
- *                 the free map the pool took it silently and the block's accounting
- *                 drifted.
- *   scribble    - two cells freed, then the first's link overwritten (what
- *                 a module writing to freed memory does): the flush walk must
- *                 stop at the bad link instead of following it off the arena.
- *   overrun, overrun_large, overrun_pkg, overrun_realloc
- *               - one byte written past a 100-byte shm cell, a 100000-byte
- *                 large fragment, a 100-byte pkg cell, or a 100-byte shm cell
- *                 shrunk in place to 60, then freed: with hg_mem_check the
- *                 free counts an overflow (and with 2 aborts); without, none.
- */
+/* fault injection in the MI worker (double_free, scribble, overrun*); the
+ * damage is seen at the next flush, or at the free with hg_mem_check */
 static mi_response_t *mi_hgs_fault(const mi_params_t *params,
                                    struct mi_handler *async_hdl)
 {
@@ -483,7 +393,7 @@ static mi_response_t *mi_hgs_fault(const mi_params_t *params,
 			return init_mi_error(500, MI_SSTR("no shm"));
 		shm_free(a);
 		shm_free(b);                 /* chain: b -> a -> (older) */
-		memset(a, 0xa5, 2 * sizeof(void *));   /* a's link, after the free */
+		memset(a, 0xa5, 2 * sizeof(void *));   /* a's link, post-free */
 		LM_NOTICE("hgstress FAULT: link of freed %p overwritten (chain %p -> %p -> garbage)\n", a, b, a);
 	} else if (kind.len >= 7 && !memcmp(kind.s, "overrun", 7)) {
 		unsigned long n = 100, at = 100;

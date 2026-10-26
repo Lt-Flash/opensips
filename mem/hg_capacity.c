@@ -51,14 +51,8 @@
 #include "../lib/dbg/struct_hist.h"
 #include "hg_backing.h"
 
-/*
- * The host-memory floor no commit may cross, in MB: hg_ram_floor_mb, else
- * MemTotal/20 but at least the smaller of 256 MB and MemTotal/8 (a flat
- * 256 MB would refuse startup on a small host). Not cached: arenas created
- * before the config is parsed must not pin the default for later grows,
- * and MemTotal itself moves with memory hotplug and balloon drivers - the
- * checks read it with MemAvailable, in the same pass.
- */
+/* the host floor in MB: hg_ram_floor_mb, else MemTotal/20 but at least
+ * min(256 MB, MemTotal/8); not cached, as MemTotal and the config change */
 static long hg_ram_floor_of(long total_kb)
 {
 	if (hg_ram_floor_mb > 0)
@@ -76,8 +70,7 @@ static long hg_ram_floor(void)
 }
 
 /* bytes the hugetlb pool can still hand out: free pages not already
- * promised to a mapping. 64-bit like the room (hg_memlimit.h): the pool
- * is the host's */
+ * promised to a mapping; 64-bit, as the pool is the host's */
 static unsigned long long hg_pool_free_bytes(void)
 {
 	long free_pg = hg_meminfo_kb("HugePages_Free");
@@ -90,10 +83,8 @@ static unsigned long long hg_pool_free_bytes(void)
 		((unsigned long long)page_kb << 10);
 }
 
-/* bytes of general RAM that can still be committed: the host's above its
- * floor, or the memory cgroup's above its own floor when that is tighter
- * (hg_memlimit.c); HG_ROOM_ANY when neither says. @ci, if given, describes
- * the cgroup level that binds, version 0 when the host does */
+/* general RAM still committable: the host's or the memory cgroup's room,
+ * whichever is tighter (HG_ROOM_ANY if neither); @ci gets the binding level */
 static unsigned long long hg_ram_room_why(struct hg_cg_info *ci)
 {
 	long total_kb, avail_kb;
@@ -124,12 +115,8 @@ static unsigned long long hg_ram_room(void)
 	return hg_ram_room_why(NULL);
 }
 
-/*
- * Can a new arena commit @init bytes now? Tier 1 takes them from the
- * hugetlb pool (a shared arena only, and only on the huge-page grid); tiers
- * 2-4 take them from general RAM, which must stay above the floor. Logs why
- * not, for @what, and returns 0; 1 when it fits.
- */
+/* can a new arena commit @init bytes now (hugetlb pool or RAM above the
+ * floor)? 1 if so, else 0 with the reason logged for @what */
 int hg_init_fits(const char *what, unsigned long init,
 		unsigned long cap, int no_pool)
 {
@@ -159,12 +146,8 @@ int hg_init_fits(const char *what, unsigned long init,
 	return 0;
 }
 
-/*
- * Private arenas are per process, so their growth refusals are invisible
- * to statistics read in another process. Each process publishes its own
- * pkg arena's refusal count and GROW-BLOCKED state into its slot of this
- * shared array at every cache sweep; the hgmem: statistics sum them.
- */
+/* pkg refusals are per process, invisible to stats read elsewhere: each
+ * process publishes its own into its slot here, and hgmem: sums them */
 struct hg_pkg_pub {
 	unsigned long grow_refused;
 	unsigned int grow_blocked;
@@ -226,12 +209,8 @@ unsigned long hg_pkg_pub_stat(void *ctx)
 	return sum;
 }
 
-/*
- * Before forking one more process (startup or auto-scaler): can its private
- * arena commit its INIT? 0 makes the fork fail cleanly - the auto-scaler
- * keeps the processes it has - instead of an OOM kill. Logged once per
- * episode, re-armed when a fork fits again.
- */
+/* before forking another process: can its private arena commit INIT? 0
+ * fails the fork cleanly instead of an OOM kill; logged once per episode */
 int hg_fork_fits(void)
 {
 #ifdef PKG_MALLOC
@@ -259,13 +238,8 @@ int hg_fork_fits(void)
 #endif
 }
 
-/*
- * Startup, before anything forks: will every child's private arena (its
- * own -M INIT) fit in RAM above the floor? A private arena never takes
- * hugetlb pages (hg_mem_reserve()). -1 when the processes forked at
- * startup do not fit; only a warning for the auto-scaling maximum or caps
- * beyond MemTotal (the per-fork check stops scaling there).
- */
+/* at startup, before any fork: does every child's private arena INIT fit
+ * above the floor? -1 if the startup processes do not; else only warnings */
 int hg_capacity_check(unsigned int start_procs, unsigned int max_procs)
 {
 #ifndef PKG_MALLOC
@@ -332,15 +306,8 @@ int hg_capacity_check(unsigned int start_procs, unsigned int max_procs)
 #endif
 }
 
-/*
- * The host-RAM limb of the growth ceiling (see the prototype), defending
- * hg_ram_floor(); a limited memory cgroup is held to the same rule on its
- * own limit (hg_memlimit.c). MemAvailable is the kernel's estimate of what
- * can be claimed without swapping; a kernel without it passes the check,
- * and the mlock in hg_mem_commit() still refuses cleanly. The reads open
- * and parse files, so they run without hb->lock: the shm arena's lock is
- * every worker's.
- */
+/* host-RAM limb of the growth ceiling (see the prototype). It reads files,
+ * so it runs without hb->lock, which is every worker's on the shm arena */
 unsigned int hg_grow_room_short(const struct hg_block *hb,
 		unsigned long delta, struct hg_room_short *rs)
 {

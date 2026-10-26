@@ -17,19 +17,8 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-/*
- * The HG_MALLOC maintenance process: proactive growth and shrink of the
- * shared arenas. A process of its own because timer jobs run in whichever
- * process reads the timer-job pipe, SIP workers included (net/net_udp.c,
- * net/net_tcp_proc.c), and a grow there parks the worker for the populate.
- *
- * Every second it applies the headroom rule (grow one granule ahead when
- * the free grid is below twice the reserve floor), every hg_scaling_cycle
- * ticks the profile and shrink gates; the populate runs here with the lock
- * released. While it is alive (hb->maint_active) the sweep timer's copies
- * of these ticks stand down; exhaustion growth stays armed everywhere.
- * pkg arenas are not served: only their own process can populate them.
- */
+/* the maintenance process: shm arena grow and shrink in a process of its
+ * own, as timer jobs can run in a SIP worker and park it for the populate */
 
 #ifdef HG_MALLOC
 
@@ -55,9 +44,8 @@
 static hg_ns_t maint_last_ns;
 static unsigned int maint_ticks;
 
-/* a shared arena with a cap above its initial size: shm with -m INIT:CAP,
- * or a module arena (hg_arena_create()) - these exist before the process
- * count, since modules initialise first */
+/* a shared arena with a cap above its INIT (shm -m INIT:CAP, or a module
+ * arena); these exist before the process count, as modules init first */
 static int maint_arena(const struct hg_block *hb)
 {
 	return hb && hb->shared && hb->buddy_ready &&

@@ -80,23 +80,8 @@ int set_pkg_mm(const char *mm_name)
 int init_pkg_mallocs(void)
 {
 #ifdef PKG_MALLOC
-	/*
-	 * HG_MALLOC does its OWN reservation (its own hugepage tier ladder,
-	 * see hg_malloc_init() in hg_malloc.c) and never touches a
-	 * pre-allocated address - unlike every other allocator here, which
-	 * receives this malloc()'d block and lays its control structure out
-	 * inside it. Calling malloc(pkg_mem_size) for HG_MALLOC would just
-	 * leak that block (never freed, never used) - across dozens of
-	 * worker processes that adds up, so the call is skipped for it
-	 * rather than allocated-and-ignored.
-	 *
-	 * HG_INIT_INHERITED: this is the ONE arena every forked child
-	 * inherits copy-on-write (pt.c hands each child a fresh arena of its
-	 * own, but the parent's stays mapped in the child, holding all the
-	 * module state parsed pre-fork). It must not sit on hugetlb - a
-	 * child's COW fault there has no 4K fallback and no reservation, so
-	 * an empty pool at fork is a silent SIGBUS. It starts on THP instead.
-	 */
+	/* HG_MALLOC reserves its own arena, so no pool is malloc'd for it;
+	 * INHERITED keeps it off hugetlb, where a child COW fault can SIGBUS */
 #ifdef INLINE_ALLOC
 #if defined HG_MALLOC
 	mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0, NULL, HG_INIT_INHERITED);

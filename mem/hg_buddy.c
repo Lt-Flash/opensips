@@ -54,12 +54,8 @@ static inline unsigned long wf_count(const struct hg_block *hb)
 	return n;
 }
 
-/*
- * Release the leaves [from, to) of the one page the block header and the buddy
- * metadata partly occupy, leaf by leaf through the ordinary free path so the
- * merges follow the ordinary rules. Skipping the page instead would waste up
- * to a huge page, 25% of an 8 MB pkg arena.
- */
+/* Free the leaves [from, to) of the page the header and metadata share:
+ * skipping that page would waste up to a huge page, 25% of an 8 MB arena */
 static void page_release_range(struct hg_block *hb, struct hg_page *pg,
                                unsigned long from, unsigned long to)
 {
@@ -96,13 +92,8 @@ int hg_buddy_init(struct hg_block *hb)
 	bmwords = (nodes_per_page(top) + sizeof(long) * 8 - 1) /
 	          (sizeof(long) * 8);
 
-	/*
-	 * One metadata carve for all pages, from the FRONT of the arena
-	 * via the bump allocator: it inherits the arena's tier and
-	 * sharing and costs no extra huge page. Sized for npages_cap, so
-	 * a grow only publishes descriptors and never needs room for
-	 * metadata in a full arena.
-	 */
+	/* one metadata carve for all pages, from the arena FRONT, sized for
+	 * npages_cap so a grow never needs room for metadata in a full arena */
 	wfwords = (hb->npages_cap + HG_WF_BITS - 1) / HG_WF_BITS;
 	meta = hb->npages_cap * (sizeof(struct hg_page) + lpp +
 	                         bmwords * sizeof(long)) + wfwords * sizeof(long);
@@ -136,11 +127,8 @@ int hg_buddy_init(struct hg_block *hb)
 		 * pages beyond wait for hg_buddy_grow_unlocks() */
 	}
 
-	/*
-	 * Everything below hoff (block header, then the metadata) is spoken
-	 * for. hoff is leaf aligned (hg_arena_init); round up anyway, so a
-	 * change to the bump allocator cannot hand out a partly used leaf.
-	 */
+	/* everything below hoff (header, then metadata) is spoken for; rounded
+	 * up, so a bump allocator change cannot hand out a partly used leaf */
 	consumed_leaves = 0;
 	{
 		unsigned long hoff = hb->hoff;
@@ -166,20 +154,14 @@ int hg_buddy_init(struct hg_block *hb)
 		page_release_range(hb, pg, consumed_leaves - first, lpp);
 	}
 
-	/*
-	 * Rebase the coalesce counters: the straddling page's merges above say
-	 * nothing about fragmentation. Keep their total and restart from zero,
-	 * so buddy_splits and buddy_merges share a zero point.
-	 */
+	/* rebase the coalesce counters: the straddling page's merges say
+	 * nothing about fragmentation; splits and merges share a zero point */
 	hb->buddy_merges_init = hb->buddy_merges;
 	hb->buddy_merges = 0;
 	hb->buddy_splits = 0;   /* init allocates nothing; make that explicit */
 
 	hb->buddy_ready = 1;
-	/*
-	 * Reserve floor at 1/16 of the grid: a fraction, not a constant,
-	 * because arenas range from 8 MB pkg to 5 GB shm.
-	 */
+	/* reserve floor: 1/16 of the grid, as arenas span 8 MB to 5 GB */
 	hb->reserve_floor = (hb->npages * hg_leaves_per_page(hb)) / 16;
 	LM_DBG("%s buddy: %lu pages, orders 0..%u (%lu B..%lu B), %lu B metadata "
 		"(%lu B/page, %.3f%%), %lu of %lu leaves free after reserving %lu\n",
@@ -196,11 +178,8 @@ unsigned long hg_buddy_top_reachable(struct hg_block *hb)
 	return wf_count(hb);
 }
 
-/*
- * Rebuild one order's free list from the per-page bitmaps, skipping punched
- * pages (hg_buddy_regrow_holes_unlocks() republishes those). Corruption path
- * only - reached when a list head is on a punched page - and a full walk.
- */
+/* Rebuild one order's free list from the bitmaps, skipping punched pages.
+ * Corruption path only (a list head on a punched page): a full walk. */
 static void fl_rebuild(struct hg_block *hb, unsigned int o)
 {
 	unsigned int top = hb->buddy_top;
@@ -256,14 +235,8 @@ void *hg_buddy_alloc(struct hg_block *hb, unsigned int order)
 		}
 		if (!pg->punched)
 			break;
-		/*
-		 * The list head is on a punched page: its descriptor (metadata
-		 * region) is readable, the page is not - on hugetlb a touch
-		 * can SIGBUS, elsewhere it reads as zeros and an unlink would
-		 * orphan the list. So check BEFORE the unlink, never touch the
-		 * page, and rebuild the list from the bitmaps (which skip
-		 * punched pages), then serve from it or move up an order.
-		 */
+		/* the list head is on a punched page, which must not be
+		 * touched (SIGBUS on hugetlb): rebuild from the bitmaps */
 		LM_CRIT("%s: free list order %u heads at punched page %u - the "
 			"list and the page descriptor disagree; rebuilding the list "
 			"from the bitmaps\n", hb->name, o, pg->idx);
@@ -356,11 +329,8 @@ void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order)
 		hg_corrupt(hb, HG_C_BUDDY_BAD_FREE);
 		return;
 	}
-	/*
-	 * Double free: the leaforder check above passes it (a free block that
-	 * did not merge still records its order), and a second push would hand
-	 * the address out twice. The bitmap knows "already free and entire".
-	 */
+	/* double free: leaforder passes it (an unmerged free block still
+	 * records its order); the bitmap knows "already free and entire" */
 	if (bit_test(pg->bitmap, node_id(top, order, leaf))) {
 		LM_CRIT("%s: double buddy free of %p at order %u - ignoring\n",
 			hb->name, p, order);
@@ -371,10 +341,8 @@ void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order)
 	pg->free_leaves += 1U << order;
 	hb->buddy_free_leaves += 1UL << order;
 
-	/*
-	 * Merge up while the buddy (leaf ^ (1 << o)) is free and entire: O(1)
-	 * per step, at most `top` steps, ending at the page.
-	 */
+	/* merge up while the buddy (leaf ^ (1 << o)) is free and entire: O(1)
+	 * per step, at most `top` steps */
 	while (o < top) {
 		unsigned long bleaf = leaf ^ (1UL << o);
 		char *buddy = pg->base + (bleaf << HG_LEAF_SHIFT);
@@ -416,9 +384,8 @@ void *hg_buddy_alloc_run(struct hg_block *hb, unsigned long npages)
 		return hg_buddy_alloc(hb, top);
 
 	for (i = 0, start = 0; i < hb->npages; i++) {
-		/* a punched page is whole-free by its bitmap but unbacked
-		 * and off the list; a run must not take it (a grow
-		 * re-commits it) */
+		/* a punched page is whole-free by its bitmap but unbacked and
+		 * off the list: a run must not take it */
 		if (hb->pages[i].punched || hb->pages[i].releasing ||
 		    !page_is_whole_free(hb, &hb->pages[i])) {
 			run = 0;

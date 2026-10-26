@@ -47,7 +47,7 @@
 #ifdef HG_MALLOC
 #include "../mem/shm_mem.h"
 #include "../mem/hg_malloc.h"
-#include "../core_stats.h"   /* hg_pkg_peak_all: the per-process pkg high-water */
+#include "../core_stats.h"   /* hg_pkg_peak_all: per-process pkg peaks */
 #endif
 #include "../cachedb/cachedb.h"
 #include "../evi/event_interface.h"
@@ -988,20 +988,10 @@ static mi_response_t *w_reload_routes(const mi_params_t *params,
 
 
 #ifdef HG_MALLOC
-/*
- * HG_MALLOC keeps state the shared shmem:/pkgmem: statistics cannot express.
- * Those six figures were designed for a free-list allocator, where freed
- * memory returns to one general pool; HG_MALLOC instead CARVES the arena into
- * fixed size-class chunks that are never given back, so "how much is
- * committed", "how much is live" and "how much can still be handed out" stop
- * being the same question. Rather than overload the shared names further,
- * report the allocator's own view here.
- */
-/* @per_process: this arena is private to the answering process (pkg), so stamp
- * whose it is into the payload - see the call site for why that matters */
-/* one lock/gc/commit timing record - count, mean, max, stalls and the
- * log2-microsecond histogram (bucket 0 = <1 us, k = [2^(k-1), 2^k) us,
- * the last = >= 64 ms) */
+/* hg_stats/hg_advise: HG_MALLOC carves size-class chunks, so committed,
+ * live and still-available differ - more than shmem:/pkgmem: can say */
+/* one timing record: count, mean, max, stalls and a log2-us histogram
+ * (bucket 0 = <1 us, k = [2^(k-1), 2^k) us, the last = >= 64 ms) */
 static int hg_stats_lk(mi_item_t *parent, const char *name,
                        const struct hg_lkstat *st)
 {
@@ -1071,6 +1061,8 @@ static int hg_stats_lock(mi_item_t *parent, struct hg_block *hb)
 	return 0;
 }
 
+/* @per_process: the arena is private to the answering process (pkg), so
+ * the payload names that process */
 static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
                         int per_process)
 {
@@ -1103,21 +1095,14 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 
 	carved = hb->real_used;
 	tier = hg_mem_tier_str(hb->tier);
-	/* call this before reading max_live_used: the high-water mark is
-	 * refreshed on read, so sampling it here keeps live_peak in step with
-	 * shmem:max_used_size instead of reporting a stale 0 until something
-	 * else happens to query the statistics */
+	/* before reading max_live_used: the high-water is refreshed on read,
+	 * keeping live_peak in step with shmem:max_used_size */
 	live_committed = hg_get_real_used(hb);
 
 	if (add_mi_string(o, MI_SSTR("tier"), (char *)tier, strlen(tier)) < 0)
 		return -1;
-	/*
-	 * "tier" above is what INIT achieved. Growth deltas negotiate their
-	 * backing separately and may land lower, so a grown arena is described
-	 * by the byte split, not by one label - the label alone would be the
-	 * "outcome reported as an attribute" mistake. Emitted only when a
-	 * second tier actually holds bytes, so the common case stays terse.
-	 */
+	/* "tier" is what INIT got; grows may land on a lower tier, so a mixed
+	 * arena also gets the per-tier byte split */
 	{
 		int nt = 0, t;
 		for (t = HG_MEM_HUGETLB; t <= HG_MEM_4K; t++)
@@ -1129,8 +1114,8 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 			if (!ta)
 				return -1;
 			for (t = HG_MEM_HUGETLB; t <= HG_MEM_4K; t++) {
-				/* add_mi_number() takes a non-const name; the tier
-				 * strings are literals it only reads */
+				/* add_mi_number() wants a non-const name;
+				 * it only reads these literals */
 				char *ts = (char *)hg_mem_tier_str((enum hg_mem_tier)t);
 
 				if (hb->tier_bytes[t] &&
@@ -1144,9 +1129,8 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("pinned_mb"), hb->locked_mb) < 0)
 		return -1;
-	/* 1: the arena is swappable - init could not mlock() it, or a grow
-	 * the memory-lock limit could not cover went on unpinned; pinned_mb
-	 * then stays at what was locked before */
+	/* 1: swappable - init could not mlock() it, or a grow went on unpinned
+	 * past the memlock limit; pinned_mb keeps what was locked */
 	if (add_mi_number(o, MI_SSTR("unpinned"), hb->unpinned) < 0)
 		return -1;
 	/* 1: new allocations get hg_mem_check's tail guard */
@@ -1164,16 +1148,12 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("grows"), hb->grows) < 0)
 		return -1;
-	/* interior release: a punch gives backing back without moving the span, so
-	 * committed above can sit BELOW span_bytes; punched_pages is the gap.
-	 * repin_failed is the pinning promise being broken out loud. */
+	/* a punch frees backing without moving the span, so committed can sit
+	 * below span_bytes (punched_pages is the gap) */
 	if (add_mi_number(o, MI_SSTR("span_bytes"), hb->span_end) < 0)
 		return -1;
-	/* whole_free_pages is the punch's OPPORTUNITY SET, and the number
-	 * that explains a zero: an arena can be 90%% free by leaf and still
-	 * offer nothing to give back, because a page is only reclaimable
-	 * whole. Reported always - gating a gauge on its own non-zero hides
-	 * exactly the case an operator is trying to diagnose. */
+	/* whole_free_pages, always shown: a page is reclaimable only whole, so
+	 * this explains a zero punch on a mostly free arena */
 	if (add_mi_number(o, MI_SSTR("shrink_step"), hb->shrink_step) < 0 ||
 	    add_mi_number(o, MI_SSTR("scaling_cycle_s"),
 	                  (unsigned long)hg_scaling_cycle) < 0 ||
@@ -1194,9 +1174,8 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("grow_refused"), hb->grow_refused) < 0)
 		return -1;
-	/* what refused the latest grow - the cap, a profile ceiling or a
-	 * resource; still shown once growth works again, grow_blocked says
-	 * whether it is current */
+	/* what refused the last grow (cap, profile ceiling or resource); kept
+	 * after growth recovers - grow_blocked says if it is current */
 	{
 		const char *why = hg_grow_refusal_str(hb->grow_refuse_why);
 
@@ -1235,23 +1214,22 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 	if (add_mi_number(o, MI_SSTR("shrink_bytes"), hb->shrink_bytes) < 0)
 		return -1;
 
-	/* carved: bytes taken from the arena and cut into size-class chunks.
-	 * Never returned - this is the figure that only ever grows, and the one
-	 * that free_size counts down from. */
+	/* carved: arena bytes cut into size-class chunks, which free_size
+	 * counts down from */
 	if (add_mi_number(o, MI_SSTR("carved"), carved) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("carved_peak"), hb->max_real_used) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("chunks"), hb->nchunks) < 0)
 		return -1;
-	/* what shmem:free_size reports: arena never yet carved */
+	/* shmem:free_size: never-carved arena; idle carved cells are not
+	 * counted, as they serve only their own size class */
 	if (add_mi_number(o, MI_SSTR("free_to_carve"),
 	        hb->size > carved ? hb->size - carved : 0) < 0)
 		return -1;
 
-	/* live: what is actually handed out right now. live_committed and
-	 * live_peak are what shmem:real_used_size and shmem:max_used_size
-	 * report; payload and cells are shmem:used_size and shmem:fragments. */
+	/* live = handed out now; live_committed, live_peak, payload, cells are
+	 * shmem: real_used_size, max_used_size, used_size, fragments */
 	if (add_mi_number(o, MI_SSTR("live_committed"), live_committed) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("live_peak"), hb->max_live_used) < 0)
@@ -1260,24 +1238,14 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("live_cells"), hg_fragments(hb)) < 0)
 		return -1;
-	/* SLAB ONLY - large allocations (> the top size class) are served by
-	 * the boundary-tag tier and never appear here, so this is deliberately
-	 * NOT comparable with live_payload above, which counts both. */
+	/* slab only: large allocations live in the boundary-tag tier, so this
+	 * is NOT comparable with live_payload, which counts both */
 	if (add_mi_number(o, MI_SSTR("slab_cell_bytes_live"),
 		hg_cell_live(hb)) < 0)
 		return -1;
 
-	/* carved but idle: on a private free stack or in the global pool.
-	 * Reusable, but ONLY for its own size class - which is why it is not
-	 * counted as free_to_carve. */
-	/*
-	 * Reclaim. blocks_carved counts every block ever cut and
-	 * blocks_returned every one handed back, so the difference is the live
-	 * block count and the ratio is how well reclaim keeps up. Watch
-	 * carved against carved_peak too: without reclaim carve would only
-	 * ever grow and the two would always be equal, so carved BELOW its
-	 * peak is itself the proof that memory is being given back.
-	 */
+	/* reclaim: blocks_carved - blocks_returned = live blocks; carved below
+	 * carved_peak proves memory is being given back */
 	if (add_mi_number(o, MI_SSTR("blocks_carved"), hb->blocks_carved) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("blocks_returned"), hb->gc_blocks_returned) < 0)
@@ -1294,9 +1262,8 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("pressure_cells"), hb->pressure_cells) < 0)
 		return -1;
-	/* blocks returned by the maintenance tick vs at a trigger site,
-	 * and the drained blocks currently kept (the per-class keeps are in the
-	 * classes array) */
+	/* blocks returned by the maintenance tick vs at a trigger site, and
+	 * the drained blocks kept now (per-class keeps: classes array) */
 	if (add_mi_number(o, MI_SSTR("gc_tick_blocks"), hb->gc_tick_blocks) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("gc_inline_blocks"), hb->gc_inline_blocks) < 0)
@@ -1324,14 +1291,8 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 	if (add_mi_number(o, MI_SSTR("slab_recycled"), hg_slab_recycled(hb)) < 0)
 		return -1;
 
-	/*
-	 * Corruption detections. Zero is the only acceptable value: every site
-	 * that bumps one of these has already refused an operation or leaked a
-	 * cell. Broken out by kind because a recurrence of one defect looks very
-	 * different from several unrelated rare ones, and the nfree_underflow
-	 * kind in particular is the signature of the __thread palloc_slots bug
-	 * family. Until now the ONLY detector was a log grep.
-	 */
+	/* corruption detections by kind: any non-zero means an operation was
+	 * already refused or a cell leaked */
 	{
 		static const char * const kind[HG_CORRUPT_KINDS] = {
 			"class_mismatch", "double_free", "nfree_underflow",
@@ -1365,12 +1326,8 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 	if (add_mi_number(o, MI_SSTR("large_chunks_returned"),
 			hb->large_chunks_returned) < 0)
 		return -1;
-	/*
-	 * Reserve-floor state.  Without these the floor is unobservable in
-	 * production: crossing it only logs (a WARN only when the arena
-	 * cannot grow out of it) and bumps a sweep generation that is
-	 * indistinguishable from the periodic sweep.
-	 */
+	/* reserve-floor state: otherwise visible only as a log line and a
+	 * sweep indistinguishable from the periodic one */
 	if (add_mi_number(o, MI_SSTR("reserve_floor"), hb->reserve_floor) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("below_floor"), hb->below_floor) < 0)
@@ -1381,12 +1338,8 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 	if (hg_stats_lock(o, hb) < 0)
 		return -1;
 
-	/*
-	 * Per-order buddy free lists.  buddy_free_leaves alone cannot say
-	 * whether the free space is one contiguous run or the same number of
-	 * leaves scattered at order 0 - which is the difference between an
-	 * arena that can still serve a large chunk and one that cannot.
-	 */
+	/* per-order buddy free lists: tells one contiguous run from scattered
+	 * leaves, i.e. whether a large chunk can still be served */
 	{
 		mi_item_t *ord_arr, *ord_item;
 		unsigned int ord;
@@ -1442,16 +1395,8 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 			return -1;
 		if (add_mi_number(cls_item, MI_SSTR("cells"), cells_of[c]) < 0)
 			return -1;
-		/*
-		 * Free cells of this class in the SHARED pool.  Cells sitting in
-		 * a thread's private cache are not counted - they are unreachable
-		 * from here by construction - so this is a lower bound on what is
-		 * reusable.  It is still the missing half of the picture: "cells"
-		 * alone is capacity, and capacity cannot distinguish a class that
-		 * is fully occupied from one that carved a lot and then went idle,
-		 * which is precisely the shape of the 2026-08-10 wrong-class
-		 * exhaustion seen in staging.
-		 */
+		/* free cells in the SHARED pool (thread caches unseen), a lower
+		 * bound; tells a full class from one that went idle */
 		if (add_mi_number(cls_item, MI_SSTR("free_shared"),
 			hb->gpool_n[c]) < 0)
 			return -1;
@@ -1460,25 +1405,12 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 	return 0;
 }
 
-/*
- * Sizing advice for -m / -M, from what the arenas have actually reached.
- *
- * Both margins are multipliers on the observed HIGH-WATER, not on current
- * use: an arena that is 90% idle right now may still have peaked at 90% full
- * during the busy hour, and it is the peak that has to fit.  They differ
- * because the two failure modes differ - shm exhaustion makes an allocation
- * fail and a call drop, pkg exhaustion kills the process outright, so pkg
- * gets the wider margin.
- */
+/* -m/-M sizing advice: margins multiply the HIGH-WATER, not current use;
+ * pkg gets more, as pkg exhaustion kills the process outright */
 #define HG_ADVISE_SHM_MARGIN   2
 #define HG_ADVISE_PKG_MARGIN   3
-/*
- * Floors, deliberately low. An earlier 64 MB shm floor swallowed the answer:
- * peak x margin came to ~13 MB on every workload tried, always below it, so
- * the command replied "64" whatever it was asked and the arithmetic was never
- * visible. A floor should stop a silly recommendation, not become the
- * recommendation.
- */
+/* floors kept low: a floor should stop a silly recommendation, not become
+ * the recommendation (an earlier 64 MB one swallowed every answer) */
 #define HG_ADVISE_SHM_FLOOR_MB 8
 #define HG_ADVISE_PKG_FLOOR_MB 2
 
@@ -1540,23 +1472,8 @@ static int hg_advise_one(mi_item_t *parent, const char *name,
 	        strlen(hg_advise_verdict(peak, hb->size))) < 0)
 		return -1;
 
-	/*
-	 * Split the live figure into the part that is a property of the
-	 * WORKLOAD and the part that is a property of the ARENA SIZE, because
-	 * the second one makes any "shrink to N x observed" advice circular.
-	 *
-	 * Measured on an idle pkg arena across -M 32/16/8/4: slab live stayed
-	 * at exactly 6,560 bytes while the large tier halved with every halving
-	 * of -M. The cause is in reactor.c:85 -
-	 *     reactor_size = mem_size / n * FD_MEM_PERCENT / 100;
-	 * the reactor's fd table is a PERCENTAGE of pkg memory, so it shrinks
-	 * when the arena does. Apply a recommendation derived from total live
-	 * and the next reading is smaller again, all the way to the floor.
-	 *
-	 * Reporting both halves is honest; guessing which large allocations are
-	 * size-proportional and which are real workload is not, so no attempt
-	 * is made to net it out automatically.
-	 */
+	/* split live into slab (workload) and large, as some large consumers
+	 * (the reactor fd table) scale with the arena: advice turns circular */
 	{
 		unsigned long slab_live  = hg_cell_live(hb);
 		unsigned long large_live = hb->large_live;
@@ -1577,9 +1494,8 @@ static int hg_advise_one(mi_item_t *parent, const char *name,
 			return -1;
 	}
 
-	/* pkg is per-process, so the interesting number is the whole set of
-	 * arenas, not one of them - that is what is pinned out of the hugepage
-	 * pool and cannot be used by anything else */
+	/* pkg is per process: the set of arenas is what is pinned out of the
+	 * hugepage pool */
 	if (nproc > 0) {
 		if (add_mi_number(o, MI_SSTR("processes"), nproc) < 0 ||
 		    add_mi_number(o, MI_SSTR("pinned_total_mb"),
@@ -1629,9 +1545,8 @@ static mi_response_t *mi_hg_advise(const mi_params_t *params,
 		if (hg_pkg_peak_all(&peak, &sum, &nproc) < 0)
 			nproc = 0;
 #endif
-		/* fall back to this process's own arena if the shared array is
-		 * not populated - better a narrow answer than none, but say so
-		 * in the notes below */
+		/* shared array empty: fall back to this process's own arena -
+		 * a narrow answer, but better than none */
 		if (!nproc)
 			peak = hb->max_real_used;
 
@@ -1693,14 +1608,8 @@ static mi_response_t *mi_hg_stats(const mi_params_t *params,
 #ifdef PKG_MALLOC
 	if (mem_allocator_pkg == MM_HG_MALLOC ||
 	    mem_allocator_pkg == MM_HG_MALLOC_DBG) {
-		/*
-		 * pkg arenas are per-process, and the payload now says so rather
-		 * than leaving it to a comment here. Over mi_fifo the answering
-		 * process is the FIFO listener, which does no SIP work at all -
-		 * reading its arena as "the" pkg arena is exactly how a worker
-		 * running out of pkg stays invisible. The all-process picture is
-		 * in the generic pkmem: statistics group.
-		 */
+		/* this process's arena only (over mi_fifo, the idle FIFO
+		 * listener); pkmem: statistics cover every process */
 		if (hg_stats_one(resp_obj, "pkg", (struct hg_block *)mem_block, 1) < 0)
 			goto error;
 		reported++;
@@ -1730,13 +1639,8 @@ static mi_response_t *mi_hg_stats(const mi_params_t *params,
 			MI_SSTR("HG_MALLOC is not the active allocator"));
 	}
 
-	/*
-	 * Per-process, like the pkg figures above: frees this process handed
-	 * back to an arena other than the one named by the caller. The name
-	 * says so, because read over mi_fifo this only ever samples the FIFO
-	 * listener and will sit at 0 no matter what the SIP workers do - a
-	 * zero here is not evidence of anything.
-	 */
+	/* this process's frees into an arena other than the named one; over
+	 * mi_fifo that is the idle FIFO listener, so a zero proves nothing */
 	if (add_mi_number(resp_obj, MI_SSTR("cross_arena_frees_this_proc"),
 			hg_xarena_frees) < 0)
 		goto error;

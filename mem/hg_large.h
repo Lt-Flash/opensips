@@ -20,19 +20,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-/*
- * Large-object tier, for requests above HG_CELL_MAX, which the fixed size
- * classes of hg_arena.c cannot serve. Boundary-tag fragments as in f_malloc,
- * simplified because large allocations are rare and already slow-path: ONE
- * unsorted free list per hg_block, searched first-fit, and no coalescing
- * across chunks - each chunk is a self-contained f_malloc-style heap, and a
- * new one is taken from the buddy when no free frag fits.
- *
- * hg_cell_alloc() routes oversized requests here. hg_free()/hg_realloc()
- * tell a large frag from a cell by the class byte at HG_CELL_HDR before the
- * payload: HG_LARGE_MARKER, a value >= HG_NCLASSES (HG_CLASS/HG_HDR in
- * hg_malloc.h).
- */
+/* Large-object tier, above HG_CELL_MAX: f_malloc-style chunks from the
+ * buddy, ONE unsorted first-fit list, as large allocations are rare */
 
 #ifndef hg_large_h
 #define hg_large_h
@@ -43,11 +32,8 @@
  * turned into its frag header */
 #define HG_LFRAG_HDR (sizeof(struct hg_lfrag))
 
-/*
- * @size is the usable payload size asked for (HG_CELL_HDR and HG_LFRAG_HDR
- * are added inside). A plain #ifdef DBG_MALLOC is safe here: hg_large.c
- * sees DBG_MALLOC's true state, with no hg_malloc.c-style local #undef.
- */
+/* @size is the usable payload asked for; a plain #ifdef DBG_MALLOC is
+ * safe, as hg_large.c has no hg_malloc.c-style local #undef */
 #ifdef DBG_MALLOC
 void *hg_large_alloc(struct hg_block *hb, unsigned long size,
                      const char *file, const char *func, unsigned int line);
@@ -67,10 +53,8 @@ unsigned long hg_large_frag_size(const struct hg_lfrag *frag);
 
 void hg_large_destroy(struct hg_block *hb);
 
-/* @cb(payload, ctx) for every live large frag. Always exact, pre- or
- * post-fork: a frag's ->prev is its free flag (NULL = live), as in
- * f_malloc's frag_is_free(). @cb runs with hb->lock held: it may not
- * allocate or free in any HG_MALLOC arena (see hg_arena_walk_live()) */
+/* @cb(payload, ctx) for every live large frag; exact, as ->prev NULL = live.
+ * @cb runs under hb->lock: no allocating or freeing in any HG_MALLOC arena */
 void hg_large_walk_live(struct hg_block *hb,
 		void (*cb)(void *payload, void *ctx), void *ctx);
 

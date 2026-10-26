@@ -27,19 +27,11 @@
  * and page helpers they share; include after their headers */
 
 
-/*
- * Two records per page tree make split and merge O(1). leaforder[leaf] is the
- * order of the block CONTAINING the leaf, kept in every leaf of the block, so
- * an interior address (a cell being freed) finds its block with a mask;
- * HG_LEAF_NONE = not buddy space (e.g. part of a multi-page run). bitmap[node]
- * is 1 iff the node is a WHOLE free block, i.e. on a free list - a split node
- * is 0 even if both halves are free - which is the merge test "is my buddy
- * free AND entire".
- */
+/* leaforder[leaf]: order of the block CONTAINING the leaf, in all its
+ * leaves; bitmap[node]: 1 iff a WHOLE free block (split = 0), the merge test */
 
 /* node id in the per-page tree: level 0 is the whole page, level `top`
- * the leaves; 2^(top+1)-1 nodes (511, a 64 byte bitmap, for 8 KB leaves
- * in a 2 MB page) */
+ * the leaves; 2^(top+1)-1 nodes */
 static inline unsigned long node_id(unsigned int top, unsigned int order,
                                     unsigned long leaf)
 {
@@ -68,11 +60,8 @@ static inline void bit_clear(unsigned long *bm, unsigned long n)
 	bm[n / (sizeof(long) * 8)] &= ~(1UL << (n % (sizeof(long) * 8)));
 }
 
-/*
- * The top order IS the page, so its free list is a bitmap (hb->wfree), one bit
- * per page with nothing stored in the page. Find-first-set serves the lowest
- * page, so carves stay low and the top pages drain for the trim.
- */
+/* The top order's free list is a bitmap, one bit per page; find-first-set
+ * serves the lowest page, so carves stay low and the top pages drain. */
 #define HG_WF_BITS (sizeof(long) * 8)
 
 static inline int wf_test(const struct hg_block *hb, unsigned long idx)
@@ -108,9 +97,8 @@ static inline void fl_push(struct hg_block *hb, void *p, unsigned int order)
 {
 	struct hg_free_blk *b = (struct hg_free_blk *)p;
 
-	/* the top order lives in the bitmap. Lower orders stay LIFO: inside
-	 * carved pages the cell-level policy owns placement, and ordering
-	 * these long lists would cost a walk */
+	/* the top order lives in the bitmap; lower orders stay LIFO, as the
+	 * cell-level policy owns placement inside carved pages */
 	if (order == hb->buddy_top) {
 		wf_set(hb, hg_page_of(hb, p));
 		return;
@@ -162,16 +150,8 @@ static inline void page_publish_whole(struct hg_block *hb, struct hg_page *pg)
 	hb->buddy_free_leaves += pg->free_leaves;
 }
 
-/*
- * A punched page keeps its address in the span but its bytes are no longer
- * committed, so the invariant is:
- *
- *     committed_bytes + punched_pages * hps == span_end
- *
- * Re-checked wherever either side moves (grow, trim, punch, re-commit). A
- * mismatch is an accounting slip in this file, not damaged memory: it is
- * counted as an internal inconsistency and the arena carries on.
- */
+/* Invariant: committed_bytes + punched_pages * hps == span_end. A
+ * mismatch is an accounting slip, not damaged memory: counted, not fatal. */
 static inline void span_check(struct hg_block *hb, const char *after)
 {
 	unsigned long holes = hb->punched_pages << hb->hps_shift;
@@ -184,34 +164,16 @@ static inline void span_check(struct hg_block *hb, const char *after)
 	hg_corrupt(hb, HG_C_INTERNAL);
 }
 
-/*
- * Reserve floor at 1/16 of the pages the allocator can carve - committed
- * pages, not the span. Counting holes would inflate the floor by what the
- * drain gave back, and the drain would then throttle itself on its own holes.
- */
+/* Reserve floor at 1/16 of the committed pages, not the span: counting
+ * holes would make the drain throttle itself on its own holes. */
 static inline void floor_recompute(struct hg_block *hb)
 {
 	hb->reserve_floor = ((hb->npages - hb->punched_pages) *
 	                     hg_leaves_per_page(hb)) / 16;
 }
 
-/*
- * Interior release (punch): give back a whole-free page from ANYWHERE in the
- * span, so one live cell at the top no longer pins the free pages below it
- * (MADV_REMOVE is valid at any offset of a shared mapping). The page stays in
- * the span as a hole; its bytes leave committed_bytes and its leaves
- * buddy_free_leaves, which counts CARVABLE leaves only.
- *
- * The page is unlinked first, so no carve can take it while it is released
- * with the lock dropped, and stays off until
- * hg_buddy_regrow_holes_unlocks() re-commits it. Its bitmap and leaforder
- * (metadata region) are untouched, so page_is_whole_free() stays true.
- *
- * Phases as in the trim: choose and unlink under hb->lock, release unlocked
- * (one syscall pair per page), publish under it. A refusal latches
- * shrink_unsupported and puts the rest back. Called from the drain after the
- * trim; returns the pages punched.
- */
+/* Punch: a whole-free page from ANYWHERE in the span goes back as a hole,
+ * off the free lists until hg_buddy_regrow_holes_unlocks() re-commits it. */
 #define HG_PAGES_PER_EVENT 128   /* per release or re-commit event */
 
 /* --- multi-page runs -------------------------------------------------- */

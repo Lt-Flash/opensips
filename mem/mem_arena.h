@@ -17,20 +17,8 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-/*
- * Module-owned shared arenas.
- *
- * A module asks for an arena - a name, an initial size and a cap - and
- * gets memory fully managed by the allocator: on a build with HG_MALLOC
- * the arena is an HG block of its own (slab classes, per-process caches,
- * block GC and re-typing, elastic growth and shrink within the cap, the
- * maintenance process, hg_stats), created before the fork and inherited by
- * every child; with no HG_MALLOC compiled in shm_arena_create() returns
- * NULL and the module falls back to whatever it did before. The core
- * allocator selected with -a does not matter: the arena is HG either way.
- *
- * Call shm_arena_create() from mod_init() only.
- */
+/* Module-owned shared arenas: an HG block of the module's own whatever -a
+ * selects; shm_arena_create() from mod_init() only, NULL without HG_MALLOC */
 #ifndef mem_arena_h
 #define mem_arena_h
 

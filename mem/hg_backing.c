@@ -51,11 +51,8 @@
 #include "../lib/dbg/struct_hist.h"
 #include "hg_backing.h"
 
-/*
- * Linux values, defined ONLY under __OS_linux: elsewhere the same bits mean
- * something else (0x40000 is MAP_PREFAULT_READ on FreeBSD), so mmap() would
- * succeed with unrelated semantics. Other OSes get a plain anonymous mapping.
- */
+/* Linux values, defined only under __OS_linux: elsewhere the same bits mean
+ * something else (0x40000 is MAP_PREFAULT_READ on FreeBSD) */
 #ifdef __OS_linux
 #ifndef MAP_HUGETLB
 #define MAP_HUGETLB 0x40000
@@ -71,13 +68,8 @@
 #endif
 #endif /* __OS_linux */
 
-/*
- * The system's default huge page size, probed once: 2M on x86_64 and on
- * arm64 with 4K pages, 32M with 16K pages, 512M with 64K pages.
- * mmap(MAP_HUGETLB) rounds the mapping up to it, so a wrong value makes the
- * munmap() fail (the arena leaks) and misaligns the THP tiers, which then
- * silently stay on 4K. Falls back to 2M only if /proc/meminfo cannot be read.
- */
+/* default huge page size, probed once: not always 2M (arm64 with 16K/64K
+ * pages uses 32M/512M), and a wrong value breaks munmap() and THP tiers */
 #define HG_HPS_FALLBACK (2UL * 1024 * 1024)
 
 static unsigned long hg_hps_cached;
@@ -160,11 +152,8 @@ void hg_meminfo_kb2(const char *k1, long *v1, const char *k2, long *v2)
 	fclose(f);
 }
 
-/*
- * Every grow mlock()s its delta, and mlock() checks RLIMIT_MEMLOCK on
- * hugetlb mappings too. The kernel returns ENOMEM both for that limit and
- * for an empty hugetlb pool; the helpers below tell the two apart.
- */
+/* a grow's mlock() gets ENOMEM both from RLIMIT_MEMLOCK (hugetlb too) and
+ * from an empty hugetlb pool; the helpers below tell the two apart */
 #define HG_CAP_IPC_LOCK	14	/* linux/capability.h; mlock() ignores the
 				 * limit for a process that holds it */
 
@@ -275,12 +264,8 @@ static void hg_mlock_refused(struct hg_block *hb, unsigned long delta, int err)
 	hb->grow_refuse_why = hb->grow_refuse_mlock;
 }
 
-/*
- * Does the host's THP policy forbid MADV_COLLAPSE for this mapping kind?
- * The kernel lets an explicit MADV_COLLAPSE bypass "never", so the setting
- * is honoured here: "never" or "deny" for shmem, "never" for anon (which
- * has no deny). Read once per kind and cached - it is a host property.
- */
+/* does host THP policy forbid MADV_COLLAPSE? An explicit collapse bypasses
+ * "never" in the kernel, so it is honoured here; cached per mapping kind */
 static int hg_thp_collapse_denied(int shared)
 {
 	static int cached[2] = { -1, -1 };
@@ -304,13 +289,8 @@ static int hg_thp_collapse_denied(int shared)
 	return cached[!!shared];
 }
 
-/*
- * Why a 4K arena is on 4K, for its startup line, when a host THP setting
- * is the cause: with shmem_enabled=never MADV_COLLAPSE would still give
- * shmem huge pages, so the arena is on 4K because this build honours the
- * setting, and the operator is told which knob changes it. Below Linux 6.1
- * there is no MADV_COLLAPSE at all.
- */
+/* startup-line suffix naming the host THP setting that keeps a 4K arena on
+ * 4K, so the operator knows which knob to change; "" when none does */
 const char *hg_4k_reason(int shared)
 {
 	if (!hg_thp_collapse_denied(shared))
@@ -327,13 +307,8 @@ static long hg_read_huge_kb(int shared)
 	return hg_meminfo_kb(shared ? "ShmemHugePages" : "AnonHugePages");
 }
 
-/*
- * Did a populate of @len bytes land on huge pages? Judged from the
- * system-wide counter delta across it, not from /proc/self/smaps, which
- * walks the page tables of the whole mapping. Huge faults elsewhere can
- * over-count; 90% of the range must show so a partial fallback does not
- * read as success, and a false negative only costs a collapse retry.
- */
+/* did a populate of @len land on huge pages? Read from the system-wide
+ * counter delta (O(1), unlike smaps); 90% must show, so a partial fails */
 static int hg_delta_is_huge(long before_kb, long after_kb, unsigned long len)
 {
 	return before_kb >= 0 && after_kb >= 0 &&
@@ -341,14 +316,8 @@ static int hg_delta_is_huge(long before_kb, long after_kb, unsigned long len)
 }
 
 
-/*
- * Keep the arena out of core dumps: it is all resident (pre-faulted and
- * pinned), so every crashing worker would dump the whole reservation.
- * HG_DUMP_ARENA=1 in the environment keeps it in, to debug the allocator;
- * coredump_filter cannot, VM_DONTDUMP overrides it. An environment variable
- * because it applies at allocator init, before the config is parsed.
- * Best effort (MADV_DONTDUMP is Linux 3.4+): failure only means bigger cores.
- */
+/* keep the all-resident arena out of core dumps; HG_DUMP_ARENA=1 in the
+ * environment keeps it in (coredump_filter cannot undo VM_DONTDUMP) */
 static void hg_exclude_from_core(void *base, unsigned long size)
 {
 #ifdef MADV_DONTDUMP
@@ -365,17 +334,8 @@ static void hg_exclude_from_core(void *base, unsigned long size)
 #endif
 }
 
-/*
- * Reserve an aligned region of at least @size bytes, huge-page-backed where
- * possible and mlock-pinned, mapped until hg_malloc_destroy(); @cap comes
- * back as what was reserved. NULL only when mmap fails outright: a
- * huge-page miss still returns a plain 4K mapping.
- *
- * @shared: MAP_SHARED for shm, one arena for every forked worker. pkg MUST
- * be MAP_PRIVATE so each worker gets its own copy-on-write arena; shared,
- * the hg_block with its lock (a spinlock under FAST_LOCK) and free lists
- * would be common to all workers.
- */
+/* reserve >= @size, aligned and pinned, on huge pages where possible; NULL
+ * only if mmap fails. pkg must be !@shared: each worker needs its own copy */
 void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 		enum hg_mem_tier *tier, unsigned long *locked_b, int shared,
 		unsigned long apage)
@@ -406,20 +366,8 @@ void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 	return p;
 #else
 
-	/*
-	 * tier 1: MAP_HUGETLB, unswappable without mlock(), so INIT escapes
-	 * RLIMIT_MEMLOCK; a grow does not, it is an mlock() of its delta (see
-	 * hg_mlock_refusal()). Try the whole cap, then INIT alone: a pool too
-	 * small for the cap fails the mmap, and keeping huge pages without
-	 * growth room beats dropping to THP.
-	 *
-	 * Shared arenas only. A private arena is copied on write into every
-	 * process forked after it: the pre-fork arena into every child, and a
-	 * child's own into whatever a module forks without the core's child
-	 * init (cpl_c's mail sender, which allocates before its exec). A COW
-	 * fault on a hugetlb page with the pool empty is a SIGBUS, while
-	 * THP's falls back to 4K pages.
-	 */
+	/* tier 1: MAP_HUGETLB, shared only (a COW fault on an empty pool is a
+	 * SIGBUS): the whole cap, else INIT alone to keep the huge pages */
 	p = (!shared || small) ? MAP_FAILED :
 	    mmap(NULL, csize, PROT_READ|PROT_WRITE,
 	         vis|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
@@ -445,19 +393,8 @@ void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 		return p;
 	}
 
-	/*
-	 * tiers 2-4: an aligned anon mapping. THP on shmem needs the VA
-	 * congruent with the file offset modulo the huge page size, so reserve
-	 * PROT_NONE first and MAP_FIXED the real mapping at an aligned address
-	 * inside it (an atomic replace); harmless for MAP_PRIVATE.
-	 *
-	 * The real mapping covers the whole cap R/W, though only asize is
-	 * committed: made before fork, it is the one VMA every worker inherits,
-	 * so a grow only faults in more of the shared object. An mmap/mprotect
-	 * of the tail at grow time would change only the grower's page tables,
-	 * and the other workers would SIGSEGV there. An untouched tail costs
-	 * page-table entries, not memory.
-	 */
+	/* tiers 2-4: aligned anon map of the whole cap R/W, made before fork so
+	 * every worker shares it (a grow-time mmap would be the grower's) */
 	resv = mmap(NULL, csize + apage, PROT_NONE,
 	            MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	if (resv == MAP_FAILED)
@@ -486,9 +423,8 @@ void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 		return base;
 	}
 
-	/* advise huge before first touch (tier 2), then pin: a cold mlock
-	 * populates, so it is also the pre-fault. The advice covers the whole
-	 * cap so growth inherits it; each delta is still verified when grown */
+	/* advise huge before first touch (tier 2), then pin: a cold mlock is
+	 * also the pre-fault; advising the whole cap lets growth inherit it */
 	madvise(base, csize, MADV_HUGEPAGE);
 	shmem_kb = hg_read_huge_kb(shared);
 	if (mlock(base, asize) == 0) {
@@ -514,13 +450,8 @@ void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 #endif /* __OS_linux */
 }
 
-/*
- * MADV_COLLAPSE one committed range, for hg_collapse_deferred() (which owns
- * the page bookkeeping): 1 when it is now on huge pages, else the negated
- * errno, or 0 if the host's THP policy forbids it. The kernel returns 0 only
- * when every huge-page-aligned part collapsed, so success needs no counter
- * check; a failure is often transient (EAGAIN) and worth a retry.
- */
+/* MADV_COLLAPSE one committed range: 1 when now huge, 0 if host THP policy
+ * forbids it, else -errno (often a transient EAGAIN, worth a retry) */
 int hg_mem_collapse(struct hg_block *hb, char *base, unsigned long len)
 {
 #ifdef __OS_linux
@@ -532,17 +463,8 @@ int hg_mem_collapse(struct hg_block *hb, char *base, unsigned long len)
 #endif
 }
 
-/*
- * Commit [hbase+off, +delta): the cap is mapped R/W since reserve time, so
- * this faults the pages in, pins them and verifies their backing. mlock()
- * is the commit primitive on every tier because it fails with an errno, not
- * a later SIGBUS in whichever worker touches the shortfall: an unbackable
- * grow fails HERE, before the buddy sees the range. On tier 1 (unswappable
- * anyway) it is only the populate; a short pool gives ENOMEM, no SIGBUS
- * (hgstress exercises this). Returns the delta's hg_mem_tier, or -1 with
- * the range munlock'd (refuse, never half-commit). Reserve time already
- * excluded the whole cap from core dumps.
- */
+/* commit [hbase+off, +delta) via mlock(), which fails with an errno rather
+ * than a later SIGBUS; returns the delta's hg_mem_tier, or -1, all undone */
 const char * const hg_cp_phase_str[HG_CP_PHASES] = {
 	"meminfo", "advise", "mlock_populate", "verify", "collapse"
 };
@@ -601,12 +523,8 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
 		} else {
 			HG_CP_TIME(HG_CP_MLOCK, mlock_rc = mlock(base, delta));
 			if (mlock_rc != 0 && hg_memlock_limit()) {
-				/* 4 KB/THP memory is swappable: the pin is a
-				 * latency guarantee, not a requirement, so a
-				 * grow the memlock limit cannot cover goes on
-				 * unpinned. A failure with no binding limit
-				 * still refuses below; hugetlb always needs
-				 * the lock (above). */
+				/* off hugetlb the pin is a latency aid, not a
+				 * must: past the limit, go on unpinned */
 				munlock(base, delta);
 				LM_WARN("%s: RLIMIT_MEMLOCK (%lu KB) cannot pin a %lu MB "
 					"grow - the arena continues unpinned (swappable). "
@@ -635,9 +553,8 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
 			hg_read_huge_kb(hb->shared), delta));
 		if (is_huge)
 			return HG_MEM_THP_ADVISE;
-		/* a worker is waiting on this grow and a collapse takes
-		 * milliseconds: publish on 4 KB pages now, the maintenance
-		 * process collapses them later (hg_collapse_deferred) */
+		/* a worker waits on this grow and a collapse takes ms: publish
+		 * on 4 KB now, hg_collapse_deferred() collapses it later */
 		if (collapse_later && shmem_kb >= 0 &&
 		    !hg_thp_collapse_denied(hb->shared)) {
 			*collapse_later = 1;
@@ -677,10 +594,8 @@ int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len)
 	}
 
 #ifndef __OS_linux
-	/* no portable release off Linux: MADV_REMOVE (the only call that frees
-	 * shmem pages) is Linux-only, a remap would split the range from the
-	 * other processes, and MADV_DONTNEED neither frees nor zeroes on the
-	 * BSDs or macOS. The arena keeps its memory and stops shrinking. */
+	/* no portable release off Linux (MADV_REMOVE is Linux-only, a remap
+	 * would unshare the range): the arena keeps its memory */
 	(void)base;
 	if (!hb->shrink_unsupported) {
 		hb->shrink_unsupported = 1;
@@ -689,9 +604,8 @@ int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len)
 	}
 	return -1;
 #else
-	/* the kernel refuses MADV_DONTNEED and MADV_REMOVE on locked pages, so
-	 * the range is unlocked first - and a refused advice has to pin it
-	 * again, or the pages stay committed, carved from, and unpinned */
+	/* the kernel refuses these advices on locked pages, so unlock first;
+	 * a refused advice must then pin the range again */
 	munlock(base, len);
 
 	if (madvise(base, len, advice) != 0) {
@@ -704,9 +618,8 @@ int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len)
 			"- shrink disabled for this arena\n", hb->name,
 			hb->shared ? "MADV_REMOVE" : "MADV_DONTNEED",
 			len >> 20, strerror(err));
-		/* an arena that runs unpinned had nothing locked to restore; if
-		 * the pin is refused, the pinned figure drops instead of counting
-		 * pages that are no longer locked */
+		/* an unpinned arena has nothing to restore; a refused re-pin
+		 * drops the pinned figure instead */
 		if (!hb->unpinned && mlock(base, len) != 0) {
 			LM_WARN("%s: could not pin the %lu MB again after the refused "
 				"release (%s) - they stay committed but unpinned\n",
@@ -727,18 +640,8 @@ int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len)
 #endif /* __OS_linux */
 }
 
-/*
- * Bring a punched range back: populate it and, unless the arena runs
- * unpinned, mlock() it again IN THE CALLING PROCESS - mlock() is per VMA
- * and not inherited across fork(), so the maintenance process's munlock()
- * says nothing about a worker, and a carver that does not mlock gets the
- * page back swappable. mlock() populates as well as pins.
- * Tiers 2-4: a failure does not refuse the carve - the memory is valid,
- * only unpinned; counted in repin_failed and logged once.
- * Hugetlb: a failure MUST refuse - the punched page went back to the pool
- * unreserved, so a failed mlock() means it is gone and touching it would
- * SIGBUS; the caller refuses the request.
- */
+/* populate a punched range and re-mlock it in the calling process; -1 on
+ * hugetlb means the page is gone (refuse), elsewhere only unpinned */
 int hg_mem_repin(struct hg_block *hb, unsigned long off, unsigned long len,
                  int tier)
 {

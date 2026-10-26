@@ -34,17 +34,8 @@
 #include "../globals.h"
 #include "hg_buddy_int.h"
 
-/*
- * Trim: release whole-free pages from the TOP of the span, retracting it,
- * never below committed_min (-m/-M). Top-only keeps hg_owns() one contiguous
- * test and the registry entry valid. Whole-free needs no cross-process
- * coordination: a cell in any thread's private cache still counts in its
- * block's live count, so its page is never whole-free. The pages leave the
- * free list under hb->lock, out of every carve's reach, and grow_inflight
- * keeps other range operations out; the release runs with the lock RELEASED
- * and the bookkeeping finishes under it. A kernel refusal puts the pages back.
- * Returns the number of pages released.
- */
+/* Trim: release whole-free pages from the TOP of the span (so hg_owns()
+ * stays one range test), never below committed_min. Returns the pages. */
 static unsigned long buddy_shrink_body(struct hg_block *hb)
 {
 	unsigned long lpp = hg_leaves_per_page(hb);
@@ -54,11 +45,8 @@ static unsigned long buddy_shrink_body(struct hg_block *hb)
 	unsigned int top = hb->buddy_top;
 	int reason, rc;
 
-	/*
-	 * Only still-backed pages ("backed") count against committed_min: a
-	 * punched page's bytes left committed_bytes at the punch. The test
-	 * cannot wrap: backed never exceeds committed_bytes - committed_min.
-	 */
+	/* only still-backed pages count against committed_min: a punched
+	 * page's bytes left committed_bytes at the punch */
 	while (n < limit) {
 		struct hg_page *pg = &hb->pages[hb->npages - 1 - n];
 		unsigned long cost = pg->punched ? 0 : hb->hps;
@@ -69,9 +57,8 @@ static unsigned long buddy_shrink_body(struct hg_block *hb)
 			break;
 		if (hb->committed_bytes - backed < hb->committed_min + cost)
 			break;
-		/* stay above the headroom rule's line (free leaves after this
-		 * page >= 2x the floor after it), or the next tick regrows
-		 * what this one released */
+		/* stay above the headroom line (free >= 2x the floor after this
+		 * page), or the next tick regrows what this one released */
 		if (hb->buddy_free_leaves < bpages * lpp)
 			break;
 		free_after = hb->buddy_free_leaves - bpages * lpp;
@@ -94,8 +81,7 @@ static unsigned long buddy_shrink_body(struct hg_block *hb)
 	}
 
 	/* phase 1 - off the free set under the lock, out of every carve's
-	 * reach: the release below runs with the lock dropped. A punched
-	 * page is already off. */
+	 * reach; a punched page is already off */
 	for (i = hb->npages - n; i < hb->npages; i++) {
 		struct hg_page *pg = &hb->pages[i];
 
@@ -195,10 +181,8 @@ static unsigned long buddy_punch_body(struct hg_block *hb)
 	if (limit > HG_PAGES_PER_EVENT)
 		limit = HG_PAGES_PER_EVENT;
 
-	/* phase 1 - choose from the bottom, where the re-commit refills
-	 * too, and unlink each page so no carve can take it. The
-	 * floor is in COMMITTED bytes (a hole is not usable memory); the
-	 * span never moves */
+	/* phase 1 - choose from the bottom, where the re-commit refills too;
+	 * the floor is in COMMITTED bytes, as a hole is not usable memory */
 	for (i = 0; i + 1 < hb->npages && got < limit; i++) {
 		struct hg_page *pg = &hb->pages[i];
 
@@ -294,16 +278,8 @@ static unsigned long hg_buddy_punch_unlocks(struct hg_block *hb)
  * minutes at the 30 s sweep); a profile sets its own cycle count */
 #define HG_SHRINK_QUIET_TICKS 4
 
-/*
- * The shrink decision, once per sweep interval, hb->lock held. A tick is quiet
- * only if elastic bytes exist, nothing is starved (below the floor,
- * grow-blocked) and free space passes the drain's own gate (hg_drain_tick()).
- * The release then re-checks every page against what it would leave
- * (buddy_shrink_body()), so a shrink never re-triggers pressure; asking here
- * for a whole grow step on top would keep any arena under about a step plus
- * four floors from ever shrinking. Any failed condition, and any grow,
- * resets the window.
- */
+/* The shrink decision, once per sweep interval. No grow-step margin here:
+ * buddy_shrink_body() re-checks each page, so a shrink cannot cause a grow. */
 static void shrink_tick_body(struct hg_block *hb)
 {
 	unsigned long lpp = hg_leaves_per_page(hb);
@@ -327,10 +303,8 @@ static void shrink_tick_body(struct hg_block *hb)
 		hb->shrink_quiet = 0;
 		return;
 	}
-	/* never shrink an arena that is starved or latched, policy or not. A
-	 * busy top page ends the tick only without interior release: it
-	 * blocks just the trim (which re-tests it), and it is the very case
-	 * the punch exists for */
+	/* never shrink a starved or latched arena; a busy top page ends the
+	 * tick only without interior release, as the punch exists for it */
 	if (hb->below_floor || hb->grow_blocked ||
 	    (!hg_interior_release &&
 	     !page_is_whole_free(hb, &hb->pages[hb->npages - 1]))) {
@@ -338,9 +312,8 @@ static void shrink_tick_body(struct hg_block *hb)
 		return;
 	}
 	if (hb->pol.active) {
-		/* the profile's quiet test: usage at or below its
-		 * down-threshold, and free space of at least a page plus
-		 * twice the floor */
+		/* the profile's quiet test: usage at or below down_pct, and
+		 * free space of at least a page plus twice the floor */
 		if (hg_get_real_used(hb) * 100 > (unsigned long)hb->pol.down_pct *
 		                          hb->committed_bytes ||
 		    hb->buddy_free_leaves < lpp + hb->reserve_floor * 2) {
@@ -382,13 +355,8 @@ void hg_shrink_tick(struct hg_block *hb)
 	hg_lock_assert_held(hb, "hg_shrink_tick return");
 }
 
-/*
- * One drain step, hb->lock held: the top trim, then the interior punch. Every
- * maintenance tick (1 s) while draining, and once from the sweep fallback. The
- * gates are re-tested each step, since one tick of demand withdraws the
- * decision; free space must exceed the headroom line (2x the floor with a
- * profile, 4x without) by a page, so a drain never trips the regrow.
- */
+/* One drain step, hb->lock held: the top trim, then the interior punch.
+ * The gates are re-tested each step, as one tick of demand ends the drain. */
 void hg_drain_tick(struct hg_block *hb)
 {
 	unsigned long lpp = hg_leaves_per_page(hb), released;

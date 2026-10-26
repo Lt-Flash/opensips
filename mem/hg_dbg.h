@@ -25,14 +25,8 @@
 
 #include "hg_malloc.h"
 
-/*
- * HG_MALLOC_DBG checks, on an arena with hb->dbg set. Each allocation gets
- * HG_DBG_TAIL extra bytes: the cell's last HG_DBG_TAIL bytes hold the size
- * asked for (encoded) and the gap up to them is HG_DBG_REDZONE, so a free
- * finds a write past the request. A freed cell is filled with HG_DBG_POISON
- * and held in a per-thread quarantine; a byte changed when it leaves means a
- * write after free.
- */
+/* HG_MALLOC_DBG: a cell's last HG_DBG_TAIL bytes hold the encoded size and
+ * the gap before them is red zone; freed cells are poisoned, quarantined */
 #define HG_DBG_TAIL     (sizeof(unsigned long))
 #define HG_DBG_REDZONE  0xcc
 #define HG_DBG_POISON   0x6b
@@ -40,15 +34,13 @@
 #define HG_QUAR_MIN     (16UL << 10)
 #define HG_QUAR_MAX     (1UL << 20)
 
-/* stamp the trailer and red zone of the cell starting at @cs, which holds
- * @cap payload bytes of which @size were asked for (size + HG_DBG_TAIL <=
- * cap); check them - 0 if intact, else counted (overflow) and logged */
+/* stamp/check the trailer and red zone of cell @cs (@cap payload bytes,
+ * @size asked for); check returns 0 if intact, else counts and logs */
 void hg_dbg_tail_set(void *cs, unsigned long cap, unsigned long size);
 int hg_dbg_tail_check(struct hg_block *hb, void *cs, unsigned long cap);
 
-/* the per-thread, per-arena quarantine: a FREE cell of class @c in, poisoned;
- * all out, checked - returns how many left; emptied without releasing
- * anything (after fork, when the cells are the parent's) */
+/* per-thread, per-arena quarantine: put poisons a FREE cell of class @c in,
+ * drain checks all out (returns how many left), reset empties after fork */
 void hg_quar_put(struct hg_block *hb, struct hg_palloc *pl, unsigned int c,
                  char *cs);
 unsigned int hg_quar_drain(struct hg_block *hb, struct hg_palloc *pl);

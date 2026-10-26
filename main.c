@@ -394,10 +394,8 @@ error:
  * \return don't return on sucess, -1 on error
  * \see main_loop
  */
-/* One half of -m/-M INIT[:CAP]: a number with an optional k/m/g suffix,
- * returned in BYTES. A bare number keeps the historical meaning of
- * megabytes. On return *end points past everything consumed (the ':'
- * separator or a trailing garbage character is the caller's to judge). */
+/* one half of -m/-M INIT[:CAP], in BYTES (k/m/g suffix, bare = MB); *end is
+ * left past what was consumed, for the caller to judge the rest */
 static long parse_mem_size(const char *s, char **end)
 {
 	long v = strtol(s, end, 10);
@@ -449,28 +447,16 @@ int main(int argc, char** argv)
 	while((c=getopt(argc,argv,options))!=-1){
 		switch(c){
 			case 'M':
-					/* parsed signed: pkg_mem_size is unsigned, so a
-					 * "-M -5" stored there first would pass any <= 0 test */
+					/* signed: pkg_mem_size is unsigned,
+					 * so -M -5 would pass a <= 0 test */
 					memv = parse_mem_size(optarg, &tmp);
 					if (memv <= 0) {
 						LM_ERR("bad pkgmem size number: -M %s\n", optarg);
 						goto error00;
 					}
 					pkg_mem_size = memv;
-					/*
-					 * -M INIT[:CAP] - CAP of growth headroom for the
-					 * elastic arena. A COMMAND LINE extension rather
-					 * than a config global because this runs before the
-					 * config is parsed, and the reservation (for tier-1
-					 * hugetlb, a map-time pool reservation) must exist
-					 * before the first arena is created. The
-					 * auto-scaling profile from the config supplies the
-					 * POLICY within this reservation, never the
-					 * reservation itself.
-					 *
-					 * Each half takes an optional k/m/g suffix
-					 * (-M 512k:16m); a bare number stays megabytes.
-					 */
+					/* :CAP reserves growth room before cfg
+					 * parsing; profiles only set policy */
 					if (tmp && *tmp == ':') {
 						long capv = parse_mem_size(tmp + 1, &tmp);
 
@@ -497,7 +483,7 @@ int main(int argc, char** argv)
 						goto error00;
 					}
 					shm_mem_size = memv;
-					/* -m INIT[:CAP], see the -M note above */
+					/* INIT[:CAP], as for -M above */
 					if (tmp && *tmp == ':') {
 						long capv = parse_mem_size(tmp + 1, &tmp);
 

@@ -23,12 +23,8 @@
 #ifndef hg_memlimit_h
 #define hg_memlimit_h
 
-/*
- * How much memory may still be committed: the tighter of the host's room
- * (/proc/meminfo) and the memory cgroup's (a container limit, systemd
- * MemoryMax). A limited cgroup meets its limit first, and the kernel's OOM
- * killer then acts on the cgroup alone.
- */
+/* memory still committable: the tighter of the host's room (/proc/meminfo)
+ * and the memory cgroup's, whose limit binds first and scopes the OOM kill */
 
 /* the floor a commit must leave free, in MB, on @total_mb of memory: a
  * twentieth, but at least the smaller of 256 MB and an eighth */
@@ -43,33 +39,16 @@ struct hg_cg_info {
 	unsigned long floor_mb; /* what the floor keeps free */
 };
 
-/*
- * Room - what the host or a cgroup leaves above its floor - is in 64-bit
- * bytes on every build: a 32-bit process addresses at most 4 GB, but the
- * host and the processes together are not held to that. HG_ROOM_ANY: no
- * limit known.
- */
+/* room above a floor, in 64-bit bytes even on 32-bit builds: the host is
+ * not held to the process's 4 GB; HG_ROOM_ANY = no limit known */
 #define HG_ROOM_ANY (~0ULL)
 
-/*
- * The room the calling process's memory cgroups leave above their floors:
- * the tightest of its own and every limited ancestor. HG_ROOM_ANY when none
- * is limited or the files cannot be read (not Linux, no memory controller);
- * the host check then decides alone. @ci, if given, gets the binding level.
- */
+/* room the caller's memory cgroups leave above their floors, the tightest
+ * level; HG_ROOM_ANY if none is limited or readable. @ci gets that level */
 unsigned long long hg_cgroup_room(struct hg_cg_info *ci);
 
-/*
- * The host-RAM limb of the growth ceiling: would committing @delta more
- * bytes leave the host, or the memory cgroup, under its floor? Tier 1
- * always passes: a hugetlb mapping reserved its whole cap from the pool at
- * map time. For pkg the delta is multiplied by the process count (every
- * worker grows its own arena). In two halves, so /proc and the cgroup files
- * are read without hb->lock: hg_grow_room_short() reads and decides,
- * writing no arena field - run in a grow's unlocked phase, once it holds
- * grow_inflight - and hg_grow_room_refused() records a refusal and warns,
- * once per episode, under the lock.
- */
+/* would committing @delta more bytes break the host or cgroup floor? _short()
+ * decides without hb->lock; _refused() records and warns, under the lock */
 struct hg_block;
 
 struct hg_room_short {
@@ -83,9 +62,8 @@ unsigned int hg_grow_room_short(const struct hg_block *hb,
 		unsigned long delta, struct hg_room_short *rs);
 void hg_grow_room_refused(struct hg_block *hb, const struct hg_room_short *rs);
 
-/* test hook: read the cgroup files under @root and the membership from
- * @self_cgroup instead of /sys/fs/cgroup and /proc/self/cgroup; NULL
- * restores the defaults */
+/* test hook: read cgroup files under @root and membership from @self_cgroup
+ * instead of /sys/fs/cgroup and /proc/self/cgroup; NULL restores them */
 void hg_cgroup_test_paths(const char *root, const char *self_cgroup);
 
 /* the file host memory is read from, /proc/meminfo; test hook: read it

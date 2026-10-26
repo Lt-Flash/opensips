@@ -37,11 +37,8 @@
 
 /* --- grow ------------------------------------------------------------- */
 
-/*
- * A RESOURCE refusal - the host, not the admin, said no: count it and run the
- * two-step latch (see grow_blocked's declaration). The event is raised by the
- * sweep timer via grow_event_due, never here under hb->lock.
- */
+/* a RESOURCE refusal (the host, not the admin, said no): count it and run
+ * the two-step latch; the event is raised later by the sweep timer */
 static int grow_resource_refused(struct hg_block *hb)
 {
 	hb->grow_refused++;
@@ -50,9 +47,8 @@ static int grow_resource_refused(struct hg_block *hb)
 		return -1;
 
 	if (!hb->grow_blocked_mark) {
-		/* the mark doubles as the "armed" flag: gc_passes + 1
-		 * is never 0, and is the count gc_passes reaches once a
-		 * GC pass has run */
+		/* the mark doubles as the "armed" flag: gc_passes + 1 is
+		 * never 0, and is what gc_passes reaches after one GC pass */
 		hb->grow_blocked_mark = hb->gc_passes + 1;
 		hb->grow_blocked_refuse0 = hb->grow_refused;
 	} else if (hb->gc_passes >= hb->grow_blocked_mark) {
@@ -80,10 +76,8 @@ void hg_grow_unblock(struct hg_block *hb, const char *how)
 	hb->grow_refuse_mlock = 0;
 }
 
-/*
- * The sweep timer's half of the latch (see grow_blocked_refuse0), once per
- * sweep interval with hb->lock held.
- */
+/* the sweep timer's half of the latch (see grow_blocked_refuse0), once per
+ * sweep interval with hb->lock held */
 void hg_grow_blocked_tick(struct hg_block *hb)
 {
 	if (hb->grow_blocked || !hb->grow_blocked_mark)
@@ -111,18 +105,8 @@ void hg_grow_blocked_tick(struct hg_block *hb)
 static int hg_buddy_regrow_holes_unlocks(struct hg_block *hb, unsigned long need,
                                          unsigned long room);
 
-/*
- * Deferred collapse. A worker's exhaustion grow publishes a delta that did not
- * fault in huge on 4 KB pages, flagged want_collapse (hg_mem_commit()), so the
- * worker does not wait for the MADV_COLLAPSE retrofit. The maintenance process
- * calls this every tick: at most one pass over the pages, each flagged page
- * collapsed with the arena lock released, until HG_COLLAPSE_BUDGET_NS is
- * spent. Failures are usually transient (a page just faulted cannot be
- * isolated yet), so a page gets HG_COLLAPSE_TRIES attempts over later ticks
- * before it is left on 4 KB. Pages are only released by this same process, so
- * a page picked here cannot be released under it; the flag is re-checked
- * once the lock is back all the same.
- */
+/* collapse the 4 KB pages a worker's grow left flagged want_collapse, lock
+ * released per page, within HG_COLLAPSE_BUDGET_NS and HG_COLLAPSE_TRIES */
 #define HG_COLLAPSE_BUDGET_NS	(100UL * 1000000UL)
 
 void hg_collapse_deferred(struct hg_block *hb)
@@ -190,14 +174,8 @@ void hg_collapse_deferred(struct hg_block *hb)
 	}
 }
 
-/*
- * Grow in three phases: RESERVE the range under hb->lock, POPULATE it with
- * hg_mem_commit() with the lock released (faulting, pinning and verifying the
- * backing are slow and must not stall the arena), PUBLISH under the lock.
- * grow_inflight keeps every other grow, trim and punch out meanwhile. Reached
- * on buddy exhaustion (carve_chunk, the large tier) and from the proactive
- * ticks, never on the fast path.
- */
+/* grow in three phases: RESERVE under hb->lock, POPULATE unlocked, PUBLISH
+ * under it; grow_inflight keeps other grows, trims and punches out */
 static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow_why why)
 {
 	unsigned long delta, room, old_pages, i, limit, off, commit_ns;
@@ -224,23 +202,16 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 		return -1;
 	}
 
-	/*
-	 * Another grow is in flight: wait for its publish WITHOUT the lock and
-	 * report "grew", so the caller retries its carve on the new pages.
-	 */
+	/* another grow is in flight: wait for its publish WITHOUT the lock and
+	 * report "grew", so the caller retries its carve on the new pages */
 	if (hb->grow_inflight) {
 		unsigned long gen = hb->grow_gen, waited = 0;
 
 		hb->grow_waits++;
 		reason = hb->lk_cur;
 		t0 = hg_now_ns();
-		/*
-		 * The token can be re-taken between the poll seeing it
-		 * clear and the lock coming back (a grow after a refused
-		 * one, the drain's punch after its trim). That is no
-		 * timeout: keep waiting, within the same budget, until it
-		 * is clear UNDER the lock.
-		 */
+		/* the token can be re-taken between poll and relock: not a
+		 * timeout, keep waiting till it is clear UNDER the lock */
 		do {
 			hg_lock_leave(hb);
 			do {
@@ -249,9 +220,8 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 			} while (__atomic_load_n(&hb->grow_inflight, __ATOMIC_ACQUIRE) &&
 			         waited < HG_GROW_WAIT_MAX_NS);
 			hg_lock_enter(hb, (enum hg_lock_reason)reason);
-			/* a grow or a hole re-grow published pages: retry the
-			 * carve. A trim or a punch also holds the token; after
-			 * one of those, try this caller's own grow below */
+			/* new pages published: retry the carve; after a trim
+			 * or a punch, try this caller's own grow below */
 			if (hb->grow_gen != gen) {
 				hg_lkstat_add(&hb->lk_grow_wait, waited);
 				return 0;
@@ -271,18 +241,15 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 	 * reservation), else the reservation */
 	limit = (hb->pol.active && hb->pol.up_bytes) ? hb->pol.up_bytes
 	                                             : hb->hcap;
-	/* room is counted in committed bytes: the ceiling bounds what is
-	 * backed, not the span. Holes are refilled first (below); an append
-	 * past the reservation is refused by hg_mem_commit() */
+	/* room is in committed bytes: the ceiling bounds what is backed, not
+	 * the span; holes are refilled first (below) */
 	room = limit > hb->committed_bytes ? limit - hb->committed_bytes : 0;
 	if (room == 0) {
 		hb->grow_refused++;
 		hb->grow_refuse_why = limit == hb->hcap ? HG_GR_CAP
 		                                        : HG_GR_PROFILE;
-		/* a ceiling doing its job is a notice, not an alarm; an arena
-		 * with no cap lives here silently. grows > 0 tells them apart:
-		 * a growable arena reaches room == 0 only by growing. Once per
-		 * episode; grow_refused counts. */
+		/* a ceiling doing its job is a notice, once per episode;
+		 * an arena with no cap (grows == 0) stays silent here */
 		if (hb->grows && !hb->grow_refuse_said) {
 			hb->grow_refuse_said = 1;
 			LM_NOTICE("%s: at the %lu MB growth ceiling (%s), "
@@ -322,9 +289,8 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 	reason = hb->lk_cur;
 	hg_lock_leave(hb);
 
-	/* phase 2 - the host-RAM limb of the ceiling before any work is done
-	 * (it reads /proc and the cgroup files: not under the lock), then
-	 * POPULATE with the lock released */
+	/* phase 2 - the host-RAM limb of the ceiling (reads files: not under
+	 * the lock), then POPULATE with the lock released */
 	if (hg_grow_room_short(hb, delta, &rs)) {
 		hg_lock_enter(hb, (enum hg_lock_reason)reason);
 		hb->span_pending = hb->span_end;
@@ -354,10 +320,8 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 	}
 
 	hb->tier_bytes[tier] += delta;
-	/* hb->size feeds every "total/free" report and free_to_carve
-	 * (size - real_used), which underflows if size lags. The per-thread
-	 * cache budget and chunk_max keep their init values, so the cell
-	 * caches do not change behaviour mid-flight. */
+	/* hb->size feeds free_to_carve (size - real_used), which underflows if
+	 * size lags; cache budget and chunk_max keep their init values */
 	hb->size += delta;
 	old_pages = hb->npages;
 	hb->npages = (unsigned long)(hb->hbase + off + delta - hb->pbase)
@@ -417,15 +381,8 @@ int hg_buddy_grow_unlocks(struct hg_block *hb, unsigned long need, enum hg_grow_
 	return r;
 }
 
-/*
- * Re-commit holes, from hg_buddy_grow_unlocks() before it extends the span. A
- * hole is faulted back in AND re-pinned in THIS process before it can be
- * carved again: mlock() is per-vma and does not survive fork. Phases as in the
- * grow: select under hb->lock (holes are off the free list, so no carve
- * reaches them; grow_inflight keeps trim and punch out), pin with the lock
- * released, publish under it. Returns 1 if it served the request, 0 if no hole
- * could serve it, -1 if the RAM limb or every re-pin refused.
- */
+/* re-commit holes before the span grows: each is re-pinned in THIS process
+ * (mlock() does not survive fork). 1 served, 0 no hole fits, -1 refused */
 static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
                                    unsigned long room)
 {
@@ -474,10 +431,8 @@ static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
 		return grow_resource_refused(hb);
 	}
 
-	/* phase 2 - pin, in this process, lock released. On hugetlb a hole's
-	 * pages went back to the pool for anyone to take, so the re-commit can
-	 * fail and those pages stay holes. The other tiers populate even when
-	 * they cannot pin (hg_mem_repin() counts that). */
+	/* phase 2 - pin, in this process, lock released; on hugetlb a hole's
+	 * pages went back to the pool, so this can fail and leave holes */
 	t0 = hg_now_ns();
 	for (i = 0, ok = 0; i < got; i++) {
 		struct hg_page *pg = &hb->pages[sel[i]];
@@ -545,12 +500,8 @@ static int hg_buddy_regrow_holes_unlocks(struct hg_block *hb, unsigned long need
 	return r;
 }
 
-/*
- * The always-on headroom rule, profile or not: keep the free grid above twice
- * the floor while the reservation allows, so the arena does not sit at its
- * floor flushing caches every sweep. Ticked every second by the maintenance
- * process, else once per sweep interval. Returns 1 if it grew.
- */
+/* always-on headroom rule: keep the free grid above twice the floor while
+ * the reservation allows, so caches are not flushed every sweep; 1 if grew */
 static int grow_headroom_tick_body(struct hg_block *hb)
 {
 	if (!hb->buddy_ready || !hg_grow_ahead)
@@ -573,12 +524,8 @@ int hg_grow_headroom_tick(struct hg_block *hb)
 	return r;
 }
 
-/*
- * The profile's proactive grow: grow BEFORE exhaustion when usage crossed the
- * up-threshold often enough. Same call sites and lock contract as
- * hg_shrink_tick(). Exhaustion growth stays armed with a profile too: a burst
- * between ticks must not fail allocations.
- */
+/* the profile's proactive grow, before exhaustion once usage crossed the
+ * up-threshold often enough; same call sites and locking as hg_shrink_tick() */
 static void grow_tick_body(struct hg_block *hb)
 {
 	int hit;

@@ -295,9 +295,8 @@ int shm_mem_init_mallocs(void* mempool, unsigned long pool_size,int idx)
 #elif defined F_PARALLEL_MALLOC
 	shm_blocks[idx] = parallel_malloc_init(mempool, pool_size, "shm", idx);
 #elif defined HG_MALLOC
-	/* ignores mempool/pool_size as an address - HG_MALLOC does its own
-	 * reservation, pool_size is reused only as the size to request, see
-	 * the shm_mem_init() caller-side skip of shm_getmem() for this case */
+	/* HG_MALLOC reserves its own arena: mempool is unused (shm_mem_init()
+	 * skips shm_getmem()), pool_size is only the size to request */
 	shm_block = hg_malloc_init(pool_size, "shm", 1, NULL, 0);
 #endif
 #else
@@ -325,13 +324,8 @@ int shm_mem_init_mallocs(void* mempool, unsigned long pool_size,int idx)
 
 #ifdef HG_MALLOC
 	if (mem_allocator_shm == MM_HG_MALLOC || mem_allocator_shm == MM_HG_MALLOC_DBG) {
-		/* HG_MALLOC does its own internal locking (hb->lock, slow-path
-		 * only) - without this, shm_lock()/shm_unlock() would still
-		 * acquire the unrelated F_MALLOC/Q_MALLOC-style global mem_lock
-		 * around every hg_malloc()/hg_free() call: not a corruption risk
-		 * (hg_malloc still does its own correct locking underneath), but
-		 * it would serialize every shm allocation behind one lock again,
-		 * defeating the fine-grained design entirely. */
+		/* HG locks internally (hb->lock, slow path only); the global
+		 * mem_lock would serialise every shm allocation again */
 		shm_use_global_lock = 0;
 	}
 #endif
@@ -526,8 +520,8 @@ int shm_mem_init_mallocs(void* mempool, unsigned long pool_size,int idx)
 #endif
 #ifdef HG_MALLOC
 	case MM_HG_MALLOC:
-		/* ignores mempool - HG_MALLOC does its own reservation; see the
-		 * shm_mem_init() caller-side skip of shm_getmem() for this case */
+		/* mempool unused: HG_MALLOC reserves its own arena (see the
+		 * shm_getmem() skip in shm_mem_init()) */
 		shm_block = hg_malloc_init(pool_size, "shm", 1, NULL, 0);
 		gen_shm_malloc         = (osips_block_malloc_f)hg_malloc;
 		gen_shm_malloc_unsafe  = (osips_block_malloc_f)hg_malloc;
@@ -924,12 +918,8 @@ int shm_mem_init(void)
 #ifdef HG_MALLOC
 	} else if (mem_allocator_shm == MM_HG_MALLOC ||
 	           mem_allocator_shm == MM_HG_MALLOC_DBG) {
-		/* HG_MALLOC does its own reservation (its own hugepage tier
-		 * ladder) - shm_getmem()'s plain mmap is skipped entirely here,
-		 * not just allocated-and-ignored, since for -m sized regions
-		 * (often gigabytes) that would be a real leak, not a rounding
-		 * error. mempool is passed as NULL: shm_mem_init_mallocs() never
-		 * dereferences it for this allocator. */
+		/* HG_MALLOC reserves its own arena: skip shm_getmem(), whose
+		 * -m sized mmap would just leak; mempool NULL is never read */
 #ifndef USE_ANON_MMAP
 		close(fd);
 #endif /* USE_ANON_MMAP */
@@ -1225,17 +1215,8 @@ void shm_mem_destroy(void)
 #endif
 
 #ifdef HG_MALLOC
-	/*
-	 * shm_mempool/shm_dbg_mempool were never set for HG_MALLOC (see the
-	 * shm_getmem() skip in shm_mem_init()/shm_dbg_mem_init()) - the real
-	 * reservation is hb->hbase/hb->hcap, owned and released entirely by
-	 * hg_malloc_destroy() (arena teardown + lock_destroy + munmap of the
-	 * actual hugepage mapping). A runtime check, not a compile-time
-	 * unconditional return like F_PARALLEL_MALLOC above: a multi-allocator
-	 * build could have HG_MALLOC compiled in while some other allocator is
-	 * the one actually selected at runtime, which still needs the cleanup
-	 * below.
-	 */
+	/* hg_malloc_destroy() owns HG's mapping (shm_mempool is never set);
+	 * a runtime test, as another allocator may be the one selected */
 	if (mem_allocator_shm == MM_HG_MALLOC || mem_allocator_shm == MM_HG_MALLOC_DBG) {
 		if (shm_block)
 			hg_malloc_destroy((struct hg_block *)shm_block);

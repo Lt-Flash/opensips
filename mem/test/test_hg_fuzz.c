@@ -20,32 +20,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,USA
  */
 
-/*
- * A seeded random sequence of malloc / free / realloc / read-back, checked
- * after every step against a model that knows nothing of the allocator's
- * insides: its own table of live blocks, a stamp written into every byte of
- * each one, and a set of the live addresses. What it checks:
- *
- *   identity      no address is handed out while it is still live
- *   alignment     every block is 8-aligned
- *   non-overlap   and data integrity: each block reads back its own stamp
- *                 at every free, realloc and read-back, and all blocks are
- *                 read back every HGF_CHECK steps - two live blocks that
- *                 overlap cannot both keep their stamps
- *   realloc       the prefix both sizes share survives a move; a NULL
- *                 leaves the old block valid; to 0 bytes it is a free
- *   accounting    this process's live-fragment count in the arena moves by
- *                 exactly the model's count; its used bytes cover the bytes
- *                 the model asked for (a bound only - size classes round up)
- *   failure       on a capped arena: allocations do fail, nothing already
- *                 handed out is damaged by the failures, and after frees the
- *                 arena serves again
- *
- * Each run is one seed in one child; a failure prints the seed, the step
- * and the last HGF_LOG steps, and HG_FUZZ_SEED / HG_FUZZ_OPS in the
- * environment replay it. A seed that ever found a bug goes into
- * hgf_seeds[] for good.
- */
+/* Seeded random malloc/free/realloc, checked each step against an outside
+ * model (stamps, live set, counts); HG_FUZZ_SEED/HG_FUZZ_OPS replay one. */
 
 #ifdef HG_MALLOC
 
@@ -443,12 +419,8 @@ static int hgf_child_shm(void *arg)
 	return hgf_run(f);
 }
 
-/*
- * A capped arena run into its cap: allocations fail and nothing handed out
- * is damaged by the failures; then half is freed and the arena must serve
- * again - under HG_MALLOC_DBG this is also the quarantine's drain-on-failure
- * path. A run that never reaches the cap proves nothing and fails.
- */
+/* a capped arena run into its cap: nothing handed out is damaged and
+ * after frees it serves again; a run that never reaches the cap fails */
 static int hgf_child_capped(void *arg)
 {
 	struct hgf *f = &F;

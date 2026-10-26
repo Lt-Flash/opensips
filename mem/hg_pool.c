@@ -36,21 +36,13 @@
 #include "../globals.h"
 #include "hg_arena_int.h"
 
-/*
- * Ownership is hg_owns() (hg_malloc.h), against the reservation's bounds,
- * fixed at init, so a lock-free reader never sees them move. A cell of
- * another hg arena has a valid-looking class byte: taken here, its real
- * owner would reuse it and overwrite the free-list link. Refusing the free
- * leaks one cell; accepting it corrupts the pool.
- */
+/* ownership is hg_owns(), against bounds fixed at init: another arena's cell
+ * looks valid, but pooled here its real owner would overwrite the link */
 /* global pool ops - hb->lock must be held. Both take/return cell_start. */
 /* --- shared free cells, held per block and graded by fullness ---------- */
 
-/*
- * Which fullness list a block belongs on, from its own free-cell count.
- * Grade 0 is the fullest partial (fewest free cells): a refill drains it and
- * leaves the emptier blocks to reach zero.
- */
+/* a block's fullness list, from its free-cell count; grade 0 is the fullest
+ * partial, so a refill drains it and leaves emptier blocks to reach zero */
 static inline unsigned int grade_of(const struct hg_chunk *ch)
 {
 	unsigned int g;
@@ -171,12 +163,8 @@ static inline int pool_link_ok(struct hg_block *hb, struct hg_chunk *ch,
 	return 1;
 }
 
-/*
- * Hand fully-drained blocks of class @c back to the buddy, down to @keep
- * of them (the class's demand-sized reserve) and at most @limit per call.
- * O(1) per block: a drained block's cells are all on its own list, which is
- * discarded with it. hb->lock must be held.
- */
+/* hand drained blocks of class @c back to the buddy, down to @keep and at
+ * most @limit per call; O(1) per block. hb->lock must be held */
 static unsigned int gc_class_run(struct hg_block *hb, int c, unsigned int keep,
                                  unsigned int limit);
 
@@ -202,9 +190,8 @@ static unsigned int gc_class_run(struct hg_block *hb, int c, unsigned int keep,
 		unsigned int ord;
 		unsigned long sz;
 
-		/* the oldest drained block (the head, most recently drained, is
-		 * the one worth keeping); the tail pointer saves an O(n^2) walk
-		 * under hb->lock */
+		/* the oldest drained block, via the tail: the head, the most
+		 * recently drained, is the one worth keeping */
 		ch = hb->drained_tail[c];
 #ifdef HG_PARANOIA
 		{
@@ -238,9 +225,8 @@ static unsigned int gc_class_run(struct hg_block *hb, int c, unsigned int keep,
 		ch->in_gpool = 0;
 		ch->free_head = NULL;
 
-		/* out of the registry, or hg_slab_recycled() counts a capacity
-		 * that is gone and the DBG walker reads a block the buddy has
-		 * since handed to another class */
+		/* out of the registry, or hg_slab_recycled() and the DBG walker
+		 * see a block the buddy has since handed elsewhere */
 		if (ch->prev)
 			ch->prev->next = ch->next;
 		else
@@ -309,23 +295,16 @@ int hg_gpool_push(struct hg_block *hb, int c, void *cell_start)
 	hb->gpool_n[c]++;
 	block_regrade(hb, c, ch);
 
-	/*
-	 * The maintenance tick returns drained blocks; this path returns a
-	 * batch only once the list is HG_GC_EMERGENCY past keep. Never during a
-	 * flush (gc_deferred), for correctness: the buddy reuses a returned
-	 * block's first bytes at once, and the flush walk may still reach the
-	 * next cell of that block.
-	 */
+	/* a batch only past HG_GC_EMERGENCY beyond keep, never in a flush
+	 * (gc_deferred): the buddy reuses a block the walk may still reach */
 	if (!hb->gc_deferred &&
 	    hb->ndrained[c] > hb->gc_keep[c] + HG_GC_EMERGENCY)
 		hb->gc_inline_blocks += hg_gc_class(hb, c, hb->gc_keep[c], HG_GC_EMERGENCY);
 	return 0;
 }
 
-/*
- * Take a shared cell from the fullest partial block, the concentration the
- * reclaim depends on: at most HG_GRADES pointer tests.
- */
+/* a shared cell from the fullest partial block, the concentration reclaim
+ * depends on: at most HG_GRADES pointer tests */
 void *hg_gpool_pop(struct hg_block *hb, int c)
 {
 	struct hg_chunk *ch = NULL;
@@ -391,11 +370,8 @@ void *hg_gpool_pop(struct hg_block *hb, int c)
 	return cell_start;
 }
 
-/*
- * Recompute every class's keep from the cycle just ended: the larger of the
- * cycle's carves and half the old keep, capped by a byte budget and
- * HG_GC_KEEP_MAX blocks. hb->lock held.
- */
+/* recompute each class's keep: the larger of the cycle's carves and half the
+ * old keep, capped by a byte budget and HG_GC_KEEP_MAX. hb->lock held */
 void hg_gc_cycle(struct hg_block *hb)
 {
 	unsigned long budget = hb->size >> HG_GC_KEEP_BUDGET_SHIFT;
@@ -415,11 +391,8 @@ void hg_gc_cycle(struct hg_block *hb)
 	}
 }
 
-/*
- * The deferred GC: return up to @budget drained blocks beyond their classes'
- * keep, round-robin so one class cannot starve the rest. hb->lock held; run
- * by the maintenance tick (shm) or the owner's sweep (private arena).
- */
+/* deferred GC: return up to @budget drained blocks beyond keep, round-robin
+ * so one class cannot starve the rest. hb->lock held */
 unsigned int hg_gc_tick(struct hg_block *hb, unsigned int budget)
 {
 	unsigned int done = 0, n;

@@ -18,11 +18,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-/*
- * Thin public API over hg_cell_alloc()/hg_cell_free() (hg_arena.c): fixed
- * size classes leave no fragment splitting to do here. Same ifdef convention
- * as the other _dyn.h files (single/multi allocator x dbg/non-dbg).
- */
+/* Thin public API over hg_cell_alloc()/hg_cell_free() (hg_arena.c), in the
+ * other _dyn.h files' ifdef convention (single/multi x dbg/non-dbg) */
 
 #if !defined INLINE_ALLOC && defined DBG_MALLOC
 void *hg_malloc_dbg(struct hg_block *hb, unsigned long size,
@@ -65,9 +62,8 @@ void hg_free(struct hg_block *hb, void *p, const char *file,
 #ifdef DBG_MALLOC
 	LM_GEN1(memlog, "%s_free(%p), called from %s: %s(%d)\n", hb->name, p,
 		file, func, line);
-	/* judge by ANY live arena, not @hb alone: a child freeing what the
-	 * parent allocated pre-fork hands in a pointer from the inherited pkg
-	 * arena, which hg_cell_free() redirects to its owner (hg_owner()) */
+	/* judge by ANY live arena, not @hb alone: a child may free inherited
+	 * pkg memory, which hg_cell_free() hands back to its owner */
 	if (p && !hg_owns_any(HG_HDR(p))) {
 		LM_CRIT("bad pointer %p (out of memory block!) - aborting\n", p);
 		abort();
@@ -125,8 +121,7 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 		#endif
 
 	/* an impossible size is refused before the in-place arithmetic below,
-	 * which would wrap and keep the cell for it; as in hg_cell_alloc(),
-	 * and the allocation stays as it is */
+	 * which would wrap; the allocation stays as it is */
 	if (size > hb->hcap) {
 		hg_lock_enter(hb, HG_LK_REFILL);
 		if (hg_oom_first(hb, size))
@@ -138,10 +133,8 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 		return NULL;
 	}
 
-	/* ownership BEFORE the header is read: a foreign or unmapped pointer
-	 * would fault there. Any live arena will do, so a child can realloc
-	 * inherited pkg memory: it is read in place, and a move frees it
-	 * through hg_free(), which hands it back to its owner (hg_owner()) */
+	/* ownership BEFORE the header is read (a foreign pointer would fault);
+	 * any live arena will do: a child may realloc inherited pkg memory */
 	src = hg_owner(HG_HDR(p));
 	if (!src) {
 		LM_CRIT("%s: realloc of %p, which is from no live arena - "
@@ -166,16 +159,8 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 		hg_corrupt(hb, st < 0 ? HG_C_HEADER : HG_C_DOUBLE_FREE);
 		return NULL;
 	}
-	/*
-	 * cur_payload is what the caller may read from @p; the tiers put
-	 * different headers in front of it:
-	 *   small : [ HG_CELL_HDR | payload ]
-	 *   large : [ HG_LFRAG_HDR_SIZE | HG_CELL_HDR | payload ]
-	 * hg_large_frag_size_at() counts the whole frag, so both come off.
-	 * A small cell whose class still fits the new size (same rule as
-	 * hg_cell_alloc()) is kept; a large one always moves (alloc, copy,
-	 * free) - in-place resize via neighbouring frags is not done.
-	 */
+	/* cur_payload is what the caller may read from @p; a small cell whose
+	 * class still fits is kept, a large one always moves */
 	cls = HG_CLASS(p);
 	if (cls == HG_LARGE_MARKER) {
 		cur_total = hg_large_frag_size_at(HG_HDR(p) - HG_LFRAG_HDR_SIZE);
@@ -195,9 +180,8 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 		if (hb->dbg)
 			need_total += HG_DBG_TAIL;
 		if (need_total <= cur_total) {
-			/* HG_MALLOC_DBG and the guard move to the new size - checked
-			 * first, so a write past the old size is still seen. Judged
-			 * by the arena the cell came from (see hg_owner()). */
+			/* the dbg tail or guard moves to the new size, checked
+			 * first so a write past the old size is still seen */
 			struct hg_block *own = hb->dbg || HG_SAN_ON ||
 				st == HG_ST_LIVE_G ? hg_owner(HG_HDR(p)) : NULL;
 
@@ -229,9 +213,8 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 		/* copy min(old, new): a small shrink returned above, but a
 		 * shrink from the large tier gets here */
 		copy = cur_payload < size ? cur_payload : size;
-		/* the copy may read past what the caller asked for: a
-		 * sanitizer must see those bytes open first (hg_san.h) - the
-		 * bytes copied, not the whole old payload */
+		/* the copy may read past what the caller asked for, so a
+		 * sanitizer must see the copied bytes open first (hg_san.h) */
 		if (HG_SAN_ON) {
 			struct hg_block *own = hg_owner(HG_HDR(p));
 

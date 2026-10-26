@@ -1287,7 +1287,7 @@ static void *tcp_thread_routine(void *arg)
 	(void)arg;
 
 #ifdef HG_MALLOC
-	/* own HG stats slot for this IO thread (no-op unless HG is the allocator) */
+	/* own HG stats slot for this IO thread (no-op unless HG is in use) */
 	hg_thread_stats_init();
 #endif
 
@@ -1295,9 +1295,8 @@ static void *tcp_thread_routine(void *arg)
 	 * callbacks and notify completion back to the main thread. */
 	while (1) {
 #ifdef HG_MALLOC
-		/* a job boundary, no lock held: flush this thread's allocator
-		 * caches if a sweep was published since the last one (IPC cannot
-		 * reach this thread - see rpc_hg_cache_flush()) */
+		/* job boundary, no lock held: take a published cache sweep,
+		 * since IPC cannot reach this thread (rpc_hg_cache_flush()) */
 		hg_cache_flush_if_due();
 #endif
 		cond_lock(&tcp_write_queue->cond);

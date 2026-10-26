@@ -67,7 +67,7 @@ void hg_gc_cycle(struct hg_block *hb);
 unsigned int hg_gc_tick(struct hg_block *hb, unsigned int budget);
 
 /* sweep generation, bumped once per sweep (see hg_cache_flush_if_due()) */
-extern volatile unsigned long hg_sweep_gen;
+extern unsigned long hg_sweep_gen;
 
 /* evaluate the reserve floor; called from the buddy layer on every grid
  * allocation and free, the one point every consumer passes. hb->lock held */

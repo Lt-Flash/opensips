@@ -270,7 +270,7 @@ static void rpc_hg_cache_flush(int sender, void *param)
 {
 	/* runs in the target process: publish the sweep to its threads IPC
 	 * cannot reach (hg_sweep_gen is per process), then flush this one */
-	hg_sweep_gen++;
+	__atomic_fetch_add(&hg_sweep_gen, 1, __ATOMIC_RELAXED);
 	hg_cache_flush_self();
 }
 

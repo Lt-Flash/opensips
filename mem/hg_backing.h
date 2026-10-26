@@ -37,10 +37,11 @@ const char *hg_4k_reason(int shared);
 
 void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 		enum hg_mem_tier *tier, unsigned long *locked_b, int shared,
-		int inherited, unsigned long apage);
+		unsigned long apage);
 
+/* @no_pool: a private arena, which never takes hugetlb pages */
 int hg_init_fits(const char *what, unsigned long init,
-		unsigned long cap, int inherited);
+		unsigned long cap, int no_pool);
 
 
 #define HG_HPS (hg_hps())

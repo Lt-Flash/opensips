@@ -118,12 +118,12 @@ static unsigned long long hg_ram_room(void)
 
 /*
  * Can a new arena commit @init bytes now? Tier 1 takes them from the
- * hugetlb pool (never for an inherited arena, and only on the huge-page
- * grid); tiers 2-4 take them from general RAM, which must stay above the
- * floor. Logs why not, for @what, and returns 0; 1 when it fits.
+ * hugetlb pool (a shared arena only, and only on the huge-page grid); tiers
+ * 2-4 take them from general RAM, which must stay above the floor. Logs why
+ * not, for @what, and returns 0; 1 when it fits.
  */
 int hg_init_fits(const char *what, unsigned long init,
-		unsigned long cap, int inherited)
+		unsigned long cap, int no_pool)
 {
 	unsigned long apage = hg_arena_page(init, cap);
 	int huge_grid = (apage == HG_HPS);
@@ -134,7 +134,7 @@ int hg_init_fits(const char *what, unsigned long init,
 
 	if (need <= room)
 		return 1;
-	pool = (huge_grid && !inherited) ? hg_pool_free_bytes() : 0;
+	pool = (huge_grid && !no_pool) ? hg_pool_free_bytes() : 0;
 	if (need <= pool)
 		return 1;
 	if (ci.version)
@@ -225,17 +225,17 @@ int hg_fork_fits(void)
 	if (mem_allocator_pkg != MM_HG_MALLOC &&
 	    mem_allocator_pkg != MM_HG_MALLOC_DBG)
 		return 1;
+	/* from RAM: a private arena never takes hugetlb pages */
 	if (hg_ram_room() >= hg_page_round(pkg_mem_size,
 	        hg_arena_page(pkg_mem_size, hg_pkg_cap_bytes) == HG_HPS ?
-	        HG_HPS : HG_SMALL_PAGE) ||
-	    hg_pool_free_bytes() >= hg_page_round(pkg_mem_size, HG_HPS)) {
+	        HG_HPS : HG_SMALL_PAGE)) {
 		said = 0;
 		return 1;
 	}
 	if (!said) {
 		said = 1;
 		hg_init_fits("new process's pkg arena", pkg_mem_size,
-			hg_pkg_cap_bytes, 0);
+			hg_pkg_cap_bytes, 1);
 		LM_ERR("not forking more processes until memory frees up\n");
 	}
 	return 0;
@@ -246,20 +246,19 @@ int hg_fork_fits(void)
 
 /*
  * Startup, before anything forks: will every child's private arena (its
- * own -M INIT) fit? Simulated against the hugetlb pool first (a child takes
- * its whole cap from it when it can, else its INIT), then RAM above the
- * floor. -1 when the processes forked at startup do not fit; only a warning
- * for the auto-scaling maximum or caps beyond MemTotal (the per-fork check
- * stops scaling there).
+ * own -M INIT) fit in RAM above the floor? A private arena never takes
+ * hugetlb pages (hg_mem_reserve()). -1 when the processes forked at
+ * startup do not fit; only a warning for the auto-scaling maximum or caps
+ * beyond MemTotal (the per-fork check stops scaling there).
  */
 int hg_capacity_check(unsigned int start_procs, unsigned int max_procs)
 {
 #ifndef PKG_MALLOC
 	return 0;      /* pkg memory is the system malloc */
 #else
-	unsigned long init = pkg_mem_size, cap, capr, initr_huge, initr_ram;
+	unsigned long init = pkg_mem_size, cap, initr_ram;
 	/* sums over every process: 64-bit, as the room they are held to */
-	unsigned long long pool, pool_left, room, ram_start = 0, ram_max = 0, caps;
+	unsigned long long room, ram_start = 0, ram_max = 0, caps;
 	long total_kb;
 	unsigned int i, children;
 	int huge_grid;
@@ -270,43 +269,28 @@ int hg_capacity_check(unsigned int start_procs, unsigned int max_procs)
 
 	cap = hg_pkg_cap_bytes > init ? hg_pkg_cap_bytes : init;
 	huge_grid = (hg_arena_page(init, cap) == HG_HPS);
-	capr = hg_page_round(cap, HG_HPS);
-	initr_huge = hg_page_round(init, HG_HPS);
 	initr_ram = hg_page_round(init, huge_grid ? HG_HPS : HG_SMALL_PAGE);
-	pool = pool_left = huge_grid ? hg_pool_free_bytes() : 0;
 	room = hg_ram_room();
 
 	/* the attendant keeps its pre-fork arena; every other process
 	 * creates its own */
 	children = max_procs > 1 ? max_procs - 1 : 0;
-	for (i = 0; i < children; i++) {
-		unsigned long long *ram = (i + 1 < start_procs) ?
-			&ram_start : &ram_max;
-
-		if (pool_left >= capr)
-			pool_left -= capr;
-		else if (pool_left >= initr_huge)
-			pool_left -= initr_huge;
-		else
-			*ram += initr_ram;
-	}
+	for (i = 0; i < children; i++)
+		*((i + 1 < start_procs) ? &ram_start : &ram_max) += initr_ram;
 	ram_max += ram_start;
 	LM_INFO("pkg: %u processes at startup, up to %u with auto-scaling, "
-		"-M INIT %lu %s: %lu MB from the hugetlb pool, %lu MB (%lu MB at "
-		"the maximum) from RAM; %ld MB of RAM available above the %ld MB "
-		"floor\n", start_procs, max_procs, HG_SZ_VAL(init),
-		HG_SZ_UNIT(init), (unsigned long)((pool - pool_left) >> 20),
+		"-M INIT %lu %s: %lu MB (%lu MB at the maximum) from RAM; %ld MB "
+		"of RAM available above the %ld MB floor\n", start_procs,
+		max_procs, HG_SZ_VAL(init), HG_SZ_UNIT(init),
 		(unsigned long)(ram_start >> 20), (unsigned long)(ram_max >> 20),
 		room == HG_ROOM_ANY ? -1L : (long)(room >> 20), hg_ram_floor());
 
 	if (room != HG_ROOM_ANY && ram_start > room) {
 		LM_ERR("pkg: the %u processes started now need %lu MB of RAM for "
-			"their -M INIT of %lu %s (after %lu MB from the hugetlb "
-			"pool), but %lu MB is available above the %ld MB floor. "
-			"Lower -M INIT or the worker counts, or add memory or huge "
-			"pages.\n", start_procs, (unsigned long)(ram_start >> 20),
+			"their -M INIT of %lu %s, but %lu MB is available above the "
+			"%ld MB floor. Lower -M INIT or the worker counts, or add "
+			"memory.\n", start_procs, (unsigned long)(ram_start >> 20),
 			HG_SZ_VAL(init), HG_SZ_UNIT(init),
-			(unsigned long)((pool - pool_left) >> 20),
 			(unsigned long)(room >> 20), hg_ram_floor());
 		return -1;
 	}

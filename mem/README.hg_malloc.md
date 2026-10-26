@@ -24,7 +24,7 @@ The arena is acquired through four tiers, best first, each verified from the ker
 
 | tier | mechanism | notes |
 |---|---|---|
-| 1 | `mmap(MAP_HUGETLB)` | huge pages from the hugetlb pool; unswappable |
+| 1 | `mmap(MAP_HUGETLB)` | huge pages from the hugetlb pool; unswappable; shared arenas only |
 | 2 | THP: `MADV_HUGEPAGE` before first touch | huge pages at fault, from general memory |
 | 3 | THP: `MADV_COLLAPSE` after fill | pages collapsed into huge pages afterwards |
 | 4 | plain 4 KB pages | always available |
@@ -34,6 +34,8 @@ Tiers 2-4 pin the committed arena with `mlock()`. The startup log names the tier
 **Each growth step negotiates its own backing.** A step may land on a different tier than the memory before it, so `core:hg_stats` reports `tier_bytes` - the split by tier - whenever more than one tier holds bytes. On tier 3 a step taken by a worker that ran out of memory is published on 4 KB pages at once and collapsed by the maintenance process afterwards - one page at a time, with the arena lock released, for up to 100 ms a second, retrying a page the kernel cannot collapse yet up to 16 times - so the worker never waits for `MADV_COLLAPSE` (about 36 ms per 16 MB step); a step taken ahead of demand collapses straight away. `core:hg_stats` counts these pages as `collapse_deferred`, `collapsed_late`, `collapse_retries` and `collapse_late_failed`.
 
 **Tier 1 reserves the whole cap from the pool when the arena is created.** Growth on tier 1 therefore cannot fail half-way, and the pool must be sized for the caps (section 7). Pages the arena gives back when it shrinks return to the pool for anyone to take, so growing back into them can fail if something else took them meanwhile. If the pool can hold the initial size but not the cap, the arena keeps huge pages at its initial size, cannot grow, and says so at startup. If it cannot hold even the initial size, the arena starts on THP with its full cap and stays elastic.
+
+**Private arenas never take tier 1.** Each is copied on write into the processes forked after it - the pre-fork arena into every child, a child's own into whatever a module forks without the core's child init - and a copy-on-write fault on a hugetlb page with the pool empty is a SIGBUS, where THP falls back to 4 KB pages.
 
 ## 3. Elastic arenas
 
@@ -69,7 +71,7 @@ Growth stops at the smallest of three limits:
 
 The host-memory check charges a private-arena step once per OpenSIPS process, since every process grows its own under the same load. Tier 1 skips it: hugetlb pages were taken from host memory when the pool was created.
 
-The same floor guards the INITs: at startup every process's private arena is checked against RAM (and the hugetlb pool, if the host has one) before anything forks, and each later fork - the auto-scaler's included - is skipped if its INIT does not fit (see [Host memory checks](#host-memory-checks)).
+The same floor guards the INITs: at startup every process's private arena is checked against RAM before anything forks, and each later fork - the auto-scaler's included - is skipped if its INIT does not fit (see [Host memory checks](#host-memory-checks)).
 
 On hugetlb pages every grow is an `mlock()` of the new range, and `mlock()` checks `RLIMIT_MEMLOCK` on hugetlb mappings too, so there a low limit refuses growth: the arena warns at startup, and a refused grow names the resource that ran out - the limit, or the hugetlb pool. On tiers 2-4 the pin is a latency guarantee, not a requirement: an arena that could not pin its initial size runs unpinned, and a grow the limit cannot cover continues unpinned instead of being refused (section 8).
 
@@ -99,9 +101,9 @@ Refusal details are logged once per episode; `grow_refused` carries the count, a
 
 ## 4. Private (pkg) arenas
 
-- Each process creates its own private arena at fork, after the configuration is parsed, so `-M INIT:CAP` and `pkg_auto_scaling_profile` apply to every process individually. The pre-fork parent arena never uses hugetlb, so no child can fault on the pool through a copy-on-write page, and never gets the profile; it keeps the `-M` cap and can still grow on exhaustion.
+- Each process creates its own private arena at fork, after the configuration is parsed, so `-M INIT:CAP` and `pkg_auto_scaling_profile` apply to every process individually. No private arena uses hugetlb pages (section 2), so no process can fault on the pool through a copy-on-write page. The pre-fork parent arena never gets the profile; it keeps the `-M` cap and can still grow on exhaustion.
 - A process grows only its own arena; its policy, and its GROW-BLOCKED latch, run in its own 30 s sweep, whatever `hg_scaling_cycle` is set to. Each process publishes its refusals and GROW-BLOCKED state at that sweep, summed as `hg_pkg_grow_refused` and `hg_pkg_grow_blocked`. A child's copy of the parent's arena, which only the frees of pre-fork pointers reach, is marked as inherited at fork: it is never grown and its figures are not published, but it gives back the pages those frees empty.
-- Host cost multiplies with the process count - and on tier 1, so does the pool reservation, since each process's arena reserves its own cap.
+- Host cost multiplies with the process count.
 
 ## 5. Module arenas
 
@@ -132,8 +134,8 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 ## 7. Sizing
 
 1. **Memory lock limit:** `LimitMEMLOCK=infinity` in the service unit (or `ulimit -l unlimited`). Required for an elastic arena on hugetlb pages; recommended on the other tiers, where without it the arena runs unpinned and can be swapped.
-2. **Tier 1 pool:** reserve `shm_cap + pkg_cap x processes`, in 2 MB pages, plus a margin of about 12%. A pool that cannot fit the caps gives fixed arenas on huge pages, or pushes late processes to THP.
-   **Tiers 2-3 instead of a pool:** THP `enabled` = `madvise` or `always` (private arenas) and `shmem_enabled` = `advise` or `always` (shared arena). With neither a pool nor THP, every arena runs on 4 KB pages.
+2. **Tier 1 pool:** reserve the `-m` cap, in 2 MB pages, plus a margin of about 12%; private arenas never use the pool. A pool that cannot fit the cap gives a fixed shared arena on huge pages.
+   **Tiers 2-3:** THP `enabled` = `madvise` or `always` for the private arenas, and, instead of a pool, `shmem_enabled` = `advise` or `always` for the shared arena. Without THP the private arenas run on 4 KB pages, and so does the shared arena unless a pool backs it.
 3. **Private caps multiply:** `-M 16:64` on 30 processes is up to 1.9 GB of potential pinned growth.
 4. **Tier 1 releases go back to the pool,** not to general memory; shrink `vm.nr_hugepages` to give them to the host.
 5. **Measuring the pool:** `HugePages_Free` alone also moves with private hugetlb use; the shared arena's pages are `(HugePages_Total - HugePages_Free) - sum of Private_Hugetlb over all processes`.
@@ -149,7 +151,7 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 | startup: `below the 512 KB minimum viable arena` | a fixed arena (no cap) under 512 KB | give a cap (`-M 256k:2m`) or INIT of at least 512 KB |
 | startup: `on huge pages INIT is at least one huge page ... no room to grow` | INIT under 2 MB on huge pages with a cap of 2 MB or less | raise the cap, or give INIT as 2 MB for a fixed arena |
 | notice: `INIT raised from ... to 2 MB` | INIT under 2 MB on huge pages | expected; give INIT as 2 MB to silence it |
-| startup: `the N processes started now need ... MB of RAM` | `-M` INIT x processes does not fit in RAM above the floor (plus the hugetlb pool, if any) | lower `-M` INIT or the worker counts, or add memory or huge pages |
+| startup: `the N processes started now need ... MB of RAM` | `-M` INIT x processes does not fit in RAM above the floor | lower `-M` INIT or the worker counts, or add memory |
 | `not forking more processes until memory frees up` | the auto-scaler wants a process whose INIT does not fit | lower the scale-up maximum or `-M` INIT; OpenSIPS keeps running meanwhile |
 | `no more HG_MALLOC arena memory ...`, then `N allocations failed in the last 30 s` | the arena is full and cannot grow (cap reached, or growth refused) | raise the cap or the host's free memory; `core:hg_stats` shows what fills it. The first failure of an episode is logged in full, the rest are summarised every 30 s |
 | `the arena has no growth room` | a profile is attached but `-m`/`-M` has no cap | add the cap: `-m 128:1024` |
@@ -331,7 +333,7 @@ Note that `shmem:free_size` counts only memory not yet carved into size-class bl
 
 - `LimitMEMLOCK=infinity` in the service unit, or `ulimit -l unlimited`, so the arena stays pinned. Required for an elastic arena on hugetlb pages: every grow there is an `mlock()`, which checks the limit on hugetlb mappings too, and a refused grow names the limit or the hugetlb pool, whichever ran out. Recommended on tiers 2-4: without it the arena runs and grows unpinned (swappable) instead of refusing. HG warns at startup when the limit is too low.
 - Huge pages are optional; without them every arena runs on plain 4 KB pages. To use them, provide either or both of:
-  - a hugetlb pool (tier 1): `vm.nr_hugepages` large enough for the shared cap plus the private arenas, in huge pages (2 MB on x86-64). On this tier the whole cap is reserved from the pool when the arena is created. A pool that can hold the initial size but not the cap gives a fixed arena on huge pages instead of an elastic one, and says so; a pool that cannot hold even the initial size leaves the arena on THP, still elastic.
+  - a hugetlb pool (tier 1): `vm.nr_hugepages` large enough for the shared cap, in huge pages (2 MB on x86-64); private arenas never use it. On this tier the whole cap is reserved from the pool when the arena is created. A pool that can hold the initial size but not the cap gives a fixed arena on huge pages instead of an elastic one, and says so; a pool that cannot hold even the initial size leaves the arena on THP, still elastic.
   - transparent huge pages (tiers 2-3): `/sys/kernel/mm/transparent_hugepage/enabled` set to `madvise` or `always` for the private arenas, and `/sys/kernel/mm/transparent_hugepage/shmem_enabled` set to `advise` or `always` for the shared arena. Many distributions ship `shmem_enabled=never`. `MADV_COLLAPSE` (tier 3) needs Linux 6.1 or later.
 
 ### Host memory checks
@@ -339,14 +341,14 @@ Note that `shmem:free_size` counts only memory not yet carved into size-class bl
 The shared arena commits its `-m` INIT at startup, and every process then creates its own private arena and commits its `-M` INIT, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`, and memory on hugetlb pages against the pool. A process in a memory-limited cgroup - a container started with a memory limit, a systemd unit with `MemoryMax` - is also held to its cgroup: the tightest limit on its own cgroup or any ancestor, less what that cgroup holds (its inactive file cache counted as free, as `MemAvailable` counts it on the host), must stay above the same floor computed on that limit (cgroup v1 and v2). `/proc/meminfo` shows the whole host inside such a container, so without this an arena would grow until the cgroup's OOM killer stepped in. The shared arena is checked first (against the default floor - the config is not read yet), and every later check counts what is left after it.
 
 - **Shared arena:** its INIT is refused if the host cannot hold it; its growth is refused at the floor (GROW-BLOCKED, `hg_shm_grow_blocked`).
-- **Private arenas at startup, before anything forks:** every process's private arena is simulated against RAM above the floor, after whatever the hugetlb pool (if the host has one) can take. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
+- **Private arenas at startup, before anything forks:** every process's private arena is checked against RAM above the floor. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
 - **Each new process, auto-scaler forks included:** not forked if its INIT does not fit. The auto-scaler keeps the processes it has and tries again on its next cycle, so a profile that allows more processes than the host holds stops short instead of running into the OOM killer.
 - **Every arena:** an INIT the host cannot hold is refused when the arena is created.
 - **Every grow:** refused if it would cross the floor; a private-arena step is counted once per process. Private-arena refusals show in `hg_pkg_grow_refused` and `hg_pkg_grow_blocked`.
 
 ```
-INFO:  pkg: 14 processes at startup, up to 16 with auto-scaling, -M INIT 32 MB: 192 MB from the hugetlb pool, 224 MB (288 MB at the maximum) from RAM; 0 MB of RAM available above the 11778 MB floor
-ERROR: pkg: the 14 processes started now need 224 MB of RAM for their -M INIT of 32 MB (after 192 MB from the hugetlb pool), but 0 MB is available above the 11778 MB floor. ...
+INFO:  pkg: 14 processes at startup, up to 16 with auto-scaling, -M INIT 32 MB: 416 MB (480 MB at the maximum) from RAM; 0 MB of RAM available above the 11778 MB floor
+ERROR: pkg: the 14 processes started now need 416 MB of RAM for their -M INIT of 32 MB, but 0 MB is available above the 11778 MB floor. ...
 ERROR: new process's pkg arena: committing 32 MB now does not fit - ... not forking more processes until memory frees up
 ```
 

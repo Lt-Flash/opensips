@@ -530,11 +530,10 @@ struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 	}
 	/* the INIT is committed and pinned at once: refuse one the host
 	 * cannot hold rather than let the kernel's OOM killer decide */
-	if (!hg_init_fits(name, size, cap, (flags & HG_INIT_INHERITED) != 0))
+	if (!hg_init_fits(name, size, cap, !shared))
 		return NULL;
 	cap_asked = cap;
-	base = hg_mem_reserve(size, &cap, &tier, &locked_b, shared,
-		(flags & HG_INIT_INHERITED) != 0, apage);
+	base = hg_mem_reserve(size, &cap, &tier, &locked_b, shared, apage);
 	if (!base) {
 		LM_ERR("failed to reserve %lu bytes for %s HG_MALLOC arena\n",
 			size, name);
@@ -714,8 +713,8 @@ struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 			HG_SZ_VAL(locked_b), HG_SZ_UNIT(locked_b),
 			tier == HG_MEM_4K ? hg_4k_reason(shared) : "",
 			(flags & HG_INIT_INHERITED) ?
-			" (pre-fork arena, inherited copy-on-write by every child: "
-			"hugetlb deliberately skipped, its COW cannot fall back)" : "");
+			" (pre-fork arena, inherited copy-on-write by every child)" :
+			"");
 	if (hb->hcap > hb->committed_bytes)
 		LM_NOTICE("%s arena can grow to %lu %s (%lu %s headroom "
 			"reserved, uncommitted)\n", name,

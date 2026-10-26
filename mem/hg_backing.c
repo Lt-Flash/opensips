@@ -358,7 +358,7 @@ static void hg_exclude_from_core(void *base, unsigned long size)
  */
 void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 		enum hg_mem_tier *tier, unsigned long *locked_b, int shared,
-		int inherited, unsigned long apage)
+		unsigned long apage)
 {
 	unsigned long asize = hg_page_round(size, apage);
 	unsigned long csize = hg_page_round(*cap < size ? size : *cap, apage);
@@ -393,14 +393,17 @@ void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 	 * small for the cap fails the mmap, and keeping huge pages without
 	 * growth room beats dropping to THP.
 	 *
-	 * Skipped for the arena children inherit copy-on-write
-	 * (HG_INIT_INHERITED): a child's COW fault on a hugetlb page with the
-	 * pool empty is a SIGBUS, while THP's COW falls back to 4K pages.
+	 * Shared arenas only. A private arena is copied on write into every
+	 * process forked after it: the pre-fork arena into every child, and a
+	 * child's own into whatever a module forks without the core's child
+	 * init (cpl_c's mail sender, which allocates before its exec). A COW
+	 * fault on a hugetlb page with the pool empty is a SIGBUS, while
+	 * THP's falls back to 4K pages.
 	 */
-	p = (inherited || small) ? MAP_FAILED :
+	p = (!shared || small) ? MAP_FAILED :
 	    mmap(NULL, csize, PROT_READ|PROT_WRITE,
 	         vis|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
-	if (p == MAP_FAILED && !inherited && !small && csize > asize) {
+	if (p == MAP_FAILED && shared && !small && csize > asize) {
 		p = mmap(NULL, asize, PROT_READ|PROT_WRITE,
 		         vis|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
 		if (p != MAP_FAILED) {

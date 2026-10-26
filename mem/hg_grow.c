@@ -317,6 +317,7 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 	/* phase 1 - RESERVE the range under the lock, taking grow_inflight */
 	off = hb->span_end;
 	hb->grow_inflight = 1;
+	backed_fast_update(hb);    /* the slow path while unlocked */
 	hb->span_pending = off + delta;
 	reason = hb->lk_cur;
 	hg_lock_leave(hb);
@@ -402,6 +403,7 @@ int hg_buddy_grow_unlocks(struct hg_block *hb, unsigned long need, enum hg_grow_
 
 	hg_lock_assert_held(hb, "hg_buddy_grow_unlocks entry");
 	r = buddy_grow_body(hb, need, why);
+	backed_fast_update(hb);
 	hg_lock_assert_held(hb, "hg_buddy_grow_unlocks return");
 	return r;
 }
@@ -450,6 +452,7 @@ static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
 		if (hb->pages[i].punched && !hb->pages[i].releasing)
 			sel[got++] = i;
 	hb->grow_inflight = 1;
+	backed_fast_update(hb);    /* the slow path while unlocked */
 	reason = hb->lk_cur;
 	hg_lock_leave(hb);
 
@@ -519,6 +522,7 @@ static int hg_buddy_regrow_holes_unlocks(struct hg_block *hb, unsigned long need
 
 	hg_lock_assert_held(hb, "hg_buddy_regrow_holes_unlocks entry");
 	r = buddy_regrow_holes_body(hb, need, room);
+	backed_fast_update(hb);
 	hg_lock_assert_held(hb, "hg_buddy_regrow_holes_unlocks return");
 	return r;
 }

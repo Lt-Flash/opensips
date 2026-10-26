@@ -1128,6 +1128,15 @@ void hg_cell_free(struct hg_block *hb, void *p)
 		return;
 	}
 
+	/* before the header is read: memory given back to the kernel is not
+	 * read again (see hg_backed()) */
+	if (!hg_backed(hb, cell_start)) {
+		LM_CRIT("%s: %p points into memory the arena gave back to the "
+			"kernel - freed before, not touching it\n", hb->name, p);
+		hg_corrupt(hb, HG_C_DOUBLE_FREE);
+		return;
+	}
+
 	/* no private slot: the shared pool takes it, checks and all - looked
 	 * up first, so the checks below run once per free */
 	pl = hg_get_palloc(hb);
@@ -1211,6 +1220,12 @@ void hg_cell_free_global(struct hg_block *hb, void *p)
 			hg_xarena_frees++;
 			hb = owner;
 		}
+	}
+	if (!hg_backed(hb, cell_start)) {
+		LM_CRIT("%s: %p points into memory the arena gave back to the "
+			"kernel - freed before, not touching it\n", hb->name, p);
+		hg_corrupt(hb, HG_C_DOUBLE_FREE);
+		return;
 	}
 	ci = free_check(hb, cell_start, p, &hw, &hbase);
 	if (ci < 0)

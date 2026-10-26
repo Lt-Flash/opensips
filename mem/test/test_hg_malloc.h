@@ -27,9 +27,9 @@
 
 /* children forked by test_hg_malloc(), one at a time, each in a slot of its
  * own (pt.c reserves them): pre-fork pkg, shm free, pkg shrink, inherited
- * pkg, exit, double free, large double free, cell header, the two
- * HG_MALLOC_DBG checks and the guard - plus the fuzz test's */
-#define TEST_HG_MALLOC_PROCS  (11 + TEST_HG_FUZZ_PROCS)
+ * pkg, exit, double free, large double free, unbacked free, cell header,
+ * the two HG_MALLOC_DBG checks and the guard - plus the fuzz test's */
+#define TEST_HG_MALLOC_PROCS  (12 + TEST_HG_FUZZ_PROCS)
 
 /* non-zero when HG_MALLOC (or HG_MALLOC_DBG) serves both pkg and shm */
 int hg_ut_selected(void);

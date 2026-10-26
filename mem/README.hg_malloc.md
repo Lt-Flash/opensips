@@ -413,6 +413,7 @@ ERROR: new process's pkg arena: committing 32 MB now does not fit - ... not fork
 | a process leaving for good gives its cells back | `test_hg_malloc.c`: a child leaves through `dynamic_process_final_exit()` and the arena returns to its baseline | CI | |
 | a double free is refused and counted, not handed out twice, with or without frees in between | `test_hg_malloc.c` (twice in a row; with a free in between; large fragment; realloc of freed memory); `hgstress` fault injection | CI; by hand | |
 | a damaged header or a pointer into a cell is refused, not followed | `test_hg_malloc.c` | CI | |
+| a free of memory the arena gave back to the kernel is refused without its header being read | `test_hg_malloc.c`: a pointer past the shm arena's committed span, its page checked to stay out of memory | CI | a punched page (interior release, off in the tests) takes the same check, untested |
 | two frees of one cell at the same moment: exactly one takes effect | - | - | by construction (one compare-and-swap; the large tier's re-check under its lock); no test can force the interleaving |
 | HG_MALLOC_DBG: a write past the request (small cell, large fragment, realloc in place) and a write after free are found | `test_hg_malloc.c`, HG_MALLOC_DBG run | CI | |
 | `hg_mem_check`: one byte past the request is found (small cell, large fragment, a cell with a one-byte guard, pkg, realloc in place); a cell taken without the guard is freed unchecked | `test_hg_malloc.c`; `hgstress` fault injection | CI; by hand | |

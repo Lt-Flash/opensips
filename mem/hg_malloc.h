@@ -445,6 +445,47 @@ static inline int hg_owns_any(const void *p)
 	return hg_owner(p) != NULL;
 }
 
+/* hg_buddy.c: hg_backed() past hb->backed_fast - the span's end and the
+ * page's state, read while a hole exists or a grow or release runs */
+int hg_backed_slow(const struct hg_block *hb, const void *p);
+
+/*
+ * May the memory at @p, inside @hb's reservation, be read? Not where it went
+ * back to the kernel: past the span's end (released by a trim, or never
+ * committed), or on a punched page or one being released. A read there
+ * faults the page back in behind the accounting (4K, THP) or raises SIGBUS
+ * (hugetlb with the pool empty), and only a stale pointer can lead there: a
+ * live cell's page is never released. The rest of the span is backed, the
+ * arena's own head and an arena too small for a page grid included.
+ * Lock-free and best effort: one word on a line the free path reads anyway
+ * (hb->backed_fast), and the span and the page only while a hole exists or
+ * a grow or release runs - both release paths hold grow_inflight then.
+ */
+static inline int hg_backed(const struct hg_block *hb, const void *p)
+{
+	if ((unsigned long)((const char *)p - hb->hbase) <
+	    __atomic_load_n(&hb->backed_fast, __ATOMIC_ACQUIRE))
+		return 1;
+	return hg_backed_slow(hb, p);
+}
+
+/* recompute hb->backed_fast; under hb->lock, after every change of
+ * grow_inflight, punched_pages or span_end, and at init */
+static inline void backed_fast_update(struct hg_block *hb)
+{
+	__atomic_store_n(&hb->backed_fast,
+		(hb->punched_pages || hb->grow_inflight) ? 0 : hb->span_end,
+		__ATOMIC_RELEASE);
+}
+
+/* the live arena holding @p, if its memory there may be read, else NULL */
+static inline struct hg_block *hg_owner_backed(const void *p)
+{
+	struct hg_block *hb = hg_owner(p);
+
+	return hb && hg_backed(hb, p) ? hb : NULL;
+}
+
 static inline unsigned long hg_frag_size(void *p)
 {
 	unsigned char c;
@@ -452,9 +493,10 @@ static inline unsigned long hg_frag_size(void *p)
 	if (!p)
 		return 0;
 
-	/* the header may not be mapped - check before reading it; 0 is the
-	 * "unknown size" answer, as for an out-of-range class */
-	if (!hg_owns_any(HG_HDR(p)))
+	/* the header may not be mapped, or no longer backed - check before
+	 * reading it; 0 is the "unknown size" answer, as for an out-of-range
+	 * class */
+	if (!hg_owner_backed(HG_HDR(p)))
 		return 0;
 
 	c = HG_CLASS(p);
@@ -476,19 +518,19 @@ void hg_stats_set_index(void *ptr, unsigned long idx);
 #ifdef DBG_MALLOC
 static inline const char *hg_frag_file(void *p)
 {
-	if (!hg_owns_any(HG_HDR(p)))
+	if (!hg_owner_backed(HG_HDR(p)))
 		return NULL;
 	return HG_CELL(p)->file;
 }
 static inline const char *hg_frag_func(void *p)
 {
-	if (!hg_owns_any(HG_HDR(p)))
+	if (!hg_owner_backed(HG_HDR(p)))
 		return NULL;
 	return HG_CELL(p)->func;
 }
 static inline unsigned long hg_frag_line(void *p)
 {
-	if (!hg_owns_any(HG_HDR(p)))
+	if (!hg_owner_backed(HG_HDR(p)))
 		return 0;
 	return HG_CELL(p)->line;
 }

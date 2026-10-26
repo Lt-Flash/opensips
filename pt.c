@@ -111,6 +111,11 @@ int init_multi_proc_support(void)
 	counted_max_processes += TEST_MALLOC_PROCS - 1 + TEST_HG_MALLOC_PROCS;
 #endif
 
+#ifdef HG_MALLOC
+	/* before anything forks: the flag is inherited */
+	hg_pstat_slots_check(counted_max_processes);
+#endif
+
 	/* allocate the PID table to accomodate the maximum possible number of
 	 * process we may have during runtime (covering extra procs created 
 	 * due auto-scaling) */

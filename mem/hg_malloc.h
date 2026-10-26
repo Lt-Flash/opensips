@@ -560,6 +560,33 @@ static inline struct hg_pstat *hg_pstat_mine(struct hg_block *hb)
 	return &hb->pstat[s];
 }
 
+/* set when a slot can have two writers: more processes than slots
+ * (hg_pstat_slots_check()), or a thread that found no slot of its own
+ * (hg_thread_stats_init()). Per process; inherited at fork. */
+extern int hg_pstat_shared;
+
+/* checked once the process count is known, before anything forks */
+void hg_pstat_slots_check(unsigned int nprocs);
+
+/* move this process's (or thread's) counters: plain adds while its slot
+ * has one writer, atomic ones once it may have two, or updates are lost
+ * and the sums drift (hg_used(), hg_slab_recycled() and through it the
+ * live figure a profile scales on) */
+static inline void hg_pstat_add(struct hg_pstat *ps, long used, long frags,
+		long cell)
+{
+	if (__builtin_expect(hg_pstat_shared, 0)) {
+		__atomic_fetch_add(&ps->used, used, __ATOMIC_RELAXED);
+		__atomic_fetch_add(&ps->fragments, frags, __ATOMIC_RELAXED);
+		if (cell)
+			__atomic_fetch_add(&ps->cell_live, cell, __ATOMIC_RELAXED);
+		return;
+	}
+	ps->used += used;
+	ps->fragments += frags;
+	ps->cell_live += cell;
+}
+
 /* give the calling thread its own slot (idempotent; TCP IO pool threads
  * call it first). Thread slots come from the top of the array, processes
  * use the bottom; the counter is in the shm arena, so an index is unique

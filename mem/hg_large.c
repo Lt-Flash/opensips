@@ -233,11 +233,7 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 
 	/* charge the frag's capacity, NOT @size: hg_large_free() knows only
 	 * the capacity, and the two must match */
-	{
-		struct hg_pstat *ps = hg_pstat_mine(hb);
-		ps->used += f->size - HG_CELL_HDR;
-		ps->fragments++;
-	}
+	hg_pstat_add(hg_pstat_mine(hb), (long)(f->size - HG_CELL_HDR), 1, 0);
 	/* the backing is in real_used since the chunk was taken; large_live
 	 * is the part handed out, so hg_large_recycled() can take the idle
 	 * rest out of the live figure, as hg_slab_recycled() does for slabs */
@@ -286,11 +282,8 @@ void hg_large_free(struct hg_block *hb, struct hg_lfrag *frag)
 	}
 	hg_hdr_set((char *)frag + HG_LFRAG_HDR, HG_LARGE_MARKER, HG_ST_FREE);
 
-	{
-		struct hg_pstat *ps = hg_pstat_mine(hb);
-		ps->used -= frag->size - HG_CELL_HDR;
-		ps->fragments--;
-	}
+	hg_pstat_add(hg_pstat_mine(hb), -(long)(frag->size - HG_CELL_HDR), -1,
+		0);
 	hb->large_live -= HG_LFRAG_HDR + frag->size;
 
 	/* forward coalesce: prev is NULL for a live frag and for the sentinel,

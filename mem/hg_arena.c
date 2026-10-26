@@ -275,8 +275,13 @@ void hg_cache_flush_self(void)
 
 		if (!hb)
 			continue;
-		/* clean before the walk, so a free during it is not lost */
-		hg_pstat_mine(hb)->dirty = 0;
+		/* clean before the walk, so a free during it is not lost - and
+		 * only a slot of its own: a shared slot's other writer (a thread
+		 * with no slot of its own, a process beyond the slots) may hold
+		 * freed cells this flush does not see, and a clean slot would
+		 * have the sweep skip it */
+		if (!hg_pstat_shared)
+			hg_pstat_mine(hb)->dirty = 0;
 		for (c = 0; c < HG_NCLASSES; c++) {
 			unsigned int keep = hg_flush_residue(hb, pl, c);
 
@@ -1010,12 +1015,8 @@ found:
 	HG_CELL_AT(cell_start)->line = line;
 #endif
 	/* per-process slot: no lock, no shared cache line (see hg_pstat) */
-	{
-		struct hg_pstat *ps = hg_pstat_mine(hb);
-		ps->used += cell_sizes[c] - HG_CELL_HDR;
-		ps->fragments++;
-		ps->cell_live += cell_sizes[c];
-	}
+	hg_pstat_add(hg_pstat_mine(hb), cell_sizes[c] - HG_CELL_HDR, 1,
+		cell_sizes[c]);
 	return payload;
 }
 
@@ -1169,9 +1170,9 @@ void hg_cell_free(struct hg_block *hb, void *p)
 
 	{
 		struct hg_pstat *ps = hg_pstat_mine(hb);
-		ps->used -= cell_sizes[c] - HG_CELL_HDR;
-		ps->fragments--;
-		ps->cell_live -= cell_sizes[c];
+
+		hg_pstat_add(ps, -(long)(cell_sizes[c] - HG_CELL_HDR), -1,
+			-(long)cell_sizes[c]);
 		ps->dirty = 1;   /* this cache now holds something to sweep */
 	}
 
@@ -1251,12 +1252,10 @@ void hg_cell_free_global(struct hg_block *hb, void *p)
 	pushed = hg_gpool_push(hb, c, cell_start);
 	hg_lock_leave(hb);
 
-	if (pushed == 0) {
-		struct hg_pstat *ps = hg_pstat_mine(hb);
-		ps->used -= cell_sizes[c] - HG_CELL_HDR;
-		ps->fragments--;
-		ps->cell_live -= cell_sizes[c];
-	}
+	if (pushed == 0)
+		hg_pstat_add(hg_pstat_mine(hb),
+			-(long)(cell_sizes[c] - HG_CELL_HDR), -1,
+			-(long)cell_sizes[c]);
 }
 
 /*

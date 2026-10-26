@@ -184,7 +184,7 @@ static unsigned int gc_class_run(struct hg_block *hb, int c, unsigned int keep,
 unsigned int hg_gc_class(struct hg_block *hb, int c, unsigned int keep,
                              unsigned int limit)
 {
-	unsigned long t0 = hg_now_ns();
+	hg_ns_t t0 = hg_now_ns();
 	unsigned int n;
 
 	n = gc_class_run(hb, c, keep, limit);

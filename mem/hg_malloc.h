@@ -313,17 +313,24 @@ static inline int hg_owns(struct hg_block *hb, void *cell_start)
 extern const char * const hg_lk_reason_str[HG_LK_REASONS];
 extern const char * const hg_cp_phase_str[HG_CP_PHASES];
 
-static inline unsigned long hg_now_ns(void)
+static inline hg_ns_t hg_now_ns(void)
 {
 	struct timespec ts;
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (unsigned long)ts.tv_sec * 1000000000UL + (unsigned long)ts.tv_nsec;
+	return (hg_ns_t)ts.tv_sec * 1000000000ULL + (hg_ns_t)ts.tv_nsec;
 }
 
-static inline void hg_lkstat_add(struct hg_lkstat *s, unsigned long ns)
+/* an interval for an unsigned long field or format: saturated, so one of
+ * more than 4.29 s on a 32-bit build reads as huge, not as a small rest */
+static inline unsigned long hg_ns_ul(hg_ns_t ns)
 {
-	unsigned long us = ns / 1000;
+	return ns > ~0UL ? ~0UL : (unsigned long)ns;
+}
+
+static inline void hg_lkstat_add(struct hg_lkstat *s, hg_ns_t ns)
+{
+	hg_ns_t us = ns / 1000;
 	unsigned int b = 0;
 
 	if (us) {
@@ -347,7 +354,7 @@ void hg_lock_stall_note(struct hg_block *hb, int reason, unsigned long held_ns);
 
 static inline void hg_lock_enter(struct hg_block *hb, enum hg_lock_reason r)
 {
-	unsigned long t0 = hg_now_ns(), t1;
+	hg_ns_t t0 = hg_now_ns(), t1;
 
 	lock_get(&hb->lock);
 	HG_TSAN_ACQUIRE(&hb->lock);
@@ -359,7 +366,7 @@ static inline void hg_lock_enter(struct hg_block *hb, enum hg_lock_reason r)
 
 static inline void hg_lock_leave(struct hg_block *hb)
 {
-	unsigned long held = hg_now_ns() - hb->lk_t0;
+	unsigned long held = hg_ns_ul(hg_now_ns() - hb->lk_t0);
 	int r = hb->lk_cur;
 	int stalled = 0;
 

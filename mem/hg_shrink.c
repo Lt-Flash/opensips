@@ -49,7 +49,8 @@ static unsigned long buddy_shrink_body(struct hg_block *hb)
 {
 	unsigned long lpp = hg_leaves_per_page(hb);
 	unsigned long limit = hb->shrink_step >> hb->hps_shift;
-	unsigned long n = 0, i, off, len, backed = 0, t0, rel_ns;
+	unsigned long n = 0, i, off, len, backed = 0, rel_ns;
+	hg_ns_t t0;
 	unsigned int top = hb->buddy_top;
 	int reason, rc;
 
@@ -110,7 +111,7 @@ static unsigned long buddy_shrink_body(struct hg_block *hb)
 	/* phase 2 - the syscalls, lock released */
 	t0 = hg_now_ns();
 	rc = hg_mem_release(hb, off, len);
-	rel_ns = hg_now_ns() - t0;
+	rel_ns = hg_ns_ul(hg_now_ns() - t0);
 
 	/* phase 3 - publish, or put back */
 	hg_lock_enter(hb, (enum hg_lock_reason)reason);
@@ -184,7 +185,8 @@ static unsigned long buddy_punch_body(struct hg_block *hb)
 	unsigned long sel[HG_PAGES_PER_EVENT];
 	unsigned long limit = hb->shrink_step >> hb->hps_shift;
 	unsigned long lpp = hg_leaves_per_page(hb);
-	unsigned long i, got = 0, ok, t0, rel_ns, free_after, floor_after;
+	unsigned long i, got = 0, ok, rel_ns, free_after, floor_after;
+	hg_ns_t t0;
 	unsigned int top = hb->buddy_top;
 	int reason;
 
@@ -233,7 +235,7 @@ static unsigned long buddy_punch_body(struct hg_block *hb)
 		                   hb->hps) != 0)
 			break;
 	}
-	rel_ns = hg_now_ns() - t0;
+	rel_ns = hg_ns_ul(hg_now_ns() - t0);
 
 	/* phase 3 - publish what went, put back what did not */
 	hg_lock_enter(hb, (enum hg_lock_reason)reason);

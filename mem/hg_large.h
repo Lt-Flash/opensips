@@ -69,7 +69,8 @@ void hg_large_destroy(struct hg_block *hb);
 
 /* @cb(payload, ctx) for every live large frag. Always exact, pre- or
  * post-fork: a frag's ->prev is its free flag (NULL = live), as in
- * f_malloc's frag_is_free() */
+ * f_malloc's frag_is_free(). @cb runs with hb->lock held: it may not
+ * allocate or free in any HG_MALLOC arena (see hg_arena_walk_live()) */
 void hg_large_walk_live(struct hg_block *hb,
 		void (*cb)(void *payload, void *ctx), void *ctx);
 

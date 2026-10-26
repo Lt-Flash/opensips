@@ -121,7 +121,9 @@ void hg_arena_stats(struct hg_block *hb, unsigned int *nchunks,
 
 /* @cb(payload, ctx) for every live small cell; exact pre-fork, best-effort
  * post-fork (see hg_arena.c). Used by hg_arena_stats_core_init() and
- * hg_status_dbg() */
+ * hg_status_dbg(). @cb runs with hb->lock held: it may not allocate or free
+ * in any HG_MALLOC arena - this arena's lock is not recursive, and another
+ * arena's would be taken inside it */
 void hg_arena_walk_live(struct hg_block *hb,
 		void (*cb)(void *payload, void *ctx), void *ctx);
 

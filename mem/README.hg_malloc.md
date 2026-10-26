@@ -400,7 +400,7 @@ ERROR: new process's pkg arena: committing 32 MB now does not fit - ... not fork
 - A process that crashes keeps its cached cells counted as live until restart; one that exits normally or is scaled down hands them back.
 - The floor checks are not reservations: independent arenas (shm, module arenas, a child's pkg INIT) growing at the same moment can together pass the floor by one step each.
 - If the maintenance process exits, OpenSIPS shuts down. If it hung in the middle of a grow, a worker that runs out would wait 2 s and fail its allocation.
-- Each process and each of TCP main's I/O threads has a statistics slot of its own, 256 in all. Past 256 processes, or for a thread that finds none left, slots are shared, and their counters are then added atomically (logged at startup, or when the thread starts), at a small cost per allocation. `E_CORE_HG_LOCK_STALL` is raised for the core shm arena only.
+- Each process and each of TCP main's I/O threads has a statistics slot of its own, 256 in all; a thread's slot is not given back when the thread ends. Past 256 processes, or for a thread that finds none left, slots are shared, and their counters are then added atomically (logged at startup, or when the thread starts), at a small cost per allocation. `E_CORE_HG_LOCK_STALL` is raised for the core shm arena only.
 
 ### Properties and the tests that show them
 

@@ -20,22 +20,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-/*
- * Sanitizer hooks. An HG arena is one big mapping, so to ASan or Valgrind
- * every byte is addressable; the hooks below open and close the bytes a
- * caller may touch, and the allocator opens a cell itself before it reads
- * or writes the payload (debug red zone and poison, realloc's copy).
- *
- * PRIVATE arenas only (pkg and a child's own): both tools keep the state per
- * process, so a shared cell closed by the process that freed it would stay
- * closed there after another process allocated it again. Shared memory is
- * covered by HG_MALLOC_DBG's in-band poison (hg_dbg.c).
- *
- * ASan is detected from the compiler; Valgrind's memcheck needs
- * -DHG_VALGRIND and its headers. ThreadSanitizer is told about hb->lock,
- * whose futex or spin implementation it cannot see through. Without a
- * sanitizer every hook compiles to nothing.
- */
+/* ASan/Valgrind (-DHG_VALGRIND) hooks, PRIVATE arenas only: the tools keep
+ * state per process, and a shared cell changes hands between processes */
 
 #ifndef hg_san_h
 #define hg_san_h
@@ -77,7 +63,7 @@
 #define HG_SAN_FRESH(p, n)  ((void)0)
 #endif
 
-#ifdef HG_SAN_TSAN
+#ifdef HG_SAN_TSAN  /* TSan cannot see through hb->lock's futex or spin */
 void __tsan_acquire(void *addr);
 void __tsan_release(void *addr);
 #define HG_TSAN_ACQUIRE(a)  __tsan_acquire((void *)(a))

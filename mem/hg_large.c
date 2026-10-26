@@ -31,10 +31,8 @@
 
 #define HG_LARGE_MIN_FRAG    HG_ROUNDTO
 #define HG_LARGE_DEFAULT_CHUNK (1UL << 20)  /* 1 MB - amortizes future churn */
-/* on an arena this big a large chunk is at least one whole huge page: with
- * chunk_max (256 KB) sizing a 256 KB request plus headers takes a 512 KB
- * buddy block too short for a second one, half of it dead. Small arenas
- * (pkg, small shm) keep chunk_max sizing. */
+/* on an arena this big a large chunk is a whole huge page or more: a 256 KB
+ * request plus headers would take a 512 KB block, half of it dead */
 #define HG_LARGE_BIG_ARENA     (256UL << 20)
 
 struct hg_large_chunk {
@@ -91,8 +89,7 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 	unsigned int guard = hb->guard && size < 0xffffffffUL;
 
 	/* round to HG_PAYLOAD_ALIGN, not HG_ROUNDTO: a frag's size places the
-	 * next frag, so rounding to 4 (32-bit ARM) would misalign all later
-	 * frags and their payloads */
+	 * next frag, so rounding to 4 (32-bit ARM) would misalign the rest */
 	need = (HG_CELL_HDR + size + (hb->dbg ? HG_DBG_TAIL : guard ? HG_GUARD_ROOM : 0) +
 	        HG_PAYLOAD_ALIGN - 1) & ~(unsigned long)(HG_PAYLOAD_ALIGN - 1);
 
@@ -108,9 +105,8 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 	}
 
 	if (!f) {
-		/* no fit: a new chunk from the arena the slab tier uses, sized
-		 * for this request but at least a floor, so churn of smaller
-		 * large objects does not carve a chunk each time */
+		/* no fit: a new chunk sized for this request but at least a
+		 * floor, so smaller large objects do not carve one each time */
 		chunk_size = HG_LFRAG_HDR * 2 + need;
 		/* a 1 MB floor would eat a small arena: there it is capped at
 		 * chunk_max (as chunk_size_for() in hg_arena_int.h) */
@@ -132,21 +128,15 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 		}
 		chunk_size = (chunk_size + 63) & ~63UL;
 
-		/*
-		 * The chunk comes from the buddy, whose blocks top out at one
-		 * huge page: up to a page it is one block rounded up to its
-		 * order (the slack becomes free space in the chunk); above, a
-		 * run of whole pages - rare, but it MUST work: a dialog or
-		 * usrloc hash table is one allocation of several MB.
-		 */
+		/* from the buddy: up to a page, one block rounded up to its
+		 * order; above, a run of whole pages (a big hash table) */
 		{
 			unsigned long total = chunk_size + sizeof(struct hg_large_chunk);
 			int ord = hg_buddy_order_for(hb, total);
 			int attempt;
 
-			/* a miss grows the arena and retries once, from the
-			 * fresh pages; a refused grow falls through to the
-			 * exhaustion error */
+			/* a miss grows the arena and retries once; a refused
+			 * grow falls through to the exhaustion error */
 			for (attempt = 0; attempt < 2 && !base; attempt++) {
 				if (attempt && hg_buddy_grow_unlocks(hb, total, HG_GROW_EXHAUSTION) != 0)
 					break;
@@ -200,12 +190,8 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 		ch->ord = chunk_ord;
 		hb->large_chunks_carved++;
 
-		/*
-		 * Charge the whole buddy block when it is taken, as
-		 * carve_chunk() does for a slab block: charging only live
-		 * fragments would hide the chunk's slack and free space from
-		 * real_used and free_to_carve.
-		 */
+		/* charge the whole buddy block when taken, as carve_chunk()
+		 * does, or real_used would hide the chunk's slack */
 		hb->large_backing += backing;
 		hb->real_used += backing;
 		if (hb->real_used > hb->max_real_used)
@@ -234,9 +220,8 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 	/* charge the frag's capacity, NOT @size: hg_large_free() knows only
 	 * the capacity, and the two must match */
 	hg_pstat_add(hg_pstat_mine(hb), (long)(f->size - HG_CELL_HDR), 1, 0);
-	/* the backing is in real_used since the chunk was taken; large_live
-	 * is the part handed out, so hg_large_recycled() can take the idle
-	 * rest out of the live figure, as hg_slab_recycled() does for slabs */
+	/* large_live is the part handed out, so hg_large_recycled() can take
+	 * the idle rest out of the live figure */
 	hb->large_live += HG_LFRAG_HDR + f->size;
 
 	hg_lock_leave(hb);
@@ -268,10 +253,8 @@ void hg_large_free(struct hg_block *hb, struct hg_lfrag *frag)
 
 	hg_lock_enter(hb, HG_LK_LARGE);
 
-	/* re-check the state under the lock: two concurrent frees can both
-	 * pass hg_cell_free()'s check, and the second would coalesce the
-	 * fragment again. A LIVE frag still on the free list (prev set) is a
-	 * damaged tier: refused the same way. */
+	/* re-check under the lock: two concurrent frees can both pass
+	 * hg_cell_free()'s check; a LIVE frag still listed is refused too */
 	if (!hg_st_live(hg_hdr_state((char *)frag + HG_LFRAG_HDR)) ||
 	    frag->prev) {
 		hg_lock_leave(hb);
@@ -304,14 +287,8 @@ void hg_large_free(struct hg_block *hb, struct hg_lfrag *frag)
 		frag = neigh;
 	}
 
-	/*
-	 * Chunk empty? Only a chunk's first frag has a NULL pf and only its
-	 * sentinel has size 0, so a first frag followed by the sentinel spans
-	 * the whole chunk, whose header sits right in front of it. Returned
-	 * at once, with no keep-one hysteresis: thrash on a tier that keeps
-	 * emptying and refilling shows as large_chunks_carved climbing far
-	 * faster than large_chunks_returned.
-	 */
+	/* a first frag (pf NULL) followed by the sentinel spans the chunk;
+	 * freed at once, no hysteresis: thrash shows in large_chunks_carved */
 	if (!frag->pf && HG_LFRAG_NEXT(frag)->size == 0) {
 		struct hg_large_chunk *ch = (struct hg_large_chunk *)(void *)
 			((char *)frag - sizeof(struct hg_large_chunk));

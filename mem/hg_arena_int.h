@@ -50,19 +50,12 @@ static const unsigned int cell_sizes[HG_NCLASSES] = {
 	64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048,
 	3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536
 };
-/*
- * Target cells per block. A block is the unit of reclaim: fewer cells drain
- * sooner, more mean fewer carves. Do not raise it without re-measuring how
- * many blocks reach empty.
- */
+/* target cells per block, the unit of reclaim: fewer drain sooner, more mean
+ * fewer carves. Re-measure how many blocks reach empty before raising it */
 #define HG_CELLS_PER_BLOCK 32
 
-/*
- * Free-list link, one convention for the private stacks and the shared pool:
- * both helpers take @cell_start (the hidden header) and keep the link at
- * cell_start + HG_CELL_HDR: in the payload, never in the header, whichever
- * list owns the cell.
- */
+/* free-list link for the private stacks and the shared pool alike: takes
+ * @cell_start; the link lives in the payload, never in the hidden header */
 static inline void *cell_next(void *cell_start)
 {
 	/* via void *: the link is pointer-aligned (HG_ROUNDTO cells, a
@@ -75,11 +68,8 @@ static inline void cell_set_next(void *cell_start, void *next)
 	*(void **)(void *)((char *)cell_start + HG_CELL_HDR) = next;
 }
 
-/*
- * Resolve a cell to its block; refuse anything that is not a chunk of this
- * class. Large-tier blocks start with a struct hg_large_chunk, and writing
- * in_gpool there would corrupt the large heap.
- */
+/* resolve a cell to its block, refusing anything not a chunk of class @c:
+ * writing in_gpool into a large-tier block would corrupt the large heap */
 static inline struct hg_chunk *cell_block(struct hg_block *hb, int c, void *p)
 {
 	struct hg_chunk *ch = hg_buddy_block_of(hb, p);
@@ -105,19 +95,14 @@ static inline int map_test(const struct hg_chunk *ch, long i)
 	return (int)((ch->gfree[i / HG_CHUNK_MAP_BITS] >> (i % HG_CHUNK_MAP_BITS)) & 1);
 }
 
-/*
- * Chunk size scales with the arena: a chunk is claimed whole the first time
- * its class is touched, so a fixed 256 KB would cost 21 x 256 KB before the
- * first byte is served, which an 8 MB pkg arena cannot afford. hb->chunk_max
- * caps a chunk at a small fraction of the arena.
- */
+/* a chunk is claimed whole on its class's first use, so hb->chunk_max caps it
+ * at a small fraction of the arena (21 x 256 KB would sink an 8 MB pkg) */
 static inline unsigned int chunk_size_for(struct hg_block *hb, int c)
 {
 	unsigned int want, least = sizeof(struct hg_chunk) + cell_sizes[c] * 2;
 
-	/* HG_CELLS_PER_BLOCK cells, at least one buddy leaf: a block comes back
-	 * only when every cell is free, so a block of thousands of small cells
-	 * would essentially never drain */
+	/* HG_CELLS_PER_BLOCK cells, at least one leaf: a block comes back only
+	 * when every cell is free, so thousands of cells would never drain */
 	want = cell_sizes[c] * HG_CELLS_PER_BLOCK;
 	if (want < HG_LEAF_SIZE)
 		want = HG_LEAF_SIZE;

@@ -25,10 +25,8 @@
 
 #include "test_hg_fuzz.h"
 
-/* children forked by test_hg_malloc(), one at a time, each in a slot of its
- * own (pt.c reserves them): pre-fork pkg, shm free, pkg shrink, inherited
- * pkg, exit, double free, large double free, unbacked free, cell header,
- * the two HG_MALLOC_DBG checks and the guard - plus the fuzz test's */
+/* one pt.c slot per child test_hg_malloc() forks: 12, one per
+ * hgt_in_child() call in test_hg_malloc.c, plus the fuzz test's */
 #define TEST_HG_MALLOC_PROCS  (12 + TEST_HG_FUZZ_PROCS)
 
 /* non-zero when HG_MALLOC (or HG_MALLOC_DBG) serves both pkg and shm */

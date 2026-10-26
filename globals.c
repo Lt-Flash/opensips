@@ -78,10 +78,8 @@ int hg_grow_ahead = 1;
 /* maintenance ticks per profile cycle: at this default a profile's
  * "for N cycles" means 30 s per cycle */
 int hg_scaling_cycle = 30;
-/* per drain tick, decoupled from the grow granule. The release runs with
- * the arena lock RELEASED, so this bounds the window an exhausted carver
- * may wait on grow_inflight, not a lock hold: measured on kernel 6.12,
- * 4K-backed shm, ~400 us per 2 MB page -> 64 MB is ~13 ms; hugetlb ~1 us per page */
+/* bytes released per drain tick, outside the arena lock: bounds how long an
+ * exhausted carver waits on grow_inflight (~13 ms per 64 MB on 4K pages) */
 unsigned long hg_shrink_step = 64UL << 20;
 /* interior release: off until the elasticity it buys has been measured on the
  * hugetlb rung as well as the ordinary ones */

@@ -38,11 +38,8 @@
 #include "hg_cell.h"
 #include "hg_block.h"
 
-/*
- * Address -> page/leaf (see HG_LEAF_SHIFT). pages_init() in hg_arena.c
- * checks they round-trip on real addresses at every arena init, and refuses
- * the arena if not.
- */
+/* Address -> page/leaf (see HG_LEAF_SHIFT); pages_init() in hg_arena.c
+ * refuses an arena on which these do not round-trip */
 
 /* how many leaves tile one huge page */
 static inline unsigned long hg_leaves_per_page(const struct hg_block *hb)
@@ -50,9 +47,8 @@ static inline unsigned long hg_leaves_per_page(const struct hg_block *hb)
 	return 1UL << (hb->hps_shift - HG_LEAF_SHIFT);
 }
 
-/* is @p in the page-addressable region? Arena memory before pbase (the block
- * header; on a non-Linux fallback also the unaligned head) is not buddy
- * memory, so it must answer NO */
+/* is @p in the page-addressable region? Memory before pbase (the block
+ * header, an unaligned head off Linux) is not buddy memory: answer NO */
 static inline int hg_in_pages(const struct hg_block *hb, const void *p)
 {
 	return (const char *)p >= hb->pbase &&
@@ -79,51 +75,19 @@ static inline unsigned long hg_leaf_of(const struct hg_block *hb, const void *p)
 	return (off & ((1UL << hb->hps_shift) - 1)) >> HG_LEAF_SHIFT;
 }
 
-/*
- * Reserve a huge-page-backed (or degraded) region of @size bytes and lay out
- * the block control structure at its start. Unlike fm_malloc_init() it takes
- * no pre-reserved address: HG_MALLOC runs its own huge-page tier ladder to
- * get the mapping (see hg_backing.c). Returns NULL on total failure; the
- * caller aborts startup (no silent fallback to another allocator).
- *
- * @shared: 1 for shm/shm_dbg (MAP_SHARED, one arena for every worker), 0 for
- * pkg (MAP_PRIVATE, each forked worker gets its own copy-on-write arena, lock
- * and free pools); hg_mem_reserve() in hg_backing.c says why getting this
- * wrong for pkg is a correctness AND a performance bug.
- *
- * @flags: HG_INIT_INHERITED marks the ONE arena every child inherits
- * copy-on-write: the pre-fork (attendant) pkg arena. It must never be
- * hugetlb-backed: a COW fault in a hugetlb VMA needs a huge page (no 4K
- * fallback) and a forked child holds no reservation on its parent's mapping,
- * so an empty pool makes the fault a silent SIGBUS at fork time. THP falls
- * back: the COW fault splits the huge PMD and copies one 4K page. Per-child
- * arenas are never inherited (children do not fork) and keep the full ladder.
- */
+/* @flags HG_INIT_INHERITED: the pre-fork pkg arena children inherit COW;
+ * never hugetlb, where a child's COW fault finds no huge page: SIGBUS */
 #define HG_INIT_INHERITED  (1U << 0)
 
 struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 		const char *proc_desc, unsigned int flags);
 void hg_malloc_destroy(struct hg_block *hb);
 
-/*
- * The admin caps live in globals.h/globals.c (-m INIT:CAP / -M INIT:CAP, set
- * before any arena exists; 0 = fixed). The pkg cap is PER PROCESS, so the
- * host-RAM exposure is cap x nproc (applied by hg_grow_room_short()).
- */
+/* The admin caps (-m/-M INIT:CAP, 0 = fixed) live in globals.h/.c; the pkg
+ * cap is PER PROCESS, so the host-RAM exposure is cap x nproc */
 
-/*
- * Commit [off, off+delta) of the reservation (both hps-rounded, @off the
- * committed end): populate, pin, VERIFY the backing the kernel gave (and
- * retrofit huge pages where the host needs it). Returns the achieved tier
- * (>= 1), or -1 with everything rolled back - a refusal, not a degradation,
- * so no worker SIGBUSes on half-committed memory. Called by
- * hg_buddy_grow_unlocks() WITHOUT hb->lock: it touches no allocator state
- * but locked_mb (atomically) and the once-per-episode refusal flag; phase
- * timings come back in @cp_ns for the caller to merge under the lock.
- * @collapse_later non-NULL: a worker waits on this grow, so a delta needing
- * the MADV_COLLAPSE retrofit is published on 4 KB pages and *collapse_later
- * set; hg_collapse_deferred() collapses it later.
- */
+/* Commit [off, off+delta) of the reservation: the achieved tier (>= 1), or -1
+ * with all rolled back. Called WITHOUT hb->lock: merge @cp_ns under it */
 int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
 		unsigned long cp_ns[HG_CP_PHASES], int *collapse_later);
 int hg_mem_collapse(struct hg_block *hb, char *base, unsigned long len);
@@ -132,33 +96,19 @@ void hg_collapse_deferred(struct hg_block *hb);
 
 const char *hg_grow_refusal_str(unsigned int why);
 
-/*
- * Why mlock() refused @delta bytes: @lim the binding RLIMIT_MEMLOCK in bytes
- * (0: none), @locked_kb the process's VmLck, and on hugetlb (@hugetlb) the
- * pool's free and reserved pages of @page_kb each (negative: unreadable).
- * Pure, so unit tests can check it without changing the real limits.
- */
+/* Why mlock() refused @delta bytes, from the limit, VmLck and hugetlb pool
+ * figures given (negative: unreadable); pure, so unit tests can call it */
 enum hg_grow_refusal hg_mlock_refusal_why(unsigned long lim, long locked_kb,
 		unsigned long delta, int hugetlb, long free_pg, long rsvd_pg,
 		long page_kb);
 
-/*
- * Host-memory checks for every process's private arena, so a process count
- * or auto-scaler maximum the host cannot hold is refused or stopped instead
- * of ending in the OOM killer. hg_capacity_check() runs once before anything
- * forks: -1 when the startup processes cannot fit (warns for the
- * auto-scaling maximum and caps beyond MemTotal). hg_fork_fits() runs before
- * each fork: 0 = do not fork this one. Both count the hugetlb pool and RAM
- * above the floor.
- */
+/* Refuse process counts the host cannot hold, before the OOM killer does:
+ * hg_capacity_check() pre-fork (-1: no fit), hg_fork_fits() per fork (0: no) */
 int hg_capacity_check(unsigned int start_procs, unsigned int max_procs);
 int hg_fork_fits(void);
 
-/* allocation-failure throttle, hb->lock held: hg_oom_first() counts a
- * failure and says whether to log it in full; hg_oom_take() returns the
- * failures since the last call (and the largest request), ending the
- * episode after a quiet interval. hg_oom_report_shared() logs the shared
- * arenas' summaries once per sweep interval. */
+/* allocation-failure throttle, hb->lock held: hg_oom_first() says whether to
+ * log a failure in full, hg_oom_take() takes the count since the last call */
 static inline int hg_oom_first(struct hg_block *hb, unsigned long req)
 {
 	hb->oom_fails++;
@@ -187,51 +137,23 @@ void hg_oom_report(struct hg_block *hb, unsigned long n, unsigned long max_req);
 void hg_oom_report_shared(void);
 void hg_sample_live_peaks(void);
 
-/*
- * Private-arena growth refusals, published per process into a shared array
- * (hg_pkg_pub_init(), pre-fork) at each cache sweep (hg_pkg_publish()), read
- * as hgmem:hg_pkg_grow_refused (sum) and hgmem:hg_pkg_grow_blocked
- * (processes blocked now) via hg_pkg_pub_stat(). hg_pkg_pub_reset() clears
- * the slot of a process that is gone.
- */
+/* Per-process private-arena growth refusals, published to a shared array at
+ * each sweep, read as hgmem:hg_pkg_grow_refused and hg_pkg_grow_blocked */
 int hg_pkg_pub_init(unsigned int nproc);
 void hg_pkg_publish(struct hg_block *hb);
 void hg_pkg_pub_reset(int proc);
 unsigned long hg_pkg_pub_stat(void *ctx);
 
-/*
- * Release the backing of [hbase+off, +len), the shrink primitive (kernel
- * behaviour verified on 5.4, the oldest tested):
- *
- *   shared (shm):  madvise(MADV_REMOVE) punches the shmem OBJECT, so every
- *                  mapper is affected, even while another process holds
- *                  the pages VM_LOCKED; the range recommits cleanly. NOT
- *                  mmap(PROT_NONE|MAP_FIXED): it rebinds only the caller's
- *                  mapping and leaves other workers reading the old bytes.
- *   shared tier 1: same call; hugetlb hole punch returns the pages to
- *                  HugePages_Free.
- *   private (pkg): madvise(MADV_DONTNEED); next touch refaults zero.
- *
- * munlock first: it drops only THIS process's VM_LOCKED accounting (the
- * worker that grew the range keeps a stale VmLck until exit, cosmetic); the
- * punch frees the memory regardless. Returns 0, or -1 with
- * shrink_unsupported latched (nothing to retry).
- */
+/* Release the backing of [hbase+off, +len): MADV_REMOVE punches the shmem
+ * object for every mapper, pkg uses MADV_DONTNEED; -1: shrink_unsupported */
 int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len);
 int hg_mem_repin(struct hg_block *hb, unsigned long off, unsigned long len,
                  int tier);
 /* whole-free pages counted in the bitmap, to compare with nfree[top] */
 unsigned long hg_buddy_top_reachable(struct hg_block *hb);
 
-/*
- * Resolve and validate the auto-scaling profiles once, after the config is
- * parsed (from init_shm_post_yyparse()). Attaches the policy to the LIVE shm
- * arena and stashes the pkg policy for the per-child arenas pt.c creates
- * after fork; the pre-fork parent pkg arena predates the config and gets no
- * profile (it keeps its -M cap and grows on exhaustion). Fails LOUDLY on a
- * profile that names nothing, exceeds the -m/-M reservation, or sits on an
- * arena with no growth room: a policy that cannot act is a misconfiguration.
- */
+/* Resolve the auto-scaling profiles once the config is parsed; fails LOUDLY on
+ * one that cannot act (names nothing, exceeds -m/-M, no growth room) */
 int hg_autoscale_post_cfg(void);
 
 /* re-sync per-process state after fork(): the inherited private
@@ -240,10 +162,8 @@ void hg_malloc_child_init(struct hg_block *hb);
 /* fork reset for every SHARED arena in the registry (core + module) */
 void hg_malloc_child_init_all(void);
 
-/* sizes the DBG_MALLOC allocation-history pool (shm_hist / struct_hist) like
- * fm_get_dbg_pool_size(), with a HG_CELL_HDR-based estimate for FRAG_OVERHEAD.
- * Best-effort: a wrong estimate wastes a little of -m or fails a chunk carve
- * loudly - no correctness risk, as chunks are carved dynamically. */
+/* sizes the DBG_MALLOC history pool like fm_get_dbg_pool_size(); best-effort:
+ * a wrong estimate wastes a little of -m or fails a carve loudly */
 unsigned long hg_get_dbg_pool_size(unsigned int hist_size);
 
 #ifdef DBG_MALLOC
@@ -276,34 +196,16 @@ void hg_info(struct hg_block *hb, struct mem_info *info);
 /* defined in hg_arena.c; table lookup, no lock needed (immutable) */
 unsigned int hg_cell_total_size(unsigned char cls);
 
-/* defined in hg_large.c; @frag is HG_HDR(p) - HG_LFRAG_HDR_SIZE (the struct
- * hg_lfrag at the start of the block), opaque so this header need not
- * include hg_large.h, which includes it */
+/* defined in hg_large.c; @frag is HG_HDR(p) - HG_LFRAG_HDR_SIZE, opaque so
+ * this header need not include hg_large.h, which includes it */
 unsigned long hg_large_frag_size_at(const void *frag);
 
-/*
- * Arena ownership tests. Everything hg hands out lies inside some block's
- * hbase reservation, fixed at init. For a pointer from outside it (foreign
- * arena, stale, corrupted) the "class byte" at HG_HDR(p) is garbage or
- * unmapped, and reading it can fault.
- *
- *   hg_owns()     - the caller knows the block: one exact range test.
- *   hg_owns_any() - it does not: hg_frag_size() is installed as the shared
- *                   shm_frag_size(void *) hook next to fm_/qm_/hp_/
- *                   parallel_frag_size(), so it cannot take an hb and walks
- *                   a registry of live arenas. This is on the free fast path
- *                   (_shm_free() calls shm_frag_size() on every free); the
- *                   cost is below noise, so the registry stays a plain
- *                   linear walk. Revisit only if HG_ARENA_REG_MAX grows.
- *
- * Both are advisory: they turn "dereference and die" into "decline and carry
- * on". They do not make a bad pointer good.
- */
+/* Arena ownership tests, advisory: a foreign pointer's HG_HDR(p) may be
+ * unmapped; hg_owns_any() walks a registry for the hb-less frag_size hook */
 static inline int hg_owns(struct hg_block *hb, void *cell_start)
 {
-	/* against the CAP, not the span: nothing in [span_end, hcap) was handed
-	 * out, and hcap never changes after init, which keeps this fast path
-	 * off the slow path's cache lines (as hg_arena_reg does) */
+	/* against the CAP, not the span: hcap never changes after init, which
+	 * keeps this fast path off the slow path's cache lines */
 	return (char *)cell_start >= hb->hbase &&
 	       (char *)cell_start < hb->hbase + hb->hcap;
 }
@@ -394,12 +296,8 @@ static inline void hg_lock_leave(struct hg_block *hb)
 		hg_lock_stall_note(hb, r, held);
 }
 
-/*
- * Contract check for the functions that drop and re-take hb->lock inside
- * (the *_unlocks family in hg_grow.c and hg_shrink.c and the ticks calling
- * them): the lock is held on entry and again on return. Out of line
- * (hg_stats.c) so the header stays free of dprint.
- */
+/* Contract check for the *_unlocks functions that drop and re-take hb->lock
+ * (hg_grow.c, hg_shrink.c): held on entry and again on return */
 void hg_lock_assert_held(struct hg_block *hb, const char *where);
 
 #define HG_ARENA_REG_MAX 8
@@ -408,22 +306,15 @@ struct hg_arena_range {
 	unsigned long     size;
 	struct hg_block  *hb;
 };
-/* defined in hg_malloc.c; maintained by hg_malloc_init/destroy. Process-local
- * on purpose - a forked child inherits the parent's entries (its shm mapping
- * really is the same memory) and adds its own private pkg arena on top. */
+/* defined in hg_malloc.c; process-local on purpose: a child inherits the
+ * parent's entries (same shm) and adds its own private pkg arena */
 extern struct hg_arena_range hg_arena_reg[HG_ARENA_REG_MAX];
 
 /* count of frees redirected to their true owner; reported by hg_stats */
 extern unsigned long hg_xarena_frees;
 
-/*
- * Which arena does this pointer belong to, if any? A child may free what
- * its parent allocated pre-fork (cachedb_redis and other modules do it in
- * child_init()), supported with every allocator through the COW-inherited
- * pkg arena. HG_MALLOC gives each child a fresh arena (pt.c), so such frees
- * reach an arena that never issued them: resolve the owner and free there.
- * Only a pointer owned by NO arena is a defect.
- */
+/* Which arena owns @p? A child may free what its parent allocated pre-fork,
+ * so the free goes to that owner; only a pointer NO arena owns is a defect */
 static inline struct hg_block *hg_owner(const void *p)
 {
 	int i;
@@ -447,18 +338,8 @@ static inline int hg_owns_any(const void *p)
  * page's state, read while a hole exists or a grow or release runs */
 int hg_backed_slow(const struct hg_block *hb, const void *p);
 
-/*
- * May the memory at @p, inside @hb's reservation, be read? Not where it went
- * back to the kernel: past the span's end (released by a trim, or never
- * committed), or on a punched page or one being released. A read there
- * faults the page back in behind the accounting (4K, THP) or raises SIGBUS
- * (hugetlb with the pool empty), and only a stale pointer can lead there: a
- * live cell's page is never released. The rest of the span is backed, the
- * arena's own head and an arena too small for a page grid included.
- * Lock-free and best effort: one word on a line the free path reads anyway
- * (hb->backed_fast), and the span and the page only while a hole exists or
- * a grow or release runs - both release paths hold grow_inflight then.
- */
+/* May @p, inside @hb's reservation, be read? Not past the span's end or on a
+ * punched or releasing page, where only a stale pointer leads; lock-free */
 static inline int hg_backed(const struct hg_block *hb, const void *p)
 {
 	if ((unsigned long)((const char *)p - hb->hbase) <
@@ -491,9 +372,8 @@ static inline unsigned long hg_frag_size(void *p)
 	if (!p)
 		return 0;
 
-	/* the header may not be mapped, or no longer backed - check before
-	 * reading it; 0 is the "unknown size" answer, as for an out-of-range
-	 * class */
+	/* the header may be unmapped or no longer backed: check before reading;
+	 * 0 is the "unknown size" answer */
 	if (!hg_owner_backed(HG_HDR(p)))
 		return 0;
 
@@ -539,12 +419,8 @@ static inline unsigned long hg_frag_line(void *p) { return 0; }
 #endif
 #endif
 
-/*
- * Fast-path stats helpers. hg_pstat_mine() picks this process's slot:
- * process_no is -1 in the attendant and 0 in main before fork, so it is
- * biased by one and wrapped. Two processes sharing a slot would only race
- * on its counters, never corrupt anything.
- */
+/* Fast-path stats: hg_pstat_mine() biases process_no by one (-1 in the
+ * attendant) and wraps it; a shared slot only races on counters */
 /* a thread of a threaded process (TCP main's IO pool) has its own slot,
  * claimed at thread start by hg_thread_stats_init(); -1 = the process slot */
 extern __thread int hg_pstat_slot;
@@ -558,18 +434,15 @@ static inline struct hg_pstat *hg_pstat_mine(struct hg_block *hb)
 	return &hb->pstat[s];
 }
 
-/* set when a slot can have two writers: more processes than slots
- * (hg_pstat_slots_check()), or a thread that found no slot of its own
- * (hg_thread_stats_init()). Per process; inherited at fork. */
+/* set when a slot can have two writers (more processes than slots, or a
+ * thread with no slot of its own); per process, inherited at fork */
 extern int hg_pstat_shared;
 
 /* checked once the process count is known, before anything forks */
 void hg_pstat_slots_check(unsigned int nprocs);
 
-/* move this process's (or thread's) counters: plain adds while its slot
- * has one writer, atomic ones once it may have two, or updates are lost
- * and the sums drift (hg_used(), hg_slab_recycled() and through it the
- * live figure a profile scales on) */
+/* move this process's (or thread's) counters: atomic adds once its slot may
+ * have two writers, or updates are lost and the sums drift */
 static inline void hg_pstat_add(struct hg_pstat *ps, long used, long frags,
 		long cell)
 {
@@ -585,10 +458,8 @@ static inline void hg_pstat_add(struct hg_pstat *ps, long used, long frags,
 	ps->cell_live += cell;
 }
 
-/* give the calling thread its own slot (idempotent; TCP IO pool threads
- * call it first). Thread slots come from the top of the array, processes
- * use the bottom; the counter is in the shm arena, so an index is unique
- * across every process that could start a thread. */
+/* give the calling thread its own slot (idempotent); thread slots come from
+ * the top of the array, via a shm counter so no two processes share one */
 void hg_thread_stats_init(void);
 
 /* summed on read; clamped at 0 because slots go negative when one process
@@ -617,15 +488,8 @@ static inline unsigned long hg_fragments(struct hg_block *hb)
  * since hg_arena.h includes THIS header and cannot be included back) */
 unsigned long hg_slab_recycled(struct hg_block *hb);
 
-/*
- * Register the SHM arena's statistics with the statistics collector, so they
- * are scrapeable and not only via the hg_stats MI command. Called from
- * init_stats_collector(); a no-op unless HG_MALLOC is the shm allocator in
- * use. Returns 0 on success. SHM only: pkg memory already shows through the
- * generic struct mem_info route (pkmem: and proc_ statistics), and
- * per-process allocator statistics would need extending
- * signal_pkg_status()/pkg_status[][], as a pkg arena is private memory.
- */
+/* Register the SHM arena's statistics with the statistics collector, from
+ * init_stats_collector(); 0 on success, a no-op unless shm is HG_MALLOC */
 #ifdef HG_MALLOC
 int hg_register_stats(void);
 
@@ -648,11 +512,8 @@ static inline int hg_register_stats(void) { return 0; }
 void hg_corrupt_abort(struct hg_block *hb, enum hg_corrupt_kind k)
 	__attribute__ ((noreturn, cold));
 
-/*
- * Bump a corruption counter; hb may be NULL where no arena is in scope.
- * Every site calls it after its own LM_CRIT, so with hg_mem_check = 2 the
- * process aborts with the details already in the log.
- */
+/* Bump a corruption counter (hb may be NULL); every site calls it after its
+ * own LM_CRIT, so hg_mem_check = 2 aborts with the details logged */
 static inline void hg_corrupt(struct hg_block *hb, enum hg_corrupt_kind k)
 {
 	if (hb)
@@ -706,17 +567,12 @@ static inline unsigned long hg_get_used(struct hg_block *hb)
 {
 	return hg_used(hb);
 }
-/* these feed the shmem: and pkgmem: statistics (SHM_GET_/PKG_GET_ in
- * shm_mem.h and mem.h), a different path from hg_info(), so the recycled
- * subtraction is applied here too */
+/* these feed the shmem: and pkgmem: statistics (SHM_GET_/PKG_GET_), not
+ * hg_info(), so the recycled subtraction is applied here too */
 static inline unsigned long hg_get_free(struct hg_block *hb)
 {
 	/* headroom left to CARVE, not size minus live: recycled cells serve
-	 * only their own class, so counting them free would report plenty
-	 * until an allocation of another size fails. Hence free + real_used !=
-	 * size here (real_used is live), unlike q_malloc; free + carve == size
-	 * holds. used = live payload, real_used / max_used = live commitment
-	 * and its peak, free = room left to carve. */
+	 * only their own class; so free + real_used != size, unlike q_malloc */
 	return hg_free_to_carve(hb);
 }
 /* the large tier's counterpart to hg_slab_recycled(): buddy backing not

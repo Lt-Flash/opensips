@@ -20,12 +20,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,USA
  */
 
-/*
- * The floor formula; the cgroup room read from fake cgroup trees in a
- * temporary directory, so CI checks the parsing and the walk without a
- * limited cgroup of its own; and the host check on a fake /proc/meminfo
- * with more than 4 GB available, which a 32-bit build must count whole.
- */
+/* The floor formula, cgroup room from fake cgroup trees in a temp dir (so
+ * CI needs no limited cgroup) and the host check on a fake >4 GB meminfo. */
 
 #ifdef HG_MALLOC
 
@@ -97,14 +93,8 @@ static unsigned long long hml_room(const char *self, struct hg_cg_info *ci)
 	return hg_cgroup_room(ci);
 }
 
-/*
- * The host check, through a 16 MB shm grow, on a fake /proc/meminfo with
- * 8 GB of RAM and a 409 MB floor (a twentieth): 4 GB + 100 MB available
- * must pass (a 32-bit unsigned long would see 100 MB, under the floor),
- * 8 MB above the floor must be refused. A missing membership file leaves
- * only the host. Then the cgroup the caller left with 70 MB of room
- * refuses a 128 MB grow on a roomy host. Each refusal records its cause.
- */
+/* host check on a fake 8 GB /proc/meminfo: 4 GB + 100 MB free counts
+ * whole on 32-bit and passes; then refusals by the floor and a cgroup */
 /* a grow's two halves, as hg_buddy_grow_unlocks() runs them: nonzero =
  * refused, with the cause recorded */
 static int hml_grow_refused(struct hg_block *hb, unsigned long delta)
@@ -188,9 +178,8 @@ void test_hg_memlimit(void)
 		return;
 	}
 
-	/* cgroup v2: the 256 MB limit sits on the parent, the process's own
-	 * cgroup has none - the walk must find it there. 100 MB in use, floor
-	 * 32 MB: 124 MB of room */
+	/* cgroup v2, 256 MB limit on the parent only - the walk must find
+	 * it. 100 MB in use, floor 32 MB: 124 MB of room */
 	bad |= hml_put("cg", NULL) | hml_put("cg/a", NULL) | hml_put("cg/a/b", NULL);
 	bad |= hml_put("self2", "0::/a/b\n");
 	bad |= hml_put("cg/a/memory.max", "268435456\n");
@@ -229,9 +218,8 @@ void test_hg_memlimit(void)
 		"limit %lu MB, %lu MB held, %lu MB floor",
 		r / MB, ci.limit_mb, ci.used_mb, ci.floor_mb);
 
-	/* cgroup v1 on a hybrid host: the memory controller's line wins over
-	 * "0::"; the root reports "unlimited" as a number near 2^63. 64 MB
-	 * limit, 10 MB charged of which 4 MB inactive cache, floor 8 MB: 50 MB */
+	/* cgroup v1 on a hybrid host: the memory line beats "0::", and root's
+	 * "unlimited" is near 2^63. 64 MB - 6 MB held - 8 MB floor: 50 MB */
 	bad |= hml_put("self1", "7:memory:/x\n1:name=systemd:/x\n0::/x\n");
 	bad |= hml_put("cg/memory", NULL) | hml_put("cg/memory/x", NULL);
 	bad |= hml_put("cg/memory/memory.limit_in_bytes", "9223372036854771712\n");
@@ -253,10 +241,8 @@ void test_hg_memlimit(void)
 		hml_room("nosuch", NULL) == HG_ROOM_ANY,
 		"no limited level, or no membership file: no cgroup limit");
 
-	/* what an mlock() refusal is put down to: a 64 KB limit with 32 KB
-	 * locked cannot take a 2 MB grow, whatever the pool holds; one free
-	 * unreserved 2 MB page cannot give 4 MB; with neither short it is the
-	 * kernel's own refusal */
+	/* what an mlock() refusal is put down to: the lock limit if short,
+	 * else the hugetlb pool if short, else the kernel's own refusal */
 	ok(hg_mlock_refusal_why(64 * 1024, 32, 2 * MB, 1, 400, 0, 2048) ==
 			HG_GR_MEMLOCK &&
 		hg_mlock_refusal_why(0, 0, 4 * MB, 1, 3, 2, 2048) ==

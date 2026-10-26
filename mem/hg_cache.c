@@ -36,11 +36,8 @@
 #include "../globals.h"
 #include "hg_arena_int.h"
 
-/*
- * Give up every cell this thread has cached, for every class. Only the
- * owning thread can: the caches are __thread. hb->lock must be held.
- * Returns the number of cells handed over.
- */
+/* give up every cell this thread has cached, all classes; owning thread only
+ * (__thread caches), hb->lock held. Returns the number of cells handed over */
 unsigned int hg_cache_flush_locked(struct hg_block *hb,
                                        struct hg_palloc *pl)
 {
@@ -89,30 +86,12 @@ unsigned int hg_cache_flush_locked(struct hg_block *hb,
 	return n;
 }
 
-/*
- * Sweep generation, bumped once per sweep. A thread IPC cannot reach - TCP
- * main's IO pool waits on a condition variable, not the reactor - compares
- * it with its own last-seen value at a job boundary and flushes when they
- * differ. Relaxed atomics, as the process's threads read it and two of them
- * may bump it at once (under different arenas' locks); no ordering is
- * needed - a missed generation only delays a flush to the next sweep, the
- * same fire-and-forget contract as the IPC path.
- */
+/* sweep generation, checked per job by threads IPC cannot reach; relaxed
+ * atomics: a missed generation only delays a flush to the next sweep */
 unsigned long hg_sweep_gen;
 
-/*
- * Reserve floor: below hb->reserve_floor free leaves (1/16 of the grid, set
- * in hg_buddy_init), publish a sweep through hg_sweep_gen, which reaches even
- * the TCP IO pool. below_floor is the hysteresis; recovery needs 2x the floor.
- *
- * Called from hg_buddy_alloc/_free, the one point every consumer of grid
- * space passes (the large tier bypasses carve_chunk()), and recovery shows
- * only on a free. Only a crossing the arena cannot grow out of (at the
- * ceiling, or growth blocked) is a WARN, once; a quiet crossing that later
- * gets stuck below the floor is upgraded to it, with one more sweep.
- *
- * hb->lock is held by every caller.
- */
+/* reserve floor: below it, publish a sweep via hg_sweep_gen; recovery needs 2x
+ * the floor. WARN once, only when the arena cannot grow out (hg_floor_stuck) */
 static inline int hg_floor_stuck(struct hg_block *hb)
 {
 	unsigned long limit = (hb->pol.active && hb->pol.up_bytes) ?
@@ -158,25 +137,19 @@ void hg_reserve_floor_check(struct hg_block *hb)
 			LM_DBG("%s: free space recovered above the reserve floor "
 				"(%lu leaves free)\n", hb->name, hb->buddy_free_leaves);
 		hb->floor_warned = 0;
-		/* the same 2x-floor mark ends a grow-blocked episode: the
-		 * demand that needed the grow has gone. One mark for both,
-		 * so "blocked" cannot outlive the pressure */
+		/* the same 2x-floor mark ends a grow-blocked episode, so
+		 * "blocked" cannot outlive the pressure */
 		hg_grow_unblock(hb, "demand fell back below the floor");
 	}
 }
 
-/*
- * The sweep flush takes hb->lock per HG_FLUSH_BATCH cells: the chain is TLS,
- * only the pushes and the GC need the lock. A class used since the last sweep
- * keeps a residue (hg_flush_residue()), so its next allocation is not a locked
- * refill; an untouched class, or any below the reserve floor, gives all back.
- * Dropping the lock between batches is safe: a block is reclaimed only when
- * all its cells are in the pool, so none holds a cell still on this chain.
- * gc_deferred covers the walk within a batch.
- */
+/* the sweep flush locks per HG_FLUSH_BATCH cells; a block is reclaimed only
+ * when all its cells are pooled, so unlocking between batches is safe */
 #define HG_FLUSH_BATCH  64   /* cells per lock hold */
 #define HG_FLUSH_KEEP   8    /* residue cap per active class */
 
+/* a class used since the last sweep keeps a residue, so its next allocation
+ * is not a locked refill; none below the reserve floor */
 unsigned int hg_flush_residue(struct hg_block *hb,
                                          struct hg_palloc *pl, int c)
 {

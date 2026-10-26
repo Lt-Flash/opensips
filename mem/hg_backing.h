@@ -23,9 +23,8 @@
 #ifndef HG_BACKING_H
 #define HG_BACKING_H
 
-/* internal to hg_malloc.c, hg_backing.c and hg_capacity.c: the
- * page-size helpers and the backing and capacity calls they share; include
- * after their headers */
+/* internal to hg_malloc.c, hg_backing.c and hg_capacity.c: page-size,
+ * backing and capacity helpers; include after their headers */
 
 unsigned long hg_hps(void);
 
@@ -49,22 +48,13 @@ int hg_init_fits(const char *what, unsigned long init,
 
 #define HG_HPS (hg_hps())
 
-/*
- * Small-arena mode: an arena whose whole reservation is under one huge page
- * gets nothing from hugetlb or THP, so its grid runs on 256 KB pages (all
- * geometry reads hb->hps).
- * A buddy block never spans pages, and 256 KB fits the largest class's
- * ~131 KB chunk floor (chunk_size_for()) and the ~140 KB large object core
- * startup takes. Minimum: two pages (512 KB; the hg_block header takes
- * ~31 KB of page 0) for a fixed arena, one for an elastic one; in huge-page
- * mode, one huge page.
- */
+/* small-arena mode: an arena under one huge page gains nothing from huge
+ * pages, so it runs on 256 KB pages (fits the largest class's chunk floor) */
 #define HG_SMALL_PAGE_SHIFT 18
 #define HG_SMALL_PAGE (1UL << HG_SMALL_PAGE_SHIFT)
 
-/* the page unit an arena with this init/cap runs on, judged by size;
- * an INIT under one huge page with a larger cap is settled by the backing
- * tier in hg_malloc_init_cap() */
+/* the page unit an arena with this init/cap runs on, by size; an INIT under
+ * one huge page with a larger cap is settled in hg_malloc_init_cap() */
 static inline unsigned long hg_arena_page(unsigned long init_b,
 		unsigned long cap_b)
 {

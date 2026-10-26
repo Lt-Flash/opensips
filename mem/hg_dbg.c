@@ -32,11 +32,8 @@
 #include "hg_dbg.h"
 #include "../dprint.h"
 
-/*
- * HG_MALLOC_DBG checks, on an arena with hb->dbg set: a tail red zone on
- * every allocation and a poisoned quarantine for freed cells. The other
- * paths only test the flag (hg_arena.c, hg_large.c, hg_malloc_dyn.h).
- */
+/* HG_MALLOC_DBG checks on an arena with hb->dbg set: a tail red zone and a
+ * poisoned quarantine; other paths only test the flag */
 
 /* the trailer is stored XORed with this, so neither the red zone's own
  * bytes nor a stray small integer reads back as a plausible size */
@@ -103,12 +100,8 @@ int hg_dbg_tail_check(struct hg_block *hb, void *cs, unsigned long cap)
 	return -1;
 }
 
-/*
- * The quarantine: a freed cell is filled with HG_DBG_POISON and held here,
- * oldest out first, so a write through a dangling pointer is seen when it
- * leaves. Per thread and arena, so no lock; bounded by HG_QUAR_CELLS and
- * hb->quar_bytes. The ring is mapped on the first free, outside the arena.
- */
+/* per-thread, per-arena quarantine (no lock): freed cells held poisoned,
+ * oldest out first, bounded by HG_QUAR_CELLS and hb->quar_bytes */
 struct hg_quar {
 	unsigned int  head;                  /* oldest entry */
 	unsigned int  n;                     /* entries held */

@@ -90,11 +90,8 @@ static unsigned long long stat_value(const char *path, const char *key)
 	return r;
 }
 
-/*
- * One level of the hierarchy: if it has a limit, its room above the floor
- * goes into @best when tighter. It holds its charge less its inactive file
- * cache, which MemAvailable counts as reclaimable on the host.
- */
+/* one hierarchy level: if limited, its room above the floor goes into @best
+ * when tighter; its charge excludes the inactive file cache (reclaimable) */
 static void cg_level(const char *dir, int v, unsigned long long *best,
                      struct hg_cg_info *ci)
 {
@@ -163,9 +160,8 @@ unsigned long long hg_cgroup_room(struct hg_cg_info *ci)
 	f = fopen(cg_self, "r");
 	if (!f)
 		return HG_ROOM_ANY;
-	/* "hierarchy:controllers:path" per line. A cgroup v1 memory line wins
-	 * - on a hybrid host the memory controller is there, and the "0::"
-	 * line only tracks processes; otherwise "0::" is cgroup v2 */
+	/* "hierarchy:controllers:path" lines: a v1 memory line wins (on a
+	 * hybrid host "0::" only tracks processes), else "0::" is cgroup v2 */
 	while (fgets(line, sizeof line, f)) {
 		line[strcspn(line, "\n")] = 0;
 		c1 = strchr(line, ':');
@@ -202,9 +198,8 @@ unsigned long long hg_cgroup_room(struct hg_cg_info *ci)
 		}
 	}
 
-	/* the own cgroup, then each ancestor: the tightest limit applies. In a
-	 * container the walk ends at the namespace root, whose files are the
-	 * container's; a host's real root has no limit files */
+	/* the own cgroup, then each ancestor: the tightest limit applies; in a
+	 * container the walk stops at the namespace root (the container's) */
 	for (;;) {
 		snprintf(dir, sizeof dir, "%s%s%s", cg_root, v == 1 ? "/memory" : "",
 			strcmp(rel, "/") ? rel : "");

@@ -52,7 +52,7 @@
 /* passed as is: reactor_main_loop() takes its timeout in milliseconds. The
  * policy cycle (profile gates, shrink decision) is hg_scaling_cycle ticks */
 
-static unsigned long maint_last_ns;
+static hg_ns_t maint_last_ns;
 static unsigned int maint_ticks;
 
 /* a shared arena with a cap above its initial size: shm with -m INIT:CAP,
@@ -81,11 +81,11 @@ int hg_maint_count_processes(void)
 
 static void hg_maint_tick(void)
 {
-	unsigned long now = hg_now_ns();
+	hg_ns_t now = hg_now_ns();
 	int i, slow;
 
 	/* the reactor returns on every IPC job too; tick once a second */
-	if (now - maint_last_ns < (unsigned long)HG_MAINT_TICK_MS * 1000000UL)
+	if (now - maint_last_ns < (hg_ns_t)HG_MAINT_TICK_MS * 1000000ULL)
 		return;
 	maint_last_ns = now;
 	slow = (++maint_ticks >= (unsigned int)hg_scaling_cycle);

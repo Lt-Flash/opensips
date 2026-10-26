@@ -169,10 +169,10 @@ void hg_lock_stall_note(struct hg_block *hb, int reason, unsigned long held_ns)
 {
 	/* once per second per process: a stall storm must not become a log
 	 * storm, the counters and the deferred event carry the magnitude */
-	static unsigned long last_warn_ns;
-	unsigned long now = hg_now_ns();
+	static hg_ns_t last_warn_ns;
+	hg_ns_t now = hg_now_ns();
 
-	if (last_warn_ns && now - last_warn_ns < 1000000000UL)
+	if (last_warn_ns && now - last_warn_ns < 1000000000ULL)
 		return;
 	last_warn_ns = now;
 	LM_WARN("%s arena lock held for %lu us by the %s path (threshold "

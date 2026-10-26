@@ -251,10 +251,14 @@ enum hg_lock_reason {
 #define HG_LK_NONE (-1)   /* lk_cur while hb->lock is not held */
 #define HG_LK_BUCKETS 18           /* <1us, 1,2,4,...,32ms, >=64ms */
 
+/* nanoseconds of CLOCK_MONOTONIC: 64-bit on every ABI, as an unsigned long
+ * of them wraps every 4.29 s on a 32-bit build */
+typedef unsigned long long hg_ns_t;
+
 struct hg_lkstat {
 	unsigned long n;
-	unsigned long total_ns;
-	unsigned long max_ns;
+	hg_ns_t total_ns;
+	hg_ns_t max_ns;
 	unsigned long stalls;              /* holds >= hg_lock_stall_us */
 	unsigned long hist[HG_LK_BUCKETS];
 };
@@ -336,7 +340,7 @@ struct hg_block {
 	 * lk_t0/lk_cur are the section in progress, valid only while the lock
 	 * is held and written by the holder alone. */
 	gen_lock_t    lock __attribute__ ((aligned (64)));
-	unsigned long lk_t0;
+	hg_ns_t lk_t0;
 	int           lk_cur;
 
 	/* --- everything from here on is written under hb->lock --- */

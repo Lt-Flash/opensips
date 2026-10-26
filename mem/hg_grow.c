@@ -127,7 +127,8 @@ static int hg_buddy_regrow_holes_unlocks(struct hg_block *hb, unsigned long need
 
 void hg_collapse_deferred(struct hg_block *hb)
 {
-	unsigned long start = hg_now_ns(), i;
+	hg_ns_t start = hg_now_ns();
+	unsigned long i;
 	struct hg_page *pg;
 	int rc;
 
@@ -199,7 +200,8 @@ void hg_collapse_deferred(struct hg_block *hb)
  */
 static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow_why why)
 {
-	unsigned long delta, room, old_pages, i, limit, t0, off, commit_ns;
+	unsigned long delta, room, old_pages, i, limit, off, commit_ns;
+	hg_ns_t t0;
 	unsigned long cp_ns[HG_CP_PHASES];
 	int tier, reason, later;
 	struct hg_room_short rs;
@@ -243,7 +245,7 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 			hg_lock_leave(hb);
 			do {
 				usleep(HG_GROW_WAIT_SLICE_US);
-				waited = hg_now_ns() - t0;
+				waited = hg_ns_ul(hg_now_ns() - t0);
 			} while (__atomic_load_n(&hb->grow_inflight, __ATOMIC_ACQUIRE) &&
 			         waited < HG_GROW_WAIT_MAX_NS);
 			hg_lock_enter(hb, (enum hg_lock_reason)reason);
@@ -336,7 +338,7 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 		(why == HG_GROW_EXHAUSTION && hb->shared &&
 		 __atomic_load_n(&hb->maint_active, __ATOMIC_ACQUIRE)) ?
 		&later : NULL);
-	commit_ns = hg_now_ns() - t0;
+	commit_ns = hg_ns_ul(hg_now_ns() - t0);
 
 	/* phase 3 - PUBLISH under the lock */
 	hg_lock_enter(hb, (enum hg_lock_reason)reason);
@@ -428,7 +430,8 @@ static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
                                    unsigned long room)
 {
 	unsigned long sel[HG_PAGES_PER_EVENT];
-	unsigned long want, i, got = 0, ok, t0, pin_ns;
+	unsigned long want, i, got = 0, ok, pin_ns;
+	hg_ns_t t0;
 	unsigned long lpp = hg_leaves_per_page(hb);
 	unsigned int top = hb->buddy_top;
 	int reason;
@@ -485,7 +488,7 @@ static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
 			sel[ok++] = sel[i];
 	}
 	got = ok;
-	pin_ns = hg_now_ns() - t0;
+	pin_ns = hg_ns_ul(hg_now_ns() - t0);
 
 	/* phase 3 - publish what came back */
 	hg_lock_enter(hb, (enum hg_lock_reason)reason);

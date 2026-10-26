@@ -547,9 +547,9 @@ const char * const hg_cp_phase_str[HG_CP_PHASES] = {
 };
 
 #define HG_CP_TIME(phase, stmt) do { \
-		unsigned long _t0 = hg_now_ns(); \
+		hg_ns_t _t0 = hg_now_ns(); \
 		stmt; \
-		cp_ns[phase] = hg_now_ns() - _t0; \
+		cp_ns[phase] = hg_ns_ul(hg_now_ns() - _t0); \
 	} while (0)
 
 int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,

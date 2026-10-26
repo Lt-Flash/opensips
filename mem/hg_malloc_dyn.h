@@ -211,7 +211,7 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 						hg_guard_bad(own, HG_HDR(p), cur_payload, asked);
 					hg_guard_set(HG_HDR(p), hsum, cur_payload, size);
 				}
-				hg_san_give(own, HG_HDR(p), cur_payload, size);
+				hg_san_keep(own, HG_HDR(p), cur_payload, size);
 			}
 			return p;
 		}
@@ -229,13 +229,14 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 		/* copy min(old, new): a small shrink returned above, but a
 		 * shrink from the large tier gets here */
 		copy = cur_payload < size ? cur_payload : size;
-		/* the copy reads past what the caller asked for: a sanitizer
-		 * must see the old payload open first (hg_san.h) */
+		/* the copy may read past what the caller asked for: a
+		 * sanitizer must see those bytes open first (hg_san.h) - the
+		 * bytes copied, not the whole old payload */
 		if (HG_SAN_ON) {
 			struct hg_block *own = hg_owner(HG_HDR(p));
 
 			if (own)
-				hg_san_open(own, HG_HDR(p), cur_payload);
+				hg_san_open(own, HG_HDR(p), copy);
 		}
 		memcpy(ptr, p, copy);
 		#if !defined INLINE_ALLOC && defined DBG_MALLOC

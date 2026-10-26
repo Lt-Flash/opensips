@@ -61,15 +61,20 @@
 #define HG_SAN_ON 1
 #define HG_SAN_CLOSE(p, n)  ASAN_POISON_MEMORY_REGION((p), (n))
 #define HG_SAN_OPEN(p, n)   ASAN_UNPOISON_MEMORY_REGION((p), (n))
+#define HG_SAN_FRESH(p, n)  ASAN_UNPOISON_MEMORY_REGION((p), (n))
 #elif defined(HG_VALGRIND)
 #include <valgrind/memcheck.h>
 #define HG_SAN_ON 1
 #define HG_SAN_CLOSE(p, n)  ((void)VALGRIND_MAKE_MEM_NOACCESS((p), (n)))
 #define HG_SAN_OPEN(p, n)   ((void)VALGRIND_MAKE_MEM_DEFINED((p), (n)))
+/* a payload handed out new holds nothing the caller wrote: undefined, so a
+ * read of it before a write is reported */
+#define HG_SAN_FRESH(p, n)  ((void)VALGRIND_MAKE_MEM_UNDEFINED((p), (n)))
 #else
 #define HG_SAN_ON 0
 #define HG_SAN_CLOSE(p, n)  ((void)0)
 #define HG_SAN_OPEN(p, n)   ((void)0)
+#define HG_SAN_FRESH(p, n)  ((void)0)
 #endif
 
 #ifdef HG_SAN_TSAN
@@ -91,8 +96,18 @@ void __tsan_release(void *addr);
 /* @cs is a cell start holding @cap payload bytes */
 #define HG_SAN_PAY(cs)      ((char *)(cs) + HG_CELL_HDR)
 
-/* handed out: @size bytes open, the rest closed */
+/* handed out new: @size bytes open (undefined, for Valgrind), the rest
+ * closed */
 #define hg_san_give(hb, cs, cap, size) do { \
+		if (HG_SAN_PRIVATE(hb)) { \
+			HG_SAN_CLOSE(HG_SAN_PAY(cs), (cap)); \
+			HG_SAN_FRESH(HG_SAN_PAY(cs), (size)); \
+		} \
+	} while (0)
+
+/* kept by a realloc in place: @size bytes open, holding the caller's data
+ * (defined), the rest closed */
+#define hg_san_keep(hb, cs, cap, size) do { \
 		if (HG_SAN_PRIVATE(hb)) { \
 			HG_SAN_CLOSE(HG_SAN_PAY(cs), (cap)); \
 			HG_SAN_OPEN(HG_SAN_PAY(cs), (size)); \

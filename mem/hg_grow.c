@@ -555,7 +555,9 @@ static int grow_headroom_tick_body(struct hg_block *hb)
 {
 	if (!hb->buddy_ready || !hg_grow_ahead)
 		return 0;
-	if (hb->span_end < hb->hcap && !hb->grow_inflight &&
+	/* committed, not the span: with holes punched at the ceiling the span
+	 * is full, and the grow re-commits them first */
+	if (hb->committed_bytes < hb->hcap && !hb->grow_inflight &&
 	    hb->buddy_free_leaves < 2 * hb->reserve_floor)
 		return hg_buddy_grow_unlocks(hb, hb->grow_granule, HG_GROW_PROACTIVE) == 0;
 	return 0;

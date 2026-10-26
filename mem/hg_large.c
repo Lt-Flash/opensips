@@ -323,10 +323,19 @@ void hg_large_free(struct hg_block *hb, struct hg_lfrag *frag)
 			int ord = ch->ord;
 
 			for (pp = &hb->large_chunks; *pp; pp = &(*pp)->next)
-				if (*pp == ch) {
-					*pp = ch->next;
+				if (*pp == ch)
 					break;
-				}
+			/* a chunk the list does not hold has no backing this
+			 * arena may give to the buddy: leaked, counted */
+			if (!*pp) {
+				LM_CRIT("%s: large chunk %p is not on the arena's chunk "
+					"list - not returning its backing\n", hb->name,
+					(void *)ch);
+				hg_corrupt(hb, HG_C_INTERNAL);
+				hg_lock_leave(hb);
+				return;
+			}
+			*pp = ch->next;
 
 			hb->large_backing -= backing;
 			hb->real_used     -= backing;

@@ -325,6 +325,13 @@ void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order)
 		hg_corrupt(hb, HG_C_BUDDY_BAD_FREE);
 		return;
 	}
+	/* before any shift by it */
+	if (order > top) {
+		LM_CRIT("%s: buddy free of %p at order %u, above the page's %u - "
+			"ignoring\n", hb->name, p, order, top);
+		hg_corrupt(hb, HG_C_BUDDY_BAD_FREE);
+		return;
+	}
 	pg = page_of(hb, p);
 	leaf = hg_leaf_of(hb, p);
 
@@ -465,6 +472,22 @@ void hg_buddy_free_run(struct hg_block *hb, void *p)
 		return;
 	}
 	start = hg_page_of(hb, p);
+	/* the recorded length is checked before it is acted on: the run ends
+	 * inside the grid, and every page after its head is a member */
+	if (n > hb->npages - start) {
+		LM_CRIT("%s: run free of %p, whose recorded %lu pages run past the "
+			"%lu-page grid - ignoring\n", hb->name, p, n, hb->npages);
+		hg_corrupt(hb, HG_C_BUDDY_BAD_FREE);
+		return;
+	}
+	for (i = start + 1; i < start + n; i++)
+		if (hb->pages[i].run_len != HG_RUN_MEMBER) {
+			LM_CRIT("%s: run free of %p, whose page %lu of %lu is not "
+				"a member of it - ignoring\n", hb->name, p,
+				i - start, n);
+			hg_corrupt(hb, HG_C_BUDDY_BAD_FREE);
+			return;
+		}
 	for (i = start; i < start + n; i++) {
 		pg = &hb->pages[i];
 		pg->run_len = 0;
@@ -482,7 +505,8 @@ int hg_buddy_order_of(const struct hg_block *hb, const void *p)
 		return -1;
 	pg = &hb->pages[hg_page_of(hb, p)];
 	leaf = hg_leaf_of(hb, p);
-	if (pg->leaforder[leaf] == HG_LEAF_NONE)
+	if (pg->leaforder[leaf] == HG_LEAF_NONE ||
+	    pg->leaforder[leaf] > hb->buddy_top)
 		return -1;
 	return pg->leaforder[leaf];
 }

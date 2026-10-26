@@ -513,6 +513,12 @@ struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 		cap = hg_pkg_cap_bytes;
 	else
 		cap = 0;
+	/* every rounding below is to a page of at most HG_HPS */
+	if (!hg_page_roundable(size, HG_HPS) || !hg_page_roundable(cap, HG_HPS)) {
+		LM_ERR("%s arena: %lu bytes, cap %lu, cannot be rounded to a page\n",
+			name, size, cap);
+		return NULL;
+	}
 	apage = hg_arena_page(size, cap);
 	/* INIT under one huge page with a cap at or above it: the backing the
 	 * arena gets decides the page unit, so the reservation is made on the
@@ -1020,6 +1026,12 @@ struct hg_block *hg_arena_create(char *name, unsigned long init_bytes,
 	}
 	if (cap_bytes < init_bytes)
 		cap_bytes = init_bytes;
+	/* rounded to a page below: near the top of the type it would wrap */
+	if (!hg_page_roundable(cap_bytes, HG_HPS)) {
+		LM_ERR("module arena '%s': a %lu byte cap cannot be rounded to a "
+			"page\n", name, cap_bytes);
+		return NULL;
+	}
 	/* an INIT under one huge page with a cap at or above it is settled
 	 * by hg_malloc_init_cap() once the backing tier is known */
 	if (!(hg_arena_page(init_bytes, cap_bytes) == HG_HPS &&

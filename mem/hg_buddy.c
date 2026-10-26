@@ -400,7 +400,10 @@ void *hg_buddy_alloc_run(struct hg_block *hb, unsigned long npages)
 	unsigned int top = hb->buddy_top;
 	unsigned long i, start, run = 0;
 
-	if (!hb->buddy_ready || npages == 0)
+	/* the run's length is kept in an unsigned int with HG_RUN_MEMBER
+	 * reserved, and no run is longer than the grid */
+	if (!hb->buddy_ready || npages == 0 || npages >= HG_RUN_MEMBER ||
+	    npages > hb->npages)
 		return NULL;
 	if (npages == 1)
 		return hg_buddy_alloc(hb, top);

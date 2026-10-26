@@ -78,6 +78,12 @@ static inline unsigned long hg_page_round(unsigned long v, unsigned long pg)
 	return (v + pg - 1) & ~(pg - 1);
 }
 
+/* can @v be rounded up to a page of @pg bytes, or it wraps to a small one */
+static inline int hg_page_roundable(unsigned long v, unsigned long pg)
+{
+	return v <= ~0UL - (pg - 1);
+}
+
 /* the smallest arena that can function in this page unit */
 static inline unsigned long hg_min_viable(unsigned long apage)
 {

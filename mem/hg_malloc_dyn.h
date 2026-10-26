@@ -124,6 +124,20 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 		return hg_malloc(hb, size, file, func, line);
 		#endif
 
+	/* an impossible size is refused before the in-place arithmetic below,
+	 * which would wrap and keep the cell for it; as in hg_cell_alloc(),
+	 * and the allocation stays as it is */
+	if (size > hb->hcap) {
+		hg_lock_enter(hb, HG_LK_REFILL);
+		if (hg_oom_first(hb, size))
+			LM_ERR("%s: a %lu byte realloc request exceeds the arena's "
+				"%lu byte cap - refused, the allocation is unchanged; "
+				"further failures are summarised every 30 s\n",
+				hb->name, size, hb->hcap);
+		hg_lock_leave(hb);
+		return NULL;
+	}
+
 	/* ownership BEFORE the header is read: a foreign or unmapped pointer
 	 * would fault there. Any live arena will do, so a child can realloc
 	 * inherited pkg memory: it is read in place, and a move frees it

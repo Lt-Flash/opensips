@@ -33,6 +33,7 @@
 #include "hg_large.h"
 #include "hg_dbg.h"
 #include "../dprint.h"
+#include "../pt.h"     /* counted_max_processes */
 #include "../globals.h"
 #include "hg_arena_int.h"
 
@@ -95,12 +96,29 @@ void hg_arena_stats_core_init(struct hg_block *hb, int core_index)
 /* this thread's stats slot, -1 = the process's own (see hg_pstat_mine) */
 __thread int hg_pstat_slot = -1;
 
+int hg_pstat_shared;
+
+/*
+ * Process process_no writes slot (process_no + 1) % HG_STAT_SLOTS, so more
+ * processes than slots share some, and two processes adding to one slot
+ * lose updates. Atomic adds keep the sums right then, at a small cost.
+ */
+void hg_pstat_slots_check(unsigned int nprocs)
+{
+	if (nprocs <= HG_STAT_SLOTS)
+		return;
+	hg_pstat_shared = 1;
+	LM_WARN("%u processes for %d HG_MALLOC statistics slots: some processes "
+		"share a slot, so every slot's counters are added atomically\n",
+		nprocs, HG_STAT_SLOTS);
+}
+
 void hg_thread_stats_init(void)
 {
 	struct hg_block *hb = (struct hg_block *)shm_block;
 	static unsigned int local_next = HG_STAT_SLOTS - 1;
 	static int said;
-	unsigned int *next, s;
+	unsigned int *next, s, floor;
 
 	if (hg_pstat_slot >= 0)
 		return;
@@ -110,13 +128,23 @@ void hg_thread_stats_init(void)
 	next = (hb && (mem_allocator_shm == MM_HG_MALLOC ||
 	               mem_allocator_shm == MM_HG_MALLOC_DBG)) ?
 	       &hb->thread_slot_next : &local_next;
+	/* thread slots come down from the top and must stay above the
+	 * processes' 1..counted_max_processes */
+	floor = counted_max_processes > HG_STAT_SLOTS / 4 ?
+		counted_max_processes : HG_STAT_SLOTS / 4;
 	s = __atomic_fetch_sub(next, 1, __ATOMIC_ACQ_REL);
-	if (s <= HG_STAT_SLOTS / 4 || s >= HG_STAT_SLOTS) {
-		/* out of thread slots: share the process slot */
+	if (s <= floor || s >= HG_STAT_SLOTS) {
+		/* out of thread slots: share the process slot, which now has two
+		 * writers - from here on this process adds atomically. Updates
+		 * the other thread makes before it sees the flag may still be
+		 * lost; the sums drift by those few at most. */
+		hg_pstat_shared = 1;
 		if (!said) {
 			said = 1;
-			LM_WARN("no free per-thread stats slot (claimed %u of %u) - this "
-				"thread shares its process's slot\n", s, HG_STAT_SLOTS);
+			LM_WARN("no free per-thread stats slot (claimed %u of %u, "
+				"processes use up to %u) - this thread shares its "
+				"process's slot, whose counters are now added "
+				"atomically\n", s, HG_STAT_SLOTS, floor);
 		}
 		return;
 	}

@@ -175,7 +175,8 @@ static inline void *hg_buddy_block_of(const struct hg_block *hb, const void *p)
 		return NULL;
 	leaf = hg_leaf_of(hb, p);
 	o = pg->leaforder[leaf];
-	if (o == HG_LEAF_NONE)
+	/* a damaged order is not shifted by */
+	if (o == HG_LEAF_NONE || o > hb->buddy_top)
 		return NULL;
 	return pg->base + ((leaf & ~((1UL << o) - 1)) << HG_LEAF_SHIFT);
 }

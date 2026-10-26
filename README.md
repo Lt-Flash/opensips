@@ -80,11 +80,11 @@ With a lower limit, HG runs and grows unpinned on THP and 4 KB pages, but on hug
 **To use huge pages, enable them on the host first.** HG uses only what the host offers. With no hugetlb pool and transparent huge pages turned off, every arena drops through the ladder to plain 4 KB pages. It still works, but without the huge-page gain. Configure one or both:
 
 ```bash
-# Tier 1 - hugetlb pool: shm cap + pkg cap x processes, in 2 MB pages, ~12% margin.
-# e.g. -m 128:1024 -M 16:32 with 20 processes: (1024 + 32*20) / 2 = 832 pages, +12% = 932
-sysctl -w vm.nr_hugepages=932            # persist in /etc/sysctl.d/; reserve early, before memory fragments
+# Tier 1 - hugetlb pool, for the shared arena only: its -m cap, in 2 MB pages, ~12% margin.
+# e.g. -m 128:1024: 1024 / 2 = 512 pages, +12% = 574
+sysctl -w vm.nr_hugepages=574            # persist in /etc/sysctl.d/; reserve early, before memory fragments
 
-# Tiers 2-3 - transparent huge pages, used when there is no pool or it is too small
+# Tiers 2-3 - transparent huge pages: the private arenas' always, the shared arena's without a pool
 echo madvise > /sys/kernel/mm/transparent_hugepage/enabled         # private arenas (-M)
 echo advise  > /sys/kernel/mm/transparent_hugepage/shmem_enabled   # shared arena (-m)
 ```

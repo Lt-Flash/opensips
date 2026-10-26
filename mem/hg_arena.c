@@ -868,21 +868,37 @@ unsigned int hg_cell_total_size(unsigned char cls)
 }
 
 /*
- * The head of this thread's private list must be one of the arena's cells
- * before its link is followed: a scribbled link would otherwise send the
- * next pop to an arbitrary address. A bad head drops the whole list (the
- * cells on it leak) - nothing beyond it can be trusted.
+ * The head of this thread's private list must be a FREE or FRESH cell of
+ * this class, in memory the arena holds, before its link is followed: a
+ * scribbled link would otherwise send the next pop to an arbitrary address
+ * (on hugetlb, past the committed span, a SIGBUS), and a cell whose header
+ * fails has a link nobody can vouch for. The header read is the one the
+ * allocation would make anyway; it comes back in @w and @base. A bad head
+ * drops the whole list (the cells on it leak) - nothing beyond it can be
+ * trusted.
  */
 static inline int private_head_ok(struct hg_block *hb, struct hg_palloc *pl,
-                                  int c)
+                                  int c, union hg_hdr_w *w,
+                                  unsigned short *base)
 {
 	char *cs = pl->cls[c].free_head;
+	int st;
 
-	if (hg_owns(hb, cs))
+	if (!hg_owns(hb, cs) || !hg_backed(hb, cs)) {
+		LM_CRIT("%s: class %d private list leads to %p, outside the "
+			"arena's memory - dropping the list\n", hb->name, c, cs);
+		hg_corrupt(hb, HG_C_FOREIGN_PTR);
+		goto drop;
+	}
+	st = hg_hdr_read(cs, w, base);
+	if ((st == HG_ST_FRESH || st == HG_ST_FREE) && w->f.cls == c)
 		return 1;
-	LM_CRIT("%s: class %d private list leads to %p, outside the arena - "
-		"dropping the list\n", hb->name, c, cs);
-	hg_corrupt(hb, HG_C_FOREIGN_PTR);
+	LM_CRIT("%s: class %d private list head %p is %s - dropping the "
+		"list\n", hb->name, c, cs, st < 0 ? "damaged" :
+		hg_st_live(st) ? "still in use" : "of another class");
+	hg_corrupt(hb, st < 0 ? HG_C_HEADER : hg_st_live(st) ?
+		HG_C_DOUBLE_FREE : HG_C_CLASS_MISMATCH);
+drop:
 	pl->cls[c].free_head = NULL;
 	pl->cls[c].nfree = 0;
 	return 0;
@@ -901,7 +917,9 @@ void *hg_cell_alloc(struct hg_block *hb, unsigned long size)
 	unsigned long want = size;
 	/* read once: the flag may change under a running allocation */
 	unsigned int guard = hb->guard;
-	int c;
+	int c, st;
+	union hg_hdr_w w;
+	unsigned short base;
 
 	/* a request the whole reservation could not hold is refused before
 	 * any arithmetic on it: near ULONG_MAX the additions below wrap, and
@@ -940,11 +958,11 @@ again:
 	/* fast paths: no locks, no shared lines */
 	cell_start = pl->cls[c].free_head;
 	if (cell_start) {
-		if (!private_head_ok(hb, pl, c))
+		if (!private_head_ok(hb, pl, c, &w, &base))
 			goto again;
 		pl->cls[c].free_head = cell_next(cell_start);
 		pl->cls[c].nfree--;
-		goto found;
+		goto checked;
 	}
 	if (pl->cls[c].left) {
 		cell_start = pl->cls[c].bump;
@@ -977,11 +995,11 @@ again:
 
 	cell_start = pl->cls[c].free_head;
 	if (cell_start) {
-		if (!private_head_ok(hb, pl, c))
+		if (!private_head_ok(hb, pl, c, &w, &base))
 			goto again;
 		pl->cls[c].free_head = cell_next(cell_start);
 		pl->cls[c].nfree--;
-		goto found;
+		goto checked;
 	}
 	cell_start = pl->cls[c].bump;
 	pl->cls[c].bump += cell_sizes[c];
@@ -992,30 +1010,27 @@ found:
 	 * Only a FRESH or FREE cell with an intact header is handed out. A LIVE
 	 * one was freed twice unseen (two processes at once), a damaged header
 	 * is a scribbled list or a neighbour's overflow: leak it and take
-	 * another, or one cell would go to two callers.
+	 * another, or one cell would go to two callers. A list head was
+	 * checked so before its link was followed (private_head_ok()).
 	 */
-	{
-		union hg_hdr_w w;
-		unsigned short base;
-		int st = hg_hdr_read(cell_start, &w, &base);
-
-		if ((st != HG_ST_FRESH && st != HG_ST_FREE) || w.f.cls != c) {
-			LM_CRIT("%s: class %d cell %p about to be handed out is %s - "
-				"dropping it\n", hb->name, c, cell_start,
-				st < 0 ? "damaged" : hg_st_live(st) ? "still in use" :
-				"of another class");
-			hg_corrupt(hb, st < 0 ? HG_C_HEADER : hg_st_live(st) ?
-				HG_C_DOUBLE_FREE : HG_C_CLASS_MISMATCH);
-			goto again;
-		}
-		if (guard) {
-			hg_san_open(hb, cell_start, cell_sizes[c] - HG_CELL_HDR);
-			hg_guard_set(cell_start, base, cell_sizes[c] - HG_CELL_HDR,
-				size);
-		}
-		hg_hdr_set_base(cell_start, c, guard ? HG_ST_LIVE_G : HG_ST_LIVE,
-			base);
+	st = hg_hdr_read(cell_start, &w, &base);
+	if ((st != HG_ST_FRESH && st != HG_ST_FREE) || w.f.cls != c) {
+		LM_CRIT("%s: class %d cell %p about to be handed out is %s - "
+			"dropping it\n", hb->name, c, cell_start,
+			st < 0 ? "damaged" : hg_st_live(st) ? "still in use" :
+			"of another class");
+		hg_corrupt(hb, st < 0 ? HG_C_HEADER : hg_st_live(st) ?
+			HG_C_DOUBLE_FREE : HG_C_CLASS_MISMATCH);
+		goto again;
 	}
+checked:
+	if (guard) {
+		hg_san_open(hb, cell_start, cell_sizes[c] - HG_CELL_HDR);
+		hg_guard_set(cell_start, base, cell_sizes[c] - HG_CELL_HDR,
+			size);
+	}
+	hg_hdr_set_base(cell_start, c, guard ? HG_ST_LIVE_G : HG_ST_LIVE,
+		base);
 	payload = cell_start + HG_CELL_HDR;
 	pl->cls[c].touched = 1;
 	if (hb->dbg) {

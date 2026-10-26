@@ -621,6 +621,15 @@ static inline unsigned long hg_cell_live(struct hg_block *hb)
 	return total < 0 ? 0 : (unsigned long)total;
 }
 
+/* room left to carve: the span (hb->size) less the carve footprint, and 0
+ * rather than a wrapped figure should the two ever disagree */
+static inline unsigned long hg_free_to_carve(const struct hg_block *hb)
+{
+	unsigned long size = hb->size, carved = hb->real_used;
+
+	return size > carved ? size - carved : 0;
+}
+
 #ifdef STATISTICS
 static inline unsigned long hg_get_size(struct hg_block *hb)
 {
@@ -641,7 +650,7 @@ static inline unsigned long hg_get_free(struct hg_block *hb)
 	 * size here (real_used is live), unlike q_malloc; free + carve == size
 	 * holds. used = live payload, real_used / max_used = live commitment
 	 * and its peak, free = room left to carve. */
-	return hb->size - hb->real_used;
+	return hg_free_to_carve(hb);
 }
 /* the large tier's counterpart to hg_slab_recycled(): buddy backing not
  * handed out as a fragment. O(1): both terms are kept under hb->lock. */

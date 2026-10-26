@@ -409,6 +409,7 @@ ERROR: new process's pkg arena: committing 32 MB now does not fit - ... not fork
 | a cell freed by another process comes back intact | `test_hg_malloc.c` | CI | |
 | pkg memory from before `fork()` can be realloc'ed and freed in a child | `test_hg_malloc.c`, normal and debug builds | CI | |
 | a child's copy of the parent's pkg arena is marked as inherited and its sweep never grows it; a pkg arena that grew one step shrinks again | `test_hg_malloc.c`, normal and debug builds | CI | |
+| an arena whose INIT is not a page multiple carves past INIT, its size is the page-rounded span, and its free figure does not wrap | `test_hg_malloc.c` | CI | |
 | a process leaving for good gives its cells back | `test_hg_malloc.c`: a child leaves through `dynamic_process_final_exit()` and the arena returns to its baseline | CI | |
 | a double free is refused and counted, not handed out twice, with or without frees in between | `test_hg_malloc.c` (twice in a row; with a free in between; large fragment; realloc of freed memory); `hgstress` fault injection | CI; by hand | |
 | a damaged header or a pointer into a cell is refused, not followed | `test_hg_malloc.c` | CI | |

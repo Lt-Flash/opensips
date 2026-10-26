@@ -594,11 +594,14 @@ struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 	hb = (struct hg_block *)(void *)base;
 	memset(hb, 0, sizeof *hb);
 	hb->name = name;
-	hb->size = size;
 	hb->hbase = base;
 	/* one figure assigned to both: the span and the committed count part
 	 * ways only when a hole is punched, and nothing does that yet */
 	hb->span_end = hg_page_round(size, apage);
+	/* the span, not INIT: the page grid covers the page-rounded span, so
+	 * an INIT that is not a page multiple (-M 3 on 2 MB pages) is carved
+	 * past, and every "free" figure (size - real_used) would wrap */
+	hb->size = hb->span_end;
 	hb->committed_bytes = hb->span_end;
 	hb->committed_min = hb->committed_bytes;
 	hb->span_pending = hb->span_end;
@@ -849,7 +852,7 @@ void hg_info(struct hg_block *hb, struct mem_info *info)
 	recycled = hg_slab_recycled(hb);
 	info->real_used = hb->real_used > recycled ? hb->real_used - recycled : 0;
 	/* room left to CARVE, not size minus live - see hg_get_free() */
-	info->free = hb->size - hb->real_used;
+	info->free = hg_free_to_carve(hb);
 
 	/* the peak of real_used as computed above, not of the carve
 	 * (hb->max_real_used), which only grows */

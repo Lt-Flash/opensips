@@ -1245,7 +1245,8 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 	if (add_mi_number(o, MI_SSTR("chunks"), hb->nchunks) < 0)
 		return -1;
 	/* what shmem:free_size reports: arena never yet carved */
-	if (add_mi_number(o, MI_SSTR("free_to_carve"), hb->size - carved) < 0)
+	if (add_mi_number(o, MI_SSTR("free_to_carve"),
+	        hb->size > carved ? hb->size - carved : 0) < 0)
 		return -1;
 
 	/* live: what is actually handed out right now. live_committed and

@@ -689,6 +689,8 @@ struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 	 * bump-carve from - hg_arena_init() sets hoff past it */
 	if (hg_arena_init(hb, ROUNDUP_TO(sizeof(struct hg_block))) < 0) {
 		LM_ERR("failed to init the %s arena\n", name);
+		/* or hg_owner() would route a later free into the unmapped range */
+		hg_arena_reg_del(hb);
 		lock_destroy(&hb->lock);
 		munmap(base, hb->hcap);
 		return NULL;

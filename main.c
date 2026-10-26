@@ -70,6 +70,7 @@
 #include "reactor_defs.h" /*keep this first*/
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <errno.h>
 #include <ctype.h>
 #include <string.h>
@@ -400,16 +401,21 @@ error:
 static long parse_mem_size(const char *s, char **end)
 {
 	long v = strtol(s, end, 10);
+	int shift;
 
 	if (*end == s || v < 0)
 		return -1;
 	switch (**end) {
-	case 'k': case 'K': v *= 1024;               (*end)++; break;
-	case 'g': case 'G': v *= 1024 * 1024 * 1024L; (*end)++; break;
-	case 'm': case 'M': (*end)++;                /* fall through */
-	default:            v *= 1024 * 1024;         break;
+	case 'k': case 'K': shift = 10; (*end)++; break;
+	case 'g': case 'G': shift = 30; (*end)++; break;
+	case 'm': case 'M': (*end)++;   /* fall through */
+	default:            shift = 20; break;
 	}
-	return v;
+	/* range-checked before the shift, which would otherwise wrap a huge
+	 * value into a small one that passes (17179869185g as 1 GB) */
+	if (v > (LONG_MAX >> shift))
+		return -1;
+	return v << shift;
 }
 
 int main(int argc, char** argv)

@@ -407,7 +407,7 @@ struct hg_arena_range hg_arena_reg[HG_ARENA_REG_MAX];
  */
 unsigned long hg_xarena_frees;
 
-static void hg_arena_reg_add(struct hg_block *hb)
+static int hg_arena_reg_add(struct hg_block *hb)
 {
 	int i;
 
@@ -419,14 +419,18 @@ static void hg_arena_reg_add(struct hg_block *hb)
 			 * live cells to misattribute */
 			hg_arena_reg[i].size = hb->hcap;
 			hg_arena_reg[i].hb   = hb;
-			return;
+			return 0;
 		}
 	}
-	/* Not fatal: hg_owns_any() then declines pointers it cannot vouch for,
-	 * which costs diagnostics, never correctness. */
+	/* Not fatal for a private arena: hg_owns_any() then declines pointers
+	 * it cannot vouch for, which costs diagnostics, never correctness. The
+	 * caller refuses a shared one: the registry is what resets a shared
+	 * arena's private caches in every child (hg_malloc_child_init_all()),
+	 * and without that two processes would hand out the same cells. */
 	LM_WARN("%s: more than %d live HG_MALLOC arenas in one process - "
 		"ownership checks will be incomplete\n", hb->name,
 		HG_ARENA_REG_MAX);
+	return -1;
 }
 
 static void hg_arena_reg_del(struct hg_block *hb)
@@ -688,7 +692,13 @@ struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 		return NULL;
 	}
 
-	hg_arena_reg_add(hb);
+	if (hg_arena_reg_add(hb) < 0 && shared) {
+		LM_ERR("%s: a shared arena must be in the arena registry, which "
+			"resets its caches at fork - not creating it\n", name);
+		lock_destroy(&hb->lock);
+		munmap(base, hb->hcap);
+		return NULL;
+	}
 
 	/* the region right after the block header is the first thing chunks
 	 * bump-carve from - hg_arena_init() sets hoff past it */

@@ -210,8 +210,9 @@ enum hg_grow_refusal hg_mlock_refusal_why(unsigned long lim, long locked_kb,
 		locked_kb = 0;
 	if (lim && ((unsigned long long)locked_kb << 10) + delta > lim)
 		return HG_GR_MEMLOCK;
+	/* more reserved than free is an empty pool, not a huge one */
 	if (hugetlb && free_pg >= 0 && rsvd_pg >= 0 && page_kb > 0 &&
-	    (unsigned long long)(free_pg - rsvd_pg) *
+	    (unsigned long long)(free_pg > rsvd_pg ? free_pg - rsvd_pg : 0) *
 	    ((unsigned long long)page_kb << 10) < delta)
 		return HG_GR_HUGETLB_POOL;
 	return HG_GR_MLOCK;

@@ -24,6 +24,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/mman.h>
 
 #include "hg_malloc.h"
@@ -178,7 +179,17 @@ void hg_quar_put(struct hg_block *hb, struct hg_palloc *pl, unsigned int c,
 		               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
 		if (m == MAP_FAILED) {
-			/* no quarantine: the cell goes back at once, unchecked */
+			static int said;
+
+			/* no quarantine: the cell goes back at once, unchecked -
+			 * said once per process, as it weakens the debug checks */
+			if (!said) {
+				said = 1;
+				LM_WARN("%s: no memory for this thread's HG_MALLOC_DBG "
+					"quarantine (%s) - its freed cells are reused at "
+					"once, without the write-after-free check\n",
+					hb->name, strerror(errno));
+			}
 			hg_san_take(hb, cs, hg_cell_total_size(c) - HG_CELL_HDR);
 			hg_cell_push_private(hb, pl, c, cs);
 			return;

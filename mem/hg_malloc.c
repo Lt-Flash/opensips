@@ -874,8 +874,7 @@ void hg_info(struct hg_block *hb, struct mem_info *info)
 
 	/* the peak of real_used as computed above, not of the carve
 	 * (hb->max_real_used), which only grows */
-	if (info->real_used > hb->max_live_used)
-		hb->max_live_used = info->real_used;
+	hg_live_peak(hb, info->real_used);
 	info->max_used = hb->max_live_used;
 	info->total_frags = hg_fragments(hb);
 }

@@ -726,6 +726,17 @@ static inline unsigned long hg_large_recycled(struct hg_block *hb)
 	return hb->large_backing > hb->large_live ?
 	       hb->large_backing - hb->large_live : 0;
 }
+/* raise the live peak to @live: an atomic maximum, as the sweeps of two
+ * processes sample a shared arena's peak at once */
+static inline void hg_live_peak(struct hg_block *hb, unsigned long live)
+{
+	unsigned long m = __atomic_load_n(&hb->max_live_used, __ATOMIC_RELAXED);
+
+	while (live > m && !__atomic_compare_exchange_n(&hb->max_live_used,
+	        &m, live, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+		;
+}
+
 static inline unsigned long hg_get_real_used(struct hg_block *hb)
 {
 	/* real_used is the carve footprint of BOTH tiers (slab blocks plus
@@ -734,8 +745,7 @@ static inline unsigned long hg_get_real_used(struct hg_block *hb)
 	unsigned long live = hb->real_used > recycled ?
 	                     hb->real_used - recycled : 0;
 
-	if (live > hb->max_live_used)
-		hb->max_live_used = live;
+	hg_live_peak(hb, live);
 	return live;
 }
 static inline unsigned long hg_get_max_real_used(struct hg_block *hb)

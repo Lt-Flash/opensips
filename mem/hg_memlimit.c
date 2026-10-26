@@ -25,8 +25,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <limits.h>
+#include <unistd.h>    /* access() */
 
 #include "hg_memlimit.h"
+#include "../dprint.h"
 #include "../globals.h"
 
 long hg_floor_mb_for(long total_mb)
@@ -119,7 +121,9 @@ static void cg_level(const char *dir, int v, unsigned long long *best,
 	limit_mb = (limit >> 20) > LONG_MAX ? LONG_MAX : (long)(limit >> 20);
 	floor = (unsigned long long)(hg_ram_floor_mb > 0 ? hg_ram_floor_mb :
 		hg_floor_mb_for(limit_mb)) << 20;
-	room = limit > used + floor ? limit - used - floor : 0;
+	/* no sum that could wrap: used and floor are each checked against
+	 * what is left of the limit */
+	room = used >= limit || floor >= limit - used ? 0 : limit - used - floor;
 	if (room < *best) {
 		*best = room;
 		if (ci) {
@@ -181,6 +185,22 @@ unsigned long long hg_cgroup_room(struct hg_cg_info *ci)
 	fclose(f);
 	if (!v || rel[0] != '/')
 		return HG_ROOM_ANY;
+	/* cgroup v1's memory controller is looked for at <root>/memory: a
+	 * mount elsewhere would leave the limit unchecked without a word */
+	if (v == 1) {
+		static int said;
+		char lim[1100 + 32];
+
+		snprintf(lim, sizeof lim, "%s/memory%s/memory.limit_in_bytes",
+			cg_root, strcmp(rel, "/") ? rel : "");
+		if (!said && access(lim, R_OK) != 0) {
+			said = 1;
+			LM_WARN("%s names a cgroup v1 memory controller, but %s "
+				"cannot be read - its limit is not checked (the "
+				"controller is expected at %s/memory)\n", cg_self, lim,
+				cg_root);
+		}
+	}
 
 	/* the own cgroup, then each ancestor: the tightest limit applies. In a
 	 * container the walk ends at the namespace root, whose files are the

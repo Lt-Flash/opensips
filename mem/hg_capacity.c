@@ -102,14 +102,13 @@ static unsigned long long hg_ram_room_why(struct hg_cg_info *ci)
 
 	hg_meminfo_kb2("MemTotal", &total_kb, "MemAvailable", &avail_kb);
 	floor_b = (unsigned long long)hg_ram_floor_of(total_kb) << 20;
-	avail_b = (unsigned long long)avail_kb << 10;
 
-	if (avail_kb < 0)
+	if (avail_kb < 0) {
 		room = HG_ROOM_ANY;
-	else if (avail_b <= floor_b)
-		room = 0;
-	else
-		room = avail_b - floor_b;
+	} else {
+		avail_b = (unsigned long long)avail_kb << 10;
+		room = avail_b <= floor_b ? 0 : avail_b - floor_b;
+	}
 	cg = hg_cgroup_room(&c);
 	if (cg < room)
 		room = cg;
@@ -176,15 +175,22 @@ static unsigned int hg_pkg_pub_n;
 int hg_pkg_pub_init(unsigned int nproc)
 {
 #ifdef PKG_MALLOC
+	unsigned long bytes;
+
 	if (mem_allocator_pkg != MM_HG_MALLOC &&
 	    mem_allocator_pkg != MM_HG_MALLOC_DBG)
 		return 0;
-	hg_pkg_pub = shm_malloc(nproc * sizeof *hg_pkg_pub);
+	bytes = (unsigned long)nproc * sizeof *hg_pkg_pub;
+	if (bytes / sizeof *hg_pkg_pub != nproc) {
+		LM_ERR("%u processes overflow the pkg growth statistics\n", nproc);
+		return -1;
+	}
+	hg_pkg_pub = shm_malloc(bytes);
 	if (!hg_pkg_pub) {
 		LM_ERR("no shm for the pkg growth statistics\n");
 		return -1;
 	}
-	memset(hg_pkg_pub, 0, nproc * sizeof *hg_pkg_pub);
+	memset(hg_pkg_pub, 0, bytes);
 	hg_pkg_pub_n = nproc;
 #endif
 	return 0;

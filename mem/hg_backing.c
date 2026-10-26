@@ -688,16 +688,33 @@ int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len)
 	}
 	return -1;
 #else
+	/* the kernel refuses MADV_DONTNEED and MADV_REMOVE on locked pages, so
+	 * the range is unlocked first - and a refused advice has to pin it
+	 * again, or the pages stay committed, carved from, and unpinned */
 	munlock(base, len);
 
 	if (madvise(base, len, advice) != 0) {
+		int err = errno;
+
 		/* structural, not transient: said once, and the arena never
 		 * tries to shrink again */
 		hb->shrink_unsupported = 1;
 		LM_WARN("%s: cannot release memory (%s of %lu MB failed: %s) "
 			"- shrink disabled for this arena\n", hb->name,
 			hb->shared ? "MADV_REMOVE" : "MADV_DONTNEED",
-			len >> 20, strerror(errno));
+			len >> 20, strerror(err));
+		/* an arena that runs unpinned had nothing locked to restore; if
+		 * the pin is refused, the pinned figure drops instead of counting
+		 * pages that are no longer locked */
+		if (!hb->unpinned && mlock(base, len) != 0) {
+			LM_WARN("%s: could not pin the %lu MB again after the refused "
+				"release (%s) - they stay committed but unpinned\n",
+				hb->name, len >> 20, strerror(errno));
+			if (hb->locked_mb >= len >> 20)
+				hb->locked_mb -= len >> 20;
+			else
+				hb->locked_mb = 0;
+		}
 		return -1;
 	}
 

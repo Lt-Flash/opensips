@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 
 #include "../../dprint.h"
@@ -714,6 +715,55 @@ static void test_hg_double_free(void)
 }
 
 /*
+ * A pointer past the shm arena's committed span - what a trim gave back, or
+ * what was never committed - is refused and counted without its header
+ * being read: on shared memory the read would commit the page behind the
+ * arena's accounting, on hugetlb with the pool empty it raises SIGBUS. The
+ * page must stay out of memory. In a child, as the refusal is counted.
+ */
+static int hgt_child_unbacked(void *arg)
+{
+	shm_free(arg);
+	return 0;
+}
+
+static void test_hg_unbacked(void)
+{
+#ifdef __OS_linux
+	struct hg_block *hb = shm_block;
+	unsigned long df0 = hb->corrupt[HG_C_DOUBLE_FREE];
+	unsigned long hd0 = hb->corrupt[HG_C_HEADER];
+	long pgsz = sysconf(_SC_PAGESIZE);
+	unsigned char vec = 1;
+	char *page;
+	int in_child;
+
+	if (hb->hcap < hb->span_end + (4UL << 20) || pgsz <= 0) {
+		diag("shm arena has no uncommitted reservation, unbacked free "
+			"not tested");
+		return;
+	}
+	/* deep in the part of the reservation never committed */
+	page = hb->hbase + hb->hcap - (2UL << 20);
+	if (mincore(page, (size_t)pgsz, &vec) != 0 || (vec & 1)) {
+		diag("residency of %p unknown or already in memory, unbacked free "
+			"not tested", page);
+		return;
+	}
+	in_child = hgt_in_child("hg unbacked free", hgt_child_unbacked,
+		page + pgsz);
+	vec = 1;
+	ok(in_child && hb->corrupt[HG_C_DOUBLE_FREE] == df0 + 1 &&
+		hb->corrupt[HG_C_HEADER] == hd0 &&
+		mincore(page, (size_t)pgsz, &vec) == 0 && !(vec & 1),
+		"a free of a pointer past the shm arena's committed span is "
+		"refused and counted, and its page is not read into memory");
+#else
+	diag("mincore() residency check is Linux-only, unbacked free not tested");
+#endif
+}
+
+/*
  * The header's state and checksum refuse a double free with another free
  * in between, a header overwritten by a neighbour's overflow, a pointer
  * into a cell and a realloc of freed memory. In a child, since refused
@@ -1078,6 +1128,7 @@ void test_hg_malloc(void)
 
 	/* last: these count a detection on purpose */
 	test_hg_double_free();
+	test_hg_unbacked();
 	test_hg_header();
 	test_hg_dbg();
 	test_hg_guard();

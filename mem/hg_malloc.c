@@ -695,6 +695,7 @@ struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 		munmap(base, hb->hcap);
 		return NULL;
 	}
+	backed_fast_update(hb);
 
 	/* "pinned from swapping", not "pinned": tier 1 is unswappable
 	 * without mlock(), tiers 2-4 are mlock()ed - the same guarantee */

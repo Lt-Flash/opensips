@@ -292,8 +292,9 @@ struct hg_block {
 	/*
 	 * What the LOCK-FREE fast path reads, grouped first on cache lines the
 	 * slow path never writes. Every field here is set once
-	 * (hg_malloc_init_cap(), private_caps_init()), so these lines stay
-	 * shared-clean in every process. hg_cell_free() reads priv_max[c] on
+	 * (hg_malloc_init_cap(), private_caps_init()), but backed_fast, which
+	 * changes only when the arena grows, shrinks or punches, so these lines
+	 * stay shared-clean in every process. hg_cell_free() reads priv_max[c] on
 	 * every call, so the lock must not share its line: the lock sits alone
 	 * with the section bookkeeping only its holder writes, and the
 	 * slow-path state starts on the line after it.
@@ -306,6 +307,12 @@ struct hg_block {
 	 * at its start */
 	char                 *hbase;
 	unsigned long         hcap;   /* VA reserved, >= span_end; immutable */
+	/* every offset below it is backed: span_end while no page is punched
+	 * and no grow, trim or punch runs with the lock dropped, else 0 - so
+	 * the free path's hg_backed() reads this word, on the line hg_owns()
+	 * reads anyway, and the rest only then. Written under the lock, at
+	 * every change of either (backed_fast_update()), rarely. */
+	unsigned long         backed_fast;
 	/* per-THREAD private free-cache bound in CELLS, per class: the byte
 	 * budget from the arena size expressed per class (private_caps_init()
 	 * in hg_arena.c). 0 = never cache this class privately: one cell

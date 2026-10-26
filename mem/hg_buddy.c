@@ -484,4 +484,17 @@ int hg_buddy_order_of(const struct hg_block *hb, const void *p)
 	return pg->leaforder[leaf];
 }
 
+int hg_backed_slow(const struct hg_block *hb, const void *p)
+{
+	const struct hg_page *pg;
+
+	if ((unsigned long)((const char *)p - hb->hbase) >=
+	    __atomic_load_n(&hb->span_end, __ATOMIC_RELAXED))
+		return 0;
+	if (!hb->buddy_ready || !hg_in_pages(hb, p))
+		return 1;
+	pg = &hb->pages[hg_page_of(hb, p)];
+	return !pg->punched && !pg->releasing;
+}
+
 #endif /* HG_MALLOC */

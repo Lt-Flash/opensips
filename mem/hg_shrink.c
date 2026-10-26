@@ -103,6 +103,7 @@ static unsigned long buddy_shrink_body(struct hg_block *hb)
 		pg->releasing = 1;
 	}
 	hb->grow_inflight = 1;
+	backed_fast_update(hb);    /* the slow path while unlocked */
 	reason = hb->lk_cur;
 	hg_lock_leave(hb);
 
@@ -174,6 +175,7 @@ static unsigned long hg_buddy_shrink_unlocks(struct hg_block *hb)
 
 	hg_lock_assert_held(hb, "hg_buddy_shrink_unlocks entry");
 	r = buddy_shrink_body(hb);
+	backed_fast_update(hb);
 	hg_lock_assert_held(hb, "hg_buddy_shrink_unlocks return");
 	return r;
 }
@@ -218,6 +220,7 @@ static unsigned long buddy_punch_body(struct hg_block *hb)
 	if (!got)
 		return 0;
 	hb->grow_inflight = 1;
+	backed_fast_update(hb);    /* the slow path while unlocked */
 	reason = hb->lk_cur;
 	hg_lock_leave(hb);
 
@@ -279,6 +282,7 @@ static unsigned long hg_buddy_punch_unlocks(struct hg_block *hb)
 
 	hg_lock_assert_held(hb, "hg_buddy_punch_unlocks entry");
 	r = buddy_punch_body(hb);
+	backed_fast_update(hb);
 	hg_lock_assert_held(hb, "hg_buddy_punch_unlocks return");
 	return r;
 }

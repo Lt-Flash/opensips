@@ -168,6 +168,11 @@ static inline void *hg_buddy_block_of(const struct hg_block *hb, const void *p)
 	if (!hb->buddy_ready || !hg_in_pages(hb, p))
 		return NULL;
 	pg = &hb->pages[hg_page_of(hb, p)];
+	/* a punched page keeps its leaf orders, but not its memory: a block
+	 * there is a stale pointer's, and its chunk header must not be read
+	 * (the callers check hg_backed() first; this is the second line) */
+	if (pg->punched || pg->releasing)
+		return NULL;
 	leaf = hg_leaf_of(hb, p);
 	o = pg->leaforder[leaf];
 	if (o == HG_LEAF_NONE)

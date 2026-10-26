@@ -96,6 +96,7 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 	unsigned short hsum;
 	int st;
 	void *ptr;
+	struct hg_block *src;
 
 #ifdef DBG_MALLOC
 	LM_GEN1(memlog, "%s_realloc(%p, ->%lu), called from %s: %s(%d)\n",
@@ -127,10 +128,18 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 	 * would fault there. Any live arena will do, so a child can realloc
 	 * inherited pkg memory: it is read in place, and a move frees it
 	 * through hg_free(), which hands it back to its owner (hg_owner()) */
-	if (!hg_owns_any(HG_HDR(p))) {
+	src = hg_owner(HG_HDR(p));
+	if (!src) {
 		LM_CRIT("%s: realloc of %p, which is from no live arena - "
 			"refusing it\n", hb->name, p);
 		hg_corrupt(hb, HG_C_FOREIGN_PTR);
+		return NULL;
+	}
+	/* nor memory its arena gave back to the kernel (see hg_backed()) */
+	if (!hg_backed(src, HG_HDR(p))) {
+		LM_CRIT("%s: realloc of %p, which points into memory the arena "
+			"gave back to the kernel - refusing it\n", hb->name, p);
+		hg_corrupt(hb, HG_C_DOUBLE_FREE);
 		return NULL;
 	}
 

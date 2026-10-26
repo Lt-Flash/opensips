@@ -108,7 +108,7 @@ void hg_malloc_destroy(struct hg_block *hb);
 /*
  * The admin caps live in globals.h/globals.c (-m INIT:CAP / -M INIT:CAP, set
  * before any arena exists; 0 = fixed). The pkg cap is PER PROCESS, so the
- * host-RAM exposure is cap x nproc (applied by hg_grow_ram_refused()).
+ * host-RAM exposure is cap x nproc (applied by hg_grow_room_short()).
  */
 
 /*
@@ -129,15 +129,6 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
 int hg_mem_collapse(struct hg_block *hb, char *base, unsigned long len);
 void hg_collapse_deferred(struct hg_block *hb);
 
-/*
- * Host-RAM limb of the growth ceiling: would committing @delta more bytes
- * leave the host under the configured floor of available memory? Nonzero
- * = REFUSE. Tier 1 always passes: a hugetlb mapping reserved its whole cap
- * from the pool at map time. For pkg the delta is multiplied by the process
- * count (every worker grows its own arena). Called by
- * hg_buddy_grow_unlocks() under hb->lock.
- */
-int hg_grow_ram_refused(struct hg_block *hb, unsigned long delta);
 
 const char *hg_grow_refusal_str(unsigned int why);
 

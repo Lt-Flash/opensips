@@ -59,6 +59,30 @@ struct hg_cg_info {
  */
 unsigned long long hg_cgroup_room(struct hg_cg_info *ci);
 
+/*
+ * The host-RAM limb of the growth ceiling: would committing @delta more
+ * bytes leave the host, or the memory cgroup, under its floor? Tier 1
+ * always passes: a hugetlb mapping reserved its whole cap from the pool at
+ * map time. For pkg the delta is multiplied by the process count (every
+ * worker grows its own arena). In two halves, so /proc and the cgroup files
+ * are read without hb->lock: hg_grow_room_short() reads and decides,
+ * writing no arena field - run in a grow's unlocked phase, once it holds
+ * grow_inflight - and hg_grow_room_refused() records a refusal and warns,
+ * once per episode, under the lock.
+ */
+struct hg_block;
+
+struct hg_room_short {
+	unsigned int why;           /* 0, HG_GR_HOST_FLOOR or HG_GR_CGROUP */
+	unsigned long delta, nproc;
+	unsigned long long effective;
+	long floor_mb, avail_kb;
+	struct hg_cg_info ci;
+};
+unsigned int hg_grow_room_short(const struct hg_block *hb,
+		unsigned long delta, struct hg_room_short *rs);
+void hg_grow_room_refused(struct hg_block *hb, const struct hg_room_short *rs);
+
 /* test hook: read the cgroup files under @root and the membership from
  * @self_cgroup instead of /sys/fs/cgroup and /proc/self/cgroup; NULL
  * restores the defaults */

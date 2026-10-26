@@ -30,6 +30,9 @@
 unsigned long hg_hps(void);
 
 long hg_meminfo_kb(const char *key);
+/* two fields in one pass of the file (MemTotal and MemAvailable, read
+ * together by every RAM check); each -1 if missing */
+void hg_meminfo_kb2(const char *k1, long *v1, const char *k2, long *v2);
 
 unsigned long hg_memlock_limit(void);
 

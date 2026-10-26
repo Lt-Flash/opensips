@@ -141,6 +141,25 @@ long hg_meminfo_kb(const char *key)
 	return hg_proc_field(hg_meminfo_file, key, 10);
 }
 
+void hg_meminfo_kb2(const char *k1, long *v1, const char *k2, long *v2)
+{
+	FILE *f;
+	char line[256];
+	size_t l1 = strlen(k1), l2 = strlen(k2);
+
+	*v1 = *v2 = -1;
+	f = fopen(hg_meminfo_file, "r");
+	if (!f)
+		return;
+	while ((*v1 < 0 || *v2 < 0) && fgets(line, sizeof line, f)) {
+		if (*v1 < 0 && !strncmp(line, k1, l1) && line[l1] == ':')
+			*v1 = strtol(line + l1 + 1, NULL, 10);
+		else if (*v2 < 0 && !strncmp(line, k2, l2) && line[l2] == ':')
+			*v2 = strtol(line + l2 + 1, NULL, 10);
+	}
+	fclose(f);
+}
+
 /*
  * Every grow mlock()s its delta, and mlock() checks RLIMIT_MEMLOCK on
  * hugetlb mappings too. The kernel returns ENOMEM both for that limit and

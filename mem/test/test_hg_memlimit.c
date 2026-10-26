@@ -105,6 +105,18 @@ static unsigned long long hml_room(const char *self, struct hg_cg_info *ci)
  * only the host. Then the cgroup the caller left with 70 MB of room
  * refuses a 128 MB grow on a roomy host. Each refusal records its cause.
  */
+/* a grow's two halves, as hg_buddy_grow_unlocks() runs them: nonzero =
+ * refused, with the cause recorded */
+static int hml_grow_refused(struct hg_block *hb, unsigned long delta)
+{
+	struct hg_room_short rs;
+
+	if (!hg_grow_room_short(hb, delta, &rs))
+		return 0;
+	hg_grow_room_refused(hb, &rs);
+	return 1;
+}
+
 static void test_hg_host_room(void)
 {
 	struct hg_block *hb = shm_block;
@@ -123,12 +135,12 @@ static void test_hg_host_room(void)
 	bad = hml_put("meminfo", "MemTotal:        8388608 kB\n"
 		"MemAvailable:    4296704 kB\n");
 	if (!bad)
-		pass_big = hg_grow_ram_refused(hb, 16 * MB);
+		pass_big = hml_grow_refused(hb, 16 * MB);
 	bad |= hml_put("meminfo", "MemTotal:        8388608 kB\n"
 		"MemAvailable:     427008 kB\n");
 	hb->grow_refuse_said = 1;   /* the refusal below is expected: no WARN */
 	if (!bad)
-		refuse_low = hg_grow_ram_refused(hb, 16 * MB);
+		refuse_low = hml_grow_refused(hb, 16 * MB);
 	why_low = hb->grow_refuse_why;
 
 	snprintf(self2, sizeof self2, "%s/self2", hml_dir);
@@ -136,7 +148,7 @@ static void test_hg_host_room(void)
 	bad |= hml_put("meminfo", "MemTotal:       16777216 kB\n"
 		"MemAvailable:    8388608 kB\n");
 	if (!bad)
-		refuse_cg = hg_grow_ram_refused(hb, 128 * MB);
+		refuse_cg = hml_grow_refused(hb, 128 * MB);
 	why_cg = hb->grow_refuse_why;
 
 	hb->grow_refuse_said = said;

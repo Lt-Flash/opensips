@@ -30,6 +30,7 @@
 #include "hg_malloc.h"
 #include "hg_buddy.h"
 #include "hg_arena.h"
+#include "hg_memlimit.h"
 #include "../dprint.h"
 #include "../globals.h"
 #include "hg_buddy_int.h"
@@ -201,6 +202,7 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 	unsigned long delta, room, old_pages, i, limit, t0, off, commit_ns;
 	unsigned long cp_ns[HG_CP_PHASES];
 	int tier, reason, later;
+	struct hg_room_short rs;
 
 	if (!hb->buddy_ready)
 		return -1;
@@ -310,10 +312,6 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 	if (delta > room)
 		delta = room;
 
-	/* the host-RAM limb of the ceiling, before any work is done */
-	if (hg_grow_ram_refused(hb, delta))
-		return grow_resource_refused(hb);
-
 	/* phase 1 - RESERVE the range under the lock, taking grow_inflight */
 	off = hb->span_end;
 	hb->grow_inflight = 1;
@@ -322,7 +320,16 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 	reason = hb->lk_cur;
 	hg_lock_leave(hb);
 
-	/* phase 2 - POPULATE with the lock released */
+	/* phase 2 - the host-RAM limb of the ceiling before any work is done
+	 * (it reads /proc and the cgroup files: not under the lock), then
+	 * POPULATE with the lock released */
+	if (hg_grow_room_short(hb, delta, &rs)) {
+		hg_lock_enter(hb, (enum hg_lock_reason)reason);
+		hb->span_pending = hb->span_end;
+		__atomic_store_n(&hb->grow_inflight, 0, __ATOMIC_RELEASE);
+		hg_grow_room_refused(hb, &rs);
+		return grow_resource_refused(hb);
+	}
 	t0 = hg_now_ns();
 	later = 0;
 	tier = hg_mem_commit(hb, off, delta, cp_ns,
@@ -425,6 +432,7 @@ static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
 	unsigned long lpp = hg_leaves_per_page(hb);
 	unsigned int top = hb->buddy_top;
 	int reason;
+	struct hg_room_short rs;
 
 	if (!hb->punched_pages)
 		return 0;
@@ -444,8 +452,6 @@ static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
 		want = HG_PAGES_PER_EVENT;
 	if (!want)
 		return 0;
-	if (hg_grow_ram_refused(hb, want << hb->hps_shift))
-		return grow_resource_refused(hb);
 
 	/* phase 1 - select, lowest first */
 	for (i = 0; i < hb->npages && got < want; i++)
@@ -455,6 +461,15 @@ static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
 	backed_fast_update(hb);    /* the slow path while unlocked */
 	reason = hb->lk_cur;
 	hg_lock_leave(hb);
+
+	/* the host-RAM limb first, unlocked as in a span grow; nothing was
+	 * taken off a list yet, so a refusal only gives the token back */
+	if (hg_grow_room_short(hb, got << hb->hps_shift, &rs)) {
+		hg_lock_enter(hb, (enum hg_lock_reason)reason);
+		__atomic_store_n(&hb->grow_inflight, 0, __ATOMIC_RELEASE);
+		hg_grow_room_refused(hb, &rs);
+		return grow_resource_refused(hb);
+	}
 
 	/* phase 2 - pin, in this process, lock released. On hugetlb a hole's
 	 * pages went back to the pool for anyone to take, so the re-commit can

@@ -55,18 +55,24 @@
  * The host-memory floor no commit may cross, in MB: hg_ram_floor_mb, else
  * MemTotal/20 but at least the smaller of 256 MB and MemTotal/8 (a flat
  * 256 MB would refuse startup on a small host). Not cached: arenas created
- * before the config is parsed must not pin the default for later grows.
+ * before the config is parsed must not pin the default for later grows,
+ * and MemTotal itself moves with memory hotplug and balloon drivers - the
+ * checks read it with MemAvailable, in the same pass.
  */
-static long hg_ram_floor(void)
+static long hg_ram_floor_of(long total_kb)
 {
-	long total_kb;
-
 	if (hg_ram_floor_mb > 0)
 		return hg_ram_floor_mb;
-	total_kb = hg_meminfo_kb("MemTotal");
 	if (total_kb <= 0)
 		return 256;
 	return hg_floor_mb_for(total_kb >> 10);
+}
+
+static long hg_ram_floor(void)
+{
+	if (hg_ram_floor_mb > 0)
+		return hg_ram_floor_mb;
+	return hg_ram_floor_of(hg_meminfo_kb("MemTotal"));
 }
 
 /* bytes the hugetlb pool can still hand out: free pages not already
@@ -90,10 +96,13 @@ static unsigned long long hg_pool_free_bytes(void)
  * the cgroup level that binds, version 0 when the host does */
 static unsigned long long hg_ram_room_why(struct hg_cg_info *ci)
 {
-	long avail_kb = hg_meminfo_kb("MemAvailable");
-	unsigned long long floor_b = (unsigned long long)hg_ram_floor() << 20;
-	unsigned long long avail_b = (unsigned long long)avail_kb << 10, room, cg;
+	long total_kb, avail_kb;
+	unsigned long long floor_b, avail_b, room, cg;
 	struct hg_cg_info c;
+
+	hg_meminfo_kb2("MemTotal", &total_kb, "MemAvailable", &avail_kb);
+	floor_b = (unsigned long long)hg_ram_floor_of(total_kb) << 20;
+	avail_b = (unsigned long long)avail_kb << 10;
 
 	if (avail_kb < 0)
 		room = HG_ROOM_ANY;
@@ -322,62 +331,74 @@ int hg_capacity_check(unsigned int start_procs, unsigned int max_procs)
  * hg_ram_floor(); a limited memory cgroup is held to the same rule on its
  * own limit (hg_memlimit.c). MemAvailable is the kernel's estimate of what
  * can be claimed without swapping; a kernel without it passes the check,
- * and the mlock in hg_mem_commit() still refuses cleanly. Reading /proc
- * under hb->lock is deliberate: a grow is rare and its mlock costs far more.
+ * and the mlock in hg_mem_commit() still refuses cleanly. The reads open
+ * and parse files, so they run without hb->lock: the shm arena's lock is
+ * every worker's.
  */
-int hg_grow_ram_refused(struct hg_block *hb, unsigned long delta)
+unsigned int hg_grow_room_short(const struct hg_block *hb,
+		unsigned long delta, struct hg_room_short *rs)
 {
-	long floor_mb;
-	/* a pkg grow counts once per process: 64-bit, as the room */
-	unsigned long long effective = delta, cg_room;
-	unsigned long nproc = 1;
-	long avail_kb;
-	struct hg_cg_info ci;
+	long total_kb;
+	unsigned long long cg_room;
 	int host_short, cg_short;
 
+	rs->why = 0;
 	/* tier 1: the whole cap was reserved from the hugetlb pool at map
 	 * time, so a commit takes no new host RAM */
 	if (hb->tier == HG_MEM_HUGETLB)
 		return 0;
 
-	floor_mb = hg_ram_floor();
-	avail_kb = hg_meminfo_kb("MemAvailable");
-	cg_room = hg_cgroup_room(&ci);
+	hg_meminfo_kb2("MemTotal", &total_kb, "MemAvailable", &rs->avail_kb);
+	rs->floor_mb = hg_ram_floor_of(total_kb);
+	cg_room = hg_cgroup_room(&rs->ci);
 
+	rs->delta = delta;
+	rs->nproc = 1;
+	/* a pkg grow counts once per process: 64-bit, as the room */
+	rs->effective = delta;
 	if (!hb->shared) {
 		/* pkg: every worker grows its own arena under the same load,
 		 * so the cost is the delta times the process count */
-		nproc = counted_max_processes ? counted_max_processes : 1;
-		effective = (unsigned long long)delta * nproc;
+		rs->nproc = counted_max_processes ? counted_max_processes : 1;
+		rs->effective = (unsigned long long)delta * rs->nproc;
 	}
 
 	/* the host (unknown MemAvailable: let mlock decide), then the memory
 	 * cgroup, which a container or a unit's MemoryMax hits first */
-	host_short = avail_kb >= 0 && ((unsigned long long)avail_kb << 10) <
-		effective + ((unsigned long long)floor_mb << 20);
-	cg_short = cg_room != HG_ROOM_ANY && cg_room < effective;
-	if (!host_short && !cg_short)
-		return 0;
-	hb->grow_refuse_why = host_short ? HG_GR_HOST_FLOOR : HG_GR_CGROUP;
+	host_short = rs->avail_kb >= 0 &&
+		((unsigned long long)rs->avail_kb << 10) <
+		rs->effective + ((unsigned long long)rs->floor_mb << 20);
+	cg_short = cg_room != HG_ROOM_ANY && cg_room < rs->effective;
+	if (host_short)
+		rs->why = HG_GR_HOST_FLOOR;
+	else if (cg_short)
+		rs->why = HG_GR_CGROUP;
+	return rs->why;
+}
+
+void hg_grow_room_refused(struct hg_block *hb, const struct hg_room_short *rs)
+{
+	hb->grow_refuse_why = rs->why;
 	/* once per episode - see grow_refuse_said's comment */
-	if (!hb->grow_refuse_said) {
-		hb->grow_refuse_said = 1;
-		if (host_short)
-			LM_WARN("%s: refusing to grow by %lu MB: %lu MB effective"
-				" (x%lu processes) would leave the host under the "
-				"%ld MB floor (MemAvailable %ld MB). Freeing host "
-				"memory or lowering the floor lifts this.\n",
-				hb->name, delta >> 20, (unsigned long)(effective >> 20),
-				nproc, floor_mb, avail_kb / 1024);
-		else
-			LM_WARN("%s: refusing to grow by %lu MB: %lu MB effective"
-				" (x%lu processes) would leave the memory cgroup (v%d) "
-				"under its %lu MB floor (limit %lu MB, %lu MB in use). "
-				"Raising the cgroup's memory limit or freeing memory in "
-				"it lifts this.\n", hb->name, delta >> 20,
-				(unsigned long)(effective >> 20), nproc, ci.version,
-				ci.floor_mb, ci.limit_mb, ci.used_mb);
-	}
-	return 1;
+	if (hb->grow_refuse_said)
+		return;
+	hb->grow_refuse_said = 1;
+	if (rs->why == HG_GR_HOST_FLOOR)
+		LM_WARN("%s: refusing to grow by %lu MB: %lu MB effective"
+			" (x%lu processes) would leave the host under the "
+			"%ld MB floor (MemAvailable %ld MB). Freeing host "
+			"memory or lowering the floor lifts this.\n",
+			hb->name, rs->delta >> 20,
+			(unsigned long)(rs->effective >> 20), rs->nproc,
+			rs->floor_mb, rs->avail_kb / 1024);
+	else
+		LM_WARN("%s: refusing to grow by %lu MB: %lu MB effective"
+			" (x%lu processes) would leave the memory cgroup (v%d) "
+			"under its %lu MB floor (limit %lu MB, %lu MB in use). "
+			"Raising the cgroup's memory limit or freeing memory in "
+			"it lifts this.\n", hb->name, rs->delta >> 20,
+			(unsigned long)(rs->effective >> 20), rs->nproc,
+			rs->ci.version, rs->ci.floor_mb, rs->ci.limit_mb,
+			rs->ci.used_mb);
 }
 #endif /* HG_MALLOC */

@@ -281,7 +281,8 @@ void hg_cache_flush_self(void)
 		 * freed cells this flush does not see, and a clean slot would
 		 * have the sweep skip it */
 		if (!hg_pstat_shared)
-			hg_pstat_mine(hb)->dirty = 0;
+			__atomic_store_n(&hg_pstat_mine(hb)->dirty, 0,
+				__ATOMIC_RELAXED);
 		for (c = 0; c < HG_NCLASSES; c++) {
 			unsigned int keep = hg_flush_residue(hb, pl, c);
 
@@ -1202,7 +1203,9 @@ void hg_cell_free(struct hg_block *hb, void *p)
 
 		hg_pstat_add(ps, -(long)(cell_sizes[c] - HG_CELL_HDR), -1,
 			-(long)cell_sizes[c]);
-		ps->dirty = 1;   /* this cache now holds something to sweep */
+		/* this cache now holds something to sweep; read by the
+		 * dispatcher in another process, hence the atomic store */
+		__atomic_store_n(&ps->dirty, 1, __ATOMIC_RELAXED);
 	}
 
 #ifdef DBG_MALLOC

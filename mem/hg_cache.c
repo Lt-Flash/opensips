@@ -93,10 +93,12 @@ unsigned int hg_cache_flush_locked(struct hg_block *hb,
  * Sweep generation, bumped once per sweep. A thread IPC cannot reach - TCP
  * main's IO pool waits on a condition variable, not the reactor - compares
  * it with its own last-seen value at a job boundary and flushes when they
- * differ. A plain counter: a missed generation only delays a flush to the
- * next sweep, the same fire-and-forget contract as the IPC path.
+ * differ. Relaxed atomics, as the process's threads read it and two of them
+ * may bump it at once (under different arenas' locks); no ordering is
+ * needed - a missed generation only delays a flush to the next sweep, the
+ * same fire-and-forget contract as the IPC path.
  */
-volatile unsigned long hg_sweep_gen;
+unsigned long hg_sweep_gen;
 
 /*
  * Reserve floor: below hb->reserve_floor free leaves (1/16 of the grid, set
@@ -131,7 +133,7 @@ void hg_reserve_floor_check(struct hg_block *hb)
 		} else if (hb->floor_warned || !hg_floor_stuck(hb)) {
 			return;
 		}
-		hg_sweep_gen++;
+		__atomic_fetch_add(&hg_sweep_gen, 1, __ATOMIC_RELAXED);
 		if (hg_floor_stuck(hb)) {
 			hb->floor_warned = 1;
 			LM_WARN("%s: free space fell below the reserve floor "
@@ -267,14 +269,15 @@ int hg_proc_cache_dirty(int proc)
 
 	if (!hb || proc < 0)
 		return 1;
-	return hb->pstat[((unsigned int)(proc + 1)) % HG_STAT_SLOTS].dirty != 0;
+	return __atomic_load_n(&hb->pstat[((unsigned int)(proc + 1)) %
+		HG_STAT_SLOTS].dirty, __ATOMIC_RELAXED) != 0;
 }
 
 static __thread unsigned long hg_sweep_seen;
 
 void hg_cache_flush_if_due(void)
 {
-	unsigned long g = hg_sweep_gen;
+	unsigned long g = __atomic_load_n(&hg_sweep_gen, __ATOMIC_RELAXED);
 
 	if (g == hg_sweep_seen)
 		return;

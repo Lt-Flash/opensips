@@ -1373,14 +1373,12 @@ static void hg_free_set_destroy(struct hg_free_set *set)
 static unsigned int hg_free_set_count(struct hg_block *hb)
 {
 	struct hg_palloc *pl = hg_get_palloc(hb);
-	struct hg_chunk *ch;
 	unsigned int n = 0;
 	void *cur;
 	int c;
 
 	/* the pool's free cells are read from each block's map by the
 	 * walker itself; only this thread's private cells need the set */
-	(void)ch;
 	if (pl)
 		for (c = 0; c < HG_NCLASSES; c++)
 			for (cur = pl->cls[c].free_head; cur; cur = cell_next(cur))
@@ -1392,11 +1390,9 @@ static void hg_free_set_populate(struct hg_block *hb, struct hg_free_set *set)
 {
 	int c;
 	void *cur;
-	struct hg_chunk *ch;
 	struct hg_palloc *pl = hg_get_palloc(hb);
 
 	/* this thread's private chains only, as in hg_free_set_count() */
-	(void)ch;
 	for (c = 0; c < HG_NCLASSES; c++) {
 		if (pl)
 			for (cur = pl->cls[c].free_head; cur; cur = cell_next(cur))

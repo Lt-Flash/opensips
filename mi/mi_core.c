@@ -1314,6 +1314,11 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("pressure_cells"), hb->pressure_cells) < 0)
 		return -1;
+	if (add_mi_number(o, MI_SSTR("xfer_puts"), hb->xfer_puts) < 0 ||
+	    add_mi_number(o, MI_SSTR("xfer_gets"), hb->xfer_gets) < 0 ||
+	    add_mi_number(o, MI_SSTR("xfer_full"), hb->xfer_full) < 0 ||
+	    add_mi_number(o, MI_SSTR("xfer_drained"), hb->xfer_drained) < 0)
+		return -1;
 	if (add_mi_number(o, MI_SSTR("gc_tick_blocks"), hb->gc_tick_blocks) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("gc_inline_blocks"), hb->gc_inline_blocks) < 0)

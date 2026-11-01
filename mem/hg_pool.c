@@ -35,6 +35,7 @@
 #include "../dprint.h"
 #include "../globals.h"
 #include "hg_arena_int.h"
+#include "hg_xfer.h"
 
 /* everything here runs under hb->lock */
 
@@ -351,6 +352,8 @@ void hg_gc_cycle(struct hg_block *hb)
 {
 	unsigned long budget = hb->size >> HG_GC_KEEP_BUDGET_SHIFT;
 	int c;
+
+	hg_xfer_cycle(hb);
 
 	for (c = 0; c < HG_NCLASSES; c++) {
 		unsigned int demand = hb->carves_cycle[c], keep = hb->gc_keep[c] / 2;

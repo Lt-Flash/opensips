@@ -36,6 +36,7 @@
 #include "../dprint.h"
 #include "../globals.h"
 #include "hg_arena_int.h"
+#include "hg_xfer.h"
 
 #define HG_CHUNK_SMALL    (256 * 1024)  /* ceiling on chunk_max */
 #define HG_CHUNK_MIN      (8 * 1024)    /* floor, however tiny the arena */
@@ -96,6 +97,33 @@ static inline struct hg_palloc *hg_get_palloc(struct hg_block *hb)
 	return hg_palloc_lookup(hb);
 }
 
+/* the first @donate cells to the transfer cache as one chain, its tail found
+ * outside hb->lock; 0 = not parked, and the list is as it was */
+static inline int xfer_donate(struct hg_block *hb, struct hg_palloc *pl,
+                              unsigned int c, unsigned int donate)
+{
+	void *head = pl->cls[c].free_head, *tail = head, *rest;
+	unsigned int i;
+	int ok;
+
+	for (i = 1; i < donate && tail; i++)
+		tail = cell_next(tail);
+	if (!tail)
+		return 0;
+	rest = cell_next(tail);
+	cell_set_next(tail, NULL);
+	hg_lock_enter(hb, HG_LK_RETURN);
+	ok = hg_xfer_put(hb, c, head, donate);
+	hg_lock_leave(hb);
+	if (!ok) {
+		cell_set_next(tail, rest);
+		return 0;
+	}
+	pl->cls[c].free_head = rest;
+	pl->cls[c].nfree -= donate;
+	return 1;
+}
+
 /* a freed cell (header already FREE, counters moved) onto this thread's list;
  * over the class's bound, half the list goes to the shared pool */
 static inline void cell_push_private(struct hg_block *hb,
@@ -113,6 +141,8 @@ static inline void cell_push_private(struct hg_block *hb,
 		unsigned int claimed = pl->cls[c].nfree;
 		unsigned int donate  = hb->priv_donate[c];
 
+		if (hb->xfer[c].cap && xfer_donate(hb, pl, c, donate))
+			return;
 		hg_lock_enter(hb, HG_LK_RETURN);
 		for (i = 0; i < donate; i++) {
 			d = pl->cls[c].free_head;
@@ -401,7 +431,8 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 	 * the GC can return blocks held there; retry if any came back */
 	if (!ch) {
 		unsigned long returned = hb->gc_blocks_returned;
-		unsigned int n = hg_cache_flush_locked(hb, pl);
+		unsigned int n = hg_cache_flush_locked(hb, pl) +
+		                 hg_xfer_drain_all(hb);
 
 		hb->pressure_flushes++;
 		hb->pressure_cells += n;
@@ -518,6 +549,7 @@ static void private_caps_init(struct hg_block *hb)
 		if (hb->priv_donate[c] == 0)
 			hb->priv_donate[c] = 1;
 	}
+	hg_xfer_caps(hb);
 
 	LM_DBG("%s: private cache budget %lu B/thread over %u consumers (%lu B/class): "
 		"class %u caches %u cells, class %u caches %u\n",
@@ -784,6 +816,7 @@ void *hg_cell_alloc(struct hg_block *hb, unsigned long size)
 {
 	struct hg_palloc *pl;
 	char *cell_start, *payload;
+	void *chain;
 	unsigned int got;
 	unsigned long want = size;
 	/* read once: the flag may change under a running allocation */
@@ -841,6 +874,12 @@ again:
 	}
 
 	hg_lock_enter(hb, HG_LK_REFILL);
+	if (hb->xfer[c].n && (chain = hg_xfer_get(hb, c, &got))) {
+		hg_lock_leave(hb);
+		pl->cls[c].free_head = chain;
+		pl->cls[c].nfree = got;
+		goto again;
+	}
 	for (got = 0; got < HG_REFILL_BATCH; got++) {
 		cell_start = hg_gpool_pop(hb, c);
 		if (!cell_start)

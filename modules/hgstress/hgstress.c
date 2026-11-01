@@ -63,7 +63,7 @@ struct hgs_shared {
 	int failed;
 	unsigned long long ops;
 	unsigned long long torn;
-	unsigned long long alloc_failed;   /* shm_malloc NULLs, all workers */
+	unsigned long long alloc_failed;
 };
 
 static struct hgs_shared *shared;
@@ -89,7 +89,6 @@ static void hgs_fill(struct hgs_blk *b, int pid, int slot)
 		w[i] = v;
 }
 
-/* returns the number of corrupted words */
 static unsigned long hgs_check(struct hgs_blk *b, int pid, int slot)
 {
 	uint64_t v = hgs_stamp(pid, slot), *w = (uint64_t *)b->p;
@@ -110,8 +109,6 @@ static unsigned long hgs_check(struct hgs_blk *b, int pid, int slot)
 
 static unsigned long hgs_pick_size(unsigned int *seed)
 {
-	/* small: spread across the size classes, incl. the sub-64B and the
-	 * class-boundary sizes; large: past the 64K cell cap */
 	if (hgs_large > 0 && (rand_r(seed) % hgs_large) == 0)
 		return 65536 + (rand_r(seed) % (512 * 1024));
 	return 8 + (rand_r(seed) % hgs_max_small);
@@ -134,8 +131,8 @@ static int hgs_run(int rank)
 	memset(blk, 0, hgs_slots * sizeof *blk);
 	seed = (unsigned int)pid ^ (unsigned int)rank;
 
-	/* hold phase: keep hold_mb MB of stamped blocks live with all workers
-	 * up; a SIGSEGV here means growth edited only the grower's tables */
+	/* hold phase: a SIGSEGV here means growth edited only the grower's
+	 * tables */
 	if (hgs_hold_mb > 0) {
 		maxhold = hgs_hold_mb * 8 + 8;   /* 128K min -> at most 8/MB */
 		hold = pkg_malloc(maxhold * sizeof *hold);
@@ -167,8 +164,8 @@ static int hgs_run(int rank)
 			alloc_failed ? "STOPPED by allocation failure" : "target met");
 	}
 
-	/* pkg hold: the same per process, past -M; before the shm churn so a
-	 * pkg-side crash is attributable at a glance */
+	/* pkg hold: before the shm churn, so a pkg-side crash is attributable
+	 * at a glance */
 	if (hgs_hold_pkg_mb > 0) {
 		struct hgs_blk *ph;
 		unsigned long pheld = 0;
@@ -253,8 +250,6 @@ static int hgs_run(int rank)
 		}
 	pkg_free(blk);
 
-	/* final verify + release of the held load - the stamps have now
-	 * survived the whole churn in place */
 	for (slot = 0; slot < nhold; slot++)
 		if (hold[slot].p) {
 			torn += hgs_check(&hold[slot], pid,
@@ -392,8 +387,8 @@ static mi_response_t *mi_hgs_fault(const mi_params_t *params,
 		if (!a || !b)
 			return init_mi_error(500, MI_SSTR("no shm"));
 		shm_free(a);
-		shm_free(b);                 /* chain: b -> a -> (older) */
-		memset(a, 0xa5, 2 * sizeof(void *));   /* a's link, post-free */
+		shm_free(b);
+		memset(a, 0xa5, 2 * sizeof(void *));
 		LM_NOTICE("hgstress FAULT: link of freed %p overwritten (chain %p -> %p -> garbage)\n", a, b, a);
 	} else if (kind.len >= 7 && !memcmp(kind.s, "overrun", 7)) {
 		unsigned long n = 100, at = 100;

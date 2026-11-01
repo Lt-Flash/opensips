@@ -866,8 +866,8 @@ inline static void shm_info(struct mem_info* mi)
 inline static void shm_force_unlock(void)
 {
 #ifdef HG_MALLOC
-	/* HG's lock is hb->lock inside the block, taken only on the slow path;
-	 * a crash there wedges every worker just like F_MALLOC's mem_lock */
+	/* a crash while holding hb->lock wedges every worker just like
+	 * F_MALLOC's mem_lock */
 	if (mem_allocator_shm == MM_HG_MALLOC || mem_allocator_shm == MM_HG_MALLOC_DBG) {
 		if (shm_block)
 			lock_release(&((struct hg_block *)shm_block)->lock);

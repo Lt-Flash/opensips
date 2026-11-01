@@ -17,9 +17,6 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* the maintenance process: shm arena grow and shrink in a process of its
- * own, as timer jobs can run in a SIP worker and park it for the populate */
-
 #ifdef HG_MALLOC
 
 #include <unistd.h>
@@ -38,14 +35,12 @@
 #include "hg_maint.h"
 
 #define HG_MAINT_TICK_MS     1000
-/* passed as is: reactor_main_loop() takes its timeout in milliseconds. The
- * policy cycle (profile gates, shrink decision) is hg_scaling_cycle ticks */
 
 static hg_ns_t maint_last_ns;
 static unsigned int maint_ticks;
 
-/* a shared arena with a cap above its INIT (shm -m INIT:CAP, or a module
- * arena); these exist before the process count, as modules init first */
+/* module arenas count too: they exist before the process count, as modules
+ * init first */
 static int maint_arena(const struct hg_block *hb)
 {
 	return hb && hb->shared && hb->buddy_ready &&
@@ -87,19 +82,15 @@ static void hg_maint_tick(void)
 			continue;
 		hg_lock_enter(hb, HG_LK_POLICY);
 		hg_grow_headroom_tick(hb);
-		/* deferred GC: drained blocks beyond keep go back here, a
-		 * budget per tick, not on the workers' donate path */
 		hg_gc_tick(hb, HG_GC_TICK_BUDGET);
 		if (slow) {
-			hg_gc_cycle(hb);   /* next cycle's keep */
+			hg_gc_cycle(hb);
 			hg_grow_tick(hb);
 			hg_shrink_tick(hb);
 		} else {
-			hg_drain_tick(hb);   /* the decision's execution */
+			hg_drain_tick(hb);
 		}
 		hg_lock_leave(hb);
-		/* pages a worker's grow left on 4 KB, collapsed where nobody
-		 * waits; takes the lock per page itself */
 		hg_collapse_deferred(hb);
 	}
 }
@@ -136,9 +127,8 @@ int hg_maint_start(void)
 		return -1;
 	}
 	if (id > 0)
-		return 0;                       /* parent */
+		return 0;
 
-	/* the child */
 	clean_write_pipeend();
 	if (init_worker_reactor("HG_maintenance", RCT_PRIO_MAX) < 0) {
 		LM_ERR("failed to init the maintenance reactor\n");

@@ -305,8 +305,6 @@ int init_stats_collector(void)
 		goto error;
 	}
 
-	/* HG_MALLOC shm-arena statistics (no-op under other allocators), kept
-	 * with the core memory statistics rather than behind a module */
 	if (hg_register_stats() != 0) {
 		LM_ERR("failed to register the HG_MALLOC statistics\n");
 		goto error;

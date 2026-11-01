@@ -54,8 +54,7 @@ static const unsigned int cell_sizes[HG_NCLASSES] = {
  * fewer carves. Re-measure how many blocks reach empty before raising it */
 #define HG_CELLS_PER_BLOCK 32
 
-/* free-list link for the private stacks and the shared pool alike: takes
- * @cell_start; the link lives in the payload, never in the hidden header */
+/* a free cell's list link, private stacks and pool alike; takes @cell_start */
 static inline void *cell_next(void *cell_start)
 {
 	/* via void *: the link is pointer-aligned (HG_ROUNDTO cells, a
@@ -101,8 +100,6 @@ static inline unsigned int chunk_size_for(struct hg_block *hb, int c)
 {
 	unsigned int want, least = sizeof(struct hg_chunk) + cell_sizes[c] * 2;
 
-	/* HG_CELLS_PER_BLOCK cells, at least one leaf: a block comes back only
-	 * when every cell is free, so thousands of cells would never drain */
 	want = cell_sizes[c] * HG_CELLS_PER_BLOCK;
 	if (want < HG_LEAF_SIZE)
 		want = HG_LEAF_SIZE;

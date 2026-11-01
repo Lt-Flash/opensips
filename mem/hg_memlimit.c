@@ -25,7 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <limits.h>
-#include <unistd.h>    /* access() */
+#include <unistd.h>
 
 #include "hg_memlimit.h"
 #include "../dprint.h"
@@ -72,7 +72,6 @@ static int read_ull(const char *path, unsigned long long *v)
 	return ok;
 }
 
-/* @key's value in a memory.stat file, 0 when it is not there */
 static unsigned long long stat_value(const char *path, const char *key)
 {
 	char name[64];
@@ -91,7 +90,7 @@ static unsigned long long stat_value(const char *path, const char *key)
 }
 
 /* one hierarchy level: if limited, its room above the floor goes into @best
- * when tighter; its charge excludes the inactive file cache (reclaimable) */
+ * when tighter */
 static void cg_level(const char *dir, int v, unsigned long long *best,
                      struct hg_cg_info *ci)
 {
@@ -132,7 +131,6 @@ static void cg_level(const char *dir, int v, unsigned long long *best,
 	}
 }
 
-/* is @c one of the comma-separated controllers in @list? */
 static int has_controller(const char *list, const char *c)
 {
 	size_t n = strlen(c);
@@ -168,8 +166,8 @@ unsigned long long hg_cgroup_room(struct hg_cg_info *ci)
 		c2 = c1 ? strchr(c1 + 1, ':') : NULL;
 		if (!c2)
 			continue;
-		*c1 = 0;        /* line: the hierarchy id */
-		*c2 = 0;        /* c1 + 1: the controllers; c2 + 1: the path */
+		*c1 = 0;
+		*c2 = 0;
 		if (has_controller(c1 + 1, "memory")) {
 			v = 1;
 			snprintf(rel, sizeof rel, "%s", c2 + 1);

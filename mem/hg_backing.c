@@ -30,7 +30,7 @@
 #include <sys/time.h>
 #include <errno.h>
 #include <sys/mman.h>
-#include <sys/resource.h>    /* getrlimit(RLIMIT_MEMLOCK) */
+#include <sys/resource.h>
 
 #include "hg_version.h"
 #include "hg_malloc.h"
@@ -41,8 +41,8 @@
 #include "../dprint.h"
 #include "../globals.h"
 #include "../statistics.h"
-#include "../pt_scaling.h"    /* profiles + counted_max_processes via pt.h */
-#include "shm_mem.h"           /* shm_block, for the post-cfg attach */
+#include "../pt_scaling.h"
+#include "shm_mem.h"
 
 #ifdef DBG_MALLOC
 #include "mem_dbg_hash.h"
@@ -68,8 +68,7 @@
 #endif
 #endif /* __OS_linux */
 
-/* default huge page size, probed once: not always 2M (arm64 with 16K/64K
- * pages uses 32M/512M), and a wrong value breaks munmap() and THP tiers */
+/* probed, as it is not always 2M: a wrong size breaks munmap() and THP */
 #define HG_HPS_FALLBACK (2UL * 1024 * 1024)
 
 static unsigned long hg_hps_cached;
@@ -94,7 +93,7 @@ unsigned long hg_hps(void)
 		fclose(f);
 	}
 
-	/* must be a power of two for the alignment masks below to work */
+	/* a power of two, or the alignment masks break */
 	if (kb == 0 || (kb * 1024UL) & ((kb * 1024UL) - 1))
 		hg_hps_cached = HG_HPS_FALLBACK;
 	else
@@ -106,8 +105,6 @@ unsigned long hg_hps(void)
 /* each backing tier is proven by trying it and reading /proc afterwards,
  * never inferred from the kernel version or sysfs alone */
 
-/* one numeric field ("Key:   value") from a /proc file, parsed in @base;
- * -1 if the file or the field is missing */
 static long hg_proc_field(const char *path, const char *key, int base)
 {
 	FILE *f;
@@ -154,8 +151,7 @@ void hg_meminfo_kb2(const char *k1, long *v1, const char *k2, long *v2)
 
 /* a grow's mlock() gets ENOMEM both from RLIMIT_MEMLOCK (hugetlb too) and
  * from an empty hugetlb pool; the helpers below tell the two apart */
-#define HG_CAP_IPC_LOCK	14	/* linux/capability.h; mlock() ignores the
-				 * limit for a process that holds it */
+#define HG_CAP_IPC_LOCK	14	/* linux/capability.h */
 
 static int hg_has_cap_ipc_lock(void)
 {
@@ -207,8 +203,6 @@ enum hg_grow_refusal hg_mlock_refusal_why(unsigned long lim, long locked_kb,
 	return HG_GR_MLOCK;
 }
 
-/* why mlock() refused @delta bytes of @hb, with the errno of the failed
- * mlock(); when @say, also the warning that names it */
 static enum hg_grow_refusal hg_mlock_refusal(struct hg_block *hb,
 		unsigned long delta, int err, int say)
 {
@@ -252,8 +246,6 @@ static enum hg_grow_refusal hg_mlock_refusal(struct hg_block *hb,
 	return why;
 }
 
-/* a grow's mlock() was refused: the cause is classified and logged once per
- * episode (see grow_refuse_said's comment) and recorded every time */
 static void hg_mlock_refused(struct hg_block *hb, unsigned long delta, int err)
 {
 	if (!hb->grow_refuse_said || !hb->grow_refuse_mlock) {
@@ -264,8 +256,8 @@ static void hg_mlock_refused(struct hg_block *hb, unsigned long delta, int err)
 	hb->grow_refuse_why = hb->grow_refuse_mlock;
 }
 
-/* does host THP policy forbid MADV_COLLAPSE? An explicit collapse bypasses
- * "never" in the kernel, so it is honoured here; cached per mapping kind */
+/* an explicit MADV_COLLAPSE bypasses THP "never" in the kernel, so the
+ * policy is honoured here; cached per mapping kind */
 static int hg_thp_collapse_denied(int shared)
 {
 	static int cached[2] = { -1, -1 };
@@ -289,8 +281,6 @@ static int hg_thp_collapse_denied(int shared)
 	return cached[!!shared];
 }
 
-/* startup-line suffix naming the host THP setting that keeps a 4K arena on
- * 4K, so the operator knows which knob to change; "" when none does */
 const char *hg_4k_reason(int shared)
 {
 	if (!hg_thp_collapse_denied(shared))
@@ -307,8 +297,8 @@ static long hg_read_huge_kb(int shared)
 	return hg_meminfo_kb(shared ? "ShmemHugePages" : "AnonHugePages");
 }
 
-/* did a populate of @len land on huge pages? Read from the system-wide
- * counter delta (O(1), unlike smaps); 90% must show, so a partial fails */
+/* the system-wide counter delta (O(1), unlike smaps); 90% must show, so a
+ * partial populate fails */
 static int hg_delta_is_huge(long before_kb, long after_kb, unsigned long len)
 {
 	return before_kb >= 0 && after_kb >= 0 &&
@@ -350,11 +340,10 @@ void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 
 	*locked_b = 0;
 	*tier = HG_MEM_4K;
-	*cap = csize;        /* rewritten below if a fallback shrinks it */
+	*cap = csize;
 
 #ifndef __OS_linux
-	/* no verified huge-page route outside Linux: a plain anonymous
-	 * mapping on the 4K tier, still pinned and pre-faulted */
+	/* no verified huge-page route outside Linux: the 4K tier */
 	p = mmap(NULL, csize, PROT_READ|PROT_WRITE, vis|MAP_ANONYMOUS, -1, 0);
 	if (p == MAP_FAILED)
 		return NULL;
@@ -380,7 +369,7 @@ void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 				"keeps huge pages but cannot grow. Raise "
 				"vm.nr_hugepages to allow growth.\n",
 				csize >> 20, asize >> 20);
-			*cap = asize;      /* the arena is fixed after all */
+			*cap = asize;
 		}
 		/* on total failure csize stays at the full cap for tiers 2-4:
 		 * THP reservations are plain VA, which CAN hold the cap */
@@ -393,8 +382,7 @@ void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 		return p;
 	}
 
-	/* tiers 2-4: aligned anon map of the whole cap R/W, made before fork so
-	 * every worker shares it (a grow-time mmap would be the grower's) */
+	/* tiers 2-4: an aligned anon map of the whole cap R/W */
 	resv = mmap(NULL, csize + apage, PROT_NONE,
 	            MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	if (resv == MAP_FAILED)
@@ -409,8 +397,7 @@ void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 
 	hg_exclude_from_core(base, csize);
 
-	/* small mode stops here: THP cannot back a range under one huge
-	 * page, so it is the 4K tier, pinned and pre-faulted all the same */
+	/* small mode stops here: THP cannot back a range under one huge page */
 	if (small) {
 		if (mlock(base, asize) == 0) {
 			*locked_b = asize;
@@ -434,7 +421,7 @@ void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 			"continuing unpinned (swappable). If running under "
 			"systemd, add LimitMEMLOCK=infinity to the unit.\n",
 			asize >> 20, strerror(errno));
-		memset(base, 0, asize);        /* still pre-fault */
+		memset(base, 0, asize);
 	}
 
 	if (hg_delta_is_huge(shmem_kb, hg_read_huge_kb(shared), asize)) {
@@ -444,14 +431,14 @@ void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 	           hg_read_huge_kb(shared) - shmem_kb >= (long)(asize / 1024)) {
 		*tier = HG_MEM_THP_COLLAPSE;
 	} else {
-		*tier = HG_MEM_4K;         /* reserved+pinned but 4K */
+		*tier = HG_MEM_4K;
 	}
 	return base;
 #endif /* __OS_linux */
 }
 
-/* MADV_COLLAPSE one committed range: 1 when now huge, 0 if host THP policy
- * forbids it, else -errno (often a transient EAGAIN, worth a retry) */
+/* 1 when now huge, 0 if host THP policy forbids it, else -errno (often a
+ * transient EAGAIN, worth a retry) */
 int hg_mem_collapse(struct hg_block *hb, char *base, unsigned long len)
 {
 #ifdef __OS_linux
@@ -463,8 +450,6 @@ int hg_mem_collapse(struct hg_block *hb, char *base, unsigned long len)
 #endif
 }
 
-/* commit [hbase+off, +delta) via mlock(), which fails with an errno rather
- * than a later SIGBUS; returns the delta's hg_mem_tier, or -1, all undone */
 const char * const hg_cp_phase_str[HG_CP_PHASES] = {
 	"meminfo", "advise", "mlock_populate", "verify", "collapse"
 };
@@ -475,6 +460,8 @@ const char * const hg_cp_phase_str[HG_CP_PHASES] = {
 		cp_ns[phase] = hg_ns_ul(hg_now_ns() - _t0); \
 	} while (0)
 
+/* commit [hbase+off, +delta) via mlock(), which fails with an errno rather
+ * than a later SIGBUS; returns the delta's hg_mem_tier, or -1, all undone */
 int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
 		unsigned long cp_ns[HG_CP_PHASES], int *collapse_later)
 {
@@ -513,8 +500,7 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
 		HG_CP_TIME(HG_CP_ADVISE, madvise(base, delta, MADV_HUGEPAGE));
 
 		if (hb->unpinned) {
-			/* unpinned arena (init's mlock failed): a populating
-			 * write fault is the pre-fault without the pin */
+			/* a populating write fault: the pre-fault without the pin */
 			HG_CP_TIME(HG_CP_MLOCK, {
 				if (madvise(base, delta, MADV_POPULATE_WRITE) != 0)
 					memset(base, 0, delta);   /* pre-5.14 kernels */
@@ -534,7 +520,7 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
 				hb->unpinned = 1;
 				HG_CP_TIME(HG_CP_MLOCK, {
 					if (madvise(base, delta, MADV_POPULATE_WRITE) != 0)
-						memset(base, 0, delta);   /* pre-5.14 kernels */
+						memset(base, 0, delta);
 				});
 				mlock_rc = 0;
 			}
@@ -547,14 +533,12 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
 		if (!hb->unpinned)
 			__sync_fetch_and_add(&hb->locked_mb, delta >> 20);
 
-		/* the init tier says nothing about this delta's backing: verify
-		 * it from the counter delta across the populate (O(1)) */
+		/* the init tier says nothing about this delta's backing */
 		HG_CP_TIME(HG_CP_VERIFY, is_huge = hg_delta_is_huge(shmem_kb,
 			hg_read_huge_kb(hb->shared), delta));
 		if (is_huge)
 			return HG_MEM_THP_ADVISE;
-		/* a worker waits on this grow and a collapse takes ms: publish
-		 * on 4 KB now, hg_collapse_deferred() collapses it later */
+		/* a worker waits on this grow, and a collapse takes ms: defer it */
 		if (collapse_later && shmem_kb >= 0 &&
 		    !hg_thp_collapse_denied(hb->shared)) {
 			*collapse_later = 1;
@@ -571,7 +555,7 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
 	}
 #else
 	if (mlock(base, delta) != 0) {
-		memset(base, 0, delta);        /* still pre-fault */
+		memset(base, 0, delta);
 	} else {
 		__sync_fetch_and_add(&hb->locked_mb, delta >> 20);
 	}
@@ -579,7 +563,6 @@ int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
 #endif
 }
 
-/* the shrink primitive - contract on the prototype */
 int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len)
 {
 	char *base = hb->hbase + off;
@@ -611,15 +594,11 @@ int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len)
 	if (madvise(base, len, advice) != 0) {
 		int err = errno;
 
-		/* structural, not transient: said once, and the arena never
-		 * tries to shrink again */
 		hb->shrink_unsupported = 1;
 		LM_WARN("%s: cannot release memory (%s of %lu MB failed: %s) "
 			"- shrink disabled for this arena\n", hb->name,
 			hb->shared ? "MADV_REMOVE" : "MADV_DONTNEED",
 			len >> 20, strerror(err));
-		/* an unpinned arena has nothing to restore; a refused re-pin
-		 * drops the pinned figure instead */
 		if (!hb->unpinned && mlock(base, len) != 0) {
 			LM_WARN("%s: could not pin the %lu MB again after the refused "
 				"release (%s) - they stay committed but unpinned\n",
@@ -640,8 +619,8 @@ int hg_mem_release(struct hg_block *hb, unsigned long off, unsigned long len)
 #endif /* __OS_linux */
 }
 
-/* populate a punched range and re-mlock it in the calling process; -1 on
- * hugetlb means the page is gone (refuse), elsewhere only unpinned */
+/* re-pins in the calling process, as mlock is not inherited; -1 on hugetlb:
+ * the page is gone (refuse), elsewhere it is populated but left unpinned */
 int hg_mem_repin(struct hg_block *hb, unsigned long off, unsigned long len,
                  int tier)
 {
@@ -654,8 +633,6 @@ int hg_mem_repin(struct hg_block *hb, unsigned long off, unsigned long len,
 	}
 
 	if (hb->unpinned) {
-		/* unpinned arena: a populating write fault is the commit
-		 * without the pin */
 #ifdef __OS_linux
 		if (madvise(base, len, MADV_POPULATE_WRITE) != 0)
 #endif

@@ -25,7 +25,7 @@
 #include <string.h>
 #include <limits.h>
 #include <stdlib.h>
-#include <unistd.h>   /* sysconf, for the IO-pool consumer count */
+#include <unistd.h>
 
 #include "hg_malloc.h"
 #include "hg_arena.h"
@@ -33,18 +33,15 @@
 #include "hg_large.h"
 #include "hg_dbg.h"
 #include "../dprint.h"
-#include "../pt.h"     /* counted_max_processes */
+#include "../pt.h"
 #include "../globals.h"
 #include "hg_arena_int.h"
 
-/* slab bytes carved into chunks but not handed out, fully reusable;
- * hg_get_real_used() subtracts it so free cells read as free */
 unsigned long hg_slab_recycled(struct hg_block *hb)
 {
 	unsigned long capacity, live;
 
-	/* slab_capacity is a running sum read unlocked (a registry walk needs
-	 * hb->lock); a torn read is at worst one chunk off */
+	/* read unlocked: a torn read is at worst one chunk off */
 	capacity = hb->slab_capacity;
 	live = hg_cell_live(hb);
 	return capacity > live ? capacity - live : 0;
@@ -72,22 +69,14 @@ void hg_arena_stats_core_init(struct hg_block *hb, int core_index)
 }
 #endif
 
-
-
-/* ==== Statistics: the hg_stats figures as core statistics, hg_shm_* in
- * "hgmem", registered by hg_register_stats() below ==== */
-
 #include "../statistics.h"
-#include "shm_mem.h"   /* mem_allocator_shm */
-#include "mem.h"       /* mem_allocator_pkg */
+#include "shm_mem.h"
+#include "mem.h"
 
-/* this thread's stats slot, -1 = the process's own (see hg_pstat_mine) */
 __thread int hg_pstat_slot = -1;
 
 int hg_pstat_shared;
 
-/* processes beyond HG_STAT_SLOTS share slots ((process_no + 1) % slots);
- * shared slots switch to atomic adds so concurrent updates are not lost */
 void hg_pstat_slots_check(unsigned int nprocs)
 {
 	if (nprocs <= HG_STAT_SLOTS)
@@ -112,14 +101,11 @@ void hg_thread_stats_init(void)
 	next = (hb && (mem_allocator_shm == MM_HG_MALLOC ||
 	               mem_allocator_shm == MM_HG_MALLOC_DBG)) ?
 	       &hb->thread_slot_next : &local_next;
-	/* thread slots come down from the top and must stay above the
-	 * processes' 1..counted_max_processes */
+	/* thread slots stay above the processes' 1..counted_max_processes */
 	floor = counted_max_processes > HG_STAT_SLOTS / 4 ?
 		counted_max_processes : HG_STAT_SLOTS / 4;
 	s = __atomic_fetch_sub(next, 1, __ATOMIC_ACQ_REL);
 	if (s <= floor || s >= HG_STAT_SLOTS) {
-		/* out of thread slots: share the process slot, so it has
-		 * two writers and this process adds atomically from now on */
 		hg_pstat_shared = 1;
 		if (!said) {
 			said = 1;
@@ -133,7 +119,6 @@ void hg_thread_stats_init(void)
 	hg_pstat_slot = (int)s;
 }
 
-/* --- lock-stall bookkeeping (called after the release) ----------------- */
 const char * const hg_lk_reason_str[HG_LK_REASONS] = {
 	"refill", "return", "flush", "large", "policy", "stats", "other"
 };
@@ -171,27 +156,20 @@ enum hg_stat_field {
 	HGS_TIER = 0, HGS_TOTAL, HGS_PINNED_BYTES, HGS_CARVED, HGS_CARVED_PEAK,
 	HGS_CHUNKS, HGS_FREE_TO_CARVE, HGS_LIVE, HGS_LIVE_PEAK, HGS_PAYLOAD,
 	HGS_CELLS, HGS_SLAB_LIVE, HGS_SLAB_RECYCLED,
-	/* reclaim rates: counters, not events - an EVI event per transition
-	 * would cost more than the allocator it reports on */
+	/* counters, not events: an EVI event per transition would cost more
+	 * than the allocator it reports on */
 	HGS_BLOCKS_CARVED, HGS_BLOCKS_RETURNED, HGS_GC_PASSES,
 	HGS_CACHE_FLUSHES, HGS_CELLS_FLUSHED, HGS_PRESSURE_FLUSHES, HGS_PRESSURE_CELLS,
 	HGS_GC_TICK_BLOCKS, HGS_GC_INLINE_BLOCKS, HGS_GC_KEPT_BLOCKS, HGS_SWEEPS_SKIPPED,
 	HGS_BUDDY_SPLITS, HGS_BUDDY_MERGES, HGS_BUDDY_FREE_LEAVES,
-	/* large tier footprint, and the reserve floor - without these last
-	 * three the floor is invisible outside a one-shot log line */
 	HGS_LARGE_BACKING, HGS_LARGE_LIVE, HGS_LARGE_RECYCLED,
 	HGS_LARGE_CHUNKS_CARVED, HGS_LARGE_CHUNKS_RETURNED,
 	HGS_RESERVE_FLOOR, HGS_BELOW_FLOOR, HGS_FLOOR_CROSSINGS,
-	/* one number an operator can alert on; the breakdown is in hg_stats */
 	HGS_CORRUPTION,
-	/* elastic arena: committed vs reserved, and the grow ledger. Alert on
-	 * grow_refused rising: demand hit the cap or the host */
 	HGS_COMMITTED, HGS_CAP, HGS_GROWS, HGS_GROW_BYTES, HGS_GROW_REFUSED,
 	HGS_SHRINKS, HGS_SHRINK_BYTES,
 	HGS_PUNCHES, HGS_PUNCH_BYTES, HGS_PUNCHED_PAGES, HGS_WHOLE_FREE_PAGES,
 	HGS_REPINS, HGS_REPIN_FAILED, HGS_HOLE_REGROWS,
-	/* the alertable gauge: 1 while a resource refusal is latched (cap
-	 * refusals never latch - an admin ceiling is policy, not incident) */
 	HGS_GROW_BLOCKED,
 	HGS_LOCK_STALLS, HGS_LOCK_HOLD_MAX_US,
 	HGS_GROWS_PROACTIVE, HGS_GROWS_EXHAUSTION,
@@ -206,27 +184,19 @@ static unsigned long hg_shm_stat(void *ctx)
 	switch ((enum hg_stat_field)(long)ctx) {
 	case HGS_TIER:          return hb->tier;
 	case HGS_TOTAL:         return hb->size;
-	/* bytes rather than the MB the MI reports, so it composes with the
-	 * other byte-valued statistics and with node_exporter's page counts */
+	/* bytes, not the MI's MB, like the other byte-valued statistics */
 	case HGS_PINNED_BYTES:  return (unsigned long)hb->locked_mb << 20;
-	/* carved: slab blocks plus whole large-tier chunks; not monotonic, as
-	 * hg_gc_class() subtracts returned blocks (reclaim at work) */
 	case HGS_CARVED:        return hb->real_used;
 	case HGS_CARVED_PEAK:   return hb->max_real_used;
 	case HGS_CHUNKS:        return hb->nchunks;
 	case HGS_FREE_TO_CARVE: return hg_free_to_carve(hb);
-	/* live: handed out right now. The gap to carved is free cells,
-	 * reusable only within their class - slab behaviour, not a leak */
 	case HGS_LIVE:          return hg_get_real_used(hb);
 	case HGS_LIVE_PEAK:     return hb->max_live_used;
 	case HGS_PAYLOAD:       return hg_used(hb);
 	case HGS_CELLS:         return hg_fragments(hb);
-	/* slab only: large allocations go to the boundary-tag tier and never
-	 * appear here, so this is deliberately not comparable with payload */
+	/* slab only, so deliberately not comparable with payload */
 	case HGS_SLAB_LIVE:     return hg_cell_live(hb);
 	case HGS_SLAB_RECYCLED: return hg_slab_recycled(hb);
-	/* reclaim rates: carved minus returned is the live block count, and
-	 * returned/carved shows how well reclaim keeps up */
 	case HGS_BLOCKS_CARVED:   return hb->blocks_carved;
 	case HGS_BLOCKS_RETURNED: return hb->gc_blocks_returned;
 	case HGS_GC_PASSES:       return hb->gc_passes;
@@ -362,7 +332,7 @@ int hg_register_stats(void)
 
 	if (mem_allocator_shm != MM_HG_MALLOC &&
 	        mem_allocator_shm != MM_HG_MALLOC_DBG)
-		return 0;       /* another allocator is in use */
+		return 0;
 
 	for (i = 0; hg_stat_defs[i].name; i++) {
 		if (register_stat2("hgmem", (char *)hg_stat_defs[i].name,
@@ -374,4 +344,4 @@ int hg_register_stats(void)
 	}
 	return 0;
 }
-#endif /* HG_MALLOC, statistics included */
+#endif /* HG_MALLOC */

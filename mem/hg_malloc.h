@@ -25,49 +25,40 @@
 
 #include <stdio.h>
 #include <time.h>
-#include <stddef.h>   /* offsetof, for the header-layout pins */
-#include <stdint.h>   /* uint64_t: 64-bit free-map words on every ABI */
-#include <string.h>   /* memcpy/memset, for the tail guard (hg_cell.h) */
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
 #include "meminfo.h"
 #include "common.h"
 #include "hg_san.h"
-/* process_no, for hg_pstat_mine(); included explicitly because a
- * cross-compiler build does not get it through other headers */
+/* process_no: a cross-compiler build gets it through no other header */
 #include "../globals.h"
 
 #include "hg_cell.h"
 #include "hg_block.h"
 
-/* Address -> page/leaf (see HG_LEAF_SHIFT); pages_init() in hg_arena.c
- * refuses an arena on which these do not round-trip */
-
-/* how many leaves tile one huge page */
 static inline unsigned long hg_leaves_per_page(const struct hg_block *hb)
 {
 	return 1UL << (hb->hps_shift - HG_LEAF_SHIFT);
 }
 
-/* is @p in the page-addressable region? Memory before pbase (the block
- * header, an unaligned head off Linux) is not buddy memory: answer NO */
 static inline int hg_in_pages(const struct hg_block *hb, const void *p)
 {
 	return (const char *)p >= hb->pbase &&
 	       (const char *)p <  hb->pbase + (hb->npages << hb->hps_shift);
 }
 
-/* page index of @p; only meaningful when hg_in_pages() */
+/* only meaningful when hg_in_pages() */
 static inline unsigned long hg_page_of(const struct hg_block *hb, const void *p)
 {
 	return (unsigned long)((const char *)p - hb->pbase) >> hb->hps_shift;
 }
 
-/* first byte of the page holding @p */
 static inline char *hg_page_base(const struct hg_block *hb, const void *p)
 {
 	return hb->pbase + (hg_page_of(hb, p) << hb->hps_shift);
 }
 
-/* leaf index of @p WITHIN its own page */
 static inline unsigned long hg_leaf_of(const struct hg_block *hb, const void *p)
 {
 	unsigned long off = (unsigned long)((const char *)p - hb->pbase);
@@ -75,19 +66,16 @@ static inline unsigned long hg_leaf_of(const struct hg_block *hb, const void *p)
 	return (off & ((1UL << hb->hps_shift) - 1)) >> HG_LEAF_SHIFT;
 }
 
-/* @flags HG_INIT_INHERITED: the pre-fork pkg arena children inherit COW;
- * never hugetlb, where a child's COW fault finds no huge page: SIGBUS */
+/* HG_INIT_INHERITED: the pre-fork pkg arena, which every child inherits COW */
 #define HG_INIT_INHERITED  (1U << 0)
 
 struct hg_block *hg_malloc_init(unsigned long size, char *name, int shared,
 		const char *proc_desc, unsigned int flags);
 void hg_malloc_destroy(struct hg_block *hb);
 
-/* The admin caps (-m/-M INIT:CAP, 0 = fixed) live in globals.h/.c; the pkg
- * cap is PER PROCESS, so the host-RAM exposure is cap x nproc */
+/* the -m/-M caps (globals.h): 0 = fixed; pkg's is PER PROCESS, cap x nproc */
 
-/* Commit [off, off+delta) of the reservation: the achieved tier (>= 1), or -1
- * with all rolled back. Called WITHOUT hb->lock: merge @cp_ns under it */
+/* called WITHOUT hb->lock: merge @cp_ns under it */
 int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
 		unsigned long cp_ns[HG_CP_PHASES], int *collapse_later);
 int hg_mem_collapse(struct hg_block *hb, char *base, unsigned long len);
@@ -102,13 +90,12 @@ enum hg_grow_refusal hg_mlock_refusal_why(unsigned long lim, long locked_kb,
 		unsigned long delta, int hugetlb, long free_pg, long rsvd_pg,
 		long page_kb);
 
-/* Refuse process counts the host cannot hold, before the OOM killer does:
+/* refuse process counts the host cannot hold, before the OOM killer does:
  * hg_capacity_check() pre-fork (-1: no fit), hg_fork_fits() per fork (0: no) */
 int hg_capacity_check(unsigned int start_procs, unsigned int max_procs);
 int hg_fork_fits(void);
 
-/* allocation-failure throttle, hb->lock held: hg_oom_first() says whether to
- * log a failure in full, hg_oom_take() takes the count since the last call */
+/* under hb->lock; hg_oom_take() returns the failures since its last call */
 static inline int hg_oom_first(struct hg_block *hb, unsigned long req)
 {
 	hb->oom_fails++;
@@ -137,8 +124,8 @@ void hg_oom_report(struct hg_block *hb, unsigned long n, unsigned long max_req);
 void hg_oom_report_shared(void);
 void hg_sample_live_peaks(void);
 
-/* Per-process private-arena growth refusals, published to a shared array at
- * each sweep, read as hgmem:hg_pkg_grow_refused and hg_pkg_grow_blocked */
+/* pkg grow refusals are per process: each publishes its own to a shared
+ * array at each sweep, and hgmem: sums them */
 int hg_pkg_pub_init(unsigned int nproc);
 void hg_pkg_publish(struct hg_block *hb);
 void hg_pkg_pub_reset(int proc);
@@ -156,10 +143,9 @@ unsigned long hg_buddy_top_reachable(struct hg_block *hb);
  * one that cannot act (names nothing, exceeds -m/-M, no growth room) */
 int hg_autoscale_post_cfg(void);
 
-/* re-sync per-process state after fork(): the inherited private
- * free-stack/bump state must be discarded, not kept or donated (hg_arena.c) */
+/* after fork(): the inherited private free-stack/bump state must be
+ * discarded, not kept or donated */
 void hg_malloc_child_init(struct hg_block *hb);
-/* fork reset for every SHARED arena in the registry (core + module) */
 void hg_malloc_child_init_all(void);
 
 /* sizes the DBG_MALLOC history pool like fm_get_dbg_pool_size(); best-effort:
@@ -193,25 +179,19 @@ void hg_status_dbg(struct hg_block *hb);
 #endif
 void hg_info(struct hg_block *hb, struct mem_info *info);
 
-/* defined in hg_arena.c; table lookup, no lock needed (immutable) */
+/* table lookup, no lock needed (immutable) */
 unsigned int hg_cell_total_size(unsigned char cls);
 
-/* defined in hg_large.c; @frag is HG_HDR(p) - HG_LFRAG_HDR_SIZE, opaque so
- * this header need not include hg_large.h, which includes it */
+/* @frag is HG_HDR(p) - HG_LFRAG_HDR_SIZE, opaque so this header need not
+ * include hg_large.h, which includes it */
 unsigned long hg_large_frag_size_at(const void *frag);
 
-/* Arena ownership tests, advisory: a foreign pointer's HG_HDR(p) may be
- * unmapped; hg_owns_any() walks a registry for the hb-less frag_size hook */
 static inline int hg_owns(struct hg_block *hb, void *cell_start)
 {
-	/* against the CAP, not the span: hcap never changes after init, which
-	 * keeps this fast path off the slow path's cache lines */
 	return (char *)cell_start >= hb->hbase &&
 	       (char *)cell_start < hb->hbase + hb->hcap;
 }
 
-/* --- lock instrumentation helpers -------------------------------------- */
-/* hg_lock_stall_us (cfg, default 1000 us) is declared in globals.h */
 extern const char * const hg_lk_reason_str[HG_LK_REASONS];
 extern const char * const hg_cp_phase_str[HG_CP_PHASES];
 
@@ -223,8 +203,7 @@ static inline hg_ns_t hg_now_ns(void)
 	return (hg_ns_t)ts.tv_sec * 1000000000ULL + (hg_ns_t)ts.tv_nsec;
 }
 
-/* an interval for an unsigned long field or format: saturated, so one of
- * more than 4.29 s on a 32-bit build reads as huge, not as a small rest */
+/* saturated: past 4.29 s on a 32-bit build it reads as huge, not wrapped */
 static inline unsigned long hg_ns_ul(hg_ns_t ns)
 {
 	return ns > ~0UL ? ~0UL : (unsigned long)ns;
@@ -250,8 +229,7 @@ static inline void hg_lkstat_add(struct hg_lkstat *s, hg_ns_t ns)
 	s->hist[b]++;
 }
 
-/* the stall bookkeeping + rate-limited WARN; out of line (hg_stats.c) so
- * the header stays free of dprint */
+/* out of line, so this header stays free of dprint */
 void hg_lock_stall_note(struct hg_block *hb, int reason, unsigned long held_ns);
 
 static inline void hg_lock_enter(struct hg_block *hb, enum hg_lock_reason r)
@@ -296,8 +274,7 @@ static inline void hg_lock_leave(struct hg_block *hb)
 		hg_lock_stall_note(hb, r, held);
 }
 
-/* Contract check for the *_unlocks functions that drop and re-take hb->lock
- * (hg_grow.c, hg_shrink.c): held on entry and again on return */
+/* for the *_unlocks functions, which drop and re-take hb->lock */
 void hg_lock_assert_held(struct hg_block *hb, const char *where);
 
 #define HG_ARENA_REG_MAX 8
@@ -306,11 +283,10 @@ struct hg_arena_range {
 	unsigned long     size;
 	struct hg_block  *hb;
 };
-/* defined in hg_malloc.c; process-local on purpose: a child inherits the
- * parent's entries (same shm) and adds its own private pkg arena */
+/* process-local on purpose: a child inherits the parent's entries (same
+ * shm) and adds its own private pkg arena */
 extern struct hg_arena_range hg_arena_reg[HG_ARENA_REG_MAX];
 
-/* count of frees redirected to their true owner; reported by hg_stats */
 extern unsigned long hg_xarena_frees;
 
 /* Which arena owns @p? A child may free what its parent allocated pre-fork,
@@ -334,12 +310,10 @@ static inline int hg_owns_any(const void *p)
 	return hg_owner(p) != NULL;
 }
 
-/* hg_buddy.c: hg_backed() past hb->backed_fast - the span's end and the
- * page's state, read while a hole exists or a grow or release runs */
 int hg_backed_slow(const struct hg_block *hb, const void *p);
 
-/* May @p, inside @hb's reservation, be read? Not past the span's end or on a
- * punched or releasing page, where only a stale pointer leads; lock-free */
+/* may @p, inside @hb's reservation, be read? Lock-free; only a stale
+ * pointer leads to an unbacked page */
 static inline int hg_backed(const struct hg_block *hb, const void *p)
 {
 	if ((unsigned long)((const char *)p - hb->hbase) <
@@ -348,8 +322,8 @@ static inline int hg_backed(const struct hg_block *hb, const void *p)
 	return hg_backed_slow(hb, p);
 }
 
-/* recompute hb->backed_fast; under hb->lock, after every change of
- * grow_inflight, punched_pages or span_end, and at init */
+/* under hb->lock, after every change of grow_inflight, punched_pages or
+ * span_end, and at init */
 static inline void backed_fast_update(struct hg_block *hb)
 {
 	__atomic_store_n(&hb->backed_fast,
@@ -357,7 +331,6 @@ static inline void backed_fast_update(struct hg_block *hb)
 		__ATOMIC_RELEASE);
 }
 
-/* the live arena holding @p, if its memory there may be read, else NULL */
 static inline struct hg_block *hg_owner_backed(const void *p)
 {
 	struct hg_block *hb = hg_owner(p);
@@ -372,8 +345,7 @@ static inline unsigned long hg_frag_size(void *p)
 	if (!p)
 		return 0;
 
-	/* the header may be unmapped or no longer backed: check before reading;
-	 * 0 is the "unknown size" answer */
+	/* the header may be unmapped or no longer backed; 0 = unknown size */
 	if (!hg_owner_backed(HG_HDR(p)))
 		return 0;
 
@@ -419,12 +391,10 @@ static inline unsigned long hg_frag_line(void *p) { return 0; }
 #endif
 #endif
 
-/* Fast-path stats: hg_pstat_mine() biases process_no by one (-1 in the
- * attendant) and wraps it; a shared slot only races on counters */
-/* a thread of a threaded process (TCP main's IO pool) has its own slot,
- * claimed at thread start by hg_thread_stats_init(); -1 = the process slot */
+/* a thread's own stats slot (TCP main's IO pool), else -1: the process's */
 extern __thread int hg_pstat_slot;
 
+/* process_no + 1, as the attendant's is -1 */
 static inline struct hg_pstat *hg_pstat_mine(struct hg_block *hb)
 {
 	int s = hg_pstat_slot;
@@ -441,8 +411,6 @@ extern int hg_pstat_shared;
 /* checked once the process count is known, before anything forks */
 void hg_pstat_slots_check(unsigned int nprocs);
 
-/* move this process's (or thread's) counters: atomic adds once its slot may
- * have two writers, or updates are lost and the sums drift */
 static inline void hg_pstat_add(struct hg_pstat *ps, long used, long frags,
 		long cell)
 {
@@ -458,12 +426,9 @@ static inline void hg_pstat_add(struct hg_pstat *ps, long used, long frags,
 	ps->cell_live += cell;
 }
 
-/* give the calling thread its own slot (idempotent); thread slots come from
- * the top of the array, via a shm counter so no two processes share one */
 void hg_thread_stats_init(void);
 
-/* summed on read; clamped at 0 because slots go negative when one process
- * frees another's cells, and a torn sum could underflow the return */
+/* clamped at 0: a torn sum over the signed slots can dip below it */
 static inline unsigned long hg_used(struct hg_block *hb)
 {
 	long total = 0;
@@ -484,36 +449,29 @@ static inline unsigned long hg_fragments(struct hg_block *hb)
 	return total < 0 ? 0 : (unsigned long)total;
 }
 
-/* carved-but-idle cell capacity; defined in hg_stats.c (declared here too,
- * since hg_arena.h includes THIS header and cannot be included back) */
+/* carved-but-idle cell capacity */
 unsigned long hg_slab_recycled(struct hg_block *hb);
 
-/* Register the SHM arena's statistics with the statistics collector, from
- * init_stats_collector(); 0 on success, a no-op unless shm is HG_MALLOC */
+/* from init_stats_collector(); a no-op unless shm is HG_MALLOC */
 #ifdef HG_MALLOC
 int hg_register_stats(void);
 
-/* --- module arenas (see hg_arena_create() in hg_malloc.c) --------------- */
-#define HG_CAP_BY_NAME (~0UL)   /* hg_malloc_init_cap: take the cap from -m/-M */
+#define HG_CAP_BY_NAME (~0UL)   /* @cap_req: take the cap from -m/-M */
 struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 		char *name, int shared, const char *proc_desc, unsigned int flags);
-/* a shared, elastic arena of the module's own; @name must outlive the block;
- * pre-fork only. NULL = refused (logged) */
+/* @name must outlive the block; NULL = refused (logged) */
 struct hg_block *hg_arena_create(char *name, unsigned long init_bytes,
 		unsigned long cap_bytes);
 int hg_arena_set_profile(struct hg_block *hb, const char *profile_name);
 #else
-/* no-op without the allocator, so callers (statistics.c) need no #ifdef: the
- * definition is in mem/hg_stats.c, entirely inside "#ifdef HG_MALLOC" */
 static inline int hg_register_stats(void) { return 0; }
 #endif
 
-/* hg_mem_check = 2: log and abort() - in hg_arena.c */
 void hg_corrupt_abort(struct hg_block *hb, enum hg_corrupt_kind k)
 	__attribute__ ((noreturn, cold));
 
-/* Bump a corruption counter (hb may be NULL); every site calls it after its
- * own LM_CRIT, so hg_mem_check = 2 aborts with the details logged */
+/* @hb may be NULL; every site calls it after its own LM_CRIT, so
+ * hg_mem_check = 2 aborts with the details logged */
 static inline void hg_corrupt(struct hg_block *hb, enum hg_corrupt_kind k)
 {
 	if (hb)
@@ -524,7 +482,6 @@ static inline void hg_corrupt(struct hg_block *hb, enum hg_corrupt_kind k)
 		hg_corrupt_abort(hb, k);
 }
 
-/* a guarded cell failed hg_guard_ok(): logged and counted - in hg_arena.c */
 void hg_guard_bad(struct hg_block *hb, const void *cs, unsigned long cap,
                   unsigned long size) __attribute__ ((cold));
 
@@ -538,7 +495,6 @@ static inline unsigned long hg_corrupt_total(struct hg_block *hb)
 	return t;
 }
 
-/* total cell-slot bytes handed out across every process */
 static inline unsigned long hg_cell_live(struct hg_block *hb)
 {
 	long total = 0;
@@ -549,8 +505,6 @@ static inline unsigned long hg_cell_live(struct hg_block *hb)
 	return total < 0 ? 0 : (unsigned long)total;
 }
 
-/* room left to carve: the span (hb->size) less the carve footprint, and 0
- * rather than a wrapped figure should the two ever disagree */
 static inline unsigned long hg_free_to_carve(const struct hg_block *hb)
 {
 	unsigned long size = hb->size, carved = hb->real_used;
@@ -567,23 +521,18 @@ static inline unsigned long hg_get_used(struct hg_block *hb)
 {
 	return hg_used(hb);
 }
-/* these feed the shmem: and pkgmem: statistics (SHM_GET_/PKG_GET_), not
- * hg_info(), so the recycled subtraction is applied here too */
 static inline unsigned long hg_get_free(struct hg_block *hb)
 {
 	/* headroom left to CARVE, not size minus live: recycled cells serve
 	 * only their own class; so free + real_used != size, unlike q_malloc */
 	return hg_free_to_carve(hb);
 }
-/* the large tier's counterpart to hg_slab_recycled(): buddy backing not
- * handed out as a fragment. O(1): both terms are kept under hb->lock. */
 static inline unsigned long hg_large_recycled(struct hg_block *hb)
 {
 	return hb->large_backing > hb->large_live ?
 	       hb->large_backing - hb->large_live : 0;
 }
-/* raise the live peak to @live: an atomic maximum, as the sweeps of two
- * processes sample a shared arena's peak at once */
+/* atomic: two processes' sweeps may sample a shared arena's peak at once */
 static inline void hg_live_peak(struct hg_block *hb, unsigned long live)
 {
 	unsigned long m = __atomic_load_n(&hb->max_live_used, __ATOMIC_RELAXED);
@@ -595,8 +544,6 @@ static inline void hg_live_peak(struct hg_block *hb, unsigned long live)
 
 static inline unsigned long hg_get_real_used(struct hg_block *hb)
 {
-	/* real_used is the carve footprint of BOTH tiers (slab blocks plus
-	 * whole large chunks), so both tiers' idle-but-held bytes come out */
 	unsigned long recycled = hg_slab_recycled(hb) + hg_large_recycled(hb);
 	unsigned long live = hb->real_used > recycled ?
 	                     hb->real_used - recycled : 0;

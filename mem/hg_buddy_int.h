@@ -27,11 +27,7 @@
  * and page helpers they share; include after their headers */
 
 
-/* leaforder[leaf]: order of the block CONTAINING the leaf, in all its
- * leaves; bitmap[node]: 1 iff a WHOLE free block (split = 0), the merge test */
-
-/* node id in the per-page tree: level 0 is the whole page, level `top`
- * the leaves; 2^(top+1)-1 nodes */
+/* per-page tree node: level 0 is the whole page, level `top` the leaves */
 static inline unsigned long node_id(unsigned int top, unsigned int order,
                                     unsigned long leaf)
 {
@@ -60,8 +56,8 @@ static inline void bit_clear(unsigned long *bm, unsigned long n)
 	bm[n / (sizeof(long) * 8)] &= ~(1UL << (n % (sizeof(long) * 8)));
 }
 
-/* The top order's free list is a bitmap, one bit per page; find-first-set
- * serves the lowest page, so carves stay low and the top pages drain. */
+/* the wfree bitmap: find-first-set serves the lowest page, so carves stay
+ * low and the top pages drain */
 #define HG_WF_BITS (sizeof(long) * 8)
 
 static inline int wf_test(const struct hg_block *hb, unsigned long idx)
@@ -91,14 +87,11 @@ static inline void wf_clear(struct hg_block *hb, unsigned long idx)
 	hb->nfree[hb->buddy_top]--;
 }
 
-/* --- free lists ------------------------------------------------------- */
-
 static inline void fl_push(struct hg_block *hb, void *p, unsigned int order)
 {
 	struct hg_free_blk *b = (struct hg_free_blk *)p;
 
-	/* the top order lives in the bitmap; lower orders stay LIFO, as the
-	 * cell-level policy owns placement inside carved pages */
+	/* lower orders LIFO: the cell policy owns placement in carved pages */
 	if (order == hb->buddy_top) {
 		wf_set(hb, hg_page_of(hb, p));
 		return;
@@ -129,16 +122,12 @@ static inline void fl_unlink(struct hg_block *hb, void *p, unsigned int order)
 }
 
 
-/* --- geometry --------------------------------------------------------- */
-
 static inline struct hg_page *page_of(struct hg_block *hb, const void *p)
 {
 	return &hb->pages[hg_page_of(hb, p)];
 }
 
-/* --- init ------------------------------------------------------------- */
-
-/* publish a whole page, nothing carved from it, as one top-order free block */
+/* @pg has nothing carved from it: one top-order free block */
 static inline void page_publish_whole(struct hg_block *hb, struct hg_page *pg)
 {
 	unsigned int top = hb->buddy_top;
@@ -172,13 +161,8 @@ static inline void floor_recompute(struct hg_block *hb)
 	                     hg_leaves_per_page(hb)) / 16;
 }
 
-/* Punch: a whole-free page from ANYWHERE in the span goes back as a hole,
- * off the free lists until hg_buddy_regrow_holes_unlocks() re-commits it. */
 #define HG_PAGES_PER_EVENT 128   /* per release or re-commit event */
 
-/* --- multi-page runs -------------------------------------------------- */
-
-/* is this whole page free and unsplit, i.e. available to a run? */
 static inline int page_is_whole_free(const struct hg_block *hb,
                                      const struct hg_page *pg)
 {

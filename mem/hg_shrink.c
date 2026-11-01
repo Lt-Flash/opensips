@@ -34,8 +34,7 @@
 #include "../globals.h"
 #include "hg_buddy_int.h"
 
-/* Trim: release whole-free pages from the TOP of the span (so hg_owns()
- * stays one range test), never below committed_min. Returns the pages. */
+/* Trim: release whole-free pages from the TOP of the span; returns how many */
 static unsigned long buddy_shrink_body(struct hg_block *hb)
 {
 	unsigned long lpp = hg_leaves_per_page(hb);
@@ -90,7 +89,7 @@ static unsigned long buddy_shrink_body(struct hg_block *hb)
 		pg->releasing = 1;
 	}
 	hb->grow_inflight = 1;
-	backed_fast_update(hb);    /* the slow path while unlocked */
+	backed_fast_update(hb);
 	reason = hb->lk_cur;
 	hg_lock_leave(hb);
 
@@ -133,7 +132,7 @@ static unsigned long buddy_shrink_body(struct hg_block *hb)
 			if (hb->tier_bytes[pg->tier] >= hb->hps)
 				hb->tier_bytes[pg->tier] -= hb->hps;
 		}
-		if (pg->want_collapse) {   /* released: nothing left to collapse */
+		if (pg->want_collapse) {
 			pg->want_collapse = 0;
 			hb->collapse_wanting--;
 		}
@@ -191,7 +190,6 @@ static unsigned long buddy_punch_body(struct hg_block *hb)
 		if (hb->committed_bytes <
 		    hb->committed_min + ((got + 1) << hb->hps_shift))
 			break;
-		/* the headroom rule's line, as in the trim */
 		if (hb->buddy_free_leaves < (got + 1) * lpp)
 			break;
 		free_after = hb->buddy_free_leaves - (got + 1) * lpp;
@@ -206,7 +204,7 @@ static unsigned long buddy_punch_body(struct hg_block *hb)
 	if (!got)
 		return 0;
 	hb->grow_inflight = 1;
-	backed_fast_update(hb);    /* the slow path while unlocked */
+	backed_fast_update(hb);
 	reason = hb->lk_cur;
 	hg_lock_leave(hb);
 
@@ -230,7 +228,7 @@ static unsigned long buddy_punch_body(struct hg_block *hb)
 
 		pg->releasing = 0;
 		if (i >= ok) {
-			fl_push(hb, pg->base, top);      /* still backed */
+			fl_push(hb, pg->base, top);
 			continue;
 		}
 		pg->punched = 1;
@@ -241,7 +239,7 @@ static unsigned long buddy_punch_body(struct hg_block *hb)
 		hb->punched_pages++;
 		if (hb->tier_bytes[pg->tier] >= hb->hps)
 			hb->tier_bytes[pg->tier] -= hb->hps;
-		if (pg->want_collapse) {   /* punched: nothing left to collapse */
+		if (pg->want_collapse) {
 			pg->want_collapse = 0;
 			hb->collapse_wanting--;
 		}
@@ -278,8 +276,8 @@ static unsigned long hg_buddy_punch_unlocks(struct hg_block *hb)
  * minutes at the 30 s sweep); a profile sets its own cycle count */
 #define HG_SHRINK_QUIET_TICKS 4
 
-/* The shrink decision, once per sweep interval. No grow-step margin here:
- * buddy_shrink_body() re-checks each page, so a shrink cannot cause a grow. */
+/* no grow-step margin here: buddy_shrink_body() re-checks each page, so a
+ * shrink cannot cause a grow */
 static void shrink_tick_body(struct hg_block *hb)
 {
 	unsigned long lpp = hg_leaves_per_page(hb);
@@ -296,8 +294,6 @@ static void shrink_tick_body(struct hg_block *hb)
 		hb->shrink_quiet = 0;
 		return;
 	}
-	/* post-grow cool-off: the profile grammar's 10x-cycles hold, so an
-	 * arena that just grew cannot immediately give the growth back */
 	if (hb->pol_cooldown) {
 		hb->pol_cooldown--;
 		hb->shrink_quiet = 0;
@@ -312,8 +308,6 @@ static void shrink_tick_body(struct hg_block *hb)
 		return;
 	}
 	if (hb->pol.active) {
-		/* the profile's quiet test: usage at or below down_pct, and
-		 * free space of at least a page plus twice the floor */
 		if (hg_get_real_used(hb) * 100 > (unsigned long)hb->pol.down_pct *
 		                          hb->committed_bytes ||
 		    hb->buddy_free_leaves < lpp + hb->reserve_floor * 2) {
@@ -342,8 +336,6 @@ static void shrink_tick_body(struct hg_block *hb)
 		}
 		return;
 	}
-	/* decided once per cycle; from here the drain releases one step per
-	 * maintenance tick until a gate fails or nothing is left */
 	hb->draining = 1;
 	hg_drain_tick(hb);
 }
@@ -355,8 +347,7 @@ void hg_shrink_tick(struct hg_block *hb)
 	hg_lock_assert_held(hb, "hg_shrink_tick return");
 }
 
-/* One drain step, hb->lock held: the top trim, then the interior punch.
- * The gates are re-tested each step, as one tick of demand ends the drain. */
+/* the gates are re-tested each step, as one tick of demand ends the drain */
 void hg_drain_tick(struct hg_block *hb)
 {
 	unsigned long lpp = hg_leaves_per_page(hb), released;
@@ -369,7 +360,7 @@ void hg_drain_tick(struct hg_block *hb)
 		return;
 	}
 	if (hb->grow_inflight)
-		return;               /* a release or a grow is in flight */
+		return;
 	if (hb->pol.active) {
 		if (hg_get_real_used(hb) * 100 >
 		    (unsigned long)hb->pol.down_pct * hb->committed_bytes ||

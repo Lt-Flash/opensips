@@ -43,7 +43,6 @@ static str evi_core_table[] = {
 	/* always published so event_route[] can subscribe; raised only by
 	 * HG_MALLOC with a growth cap and a latched refusal (core_stats.c) */
 	CORE_EVENT_STR(SHM_GROW_BLOCKED),
-	/* same publish-always / raise-rarely contract as the one above */
 	CORE_EVENT_STR(HG_LOCK_STALL),
 };
 

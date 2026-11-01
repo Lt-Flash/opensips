@@ -18,8 +18,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-/* the allocator's name wherever it names itself: the -a/-s/-k selector,
- * "opensips -V", each arena's startup line and mm_str() */
+/* the allocator's name everywhere, the -a/-s/-k selector included */
 
 #ifndef HG_VERSION_H
 #define HG_VERSION_H

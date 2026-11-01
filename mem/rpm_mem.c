@@ -149,8 +149,8 @@ int rpm_use_global_lock;
 #endif
 
 #if !defined INLINE_ALLOC && defined HG_MALLOC
-/* HG_MALLOC cannot live in rpm's fixed-address file pool: an inherited
- * HG choice falls back to F_MALLOC/Q_MALLOC; an explicit -e is refused */
+/* an inherited HG choice falls back to F_MALLOC/Q_MALLOC; an explicit -e
+ * is refused */
 static int rpm_resolve_allocator(void)
 {
 	if (mem_allocator_rpm == MM_HG_MALLOC ||

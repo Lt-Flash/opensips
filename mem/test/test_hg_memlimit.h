@@ -23,7 +23,6 @@
 #ifndef __TEST_HG_MEMLIMIT_H__
 #define __TEST_HG_MEMLIMIT_H__
 
-/* run from test_hg_malloc(); no child processes */
 void test_hg_memlimit(void);
 
 #endif /* __TEST_HG_MEMLIMIT_H__ */

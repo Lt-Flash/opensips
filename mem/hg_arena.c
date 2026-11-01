@@ -37,11 +37,9 @@
 #include "../globals.h"
 #include "hg_arena_int.h"
 
-#define HG_CHUNK_SMALL    (256 * 1024)  /* ceiling on chunk_max, see below */
+#define HG_CHUNK_SMALL    (256 * 1024)  /* ceiling on chunk_max */
 #define HG_CHUNK_MIN      (8 * 1024)    /* floor, however tiny the arena */
-/* GC policy: the maintenance tick returns drained blocks beyond keep, so the
- * request path never walks them, except past HG_GC_EMERGENCY beyond keep */
-#define HG_REFILL_BATCH   32             /* cells pulled from the global pool */
+#define HG_REFILL_BATCH   32
 
 /* private free-cache budget in bytes, not cells (classes span 64..65536),
  * split over the threads sharing an arena by private_caps_init() */
@@ -53,8 +51,8 @@
 #define HG_PRIVATE_CONSUMERS_MAX  64
 #define HG_PRIVATE_CAP        256  /* cells per class, whatever the budget  */
 
-/* per-thread cache state, one slot per arena; static, as HG may back pkg/shm.
- * Must be __thread: the fast path is lock-free and IO-pool threads allocate */
+/* static, as HG may back pkg/shm; __thread, as the fast path is lock-free and
+ * IO-pool threads allocate */
 #define HG_MAX_INSTANCES 8   /* shm, pkg, shm_dbg + module arenas */
 static __thread struct hg_palloc palloc_slots[HG_MAX_INSTANCES];
 
@@ -111,8 +109,6 @@ static inline void cell_push_private(struct hg_block *hb,
 	pl->cls[c].free_head = cell_start;
 	pl->cls[c].nfree++;
 
-	/* over the class's bound: donate half. A class with priv_max 0 trips
-	 * on every free, so it is never cached privately */
 	if (pl->cls[c].nfree > hb->priv_max[c]) {
 		unsigned int claimed = pl->cls[c].nfree;
 		unsigned int donate  = hb->priv_donate[c];
@@ -120,13 +116,11 @@ static inline void cell_push_private(struct hg_block *hb,
 		hg_lock_enter(hb, HG_LK_RETURN);
 		for (i = 0; i < donate; i++) {
 			d = pl->cls[c].free_head;
-			/* priv_donate is half priv_max: NULL here means
-			 * nfree drifted above the chain's real length */
+			/* NULL: nfree drifted above the chain's real length */
 			if (!d)
 				break;
 			if (!cell_block(hb, c, d)) {
-				/* an overwritten link: the chain ends here,
-				 * the rest leaks; the resync records it */
+				/* the rest leaks; the resync below logs it */
 				pl->cls[c].free_head = NULL;
 				pl->cls[c].nfree = i;
 				break;
@@ -156,8 +150,7 @@ static inline void cell_push_private(struct hg_block *hb,
 	}
 }
 
-/* hg_dbg.c's quarantine releases a cell through this; the free path here
- * keeps the inlined copy */
+/* out-of-line copy for hg_dbg.c; the free path keeps the inlined one */
 void hg_cell_push_private(struct hg_block *hb, struct hg_palloc *pl,
                           unsigned int c, char *cell_start)
 {
@@ -187,7 +180,6 @@ unsigned int hg_quarantine_drain(struct hg_block *hb)
 	return 0;
 }
 
-/* the two checks that fire where no arena pointer is in scope */
 unsigned long hg_corrupt_noarena[HG_CORRUPT_KINDS];
 
 static const char * const hg_corrupt_str[HG_CORRUPT_KINDS] = {
@@ -223,8 +215,6 @@ void hg_guard_bad(struct hg_block *hb, const void *cs, unsigned long cap,
 
 unsigned long long hg_hdr_secret;
 
-/* flush this thread's caches in every arena it has a slot in. MUST run on the
- * owning thread (__thread caches): a worker calls it inline, not via IPC */
 void hg_cache_flush_self(void)
 {
 	int i, c;
@@ -246,7 +236,6 @@ void hg_cache_flush_self(void)
 			unsigned int keep = hg_flush_residue(hb, pl, c);
 
 			pl->cls[c].touched = 0;
-			/* nothing to hand back: empty, or at its residue */
 			if (!pl->cls[c].free_head ||
 			    (keep && pl->cls[c].nfree <= keep))
 				continue;
@@ -259,16 +248,12 @@ void hg_cache_flush_self(void)
 		/* a private arena's gates tick here, once per sweep: only its
 		 * owner can release its memory (shm ticks on the timer) */
 		if (!hb->shared) {
-			/* latches or disarms GROW-BLOCKED; not for a copy
-			 * inherited at fork, which nothing allocates from */
 			if (!hb->inherited)
 				hg_grow_blocked_tick(hb);
-			/* a private arena has no maintenance process - its
-			 * owner's sweep is its policy cycle and its GC tick */
 			hg_gc_cycle(hb);
 			hg_gc_tick(hb, HG_GC_TICK_BUDGET);
-			/* an inherited copy is never grown (only pre-fork frees
-			 * reach it), but still gives back what they empty */
+			/* an inherited copy still gives back what pre-fork frees
+			 * empty */
 			if (!hb->inherited)
 				hg_grow_tick(hb);
 			hg_shrink_tick(hb);
@@ -277,8 +262,6 @@ void hg_cache_flush_self(void)
 			 * hg_sample_live_peaks() for the shared arenas */
 			(void)hg_get_real_used(hb);
 #endif
-			/* the process's own pkg arena only: the copy has the
-			 * same name, and its figures are the parent's */
 			if (!hb->inherited && !strcmp(hb->name, "pkg"))
 				hg_pkg_publish(hb);
 		}
@@ -290,8 +273,6 @@ void hg_cache_flush_self(void)
 	}
 }
 
-/* before the process leaves for good, hand back its cached cells and unused
- * chunk tails in the shared arenas, or their blocks never drain */
 void hg_cache_drain_self(void)
 {
 	int i, c;
@@ -311,8 +292,7 @@ void hg_cache_drain_self(void)
 		hg_lock_enter(hb, HG_LK_FLUSH);
 		n = hg_cache_flush_locked(hb, pl);
 
-		/* a bump cell was never handed out: it goes to the pool as is.
-		 * Reclaim waits until all are pushed, as in the flush walk */
+		/* a bump cell was never handed out: it goes to the pool as is */
 		hb->gc_deferred = 1;
 		for (c = 0; c < HG_NCLASSES; c++) {
 			while (pl->cls[c].left) {
@@ -328,8 +308,6 @@ void hg_cache_drain_self(void)
 			}
 		}
 		hb->gc_deferred = 0;
-		/* each class keeps its demand-sized reserve of drained blocks
-		 * (gc_keep) and returns the rest, as after a flush */
 		for (c = 0; c < HG_NCLASSES; c++)
 			if (hb->ndrained[c] > hb->gc_keep[c])
 				hb->gc_inline_blocks +=
@@ -345,11 +323,9 @@ void hg_cache_drain_self(void)
 	}
 }
 
-/* bump the atomic offset within the block's own reservation; no fallback:
- * exhaustion is a hard, loud failure (raise -m/-M) */
 void *hg_chunk_backing(struct hg_block *hb, unsigned long size)
 {
-	unsigned long asz = (size + 63) & ~63UL;   /* keep 64-aligned */
+	unsigned long asz = (size + 63) & ~63UL;
 	unsigned long off;
 
 	/* init only: hg_buddy_init() publishes everything above hoff as free,
@@ -492,12 +468,11 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 	hb->nchunks++;
 	hb->slab_capacity += (unsigned long)ch->cells * ch->cell_size;
 	hb->blocks_carved++;
-	hb->carves_cycle[c]++;          /* this cycle's demand */
+	hb->carves_cycle[c]++;
 	hb->real_used += size;
 	if (hb->real_used > hb->max_real_used)
 		hb->max_real_used = hb->real_used;
 
-	/* the whole chunk goes to the carving thread's bump region */
 	pl->cls[c].bump = cells;
 	pl->cls[c].left = ch->cells;
 
@@ -506,8 +481,8 @@ static int carve_chunk(struct hg_block *hb, int c, struct hg_palloc *pl)
 	return 0;
 }
 
-/* how many threads share the private-cache budget; tcp_threads is 0 until the
- * config is parsed, so hg_private_caps_retune() re-runs this afterwards */
+/* tcp_threads is 0 until the config is parsed: hg_private_caps_retune()
+ * re-runs this afterwards */
 static unsigned int hg_io_consumers(void)
 {
 	int n = tcp_threads;
@@ -524,8 +499,7 @@ static unsigned int hg_io_consumers(void)
 	return (unsigned int)n;
 }
 
-/* byte budget to per-class cell counts: priv_max 0 (never cached) when a cell
- * exceeds a thread's share; priv_donate is half, so donation never runs dry */
+/* priv_donate is half priv_max, so a donation never runs the chain dry */
 static void private_caps_init(struct hg_block *hb)
 {
 	unsigned int consumers = hg_io_consumers();
@@ -552,8 +526,8 @@ static void private_caps_init(struct hg_block *hb)
 		cell_sizes[HG_NCLASSES - 1], hb->priv_max[HG_NCLASSES - 1]);
 }
 
-/* re-derive the private caps once the config (tcp_threads) is known; runs
- * pre-fork, so children inherit it, and is the caps' last write */
+/* pre-fork, once tcp_threads is known: children inherit the caps, and this is
+ * their last write */
 void hg_private_caps_retune(struct hg_block *hb)
 {
 	if (hb)
@@ -592,13 +566,11 @@ static int pages_init(struct hg_block *hb)
 		return -1;
 	}
 
-	/* page 0 is the first aligned address at or after hbase: hbase itself
-	 * on Linux; the non-Linux plain mmap() loses the unaligned head */
+	/* pbase is hbase itself on Linux; the non-Linux plain mmap() loses the
+	 * unaligned head */
 	hb->pbase = (char *)(((unsigned long)hb->hbase + hps - 1) & ~(hps - 1));
 	end = hb->hbase + hb->span_end;
 	hb->npages = (unsigned long)(end - hb->pbase) >> shift;
-	/* the grid runs to the cap: descriptors for every possible page are
-	 * laid out at init, so a grow never relocates metadata */
 	hb->npages_cap = (unsigned long)(hb->hbase + hb->hcap - hb->pbase)
 	                 >> shift;
 	if (hb->npages_cap < hb->npages)    /* hcap==span_end or a tiny arena */
@@ -627,7 +599,6 @@ static int pages_init(struct hg_block *hb)
 		return -1;
 	}
 
-	/* --- the proof. Real addresses, spanning the whole grid. --- */
 	for (i = 0; i < 5; i++) {
 		unsigned long pg, leaf, want_pg;
 		const char *probe, *pbase_of;
@@ -706,17 +677,15 @@ int hg_arena_init(struct hg_block *hb, unsigned long hdr_size)
 	 * carve aligns every buddy block, so address lookup can be a mask */
 	hb->hoff = (hdr_size + HG_LEAF_SIZE - 1) & ~(HG_LEAF_SIZE - 1);
 	if (hb->pbase != hb->hbase) {
-		/* the grid does not start at hbase: the first carve must clear
-		 * the discarded head too */
 		unsigned long skip = (unsigned long)(hb->pbase - hb->hbase);
 
 		if (hb->hoff < skip)
 			hb->hoff = skip;
 	}
 
-	/* see chunk_size_for(): /64 keeps all 21 classes plus the large tier
-	 * within a third of a small arena, even in the worst case */
-	hb->thread_slot_next = HG_STAT_SLOTS - 1;   /* threads count down */
+	hb->thread_slot_next = HG_STAT_SLOTS - 1;
+	/* /64 keeps all 21 classes plus the large tier within a third of a small
+	 * arena, even in the worst case */
 	hb->chunk_max = hb->size / 64;
 	if (hb->chunk_max > HG_CHUNK_SMALL)
 		hb->chunk_max = HG_CHUNK_SMALL;
@@ -725,7 +694,6 @@ int hg_arena_init(struct hg_block *hb, unsigned long hdr_size)
 
 	private_caps_init(hb);
 
-	/* size -> class LUT: needed = requested payload + hidden header */
 	for (idx = 0; idx <= HG_CELL_MAX / HG_ROUNDTO; idx++) {
 		needed = idx * HG_ROUNDTO + HG_CELL_HDR;
 		for (c = 0; c < HG_NCLASSES; c++)
@@ -739,7 +707,7 @@ int hg_arena_init(struct hg_block *hb, unsigned long hdr_size)
 		HG_CELL_HDR);
 
 	/* last: it bump-carves its metadata and reserves everything below the
-	 * resulting hoff; hg_chunk_backing() refuses once buddy_ready is set */
+	 * resulting hoff */
 	if (hg_buddy_init(hb) < 0)
 		return -1;
 	return 0;
@@ -749,8 +717,8 @@ void hg_arena_destroy(struct hg_block *hb)
 {
 	int i;
 
-	/* everything lives in one mapping (hb->hbase), unmapped whole by
-	 * hg_malloc_destroy(); only this thread's palloc slot is dropped */
+	/* one mapping, unmapped whole by hg_malloc_destroy(): only this
+	 * thread's slot and the large tier's bookkeeping to drop */
 	for (i = 0; i < HG_MAX_INSTANCES; i++)
 		if (palloc_slots[i].owner == hb)
 			slot_reset(&palloc_slots[i]);
@@ -837,9 +805,9 @@ void *hg_cell_alloc(struct hg_block *hb, unsigned long size)
 	}
 
 	if (hb->dbg)
-		want += HG_DBG_TAIL;     /* room for the DBG trailer */
+		want += HG_DBG_TAIL;
 	else if (guard)
-		want += HG_GUARD_ROOM;   /* at least one guard byte */
+		want += HG_GUARD_ROOM;
 	if (want + HG_CELL_HDR > HG_CELL_MAX) {
 #ifdef DBG_MALLOC
 		return hg_large_alloc(hb, size, file, func, line);
@@ -872,7 +840,6 @@ again:
 		goto found;
 	}
 
-	/* slow path: refill from the global pool, else carve a chunk */
 	hg_lock_enter(hb, HG_LK_REFILL);
 	for (got = 0; got < HG_REFILL_BATCH; got++) {
 		cell_start = hg_gpool_pop(hb, c);
@@ -939,7 +906,6 @@ checked:
 	HG_CELL_AT(cell_start)->func = func;
 	HG_CELL_AT(cell_start)->line = line;
 #endif
-	/* per-process slot: no lock, no shared cache line (see hg_pstat) */
 	hg_pstat_add(hg_pstat_mine(hb), cell_sizes[c] - HG_CELL_HDR, 1,
 		cell_sizes[c]);
 	return payload;
@@ -988,8 +954,7 @@ static inline int free_check(struct hg_block *hb, char *cell_start, void *p,
 	return -1;
 }
 
-/* the free's LIVE -> FREE; 0 when a concurrent free of the same cell won the
- * race - counted and logged here, and this free does nothing */
+/* 0 when a concurrent free of the cell won: counted and logged here */
 static inline int free_claim(struct hg_block *hb, char *cell_start,
                              unsigned int c, void *p, union hg_hdr_w *w,
                              unsigned short base)
@@ -1021,8 +986,6 @@ void hg_cell_free(struct hg_block *hb, void *p)
 
 	cell_start = HG_HDR(p);
 
-	/* before the class byte is even read: an out-of-arena pointer may
-	 * not be mapped at all, and reading it would fault */
 	if (!hg_owns(hb, cell_start)) {
 		struct hg_block *owner = hg_owner(cell_start);
 
@@ -1033,15 +996,13 @@ void hg_cell_free(struct hg_block *hb, void *p)
 			return;
 		}
 
-		/* another arena's (normal after fork): straight to its pool;
-		 * this process never allocates there, so caching strands it */
+		/* straight to its owner's pool: this process never allocates
+		 * there, so caching strands it */
 		hg_xarena_frees++;
 		hg_cell_free_global(owner, p);
 		return;
 	}
 
-	/* before the header is read: memory given back to the kernel is not
-	 * read again (see hg_backed()) */
 	if (!hg_backed(hb, cell_start)) {
 		LM_CRIT("%s: %p points into memory the arena gave back to the "
 			"kernel - freed before, not touching it\n", hb->name, p);
@@ -1084,8 +1045,7 @@ void hg_cell_free(struct hg_block *hb, void *p)
 
 		hg_pstat_add(ps, -(long)(cell_sizes[c] - HG_CELL_HDR), -1,
 			-(long)cell_sizes[c]);
-		/* this cache now holds something to sweep; read by the
-		 * dispatcher in another process, hence the atomic store */
+		/* atomic: the sweep dispatcher reads it from another process */
 		__atomic_store_n(&ps->dirty, 1, __ATOMIC_RELAXED);
 	}
 
@@ -1121,8 +1081,6 @@ void hg_cell_free_global(struct hg_block *hb, void *p)
 	if (!hg_owns(hb, cell_start)) {
 		struct hg_block *owner = hg_owner(cell_start);
 
-		/* as in hg_cell_free(); its redirect passes the resolved
-		 * owner, so this cannot loop */
 		if (!owner) {
 			LM_CRIT("%s: %p belongs to no live arena - refusing to "
 				"free it\n", hb->name, p);
@@ -1175,7 +1133,7 @@ struct hg_free_set {
 	void         **slots;    /* NULL = empty; power-of-two count */
 	unsigned int   nslots;
 	unsigned int   nused;
-	unsigned int   overflow; /* inserts refused - must stay 0, see below */
+	unsigned int   overflow; /* inserts refused: must stay 0 */
 };
 
 static inline unsigned int hg_ptr_hash(const void *p, unsigned int nbuckets)
@@ -1240,8 +1198,6 @@ static void hg_free_set_destroy(struct hg_free_set *set)
 	set->slots = NULL;
 }
 
-/* exact number of free cells the set must hold, so the table is sized once
- * and never grown */
 static unsigned int hg_free_set_count(struct hg_block *hb)
 {
 	struct hg_palloc *pl = hg_get_palloc(hb);
@@ -1264,7 +1220,6 @@ static void hg_free_set_populate(struct hg_block *hb, struct hg_free_set *set)
 	void *cur;
 	struct hg_palloc *pl = hg_get_palloc(hb);
 
-	/* this thread's private chains only, as in hg_free_set_count() */
 	for (c = 0; c < HG_NCLASSES; c++) {
 		if (pl)
 			for (cur = pl->cls[c].free_head; cur; cur = cell_next(cur))
@@ -1296,8 +1251,6 @@ void hg_arena_walk_live(struct hg_block *hb,
 	}
 	hg_free_set_populate(hb, &set);
 
-	/* must not happen (sized from a count under this lock); if it does,
-	 * the walk may report free cells as live, so say so */
 	if (set.overflow)
 		LM_CRIT("%s: live-cell set overflowed by %u - the dump below "
 			"may report free cells as live\n", hb->name, set.overflow);
@@ -1306,12 +1259,10 @@ void hg_arena_walk_live(struct hg_block *hb,
 		for (i = 0; i < ch->cells; i++) {
 			cell_start = (char *)ch + sizeof(struct hg_chunk) +
 				(unsigned long)i * ch->cell_size;
-			/* pool-free by the block's own map, exact and free of
-			 * any allocation; private-free by the set */
 			if (map_test(ch, (long)i))
 				continue;
-			/* and only a LIVE header: cells in another
-			 * process's cache, or never handed out, are not */
+			/* the header test: cells in another process's cache,
+			 * or never handed out, are not LIVE */
 			if (!hg_st_live(hg_hdr_state(cell_start)))
 				continue;
 			if (!hg_free_set_has(&set, cell_start))

@@ -28,8 +28,6 @@
 
 #include "hg_malloc.h"
 
-/* HG_MAX_ORDERS is in hg_malloc.h: struct hg_block needs it */
-
 /* A free block keeps its list links in its own first bytes, with no magic:
  * a double free is caught by the bitmap, out of reach of freed memory. */
 struct hg_free_blk {
@@ -37,33 +35,31 @@ struct hg_free_blk {
 	struct hg_free_blk *prev;
 };
 
-/* Per-page descriptor, in the metadata region at the front of the arena, NOT
- * in the page it describes, so that the page can become wholly free. */
 /* deferred-collapse attempts per page before it is left on 4 KB pages */
 #define HG_COLLAPSE_TRIES 16
 
+/* Per-page descriptor, in the metadata region at the front of the arena, NOT
+ * in the page it describes, so that the page can become wholly free. */
 struct hg_page {
-	char          *base;       /* first byte of this page */
-	unsigned char *leaforder;  /* per leaf: order of the block it starts */
+	char          *base;
+	unsigned char *leaforder;  /* per leaf: order of the block holding it */
 	unsigned long *bitmap;     /* per node: 1 = free, whole, not split */
 
-	/* fullness lists, unused until a page-preference allocation policy
-	 * lands; they fit the descriptor's 64 byte budget */
+	/* unused, reserved for page fullness lists */
 	struct hg_page *next;
 	struct hg_page *prev;
 
-	unsigned int idx;          /* page index within the arena */
-	unsigned int free_leaves;  /* leaves not currently allocated */
-	/* >0 on the FIRST page of a multi-page run, giving its length; the
-	 * other pages carry HG_RUN_MEMBER (see hg_buddy_alloc_run()) */
+	unsigned int idx;
+	unsigned int free_leaves;
+	/* pages in the run this page heads; HG_RUN_MEMBER on its other pages */
 	unsigned int run_len;
 	/* the byte fields below fit existing padding: the descriptor stays
 	 * 56 bytes on 64-bit builds */
 	/* backing tier (enum hg_mem_tier) of the commit that brought this
 	 * page in: shrink takes from any delta, so it debits tier_bytes */
 	unsigned char tier;
-	/* backing punched out (MADV_REMOVE) while whole-free, buddy tree kept:
-	 * the next carve from this page must re-commit and re-pin it first */
+	/* MADV_REMOVEd while whole-free, tree kept: a carve re-commits it and
+	 * the CARVING process re-pins it, as mlock is not inherited */
 	unsigned char punched;
 	/* set while a trim or punch has the arena lock dropped mid-release:
 	 * every scan that reads the bitmap rather than the list must skip it */
@@ -73,53 +69,47 @@ struct hg_page {
 	unsigned char want_collapse;
 };
 
-/* run_len marker for a page that belongs to a run but does not head it */
 #define HG_RUN_MEMBER  0xffffffffu
-/* no per-order free count per page: that array would more than double the
- * descriptor; per-order counts are global, on hg_block */
+/* no per-page per-order free counts: they would double the descriptor */
 
-/* leaforder[] value for a leaf that does not START a block (it is in the
- * middle of a larger one, or its block is allocated and recorded elsewhere) */
+/* leaforder[] of a leaf in no buddy block: a page past npages, or a run */
 #define HG_LEAF_NONE  0xff
 
 /* Carve the per-page metadata from the arena front, publish the rest as
- * free. Once, from hg_arena_init() after pages_init(); 0, or -1. */
+ * free. Once, from hg_arena_init() after pages_init(). */
 int hg_buddy_init(struct hg_block *hb);
 
-/* Allocate one block of exactly (HG_LEAF_SIZE << order) bytes, naturally
- * aligned. hb->lock must be held. Returns NULL when no page can serve it. */
+/* one block of HG_LEAF_SIZE << @order bytes, naturally aligned, or NULL */
 void *hg_buddy_alloc(struct hg_block *hb, unsigned int order);
 
-/* the *_unlocks functions and the three ticks DROP hb->lock inside: held
- * on entry and on return, but nothing read before the call is valid after */
+/* *_unlocks, hg_grow_headroom_tick(), hg_grow_tick() and hg_drain_tick() DROP
+ * hb->lock: held on entry and return, but nothing read before stays valid */
 /* commit up to max(granule, @need) more and publish the new whole pages
  * as free; 0 = grew (retry the allocation), -1 = cannot */
 int hg_buddy_grow_unlocks(struct hg_block *hb, unsigned long need, enum hg_grow_why why);
-/* the always-on headroom rule on its own (the maintenance process ticks it
- * every second); hb->lock held; 1 = grew */
+/* the always-on headroom rule alone (the maintenance process ticks it every
+ * second); 1 = grew */
 int hg_grow_headroom_tick(struct hg_block *hb);
 
 /* end a grow-blocked episode (logged if one was latched) and re-arm its
- * report; hb->lock held. @how ends "GROW-BLOCKED cleared - " */
+ * report; @how ends "GROW-BLOCKED cleared - " */
 void hg_grow_unblock(struct hg_block *hb, const char *how);
 
-/* the sweep's promoter for an armed grow-blocked episode (the GC pass
- * cannot latch with nothing reclaimable); disarms a quiet one. hb->lock held */
+/* once per sweep interval: latch an armed grow-blocked episode whose
+ * refusals rose (see grow_blocked_refuse0), disarm a quiet one */
 void hg_grow_blocked_tick(struct hg_block *hb);
 
-/* the down-slow shrink gate, once per sweep interval, hb->lock held; never
- * below -m/-M. Only its owner can shrink a pkg arena, from its flush path */
+/* the down-slow shrink gate, once per sweep interval, never below
+ * committed_min; a pkg arena only from its owner's flush path */
 void hg_shrink_tick(struct hg_block *hb);
-/* one drain step (trim + punch) if the quiet window is open; every
- * maintenance tick, hb->lock held */
+/* one drain step (trim, then punch) while the quiet window is open; every
+ * maintenance tick */
 void hg_drain_tick(struct hg_block *hb);
 
-/* the profile's proactive grow gate - same cadence, call sites
- * and lock contract as hg_shrink_tick(). No-op without a policy. */
+/* the profile's proactive grow gate, with hg_shrink_tick()'s cadence and call
+ * sites; no-op without a policy */
 void hg_grow_tick(struct hg_block *hb);
 
-/* Return a block previously handed out by hg_buddy_alloc(), merging it with
- * its buddy as far up as it will go. hb->lock must be held. */
 void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order);
 
 /* Order of the block containing @p, or -1 if @p is not in buddy space. */
@@ -149,10 +139,9 @@ static inline void *hg_buddy_block_of(const struct hg_block *hb, const void *p)
 }
 
 /* A run of @npages CONTIGUOUS whole pages, for a large-tier allocation
- * over a huge page; a linear scan, hb->lock held. First byte, or NULL */
+ * over a huge page; a linear scan */
 void *hg_buddy_alloc_run(struct hg_block *hb, unsigned long npages);
 
-/* Release a run obtained from hg_buddy_alloc_run(). hb->lock must be held. */
 void hg_buddy_free_run(struct hg_block *hb, void *p);
 
 /* Length in pages of the run starting at @p, or 0 if @p heads no run. */

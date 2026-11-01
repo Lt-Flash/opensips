@@ -29,8 +29,7 @@
 unsigned long hg_hps(void);
 
 long hg_meminfo_kb(const char *key);
-/* two fields in one pass of the file (MemTotal and MemAvailable, read
- * together by every RAM check); each -1 if missing */
+/* two fields in one pass of the file; each -1 if missing */
 void hg_meminfo_kb2(const char *k1, long *v1, const char *k2, long *v2);
 
 unsigned long hg_memlock_limit(void);
@@ -53,8 +52,7 @@ int hg_init_fits(const char *what, unsigned long init,
 #define HG_SMALL_PAGE_SHIFT 18
 #define HG_SMALL_PAGE (1UL << HG_SMALL_PAGE_SHIFT)
 
-/* the page unit an arena with this init/cap runs on, by size; an INIT under
- * one huge page with a larger cap is settled in hg_malloc_init_cap() */
+/* by size alone: hg_malloc_init_cap() may settle another (tier_decides) */
 static inline unsigned long hg_arena_page(unsigned long init_b,
 		unsigned long cap_b)
 {
@@ -74,13 +72,11 @@ static inline int hg_page_roundable(unsigned long v, unsigned long pg)
 	return v <= ~0UL - (pg - 1);
 }
 
-/* the smallest arena that can function in this page unit */
 static inline unsigned long hg_min_viable(unsigned long apage)
 {
 	return apage < HG_HPS ? 2 * apage : apage;
 }
 
-/* "512 KB" vs "48 MB" in one printable pair, for the error messages */
 #define HG_SZ_VAL(b)  ((b) < (1UL << 20) ? (b) >> 10 : (b) >> 20)
 #define HG_SZ_UNIT(b) ((b) < (1UL << 20) ? "KB" : "MB")
 

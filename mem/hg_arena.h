@@ -28,16 +28,15 @@
 
 #include "hg_malloc.h"
 
-/* builds the size -> class table and starts the bump offset past the
- * @hdr_size-byte block header at hb->hbase; called once, at init */
+/* @hdr_size: the block header at hb->hbase, which the bump offset skips */
 int hg_arena_init(struct hg_block *hb, unsigned long hdr_size);
 
 /* bump-carve @size bytes, 64-aligned; NULL if exhausted. Init only, for the
  * buddy's own metadata: refused once the buddy owns the arena (buddy_ready) */
 void *hg_chunk_backing(struct hg_block *hb, unsigned long size);
 
-/* flush the calling thread's cached cells to the shared pool, in every arena.
- * MUST run on the owning thread: the caches are __thread */
+/* the calling thread's cached cells, every arena, to the shared pools; on the
+ * owning thread only, as the caches are __thread */
 void hg_cache_flush_self(void);
 void hg_private_caps_retune(struct hg_block *hb);
 int hg_proc_cache_dirty(int proc);
@@ -52,11 +51,11 @@ int hg_proc_cache_dirty(int proc);
 void hg_gc_cycle(struct hg_block *hb);
 unsigned int hg_gc_tick(struct hg_block *hb, unsigned int budget);
 
-/* sweep generation, bumped once per sweep (see hg_cache_flush_if_due()) */
+/* bumped once per sweep; see hg_cache_flush_if_due() */
 extern unsigned long hg_sweep_gen;
 
-/* evaluate the reserve floor; called from the buddy layer on every grid
- * allocation and free, the one point every consumer passes. hb->lock held */
+/* called by the buddy on every grid allocation and free, the one point
+ * every consumer passes; hb->lock held */
 void hg_reserve_floor_check(struct hg_block *hb);
 
 /* flush the calling thread's caches if a sweep was published since its last
@@ -84,20 +83,16 @@ void hg_cell_free(struct hg_block *hb, void *p);
  * arena the caller has no cache for (foreign, or no private slot) */
 void hg_cell_free_global(struct hg_block *hb, void *cell);
 
-/* re-sync after fork(): see hg_malloc_child_init() in hg_malloc.c */
 void hg_arena_child_init(struct hg_block *hb);
 
 /* release every cell the calling thread holds in @hb's quarantine
  * (HG_MALLOC_DBG), checking each; returns how many left it */
 unsigned int hg_quarantine_drain(struct hg_block *hb);
-/* a FREE cell onto the calling thread's private list of @hb - for hg_dbg.c,
- * whose quarantine hands cells back this way */
 void hg_cell_push_private(struct hg_block *hb, struct hg_palloc *pl,
                           unsigned int c, char *cell_start);
 
 void hg_arena_destroy(struct hg_block *hb);
 
-/* hg_slab_recycled() is declared in hg_malloc.h: do not redeclare it */
 void hg_arena_stats(struct hg_block *hb, unsigned int *nchunks,
 		unsigned long *bytes);
 

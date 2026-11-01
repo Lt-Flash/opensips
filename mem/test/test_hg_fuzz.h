@@ -26,7 +26,6 @@
 /* children it forks, one at a time: one per seed, plus the capped arena */
 #define TEST_HG_FUZZ_PROCS  4
 
-/* run from test_hg_malloc(), whose child runner it uses */
 void test_hg_fuzz(void);
 
 #endif /* __TEST_HG_FUZZ_H__ */

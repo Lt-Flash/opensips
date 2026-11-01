@@ -47,7 +47,7 @@
 #ifdef HG_MALLOC
 #include "../mem/shm_mem.h"
 #include "../mem/hg_malloc.h"
-#include "../core_stats.h"   /* hg_pkg_peak_all: per-process pkg peaks */
+#include "../core_stats.h"
 #endif
 #include "../cachedb/cachedb.h"
 #include "../evi/event_interface.h"
@@ -990,8 +990,6 @@ static mi_response_t *w_reload_routes(const mi_params_t *params,
 #ifdef HG_MALLOC
 /* hg_stats/hg_advise: HG_MALLOC carves size-class chunks, so committed,
  * live and still-available differ - more than shmem:/pkgmem: can say */
-/* one timing record: count, mean, max, stalls and a log2-us histogram
- * (bucket 0 = <1 us, k = [2^(k-1), 2^k) us, the last = >= 64 ms) */
 static int hg_stats_lk(mi_item_t *parent, const char *name,
                        const struct hg_lkstat *st)
 {
@@ -1095,14 +1093,11 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 
 	carved = hb->real_used;
 	tier = hg_mem_tier_str(hb->tier);
-	/* before reading max_live_used: the high-water is refreshed on read,
-	 * keeping live_peak in step with shmem:max_used_size */
+	/* before reading max_live_used: the high-water is refreshed on read */
 	live_committed = hg_get_real_used(hb);
 
 	if (add_mi_string(o, MI_SSTR("tier"), (char *)tier, strlen(tier)) < 0)
 		return -1;
-	/* "tier" is what INIT got; grows may land on a lower tier, so a mixed
-	 * arena also gets the per-tier byte split */
 	{
 		int nt = 0, t;
 		for (t = HG_MEM_HUGETLB; t <= HG_MEM_4K; t++)
@@ -1129,15 +1124,11 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("pinned_mb"), hb->locked_mb) < 0)
 		return -1;
-	/* 1: swappable - init could not mlock() it, or a grow went on unpinned
-	 * past the memlock limit; pinned_mb keeps what was locked */
 	if (add_mi_number(o, MI_SSTR("unpinned"), hb->unpinned) < 0)
 		return -1;
-	/* 1: new allocations get hg_mem_check's tail guard */
 	if (add_mi_number(o, MI_SSTR("guard"), hb->guard) < 0)
 		return -1;
-	/* committed vs reserved, and whether growth has happened or been
-	 * refused. committed == cap means a fixed arena (the default). */
+	/* committed == cap means a fixed arena (the default) */
 	if (add_mi_number(o, MI_SSTR("committed"), hb->committed_bytes) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("cap"), hb->hcap) < 0)
@@ -1148,8 +1139,6 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("grows"), hb->grows) < 0)
 		return -1;
-	/* a punch frees backing without moving the span, so committed can sit
-	 * below span_bytes (punched_pages is the gap) */
 	if (add_mi_number(o, MI_SSTR("span_bytes"), hb->span_end) < 0)
 		return -1;
 	/* whole_free_pages, always shown: a page is reclaimable only whole, so
@@ -1174,8 +1163,7 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("grow_refused"), hb->grow_refused) < 0)
 		return -1;
-	/* what refused the last grow (cap, profile ceiling or resource); kept
-	 * after growth recovers - grow_blocked says if it is current */
+	/* grow_blocked says whether this refusal is current */
 	{
 		const char *why = hg_grow_refusal_str(hb->grow_refuse_why);
 
@@ -1183,20 +1171,16 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		                  strlen(why)) < 0)
 			return -1;
 	}
-	/* which path asked for each grow */
 	if (add_mi_number(o, MI_SSTR("grows_proactive"), hb->grows_proactive) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("grows_exhaustion"), hb->grows_exhaustion) < 0)
 		return -1;
-	/* tier 3: pages a worker's grow published on 4 KB, and what the
-	 * maintenance process made of them (hg_collapse_deferred) */
 	if (add_mi_number(o, MI_SSTR("collapse_deferred"), hb->collapse_deferred) < 0 ||
 	    add_mi_number(o, MI_SSTR("collapsed_late"), hb->collapsed_late) < 0 ||
 	    add_mi_number(o, MI_SSTR("collapse_retries"), hb->collapse_retries) < 0 ||
 	    add_mi_number(o, MI_SSTR("collapse_late_failed"),
 	        hb->collapse_late_failed) < 0)
 		return -1;
-	/* the two-phase commit's state and the waits it caused */
 	if (add_mi_number(o, MI_SSTR("grow_inflight"), hb->grow_inflight) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("grow_waits"), hb->grow_waits) < 0)
@@ -1214,8 +1198,6 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 	if (add_mi_number(o, MI_SSTR("shrink_bytes"), hb->shrink_bytes) < 0)
 		return -1;
 
-	/* carved: arena bytes cut into size-class chunks, which free_size
-	 * counts down from */
 	if (add_mi_number(o, MI_SSTR("carved"), carved) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("carved_peak"), hb->max_real_used) < 0)
@@ -1256,14 +1238,10 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("cells_flushed"), hb->cells_flushed) < 0)
 		return -1;
-	/* self-flushes taken at carve exhaustion (buddy had no block of
-	 * the order) - the pressure half of the flush work */
 	if (add_mi_number(o, MI_SSTR("pressure_flushes"), hb->pressure_flushes) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("pressure_cells"), hb->pressure_cells) < 0)
 		return -1;
-	/* blocks returned by the maintenance tick vs at a trigger site, and
-	 * the drained blocks kept now (per-class keeps: classes array) */
 	if (add_mi_number(o, MI_SSTR("gc_tick_blocks"), hb->gc_tick_blocks) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("gc_inline_blocks"), hb->gc_inline_blocks) < 0)
@@ -1277,7 +1255,6 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		if (add_mi_number(o, MI_SSTR("gc_kept_blocks"), kept) < 0)
 			return -1;
 	}
-	/* sweep jobs not dispatched because the process was clean */
 	if (add_mi_number(o, MI_SSTR("sweeps_skipped"), hb->sweeps_skipped) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("buddy_splits"), hb->buddy_splits) < 0)
@@ -1291,8 +1268,6 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 	if (add_mi_number(o, MI_SSTR("slab_recycled"), hg_slab_recycled(hb)) < 0)
 		return -1;
 
-	/* corruption detections by kind: any non-zero means an operation was
-	 * already refused or a cell leaked */
 	{
 		static const char * const kind[HG_CORRUPT_KINDS] = {
 			"class_mismatch", "double_free", "nfree_underflow",
@@ -1312,8 +1287,6 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 					hb->corrupt[k]) < 0)
 				return -1;
 	}
-	/* the large tier's own footprint, so the split between the two tiers
-	 * inside carved is readable rather than inferred by subtraction */
 	if (add_mi_number(o, MI_SSTR("large_backing"), hb->large_backing) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("large_live"), hb->large_live) < 0)
@@ -1326,15 +1299,12 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 	if (add_mi_number(o, MI_SSTR("large_chunks_returned"),
 			hb->large_chunks_returned) < 0)
 		return -1;
-	/* reserve-floor state: otherwise visible only as a log line and a
-	 * sweep indistinguishable from the periodic one */
 	if (add_mi_number(o, MI_SSTR("reserve_floor"), hb->reserve_floor) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("below_floor"), hb->below_floor) < 0)
 		return -1;
 	if (add_mi_number(o, MI_SSTR("floor_crossings"), hb->floor_crossings) < 0)
 		return -1;
-	/* lock hold/wait histograms, gc and commit timings */
 	if (hg_stats_lock(o, hb) < 0)
 		return -1;
 
@@ -1388,7 +1358,6 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 			return -1;
 		if (add_mi_number(cls_item, MI_SSTR("chunks"), chunks_of[c]) < 0)
 			return -1;
-		/* this class's keep and what it holds drained right now */
 		if (add_mi_number(cls_item, MI_SSTR("gc_keep"), hb->gc_keep[c]) < 0)
 			return -1;
 		if (add_mi_number(cls_item, MI_SSTR("drained"), hb->ndrained[c]) < 0)
@@ -1410,18 +1379,17 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 #define HG_ADVISE_SHM_MARGIN   2
 #define HG_ADVISE_PKG_MARGIN   3
 /* floors kept low: a floor should stop a silly recommendation, not become
- * the recommendation (an earlier 64 MB one swallowed every answer) */
+ * the recommendation */
 #define HG_ADVISE_SHM_FLOOR_MB 8
 #define HG_ADVISE_PKG_FLOOR_MB 2
 
-/* Bands. 80% was too late to be a warning: an arena at 77% of peak reported
- * "reasonable" while being one busy hour from failing an allocation. */
+/* bands of peak as % of the configured size: TIGHT starts at 70, as an arena
+ * at 77% can be one busy hour from failing an allocation */
 #define HG_ADVISE_TIGHT_PCT    70
 #define HG_ADVISE_WATCH_PCT    50
 #define HG_ADVISE_LOOSE_PCT    20
 
-/* peak x margin, in MB, never below @floor, rounded up to a whole huge page
- * so the arena does not map a partial one */
+/* rounded up to a whole huge page so the arena does not map a partial one */
 static unsigned long hg_advise_mb(unsigned long peak, unsigned int margin,
                                   unsigned long floor_mb, unsigned long hps)
 {
@@ -1472,8 +1440,6 @@ static int hg_advise_one(mi_item_t *parent, const char *name,
 	        strlen(hg_advise_verdict(peak, hb->size))) < 0)
 		return -1;
 
-	/* split live into slab (workload) and large, as some large consumers
-	 * (the reactor fd table) scale with the arena: advice turns circular */
 	{
 		unsigned long slab_live  = hg_cell_live(hb);
 		unsigned long large_live = hb->large_live;
@@ -1545,8 +1511,7 @@ static mi_response_t *mi_hg_advise(const mi_params_t *params,
 		if (hg_pkg_peak_all(&peak, &sum, &nproc) < 0)
 			nproc = 0;
 #endif
-		/* shared array empty: fall back to this process's own arena -
-		 * a narrow answer, but better than none */
+		/* shared array empty: fall back to this process's own arena */
 		if (!nproc)
 			peak = hb->max_real_used;
 
@@ -1608,16 +1573,13 @@ static mi_response_t *mi_hg_stats(const mi_params_t *params,
 #ifdef PKG_MALLOC
 	if (mem_allocator_pkg == MM_HG_MALLOC ||
 	    mem_allocator_pkg == MM_HG_MALLOC_DBG) {
-		/* this process's arena only (over mi_fifo, the idle FIFO
-		 * listener); pkmem: statistics cover every process */
 		if (hg_stats_one(resp_obj, "pkg", (struct hg_block *)mem_block, 1) < 0)
 			goto error;
 		reported++;
 	}
 #endif
 
-	/* module arenas (hg_arena_create): every registered shared block that
-	 * is not the core shm block - they exist whatever -a says */
+	/* module arenas (hg_arena_create()) exist whatever -a says */
 	{
 		int i;
 

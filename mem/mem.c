@@ -80,8 +80,6 @@ int set_pkg_mm(const char *mm_name)
 int init_pkg_mallocs(void)
 {
 #ifdef PKG_MALLOC
-	/* HG_MALLOC reserves its own arena, so no pool is malloc'd for it;
-	 * INHERITED keeps it off hugetlb, where a child COW fault can SIGBUS */
 #ifdef INLINE_ALLOC
 #if defined HG_MALLOC
 	mem_block = hg_malloc_init(pkg_mem_size, "pkg", 0, NULL, HG_INIT_INHERITED);
@@ -103,7 +101,6 @@ int init_pkg_mallocs(void)
 	if (mem_allocator_pkg == MM_NONE)
 		mem_allocator_pkg = mem_allocator;
 
-	/* -M INIT:CAP is parsed for every allocator; only HG_MALLOC grows */
 	if (hg_pkg_cap_bytes && mem_allocator_pkg != MM_HG_MALLOC &&
 	        mem_allocator_pkg != MM_HG_MALLOC_DBG)
 		LM_WARN("-M: the cap after ':' applies to HG_MALLOC only - %s uses "

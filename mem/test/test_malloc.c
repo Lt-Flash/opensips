@@ -44,8 +44,7 @@ static osips_free_t    FREE;
 
 #define HPT_MAX_PROC_USAGE  .8
 
-/* the shm budget the workers share: HPT_SHM, or less for an elastic HG_MALLOC
- * arena whose cap is smaller (see init_malloc_tests()) */
+/* the shm budget the workers share (see init_malloc_tests()) */
 static long hpt_shm = HPT_SHM;
 
 #define MY_MAX_USED ((long)((double)hpt_shm / TEST_MALLOC_PROCS * HPT_MAX_PROC_USAGE))

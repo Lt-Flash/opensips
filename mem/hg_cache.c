@@ -25,7 +25,7 @@
 #include <string.h>
 #include <limits.h>
 #include <stdlib.h>
-#include <unistd.h>   /* sysconf, for the IO-pool consumer count */
+#include <unistd.h>
 
 #include "hg_malloc.h"
 #include "hg_arena.h"
@@ -36,8 +36,8 @@
 #include "../globals.h"
 #include "hg_arena_int.h"
 
-/* give up every cell this thread has cached, all classes; owning thread only
- * (__thread caches), hb->lock held. Returns the number of cells handed over */
+/* every cell this thread has cached, all classes, to the pool; owning thread
+ * only, hb->lock held */
 unsigned int hg_cache_flush_locked(struct hg_block *hb,
                                        struct hg_palloc *pl)
 {
@@ -86,12 +86,10 @@ unsigned int hg_cache_flush_locked(struct hg_block *hb,
 	return n;
 }
 
-/* sweep generation, checked per job by threads IPC cannot reach; relaxed
- * atomics: a missed generation only delays a flush to the next sweep */
+/* relaxed atomics: a missed generation only delays a flush to the next sweep */
 unsigned long hg_sweep_gen;
 
-/* reserve floor: below it, publish a sweep via hg_sweep_gen; recovery needs 2x
- * the floor. WARN once, only when the arena cannot grow out (hg_floor_stuck) */
+/* the arena cannot grow out of the pressure: only then does a crossing WARN */
 static inline int hg_floor_stuck(struct hg_block *hb)
 {
 	unsigned long limit = (hb->pol.active && hb->pol.up_bytes) ?
@@ -145,11 +143,10 @@ void hg_reserve_floor_check(struct hg_block *hb)
 
 /* the sweep flush locks per HG_FLUSH_BATCH cells; a block is reclaimed only
  * when all its cells are pooled, so unlocking between batches is safe */
-#define HG_FLUSH_BATCH  64   /* cells per lock hold */
+#define HG_FLUSH_BATCH  64
 #define HG_FLUSH_KEEP   8    /* residue cap per active class */
 
-/* a class used since the last sweep keeps a residue, so its next allocation
- * is not a locked refill; none below the reserve floor */
+/* the residue spares a used class's next allocation a locked refill */
 unsigned int hg_flush_residue(struct hg_block *hb,
                                          struct hg_palloc *pl, int c)
 {
@@ -161,7 +158,7 @@ unsigned int hg_flush_residue(struct hg_block *hb,
 	return keep > HG_FLUSH_KEEP ? HG_FLUSH_KEEP : keep;
 }
 
-/* hand class @c's private chain down to @keep cells; returns cells pushed */
+/* hand class @c's private chain down to @keep cells (0: all) */
 unsigned int hg_cache_flush_class(struct hg_block *hb,
                                       struct hg_palloc *pl, int c,
                                       unsigned int keep)
@@ -178,8 +175,7 @@ unsigned int hg_cache_flush_class(struct hg_block *hb,
 			void *cur = pl->cls[c].free_head;
 
 			if (!cur) {
-				/* the chain's end; nfree left non-zero is the
-				 * drift cell_push_private() also catches */
+				/* nfree left over is drift: resynced below */
 				drained = 1;
 				break;
 			}
@@ -188,7 +184,6 @@ unsigned int hg_cache_flush_class(struct hg_block *hb,
 				break;
 			}
 			if (!cell_block(hb, c, cur)) {
-				/* an overwritten link - stop, leak the rest */
 				LM_CRIT("%s: class %d private chain broken at %p - "
 					"dropping the rest of the chain\n", hb->name, c, cur);
 				pl->cls[c].free_head = NULL;
@@ -234,8 +229,7 @@ unsigned int hg_cache_flush_class(struct hg_block *hb,
 	return n;
 }
 
-/* does process @proc hold anything in its shared-arena caches since its
- * last flush? Read without the lock - a stale answer costs one interval. */
+/* read without the lock: a stale answer costs one sweep interval */
 int hg_proc_cache_dirty(int proc)
 {
 	struct hg_block *hb = (struct hg_block *)shm_block;

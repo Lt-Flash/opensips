@@ -20,9 +20,6 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,USA
  */
 
-/* Run with e.g. make test UT_ALLOC=HG_MALLOC UT_MEM="-m 64:1024 -M 16:256".
- * Each child reports via shm under a timeout: a crash fails, never hangs. */
-
 #include "test_hg_malloc.h"
 #include "test_hg_fuzz.h"
 #include "test_hg_memlimit.h"
@@ -44,9 +41,9 @@
 #include "../../mem/mem.h"
 #include "../../mem/shm_mem.h"
 #include "../../mem/hg_malloc.h"
-#include "../../mem/hg_arena.h"   /* hg_quarantine_drain() */
-#include "../../mem/hg_buddy.h"   /* hg_buddy_grow_unlocks() */
-#include "../../mem/mem_arena.h"  /* shm_arena_create() */
+#include "../../mem/hg_arena.h"
+#include "../../mem/hg_buddy.h"
+#include "../../mem/mem_arena.h"
 
 /* a fuzz seed has taken from 10 to over 30 s under an emulator (the qemu
  * cross-builds in CI); a child that dies is noticed as it exits, not here */
@@ -89,8 +86,6 @@ static int hgt_check(const void *p, unsigned long len, unsigned char seed)
 	return 1;
 }
 
-/* run @fn in a child forked the way OpenSIPS forks its workers and return
- * 1 if it reported success, 0 if it failed, crashed or timed out */
 int hgt_in_child(char *desc, int (*fn)(void *), void *arg)
 {
 	const struct internal_fork_params ifp = {
@@ -104,7 +99,6 @@ int hgt_in_child(char *desc, int (*fn)(void *), void *arg)
 
 	*hgt_verdict = 0;
 	*hgt_go = 0;
-	/* or the child inherits the unflushed TAP lines and prints them again */
 	fflush(stdout);
 	idx = internal_fork(&ifp);
 	if (idx < 0) {
@@ -227,8 +221,6 @@ static void test_hg_prefork_pkg(void)
 	pkg_free(pf.b);
 }
 
-/* shm cells of every class, allocated by one process and freed by another
- * (through its own cache and the shared pool), must come back usable */
 #define HGT_CELLS  2048
 
 static void *hgt_cell[HGT_CELLS];
@@ -287,12 +279,10 @@ static void test_hg_cross_process_shm(void)
 	ok(hgt_in_child("hg shm free", hgt_child_free_cells, NULL),
 		"another process can free shm cells of every class");
 
-	/* the same sizes again, now served from what the child freed */
 	ok(hgt_alloc_cells() == 0 && hgt_check_free_cells() == 0,
 		"shm cells freed by another process are reused intact");
 }
 
-/* requests above the largest size class go to the large tier */
 static void test_hg_large(void)
 {
 	static const unsigned long sz[] = {
@@ -374,8 +364,6 @@ static void test_hg_free_past_init(void)
 			mem_arena_free(a, p[i]);
 }
 
-/* a size no arena could hold is refused by malloc and realloc, pkg and
- * shm, without wrapping near ULONG_MAX, and the arenas serve after */
 static void test_hg_size_bound(void)
 {
 	static const unsigned long sizes[] = {
@@ -418,7 +406,6 @@ static void test_hg_size_bound(void)
 		refused, (unsigned int)(2 * sizeof sizes / sizeof sizes[0] + 1));
 }
 
-/* an elastic shm arena (-m INIT:CAP) grows past INIT on demand */
 #define HGT_GROW_CHUNK  (1024 * 1024)
 #define HGT_GROW_MAX    256
 
@@ -459,8 +446,6 @@ static void test_hg_grow(void)
 		shm_free(p[i]);
 }
 
-/* a pkg arena that grew one step shrinks again with more live than a
- * step plus four floors would leave room for; in a child, as pkg is its own */
 #define HGT_SHRINK_BLK  (256UL * 1024)
 #define HGT_SHRINK_MAX  512
 
@@ -489,7 +474,6 @@ static int hgt_child_pkg_shrink(void *arg)
 			pkg_free(p[i]);
 		return -1;
 	}
-	/* 5/8 of the size before the grow stays live */
 	keep = c0 * 5 / 8 / HGT_SHRINK_BLK;
 	if (keep > (unsigned long)n)
 		keep = n;
@@ -525,8 +509,6 @@ static void test_hg_pkg_shrink(void)
 		"a step plus four floors would leave room for");
 }
 
-/* a child's copy of the parent's pkg arena is marked inherited at fork,
- * and its sweep does not grow it even when under its headroom line */
 static int hgt_child_inherited(void *arg)
 {
 	struct hg_block *own = mem_block, *copy = NULL;
@@ -578,8 +560,7 @@ static void test_hg_inherited(void)
 		"and its sweep does not grow it even under its headroom line");
 }
 
-/* a refused grow records its cause (dry run, profile ceiling); borrowed
- * fields are restored under the lock, so no other process sees them */
+/* borrowed fields are restored under the lock: no other process sees them */
 static void test_hg_grow_refusal_cause(void)
 {
 	struct hg_block *hb = shm_block;
@@ -634,8 +615,7 @@ static void test_hg_grow_refusal_cause(void)
 	end_skip;
 }
 
-/* a leaving process gives back its cached shm cells and chunk tails, so
- * real_used gets back to baseline; the size is one no idle process uses */
+/* a size no idle process uses */
 #define HGT_EXIT_SIZE   20000
 #define HGT_EXIT_CELLS  100
 
@@ -681,8 +661,6 @@ static void test_hg_exit_returns_cells(void)
 		base >> 10, hb->real_used >> 10);
 }
 
-/* a double free is refused and counted, not handed out twice: a cell
- * freed twice in a row (still on the private list), and a large fragment */
 static int hgt_child_double_free(void *arg)
 {
 	unsigned long size = (unsigned long)arg;
@@ -724,7 +702,7 @@ static void test_hg_double_free(void)
 }
 
 /* a free past the committed span is refused without reading its header
- * (which would commit the page, or SIGBUS on hugetlb); in a child */
+ * (which would commit the page, or SIGBUS on hugetlb) */
 static int hgt_child_unbacked(void *arg)
 {
 	shm_free(arg);
@@ -767,8 +745,6 @@ static void test_hg_unbacked(void)
 #endif
 }
 
-/* the header's state and checksum refuse a double free with a free
- * between, a damaged header, a mid-cell pointer, a realloc of freed memory */
 #define HGT_HDR_SIZE  200
 
 static int hgt_child_header(void *arg)
@@ -800,7 +776,6 @@ static int hgt_child_header(void *arg)
 	memset(a - HG_CELL_HDR, 0x41, 4);
 	shm_free(a);
 
-	/* a pointer into the middle of a live cell */
 	b = shm_malloc(HGT_HDR_SIZE);
 	if (!b)
 		return -1;
@@ -808,7 +783,6 @@ static int hgt_child_header(void *arg)
 	shm_free(mid);
 	shm_free(b);
 
-	/* realloc of memory already freed */
 	b = shm_malloc(HGT_HDR_SIZE);
 	if (!b)
 		return -1;
@@ -839,8 +813,6 @@ static void test_hg_header(void)
 		hb->corrupt[HG_C_DOUBLE_FREE] - df0, hb->corrupt[HG_C_HEADER] - hd0);
 }
 
-/* HG_MALLOC_DBG: an overrun is found at the free and around a realloc,
- * a write after free (any process) at quarantine exit; never reused */
 #define HGT_DBG_SMALL  201
 #define HGT_DBG_LARGE  (200UL * 1024 + 3)
 #define HGT_DBG_REUSE  64
@@ -859,7 +831,6 @@ static int hgt_child_dbg(void *arg)
 	if (!a || !b || !r || !u)
 		return -1;
 
-	/* one byte past the request, each */
 	a[HGT_DBG_SMALL] = 0;
 	b[HGT_DBG_LARGE] = 0;
 	r[100] = 0;
@@ -868,7 +839,7 @@ static int hgt_child_dbg(void *arg)
 	r = shm_realloc(r, 120);
 	if (!r)
 		return -1;
-	r[120] = 0;     /* and one past the new size */
+	r[120] = 0;
 	shm_free(r);
 
 	/* a write through a dangling pointer, then the quarantine let go: the
@@ -947,8 +918,6 @@ static void test_hg_dbg(void)
 	end_skip;
 }
 
-/* hg_mem_check's guard without HG_MALLOC_DBG: a byte past the request
- * is found at the free and around a realloc; an unguarded cell is not */
 static int hgt_child_guard(void *arg)
 {
 	struct hg_block *hb = shm_block, *pb = mem_block;

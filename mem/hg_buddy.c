@@ -34,7 +34,6 @@
 #include "../globals.h"
 #include "hg_buddy_int.h"
 
-/* the lowest whole-free page on offer, or -1 */
 static inline long wf_first(const struct hg_block *hb)
 {
 	unsigned long w;
@@ -92,8 +91,6 @@ int hg_buddy_init(struct hg_block *hb)
 	bmwords = (nodes_per_page(top) + sizeof(long) * 8 - 1) /
 	          (sizeof(long) * 8);
 
-	/* one metadata carve for all pages, from the arena FRONT, sized for
-	 * npages_cap so a grow never needs room for metadata in a full arena */
 	wfwords = (hb->npages_cap + HG_WF_BITS - 1) / HG_WF_BITS;
 	meta = hb->npages_cap * (sizeof(struct hg_page) + lpp +
 	                         bmwords * sizeof(long)) + wfwords * sizeof(long);
@@ -108,7 +105,6 @@ int hg_buddy_init(struct hg_block *hb)
 
 	hb->pages = (struct hg_page *)(void *)meta_base;
 	cur = meta_base + hb->npages_cap * sizeof(struct hg_page);
-	/* the whole-free-page bitmap, ahead of the per-page arrays */
 	hb->wfree = (unsigned long *)(void *)cur;
 	hb->wfree_words = wfwords;
 	cur += wfwords * sizeof(long);
@@ -121,10 +117,8 @@ int hg_buddy_init(struct hg_block *hb)
 		pg->bitmap = (unsigned long *)(void *)cur;
 		cur += bmwords * sizeof(long);
 		memset(pg->leaforder, HG_LEAF_NONE, lpp);
-		/* init's achieved tier; a grow stamps the pages it commits */
 		pg->tier = (unsigned char)hb->tier;
-		/* starts wholly reserved; pages < npages are published below,
-		 * pages beyond wait for hg_buddy_grow_unlocks() */
+		/* pages < npages are published below, the rest by a grow */
 	}
 
 	/* everything below hoff (header, then metadata) is spoken for; rounded
@@ -147,21 +141,18 @@ int hg_buddy_init(struct hg_block *hb)
 		if (consumed_leaves >= last)
 			continue;                       /* wholly consumed */
 		if (consumed_leaves <= first) {
-			page_publish_whole(hb, pg);     /* wholly free */
+			page_publish_whole(hb, pg);
 			continue;
 		}
 		/* the single straddling page */
 		page_release_range(hb, pg, consumed_leaves - first, lpp);
 	}
 
-	/* rebase the coalesce counters: the straddling page's merges say
-	 * nothing about fragmentation; splits and merges share a zero point */
 	hb->buddy_merges_init = hb->buddy_merges;
 	hb->buddy_merges = 0;
-	hb->buddy_splits = 0;   /* init allocates nothing; make that explicit */
+	hb->buddy_splits = 0;
 
 	hb->buddy_ready = 1;
-	/* reserve floor: 1/16 of the grid, as arenas span 8 MB to 5 GB */
 	hb->reserve_floor = (hb->npages * hg_leaves_per_page(hb)) / 16;
 	LM_DBG("%s buddy: %lu pages, orders 0..%u (%lu B..%lu B), %lu B metadata "
 		"(%lu B/page, %.3f%%), %lu of %lu leaves free after reserving %lu\n",
@@ -178,8 +169,7 @@ unsigned long hg_buddy_top_reachable(struct hg_block *hb)
 	return wf_count(hb);
 }
 
-/* Rebuild one order's free list from the bitmaps, skipping punched pages.
- * Corruption path only (a list head on a punched page): a full walk. */
+/* corruption path only (a list head on a punched page): a full walk */
 static void fl_rebuild(struct hg_block *hb, unsigned int o)
 {
 	unsigned int top = hb->buddy_top;
@@ -207,8 +197,6 @@ static void fl_rebuild(struct hg_block *hb, unsigned int o)
 		hb->nfree[o], hb->punched_pages, hb->punched_pages == 1 ? "" : "s");
 }
 
-/* --- allocate --------------------------------------------------------- */
-
 void *hg_buddy_alloc(struct hg_block *hb, unsigned int order)
 {
 	unsigned int o, top = hb->buddy_top;
@@ -219,8 +207,7 @@ void *hg_buddy_alloc(struct hg_block *hb, unsigned int order)
 	if (!hb->buddy_ready || order > top)
 		return NULL;
 
-	/* smallest free block that fits - the first non-empty list scanning up
-	 * from the requested order - so large free blocks are preserved */
+	/* the smallest free block that fits, so large ones are preserved */
 	for (o = order; o <= top; o++) {
 		if (o == top) {
 			long idx = wf_first(hb);
@@ -261,8 +248,7 @@ void *hg_buddy_alloc(struct hg_block *hb, unsigned int order)
 	leaf = hg_leaf_of(hb, blk);
 	bit_clear(pg->bitmap, node_id(top, o, leaf));
 
-	/* split down, publishing the upper half at each step. The lower half
-	 * stays in hand, so the returned address never moves. */
+	/* split down, freeing each upper half: blk, the lower, never moves */
 	while (o > order) {
 		unsigned long bleaf;
 		char *buddy;
@@ -282,8 +268,6 @@ void *hg_buddy_alloc(struct hg_block *hb, unsigned int order)
 	hg_reserve_floor_check(hb);
 	return blk;
 }
-
-/* --- free ------------------------------------------------------------- */
 
 void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order)
 {
@@ -341,8 +325,6 @@ void hg_buddy_free(struct hg_block *hb, void *p, unsigned int order)
 	pg->free_leaves += 1U << order;
 	hb->buddy_free_leaves += 1UL << order;
 
-	/* merge up while the buddy (leaf ^ (1 << o)) is free and entire: O(1)
-	 * per step, at most `top` steps */
 	while (o < top) {
 		unsigned long bleaf = leaf ^ (1UL << o);
 		char *buddy = pg->base + (bleaf << HG_LEAF_SHIFT);
@@ -375,8 +357,7 @@ void *hg_buddy_alloc_run(struct hg_block *hb, unsigned long npages)
 	unsigned int top = hb->buddy_top;
 	unsigned long i, start, run = 0;
 
-	/* the run's length is kept in an unsigned int with HG_RUN_MEMBER
-	 * reserved, and no run is longer than the grid */
+	/* run_len is an unsigned int with HG_RUN_MEMBER reserved */
 	if (!hb->buddy_ready || npages == 0 || npages >= HG_RUN_MEMBER ||
 	    npages > hb->npages)
 		return NULL;
@@ -439,8 +420,6 @@ void hg_buddy_free_run(struct hg_block *hb, void *p)
 		return;
 	}
 	start = hg_page_of(hb, p);
-	/* the recorded length is checked before it is acted on: the run ends
-	 * inside the grid, and every page after its head is a member */
 	if (n > hb->npages - start) {
 		LM_CRIT("%s: run free of %p, whose recorded %lu pages run past the "
 			"%lu-page grid - ignoring\n", hb->name, p, n, hb->npages);

@@ -198,8 +198,6 @@ struct socket_info_full* new_sock_info(struct socket_id *sid, str *orig_name)
 					si->name.len, si->name.s);
 			} else if (check_scaling_profile_procs(si->s_profile,
 			"a listener") < 0) {
-				/* a missing profile is ignorable; one that cannot count
-				 * processes is a config error - refuse at parse time */
 				LM_ERR("bad auto-scaling profile in listener <%.*s>\n",
 					si->name.len, si->name.s);
 				goto err_free;

@@ -324,6 +324,47 @@ static void hg_exclude_from_core(void *base, unsigned long size)
 #endif
 }
 
+#ifdef __OS_linux
+/* MAP_HUGETLB refused @bytes although a pool exists: say why, as the tier
+ * line that follows names only the THP policy */
+static void hg_hugetlb_refused(unsigned long bytes, int err)
+{
+	long total = hg_meminfo_kb("HugePages_Total"), kb, freep, rsvd, v;
+	char nodes[256], path[128];
+	unsigned long need;
+	int n, len = 0;
+	FILE *f;
+
+	if (total <= 0 || (kb = hg_meminfo_kb("Hugepagesize")) <= 0)
+		return;
+	hg_meminfo_kb2("HugePages_Free", &freep, "HugePages_Rsvd", &rsvd);
+	need = bytes / ((unsigned long)kb << 10);
+	if (freep - rsvd < (long)need) {
+		LM_NOTICE("hugetlb pool has %ld free %ld KB pages, %ld of them "
+			"reserved, and a %lu MB shared arena needs %lu: it falls "
+			"back. Raise vm.nr_hugepages.\n", freep, kb, rsvd,
+			bytes >> 20, need);
+		return;
+	}
+	nodes[0] = 0;
+	for (n = 0; n < 64 && len < (int)sizeof nodes - 40; n++) {
+		snprintf(path, sizeof path, "/sys/devices/system/node/node%d/"
+			"hugepages/hugepages-%ldkB/free_hugepages", n, kb);
+		if (!(f = fopen(path, "r")))
+			continue;
+		if (fscanf(f, "%ld", &v) == 1)
+			len += snprintf(nodes + len, sizeof nodes - len, "%snode%d %ld",
+				len ? ", " : "", n, v);
+		fclose(f);
+	}
+	LM_WARN("MAP_HUGETLB refused a %lu MB shared arena (%s) although the pool "
+		"has %ld free %ld KB pages (%s): a NUMA binding (numactl, a cpuset) "
+		"leaving out the nodes that hold them, or a hugetlb cgroup limit, "
+		"makes the kernel refuse.\n", bytes >> 20, strerror(err),
+		freep - rsvd, kb, nodes[0] ? nodes : "per node unknown");
+}
+#endif
+
 /* reserve >= @size, aligned and pinned, on huge pages where possible; NULL
  * only if mmap fails. pkg must be !@shared: each worker needs its own copy */
 void *hg_mem_reserve(unsigned long size, unsigned long *cap,
@@ -374,6 +415,8 @@ void *hg_mem_reserve(unsigned long size, unsigned long *cap,
 		/* on total failure csize stays at the full cap for tiers 2-4:
 		 * THP reservations are plain VA, which CAN hold the cap */
 	}
+	if (p == MAP_FAILED && shared && !small)
+		hg_hugetlb_refused(asize, errno);
 	if (p != MAP_FAILED) {
 		hg_exclude_from_core(p, *cap);
 		memset(p, 0, asize);

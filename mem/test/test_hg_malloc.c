@@ -44,6 +44,7 @@
 #include "../../mem/hg_arena.h"
 #include "../../mem/hg_buddy.h"
 #include "../../mem/mem_arena.h"
+#include "../../mem/hg_xfer.h"
 
 /* a fuzz seed has taken from 10 to over 30 s under an emulator (the qemu
  * cross-builds in CI); a child that dies is noticed as it exits, not here */
@@ -362,6 +363,62 @@ static void test_hg_free_past_init(void)
 	for (i = 0; i < n; i++)
 		if (p[i])
 			mem_arena_free(a, p[i]);
+}
+
+/* frees past priv_max park a chain, a refill after the private list runs dry
+ * takes it, and a drain hands every parked cell back to its block */
+#define HGT_XF_ARENA  (8UL << 20)
+#define HGT_XF_SIZE   200
+#define HGT_XF_MAX    1024
+
+static void test_hg_xfer(void)
+{
+	static struct hg_block *a;
+	static unsigned int *p[HGT_XF_MAX];
+	unsigned long puts0, gets0, drained0;
+	unsigned int c, n, i, bad = 0, parked;
+
+	if (!a)
+		a = shm_arena_create("hgxfer", HGT_XF_ARENA, HGT_XF_ARENA);
+	if (!a) {
+		ok(0, "a %lu MB module arena", HGT_XF_ARENA >> 20);
+		return;
+	}
+	c = a->size2class[(HGT_XF_SIZE + HG_ROUNDTO - 1) / HG_ROUNDTO];
+	n = a->priv_max[c] * 3;
+	if (!a->xfer[c].cap || n > HGT_XF_MAX || a->dbg || a->guard) {
+		diag("class %u keeps %u cells, transfer cap %u: nothing to "
+			"park here", c, a->priv_max[c], a->xfer[c].cap);
+		return;
+	}
+	puts0 = a->xfer_puts;
+	gets0 = a->xfer_gets;
+	drained0 = a->xfer_drained;
+
+	for (i = 0; i < n; i++)
+		p[i] = mem_arena_malloc(a, HGT_XF_SIZE);
+	for (i = 0; i < n; i++)
+		if (p[i])
+			mem_arena_free(a, p[i]);
+	for (i = 0; i < n; i++)
+		if ((p[i] = mem_arena_malloc(a, HGT_XF_SIZE)))
+			*p[i] = i;
+	for (i = 0; i < n; i++)
+		if (!p[i] || *p[i] != i)
+			bad++;
+	ok(!bad && a->xfer_puts > puts0 && a->xfer_gets > gets0,
+		"%u frees and allocations of %u bytes go through the transfer "
+		"cache (%lu chains parked, %lu taken), every cell distinct",
+		n, HGT_XF_SIZE, a->xfer_puts - puts0, a->xfer_gets - gets0);
+	for (i = 0; i < n; i++)
+		if (p[i])
+			mem_arena_free(a, p[i]);
+
+	hg_lock_enter(a, HG_LK_STATS);
+	parked = hg_xfer_drain_all(a);
+	hg_lock_leave(a);
+	ok(a->xfer_drained - drained0 == parked && !a->xfer[c].n,
+		"a drain returns all %u parked cells to their blocks", parked);
 }
 
 static void test_hg_size_bound(void)
@@ -1069,6 +1126,7 @@ void test_hg_malloc(void)
 	test_hg_grow();
 	test_hg_free_past_init();
 	test_hg_size_bound();
+	test_hg_xfer();
 	test_hg_pkg_shrink();
 	test_hg_inherited();
 	test_hg_grow_refusal_cause();

@@ -209,6 +209,16 @@ enum hg_grow_refusal {
 	HG_GR_REASONS
 };
 
+/* parked whole private chains of one class, see hg_xfer.c */
+#define HG_XFER_SLOTS 8
+struct hg_xfer {
+	void *head[HG_XFER_SLOTS];
+	unsigned int len[HG_XFER_SLOTS];
+	unsigned int n;
+	unsigned int cap;     /* chains this class may park, 0 = off */
+	unsigned int busy;    /* puts and gets since the last GC cycle */
+};
+
 struct hg_block {
 	/* what the LOCK-FREE fast path reads: set once (backed_fast rarely),
 	 * on lines the slow path never writes, so they stay shared-clean */
@@ -250,6 +260,7 @@ struct hg_block {
 	 * bucket[c][0], the fullest partial: emptier ones drain for the GC */
 	struct hg_chunk *bucket[HG_NCLASSES][HG_GRADES];
 	unsigned int gpool_n[HG_NCLASSES];   /* free cells of the class, total */
+	struct hg_xfer xfer[HG_NCLASSES];
 
 	struct hg_large_chunk *large_chunks;
 	struct hg_lfrag *large_free;
@@ -438,6 +449,9 @@ struct hg_block {
 	unsigned long       cells_flushed;            /* cells recovered from TLS */
 	unsigned long       pressure_flushes;         /* self-flushes at carve exhaustion */
 	unsigned long       pressure_cells;           /* cells those handed back */
+	unsigned long       xfer_puts, xfer_gets;     /* chains parked, taken */
+	unsigned long       xfer_full;                /* donations it refused */
+	unsigned long       xfer_drained;             /* cells sent back to blocks */
 	/* corruption DETECTIONS per kind (the site refused or leaked the cell),
 	 * alongside LM_CRIT; non-zero is never routine */
 	unsigned long       corrupt[HG_CORRUPT_KINDS];

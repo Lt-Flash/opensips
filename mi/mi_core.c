@@ -1374,6 +1374,11 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		if (add_mi_number(cls_item, MI_SSTR("free_shared"),
 			hb->gpool_n[c]) < 0)
 			return -1;
+		if (add_mi_number(cls_item, MI_SSTR("xfer_chains"),
+			hb->xfer[c].n) < 0 ||
+		    add_mi_number(cls_item, MI_SSTR("xfer_cap"),
+			hb->xfer[c].cap) < 0)
+			return -1;
 	}
 
 	return 0;

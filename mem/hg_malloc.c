@@ -745,18 +745,12 @@ void hg_stats_core_init(struct hg_block *hb, int core_index)
 
 void hg_info(struct hg_block *hb, struct mem_info *info)
 {
-	unsigned long recycled;
-
 	memset(info, 0, sizeof *info);
 	info->total_size = hb->size;
 	info->min_frag = 64; /* smallest cell class, see cell_sizes */
 	info->used = hg_used(hb);
-
-	recycled = hg_slab_recycled(hb);
-	info->real_used = hb->real_used > recycled ? hb->real_used - recycled : 0;
+	info->real_used = hg_get_real_used(hb);
 	info->free = hg_free_to_carve(hb);
-
-	hg_live_peak(hb, info->real_used);
 	info->max_used = hb->max_live_used;
 	info->total_frags = hg_fragments(hb);
 }

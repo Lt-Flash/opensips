@@ -112,7 +112,6 @@ int init_multi_proc_support(void)
 #endif
 
 #ifdef HG_MALLOC
-	/* before anything forks: the flag is inherited */
 	hg_pstat_slots_check(counted_max_processes);
 #endif
 
@@ -155,8 +154,6 @@ int init_multi_proc_support(void)
 	#endif
 
 #ifdef HG_MALLOC
-	/* every process creates its own pkg arena: refuse a process count
-	 * the host cannot hold before anything forks */
 	if (hg_capacity_check(count_init_child_processes(),
 	        counted_max_processes) != 0)
 		return -1;
@@ -164,8 +161,6 @@ int init_multi_proc_support(void)
 		return -1;
 #endif
 
-	/* HG caches are __thread: a timer asks each owner to give them back;
-	 * PRE-FORK (register_timer()), once counted_max_processes is known */
 	if (hg_register_cache_sweep()!=0) {
 		LM_ERR("failed to register the HG_MALLOC cache sweep\n");
 		return -1;
@@ -335,8 +330,7 @@ int internal_fork(const struct internal_fork_params *ifpp)
 	}
 
 #ifdef HG_MALLOC
-	/* the child commits its own pkg arena at once: do not fork one the
-	 * host cannot hold (the auto-scaler logs the failure and carries on) */
+	/* on a refusal the auto-scaler logs the failure and carries on */
 	if (!hg_fork_fits())
 		return -1;
 #endif
@@ -382,7 +376,7 @@ int internal_fork(const struct internal_fork_params *ifpp)
 		/* MUST precede any allocation: copied fast-path state aliases
 		 * the parent's cells in every shared arena, under any -a */
 		hg_malloc_child_init_all();
-#endif /* HG_MALLOC */
+#endif
 
 		/* set uid */
 		process_no = new_idx;
@@ -418,8 +412,6 @@ int internal_fork(const struct internal_fork_params *ifpp)
 			}
 		}
 #if defined(PKG_MALLOC) && defined(HG_MALLOC)
-		/* HG_MALLOC too: the body uses hg_malloc_init() and hg_block;
-		 * a build without HG refuses -a HG_MALLOC long before a fork */
 		if (mem_allocator_pkg == MM_HG_MALLOC ||
 		    mem_allocator_pkg == MM_HG_MALLOC_DBG) {
 			/* own arena per child: a COW-shared one drains hugetlb;
@@ -520,7 +512,6 @@ int count_child_processes(void)
 	proc_no += timer_count_processes( &extra );
 	proc_extra_no += extra;
 
-	/* the HG_MALLOC maintenance process, for an elastic shm arena */
 	proc_no += hg_maint_count_processes();
 
 	/* attendent */
@@ -548,8 +539,7 @@ void dynamic_process_final_exit(void)
 	tcp_reset_worker_slot();
 
 #ifdef HG_MALLOC
-	/* return this process's cached cells and chunk tails to the shared
-	 * arenas, or they stay counted as live until restart */
+	/* or its cached cells stay counted as live until restart */
 	hg_cache_drain_self();
 #endif
 

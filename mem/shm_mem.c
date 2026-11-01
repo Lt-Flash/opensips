@@ -295,8 +295,6 @@ int shm_mem_init_mallocs(void* mempool, unsigned long pool_size,int idx)
 #elif defined F_PARALLEL_MALLOC
 	shm_blocks[idx] = parallel_malloc_init(mempool, pool_size, "shm", idx);
 #elif defined HG_MALLOC
-	/* HG_MALLOC reserves its own arena: mempool is unused (shm_mem_init()
-	 * skips shm_getmem()), pool_size is only the size to request */
 	shm_block = hg_malloc_init(pool_size, "shm", 1, NULL, 0);
 #endif
 #else
@@ -520,8 +518,6 @@ int shm_mem_init_mallocs(void* mempool, unsigned long pool_size,int idx)
 #endif
 #ifdef HG_MALLOC
 	case MM_HG_MALLOC:
-		/* mempool unused: HG_MALLOC reserves its own arena (see the
-		 * shm_getmem() skip in shm_mem_init()) */
 		shm_block = hg_malloc_init(pool_size, "shm", 1, NULL, 0);
 		gen_shm_malloc         = (osips_block_malloc_f)hg_malloc;
 		gen_shm_malloc_unsafe  = (osips_block_malloc_f)hg_malloc;
@@ -804,7 +800,6 @@ int shm_dbg_mem_init_mallocs(void* mempool, unsigned long pool_size)
 #ifdef HG_MALLOC
 	case MM_HG_MALLOC:
 	case MM_HG_MALLOC_DBG:
-		/* ignores mempool, same reasoning as shm_mem_init_mallocs() */
 		shm_dbg_block = hg_malloc_init(pool_size, "shm_dbg", 1, NULL, 0);
 		break;
 #endif
@@ -882,7 +877,6 @@ int shm_mem_init(void)
 	if (mem_allocator_shm == MM_NONE)
 		mem_allocator_shm = mem_allocator;
 
-	/* -m INIT:CAP is parsed for every allocator; only HG_MALLOC grows */
 	if (hg_shm_cap_bytes && mem_allocator_shm != MM_HG_MALLOC &&
 	        mem_allocator_shm != MM_HG_MALLOC_DBG)
 		LM_WARN("-m: the cap after ':' applies to HG_MALLOC only - %s uses "
@@ -1028,8 +1022,6 @@ int shm_dbg_mem_init(void)
 
 	#ifdef HG_MALLOC
 	if (mem_allocator_shm == MM_HG_MALLOC || mem_allocator_shm == MM_HG_MALLOC_DBG) {
-		/* same reasoning as shm_mem_init(): skip shm_getmem()'s plain
-		 * mmap entirely rather than allocate-and-ignore it */
 		#ifndef USE_ANON_MMAP
 		close(fd_dbg);
 		#endif
@@ -1095,8 +1087,7 @@ mi_response_t *mi_shm_check(const mi_params_t *params,
 int init_shm_post_yyparse(void)
 {
 #ifdef HG_MALLOC
-	/* resolve + attach the configured auto-scaling profiles - this is
-	 * the first moment the config is known AND the arena already exists */
+	/* the first moment the config is known AND the arena already exists */
 	if (hg_autoscale_post_cfg() < 0)
 		return -1;
 #endif
@@ -1215,8 +1206,7 @@ void shm_mem_destroy(void)
 #endif
 
 #ifdef HG_MALLOC
-	/* hg_malloc_destroy() owns HG's mapping (shm_mempool is never set);
-	 * a runtime test, as another allocator may be the one selected */
+	/* hg_malloc_destroy() owns HG's mapping (shm_mempool is never set) */
 	if (mem_allocator_shm == MM_HG_MALLOC || mem_allocator_shm == MM_HG_MALLOC_DBG) {
 		if (shm_block)
 			hg_malloc_destroy((struct hg_block *)shm_block);

@@ -62,8 +62,6 @@ void hg_free(struct hg_block *hb, void *p, const char *file,
 #ifdef DBG_MALLOC
 	LM_GEN1(memlog, "%s_free(%p), called from %s: %s(%d)\n", hb->name, p,
 		file, func, line);
-	/* judge by ANY live arena, not @hb alone: a child may free inherited
-	 * pkg memory, which hg_cell_free() hands back to its owner */
 	if (p && !hg_owns_any(HG_HDR(p))) {
 		LM_CRIT("bad pointer %p (out of memory block!) - aborting\n", p);
 		abort();
@@ -120,8 +118,7 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 		return hg_malloc(hb, size, file, func, line);
 		#endif
 
-	/* an impossible size is refused before the in-place arithmetic below,
-	 * which would wrap; the allocation stays as it is */
+	/* refused before the in-place arithmetic below, which would wrap */
 	if (size > hb->hcap) {
 		hg_lock_enter(hb, HG_LK_REFILL);
 		if (hg_oom_first(hb, size))
@@ -133,8 +130,6 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 		return NULL;
 	}
 
-	/* ownership BEFORE the header is read (a foreign pointer would fault);
-	 * any live arena will do: a child may realloc inherited pkg memory */
 	src = hg_owner(HG_HDR(p));
 	if (!src) {
 		LM_CRIT("%s: realloc of %p, which is from no live arena - "
@@ -142,7 +137,6 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 		hg_corrupt(hb, HG_C_FOREIGN_PTR);
 		return NULL;
 	}
-	/* nor memory its arena gave back to the kernel (see hg_backed()) */
 	if (!hg_backed(src, HG_HDR(p))) {
 		LM_CRIT("%s: realloc of %p, which points into memory the arena "
 			"gave back to the kernel - refusing it\n", hb->name, p);
@@ -150,8 +144,7 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 		return NULL;
 	}
 
-	/* and only a LIVE cell with an intact header: its class byte is what
-	 * the size below is read from */
+	/* only an intact LIVE header: its class byte gives the size below */
 	st = hg_hdr_read(HG_HDR(p), &hw, &hsum);
 	if (!hg_st_live(st)) {
 		LM_CRIT("%s: realloc of %p, which is %s - refusing it\n",
@@ -210,8 +203,7 @@ void *hg_realloc(struct hg_block *hb, void *p, unsigned long size,
 	#endif
 
 	if (ptr) {
-		/* copy min(old, new): a small shrink returned above, but a
-		 * shrink from the large tier gets here */
+		/* min(old, new): a shrink from the large tier gets here */
 		copy = cur_payload < size ? cur_payload : size;
 		/* the copy may read past what the caller asked for, so a
 		 * sanitizer must see the copied bytes open first (hg_san.h) */

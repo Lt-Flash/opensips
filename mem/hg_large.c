@@ -30,7 +30,7 @@
 #include "../dprint.h"
 
 #define HG_LARGE_MIN_FRAG    HG_ROUNDTO
-#define HG_LARGE_DEFAULT_CHUNK (1UL << 20)  /* 1 MB - amortizes future churn */
+#define HG_LARGE_DEFAULT_CHUNK (1UL << 20)
 /* on an arena this big a large chunk is a whole huge page or more: a 256 KB
  * request plus headers would take a 512 KB block, half of it dead */
 #define HG_LARGE_BIG_ARENA     (256UL << 20)
@@ -41,16 +41,12 @@ struct hg_large_chunk {
 	/* bytes of the buddy block/run, header and slack included (->size is
 	 * only the part available to fragments) */
 	unsigned long backing;
-	/* buddy order it was taken at, or -1 for a run of whole pages; it is
-	 * given back the same way */
-	int ord;
+	int ord;   /* buddy order, or -1 for a run of whole pages */
 	struct hg_lfrag *first_frag;
 	struct hg_lfrag *last_frag;  /* sentinel: size 0, prev NULL - stops
 	                               * forward coalescing at the chunk end */
 };
 
-/* a frag's ->size counts the bytes after its hg_lfrag header, as
- * f_malloc's fm_frag->size does */
 #define HG_LFRAG_NEXT(f) \
 	((struct hg_lfrag *)(void *)((char *)(f) + HG_LFRAG_HDR + (f)->size))
 
@@ -82,8 +78,7 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 	int chunk_ord = -1;
 	struct hg_lfrag *f, *n;
 	struct hg_large_chunk *ch;
-	/* base MUST start NULL: the grow-and-retry loop below tests it before
-	 * the first attempt assigns it */
+	/* the retry loop below tests base before its first assignment */
 	char *base = NULL, *tag;
 	/* the guarded size is 32 bits: a larger request goes unguarded */
 	unsigned int guard = hb->guard && size < 0xffffffffUL;
@@ -95,7 +90,6 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 
 	hg_lock_enter(hb, HG_LK_LARGE);
 
-	/* first fit on the one unsorted free list - see hg_large.h for why */
 	f = NULL;
 	for (n = hb->large_free; n; n = n->nxt_free) {
 		if (n->size >= need) {
@@ -105,11 +99,11 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 	}
 
 	if (!f) {
-		/* no fit: a new chunk sized for this request but at least a
-		 * floor, so smaller large objects do not carve one each time */
+		/* a new chunk, at least a floor, so smaller large objects do
+		 * not carve one each time */
 		chunk_size = HG_LFRAG_HDR * 2 + need;
 		/* a 1 MB floor would eat a small arena: there it is capped at
-		 * chunk_max (as chunk_size_for() in hg_arena_int.h) */
+		 * chunk_max */
 		{
 			unsigned long floor = HG_LARGE_DEFAULT_CHUNK;
 			if (hb->size >= HG_LARGE_BIG_ARENA) {
@@ -128,8 +122,8 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 		}
 		chunk_size = (chunk_size + 63) & ~63UL;
 
-		/* from the buddy: up to a page, one block rounded up to its
-		 * order; above, a run of whole pages (a big hash table) */
+		/* up to a page, one buddy block of its order; above, a run of
+		 * whole pages */
 		{
 			unsigned long total = chunk_size + sizeof(struct hg_large_chunk);
 			int ord = hg_buddy_order_for(hb, total);
@@ -190,8 +184,7 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 		ch->ord = chunk_ord;
 		hb->large_chunks_carved++;
 
-		/* charge the whole buddy block when taken, as carve_chunk()
-		 * does, or real_used would hide the chunk's slack */
+		/* charge the whole block, or real_used would hide its slack */
 		hb->large_backing += backing;
 		hb->real_used += backing;
 		if (hb->real_used > hb->max_real_used)
@@ -204,8 +197,6 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 
 	lfrag_remove_free(f);
 
-	/* split off a remainder big enough to be a free frag of its own
-	 * (f_malloc's fm_split_frag threshold) */
 	rest = f->size - need;
 	if (rest > HG_LFRAG_HDR + HG_LARGE_MIN_FRAG) {
 		f->size = need;
@@ -220,8 +211,6 @@ void *hg_large_alloc(struct hg_block *hb, unsigned long size)
 	/* charge the frag's capacity, NOT @size: hg_large_free() knows only
 	 * the capacity, and the two must match */
 	hg_pstat_add(hg_pstat_mine(hb), (long)(f->size - HG_CELL_HDR), 1, 0);
-	/* large_live is the part handed out, so hg_large_recycled() can take
-	 * the idle rest out of the live figure */
 	hb->large_live += HG_LFRAG_HDR + f->size;
 
 	hg_lock_leave(hb);
@@ -269,8 +258,7 @@ void hg_large_free(struct hg_block *hb, struct hg_lfrag *frag)
 		0);
 	hb->large_live -= HG_LFRAG_HDR + frag->size;
 
-	/* forward coalesce: prev is NULL for a live frag and for the sentinel,
-	 * so this stops at the chunk end */
+	/* forward coalesce */
 	neigh = HG_LFRAG_NEXT(frag);
 	if (neigh->prev) {
 		lfrag_remove_free(neigh);
@@ -287,8 +275,7 @@ void hg_large_free(struct hg_block *hb, struct hg_lfrag *frag)
 		frag = neigh;
 	}
 
-	/* a first frag (pf NULL) followed by the sentinel spans the chunk;
-	 * freed at once, no hysteresis: thrash shows in large_chunks_carved */
+	/* a first frag (pf NULL) followed by the sentinel spans the chunk */
 	if (!frag->pf && HG_LFRAG_NEXT(frag)->size == 0) {
 		struct hg_large_chunk *ch = (struct hg_large_chunk *)(void *)
 			((char *)frag - sizeof(struct hg_large_chunk));
@@ -302,8 +289,6 @@ void hg_large_free(struct hg_block *hb, struct hg_lfrag *frag)
 			for (pp = &hb->large_chunks; *pp; pp = &(*pp)->next)
 				if (*pp == ch)
 					break;
-			/* a chunk the list does not hold has no backing this
-			 * arena may give to the buddy: leaked, counted */
 			if (!*pp) {
 				LM_CRIT("%s: large chunk %p is not on the arena's chunk "
 					"list - not returning its backing\n", hb->name,
@@ -319,7 +304,7 @@ void hg_large_free(struct hg_block *hb, struct hg_lfrag *frag)
 			hb->large_chunks_returned++;
 
 			/* nothing below may touch ch or frag: the buddy writes
-			 * its free-list links over them */
+			 * its links over them */
 			if (ord >= 0)
 				hg_buddy_free(hb, base, (unsigned int)ord);
 			else
@@ -340,7 +325,6 @@ unsigned long hg_large_frag_size(const struct hg_lfrag *frag)
 	return HG_LFRAG_HDR + frag->size;
 }
 
-/* hg_frag_size()'s opaque-pointer wrapper - see hg_malloc.h for why */
 unsigned long hg_large_frag_size_at(const void *frag)
 {
 	return hg_large_frag_size((const struct hg_lfrag *)frag);
@@ -353,8 +337,6 @@ _Static_assert(HG_LFRAG_HDR_SIZE % HG_PAYLOAD_ALIGN == 0,
 
 void hg_large_destroy(struct hg_block *hb)
 {
-	/* the chunks are buddy blocks and the whole reservation goes back in
-	 * hg_malloc_destroy()'s munmap: only the bookkeeping to drop */
 	hb->large_chunks = NULL;
 	hb->large_free = NULL;
 	hb->large_backing = 0;
@@ -371,7 +353,7 @@ void hg_large_walk_live(struct hg_block *hb,
 
 	for (ch = hb->large_chunks; ch; ch = ch->next)
 		for (f = ch->first_frag; f != ch->last_frag; f = HG_LFRAG_NEXT(f))
-			if (!f->prev)   /* live, exact - see hg_large.h */
+			if (!f->prev)
 				cb((char *)f + HG_LFRAG_HDR + HG_CELL_HDR, ctx);
 
 	hg_lock_leave(hb);

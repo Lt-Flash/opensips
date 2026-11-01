@@ -224,13 +224,13 @@ int hg_pkg_peak_all(unsigned long *peak, unsigned long *sum, int *nproc)
 
 #if defined(HG_MALLOC) && !defined(INLINE_ALLOC)
 #include "mem/hg_arena.h"
-#include "mem/hg_buddy.h"       /* hg_grow_blocked_tick */
-#include "mem/shm_mem.h"        /* shm_block, for the grow-blocked gauge */
-#include "evi/evi_core.h"       /* the grow-blocked and lock-stall event ids */
-#include "evi/evi_modules.h"    /* evi_probe/get_params/raise */
+#include "mem/hg_buddy.h"
+#include "mem/shm_mem.h"
+#include "evi/evi_core.h"
+#include "evi/evi_modules.h"
 
 /* idle-cache sweep: __thread caches strand memory once a worker stops
- * allocating, so each owner is told by IPC to flush (fire and forget) */
+ * allocating, so each owner is told by IPC to flush */
 /* every 4th interval sweeps the clean processes too (their pkg caches) */
 #define HG_SWEEP_FORCE_EVERY 4
 #define HG_SWEEP_INTERVAL 30   /* seconds; a slow leak, and each sweep
@@ -244,8 +244,8 @@ static void rpc_hg_cache_flush(int sender, void *param)
 	hg_cache_flush_self();
 }
 
-/* deferred GROW-BLOCKED alert: raising allocates shm, so not under hb->lock;
- * shm arena only (pkg is per process), re-raised while the latch holds */
+/* GROW-BLOCKED alert: shm arena only (pkg is per process), re-raised
+ * while the latch holds */
 #define HG_GROW_REWARN_SWEEPS 10   /* x 30s sweep = every 5 minutes */
 
 static str hg_gb_arena_str     = str_init("arena");
@@ -257,8 +257,6 @@ static str hg_ls_hold_str      = str_init("hold_us");
 static str hg_ls_proc_str      = str_init("process");
 static str hg_ls_stalls_str    = str_init("stalls");
 
-/* deferred lock-stall alert: hg_lock_leave() latches the latest stall,
- * raised here outside the lock as raising allocates shm */
 static void hg_lock_stall_event(unsigned long hold_ns, int reason, int proc,
                                 unsigned long stalls)
 {
@@ -310,19 +308,17 @@ static void hg_grow_blocked_event(unsigned int ticks)
 	/* promote (or disarm) an armed episode first, so a latch earns its
 	 * event in the same tick that detects it */
 	hg_grow_blocked_tick(hb);
-	/* the shm arena's per-interval grow/shrink policy tick (each pkg arena
-	 * ticks itself from its owner's flush path) */
+	/* the shm arena's policy tick; each pkg arena ticks itself from its
+	 * owner's flush path */
 	if (!hb->maint_active) {        /* else the maintenance process ticks */
 		hg_grow_tick(hb);
 		hg_shrink_tick(hb);
 	}
 	due = hb->grow_event_due;
 	hb->grow_event_due = 0;
-	/* keyed on the timer's tick, not a counter: timer jobs run in
-	 * whichever process reads the timer pipe, each with its own statics */
 	if (!due && hb->grow_blocked &&
 	    (ticks / HG_SWEEP_INTERVAL) % HG_GROW_REWARN_SWEEPS == 0)
-		due = 1;                     /* still blocked - re-warn */
+		due = 1;
 	committed_mb = (int)(hb->committed_bytes >> 20);
 	cap_mb       = (int)(hb->hcap >> 20);
 	refused      = (int)hb->grow_refused;
@@ -365,8 +361,8 @@ static void hg_grow_blocked_event(unsigned int ticks)
  * not convoy on the arena lock and then all refill at once */
 static void hg_cache_sweep(unsigned int ticks, void *param)
 {
-	/* the timer's tick, not a static counter: each timer worker has its
-	 * own copy, which dispatched some processes twice per interval */
+	/* the timer's tick, not a static counter: timer jobs run in whichever
+	 * process reads the timer pipe, each with its own statics */
 	unsigned int slot = ticks % HG_SWEEP_INTERVAL;
 	int i, n = counted_max_processes;
 
@@ -382,8 +378,8 @@ static void hg_cache_sweep(unsigned int ticks, void *param)
 		 * low-index) processes over the whole interval, once each */
 		if ((unsigned int)((unsigned int)i * 2654435761u % HG_SWEEP_INTERVAL) != slot)
 			continue;
-		/* skip a process with clean shared caches; its pkg caches, not
-		 * visible here, are swept every HG_SWEEP_FORCE_EVERY-th time */
+		/* skip a process with clean shared caches; its pkg caches are not
+		 * visible here */
 		if ((ticks / HG_SWEEP_INTERVAL) % HG_SWEEP_FORCE_EVERY &&
 		    !hg_proc_cache_dirty(i)) {
 			if (mem_allocator_shm == MM_HG_MALLOC ||
@@ -411,9 +407,8 @@ int hg_register_cache_sweep(void)
 	    mem_allocator_shm != MM_HG_MALLOC_DBG &&
 	    mem_allocator_pkg != MM_HG_MALLOC &&
 	    mem_allocator_pkg != MM_HG_MALLOC_DBG)
-		return 0;   /* HG not in use - nothing caches anything */
+		return 0;
 
-	/* every second: the dispatch is staggered across the interval */
 	if (register_timer("hg-cache-sweep", hg_cache_sweep, NULL,
 	                   1, TIMER_FLAG_SKIP_ON_DELAY) < 0) {
 		LM_ERR("failed to register the HG_MALLOC cache sweep\n");

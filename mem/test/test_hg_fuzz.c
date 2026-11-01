@@ -70,7 +70,6 @@ struct hgf {
 	unsigned int live, tag;
 	unsigned long req;           /* bytes asked for, over the live blocks */
 	struct hgf_op log[HGF_LOG];
-	/* the allocator under test */
 	struct hg_block *hb;
 	void *(*alloc)(unsigned long);
 	void (*free)(void *);
@@ -159,8 +158,6 @@ static int hgf_fail(struct hgf *f, const char *what, void *p, unsigned long x)
 	return -1;
 }
 
-/* --- the live-address set ---------------------------------------------- */
-
 static unsigned int hgf_hash(const void *p)
 {
 	unsigned long long x = (unsigned long long)(unsigned long)p;
@@ -169,7 +166,6 @@ static unsigned int hgf_hash(const void *p)
 	return (unsigned int)(x ^ (x >> 29)) & (HGF_SET - 1);
 }
 
-/* 0 if added, -1 if already there */
 static int hgf_set_add(struct hgf *f, void *p)
 {
 	unsigned int i = hgf_hash(p);
@@ -201,8 +197,6 @@ static void hgf_set_del(struct hgf *f, void *p)
 		i = j;
 	}
 }
-
-/* --- the steps ---------------------------------------------------------- */
 
 static unsigned long hgf_size(struct hgf *f)
 {
@@ -304,7 +298,6 @@ static int hgf_realloc(struct hgf *f, int s)
 			return hgf_fail(f, "realloc NULL from an arena with room",
 				b->p, size);
 		f->nulls++;
-		/* a failed realloc leaves the block as it was */
 		return hgf_check_blk(f, s, "block changed by a failed realloc");
 	}
 	keep = b->size < size ? b->size : size;
@@ -346,7 +339,6 @@ static int hgf_audit(struct hgf *f)
 	return 0;
 }
 
-/* f->ops steps, the blocks left live */
 static int hgf_steps(struct hgf *f)
 {
 	unsigned int r;
@@ -380,7 +372,6 @@ static int hgf_steps(struct hgf *f)
 	return hgf_audit(f);
 }
 
-/* the steps, then every block freed: the counters back where they began */
 static int hgf_run(struct hgf *f)
 {
 	int s;
@@ -419,8 +410,6 @@ static int hgf_child_shm(void *arg)
 	return hgf_run(f);
 }
 
-/* a capped arena run into its cap: nothing handed out is damaged and
- * after frees it serves again; a run that never reaches the cap fails */
 static int hgf_child_capped(void *arg)
 {
 	struct hgf *f = &F;

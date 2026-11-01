@@ -49,8 +49,6 @@ void init_unit_tests(void)
 		init_cachedb_tests();
 		//init_malloc_tests();
 #ifdef HG_MALLOC
-		/* the allocator suites run when HG_MALLOC is selected, e.g.
-		 * make test UT_ALLOC=HG_MALLOC UT_MEM="-m 64:1024 -M 16:256" */
 		if (hg_ut_selected())
 			init_malloc_tests();
 #endif

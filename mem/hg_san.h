@@ -73,17 +73,14 @@ void __tsan_release(void *addr);
 #define HG_TSAN_RELEASE(a)  ((void)0)
 #endif
 
-/* the free-list link at a free cell's payload start, the only payload bytes
- * the free lists write (cell_next()/cell_set_next() in hg_arena_int.h) */
+/* a free cell's free-list link, the only payload bytes the free lists write */
 #define HG_SAN_LINK  (sizeof(void *))
 
 #define HG_SAN_PRIVATE(hb)  (HG_SAN_ON && !(hb)->shared)
 
-/* @cs is a cell start holding @cap payload bytes */
 #define HG_SAN_PAY(cs)      ((char *)(cs) + HG_CELL_HDR)
 
-/* handed out new: @size bytes open (undefined, for Valgrind), the rest
- * closed */
+/* handed out new: @size bytes open, the rest closed */
 #define hg_san_give(hb, cs, cap, size) do { \
 		if (HG_SAN_PRIVATE(hb)) { \
 			HG_SAN_CLOSE(HG_SAN_PAY(cs), (cap)); \
@@ -91,8 +88,7 @@ void __tsan_release(void *addr);
 		} \
 	} while (0)
 
-/* kept by a realloc in place: @size bytes open, holding the caller's data
- * (defined), the rest closed */
+/* kept by a realloc in place: @size bytes open and defined, the rest closed */
 #define hg_san_keep(hb, cs, cap, size) do { \
 		if (HG_SAN_PRIVATE(hb)) { \
 			HG_SAN_CLOSE(HG_SAN_PAY(cs), (cap)); \

@@ -20,47 +20,43 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-/* HG_MALLOC arena structures: chunks, per-thread caches, stats slots and
- * struct hg_block; included by hg_malloc.h, not on its own */
+/* included by hg_malloc.h, not on its own */
 
 #ifndef HG_BLOCK_H
 #define HG_BLOCK_H
 
-struct hg_large_chunk;   /* opaque here, defined in hg_large.c */
+struct hg_large_chunk;
 
 /* the large tier's boundary-tag fragment header (hg_large.c), visible here so
  * every site finds it at HG_HDR(p) - sizeof(struct hg_lfrag) */
 struct hg_lfrag {
 	unsigned long size;         /* bytes after this header: tag + payload */
-	struct hg_lfrag *nxt_free;  /* NULL if allocated */
-	struct hg_lfrag **prev;     /* NULL if allocated - f_malloc-style
-	                              * free-list back-link for O(1) removal */
+	struct hg_lfrag *nxt_free;
+	struct hg_lfrag **prev;     /* free-list back-link, NULL if live */
 	struct hg_lfrag *pf;        /* physical previous frag in this chunk,
 	                              * NULL if first frag of its chunk */
-} __attribute__ ((aligned (HG_ROUNDTO)));   /* == f_malloc's ROUNDTO */
+} __attribute__ ((aligned (HG_ROUNDTO)));
 
 #define HG_LFRAG_HDR_SIZE (sizeof(struct hg_lfrag))
 
-/* a chunk: one buddy block of one cell class, its header in the block's first
- * bytes rather than a side array (that would cost ~20 MB on a 5 GB arena) */
 /* fullness grades: enough to find a "fullest partial", few enough that a block
  * rarely changes grade and the source-block scan is eight pointer tests */
 #define HG_GRADES         8
 #define HG_GRADE_NONE     0xffffffffu   /* no free cells, on no list */
 #define HG_GRADE_DRAINED  0xfffffffeu   /* every cell free, on drained[] */
 
-/* a block whose cells are ALL in the global pool - the GC's work queue */
 #define HG_CHUNK_DRAINED    (1u << 0)
 /* selected by this GC pass; its cells are being unlinked right now */
 #define HG_CHUNK_RECLAIMING (1u << 1)
 
-#define HG_CHUNK_MAP_WORDS 2                /* 128 cells per block, at most */
+#define HG_CHUNK_MAP_WORDS 2
 #define HG_CHUNK_MAP_BITS  64               /* bits per map word, every ABI */
 #define HG_CHUNK_MAX_CELLS (HG_CHUNK_MAP_WORDS * HG_CHUNK_MAP_BITS)
 
+/* a chunk: one buddy block of one cell class, its header in the block's first
+ * bytes rather than a side array (that would cost ~20 MB on a 5 GB arena) */
 struct hg_chunk {
-	/* global registry, walked by hg_slab_recycled() and the DBG dump: a
-	 * reclaimed block MUST be unlinked */
+	/* walked by hg_arena_walk_live(): a reclaimed block MUST be unlinked */
 	struct hg_chunk *next;
 	struct hg_chunk *prev;
 	unsigned int cls;         /* immutable */
@@ -73,13 +69,10 @@ struct hg_chunk {
 	unsigned int flags;       /* HG_CHUNK_DRAINED / _RECLAIMING */
 	unsigned int order;       /* buddy order, so the GC can hand it back */
 
-	/* this block's OWN free cells, under hb->lock: a refill takes from ONE
-	 * block, the fullest partial, so emptier ones drain for the GC */
 	void        *free_head;
 	unsigned int grade;       /* HG_GRADE_NONE / _DRAINED, or 0..HG_GRADES-1 */
 
-	/* links on the list this block is on: bucket[cls][grade], or
-	 * drained[cls] (the empty bucket, the GC's work queue) */
+	/* links on bucket[cls][grade], or on drained[cls] */
 	struct hg_chunk *fnext;
 	struct hg_chunk *fprev;
 
@@ -88,8 +81,6 @@ struct hg_chunk {
 	uint64_t gfree[HG_CHUNK_MAP_WORDS];
 } __attribute__ ((aligned (64)));
 
-/* two cache lines on LP64 with the map in the spare bytes; smaller on ILP32,
- * where the pointers shrink - never more */
 HG_STATIC_ASSERT(sizeof(struct hg_chunk) <= 128,
 	"struct hg_chunk must not exceed two cache lines");
 
@@ -102,20 +93,14 @@ HG_STATIC_ASSERT(sizeof(struct hg_chunk) <= 128,
  * HG_LEAF_SHIFT orders (8 on 2 MB pages, 16 on arm64's 512 MB) */
 #define HG_MAX_ORDERS  24
 
-struct hg_page;      /* hg_buddy.h */
-struct hg_free_blk;  /* hg_buddy.h */
+struct hg_page;
+struct hg_free_blk;
+struct hg_quar;
 
-/* the address -> page/leaf accessors follow struct hg_block, which they
- * dereference */
-
-/* per-thread (TLS) allocation state for ONE hg_block: a process has several
- * (shm, pkg, module arenas), so hg_get_palloc() looks it up per block */
-struct hg_quar;  /* hg_dbg.c: the HG_MALLOC_DBG quarantine */
-
+/* a thread's cache state in ONE hg_block: one per thread per arena */
 struct hg_palloc {
-	struct hg_block *owner;   /* which block this state belongs to */
-	/* this thread's quarantine for the block, mapped on the first free
-	 * under HG_MALLOC_DBG; NULL otherwise */
+	struct hg_block *owner;
+	/* the HG_MALLOC_DBG quarantine, mapped on the first free; else NULL */
 	struct hg_quar *quar;
 	struct {
 		char *bump;            /* next unused cell in own chunk */
@@ -209,7 +194,6 @@ enum hg_grow_why {
 	HG_GROW_PROACTIVE         /* the profile's tick, ahead of demand */
 };
 
-/* what refused a grow - hg_stats' last_grow_refusal, hg_grow_refusal_str() */
 enum hg_grow_refusal {
 	HG_GR_NONE = 0,         /* never refused */
 	HG_GR_CAP,              /* the -m/-M reservation is spent */
@@ -228,9 +212,9 @@ enum hg_grow_refusal {
 struct hg_block {
 	/* what the LOCK-FREE fast path reads: set once (backed_fast rarely),
 	 * on lines the slow path never writes, so they stay shared-clean */
-	char *name; /* purpose of this memory block */
-	/* the reservation this block owns: mapped pre-fork (per process for
-	 * pkg), never unmapped; hb itself lives at its start */
+	char *name;
+	/* all of hcap, mapped pre-fork (pkg: per process); growth only commits:
+	 * a later map would SIGSEGV in workers. hb itself lives at its start */
 	char                 *hbase;
 	unsigned long         hcap;   /* VA reserved, >= span_end; immutable */
 	/* hg_backed()'s fast test: all below it is backed; span_end, or 0
@@ -240,11 +224,8 @@ struct hg_block {
 	 * one cell exceeds a thread's share, so the shared pool serves it */
 	unsigned int priv_max[HG_NCLASSES];
 	unsigned int priv_donate[HG_NCLASSES];
-	/* upper bound on one chunk, derived from the arena size at init -
-	 * see chunk_size_for() in hg_arena.c */
 	unsigned int chunk_max;
-	/* HG_MALLOC_DBG serves this arena: tail red zones, poisoned frees and
-	 * a quarantine (see hg_dbg.h). Set at creation, never changed. */
+	/* HG_MALLOC_DBG checks on, see hg_dbg.h */
 	unsigned int dbg;
 	/* hg_mem_check without dbg: new allocations get a tail guard; a cell's
 	 * state, not this flag, says whether it carries one */
@@ -258,19 +239,18 @@ struct hg_block {
 	hg_ns_t lk_t0;
 	int           lk_cur;
 
-	/* --- everything from here on is written under hb->lock --- */
+	/* from here on: written under hb->lock, except the atomic fields,
+	 * pstat[] (the fast path's) and corrupt[] */
 	struct hg_chunk *chunks __attribute__ ((aligned (64)));
 	unsigned int nchunks;
 	/* sum of cells * cell_size over the chunks, kept at carve and GC so
 	 * hg_slab_recycled() is O(1), not a chunk walk under hb->lock */
 	unsigned long slab_capacity;
-	/* shared free cells as BLOCKS graded by fullness: bucket[c][0] holds
-	 * the fewest free, so a scan from 0 finds the fullest partial */
+	/* shared free cells as BLOCKS graded by fullness: a refill scans from
+	 * bucket[c][0], the fullest partial: emptier ones drain for the GC */
 	struct hg_chunk *bucket[HG_NCLASSES][HG_GRADES];
 	unsigned int gpool_n[HG_NCLASSES];   /* free cells of the class, total */
 
-	/* large tier (hg_large.c): f_malloc-style boundary-tag chunks
-	 * sharing ONE free list, all under hb->lock */
 	struct hg_large_chunk *large_chunks;
 	struct hg_lfrag *large_free;
 	/* charged to real_used per whole chunk; backing minus live,
@@ -282,19 +262,16 @@ struct hg_block {
 	unsigned long large_chunks_carved;
 	unsigned long large_chunks_returned;
 
-	/* bytes carved from the reservation into chunks/regions (the arena's
-	 * footprint); changed only under hb->lock, never on the fast path */
+	/* bytes carved into chunks, slab and large: the arena's footprint */
 	unsigned long real_used;
 	unsigned long max_real_used;
 	/* peak of hg_get_real_used()'s LIVE figure (max_real_used is the CARVE
 	 * peak); sampled, unsynchronized - it can only under-report */
 	unsigned long max_live_used;
 
-	/* the fast-path counters - see struct hg_pstat above. Summed by
-	 * hg_used()/hg_fragments(); never read directly. */
 	struct hg_pstat pstat[HG_STAT_SLOTS];
 	unsigned int thread_slot_next;   /* next thread slot, counts down */
-	unsigned long size;        /* total arena size */
+	unsigned long size;        /* the span's size, moved with span_end */
 
 	/* span_end is the ADDRESS extent (address tests), committed_bytes the
 	 * COUNT backed (memory figures); they differ once a page is punched */
@@ -306,22 +283,19 @@ struct hg_block {
 	/* init could not mlock the arena (RLIMIT_MEMLOCK) and went on
 	 * unpinned; growth then populates unpinned too instead of refusing */
 	unsigned int          unpinned;
-	/* MAP_SHARED vs MAP_PRIVATE, as passed to hg_malloc_init(): a pkg
-	 * delta is per PROCESS, so the ceiling check multiplies it by nproc */
+	/* MAP_SHARED, else MAP_PRIVATE (pkg), as passed to hg_malloc_init() */
 	int                   shared;
 	/* a child's copy of the parent's pkg arena (COW): only pre-fork
 	 * pointers are freed into it, so no grow, policy or publishing */
 	int                   inherited;
 
-	/* elastic arena: the WHOLE hcap is mapped before fork and growth only
-	 * commits more: a delta mapped after fork would SIGSEGV in workers */
 	unsigned long         committed_min; /* shrink's floor: the -m/-M size,
 	                                     * or profile's scale-down size */
 	unsigned long         grow_granule; /* bytes per grow step, hps multiple */
 	unsigned long         shrink_step;  /* max bytes released per drain
 	                                     * tick, hps multiple */
 	unsigned long         grows;        /* successful commits */
-	unsigned long         grow_bytes;   /* their total */
+	unsigned long         grow_bytes;
 	unsigned long         grow_refused; /* refusals (cap or resource) */
 	/* allocation-failure throttle: an episode's first failure is logged,
 	 * the rest summarised at the sweep (hg_oom_take()) */
@@ -330,9 +304,7 @@ struct hg_block {
 	unsigned long         oom_max_req;
 	unsigned int          oom_episode;
 	unsigned long         shrinks;      /* successful releases */
-	unsigned long         shrink_bytes; /* their total */
-	/* punch: a whole-free page released inside the span; carved again, it
-	 * is re-mlock()ed BY THE CARVING PROCESS (mlock is not inherited) */
+	unsigned long         shrink_bytes;
 	unsigned long         punches;       /* interior pages released */
 	unsigned long         punch_bytes;
 	unsigned long         punched_pages; /* gauge: currently punched */
@@ -375,8 +347,6 @@ struct hg_block {
 	 * cause is classified once per episode (it reads /proc) */
 	unsigned int          grow_refuse_why;
 	unsigned int          grow_refuse_mlock;
-	/* lock instrumentation - see enum hg_lock_reason. The section in
-	 * progress (lk_t0/lk_cur) sits with the lock itself, at the top. */
 	struct hg_lkstat      lk_hold[HG_LK_REASONS];
 	struct hg_lkstat      lk_wait[HG_LK_REASONS];
 	struct hg_lkstat      lk_commit;      /* hg_mem_commit() inside a grow */
@@ -384,8 +354,6 @@ struct hg_block {
 	                                       * punch, lock released */
 	struct hg_lkstat      lk_gc;          /* gc_class() block returns */
 	struct hg_lkstat      lk_cphase[HG_CP_PHASES]; /* commit, by phase */
-	/* a grow RESERVES [span_end, span_pending) under the lock, populates it
-	 * unlocked, then publishes it under the lock; one grow at a time */
 	unsigned long         span_pending;   /* span_end + in-flight delta */
 	/* the maintenance process is alive and owns the proactive ticks */
 	unsigned int          maint_active;
@@ -405,11 +373,9 @@ struct hg_block {
 	int                   lk_last_stall_reason; /* deferred event */
 	int                   lk_last_stall_proc;
 	unsigned int          lk_stall_event_due;
-	/* growth attribution: the tick or an exhausted request */
 	unsigned long         grows_proactive;
 	unsigned long         grows_exhaustion;
-	/* deferred collapse (tier 3): pages a worker's grow published on 4 KB,
-	 * for the maintenance process to collapse (hg_collapse_deferred()) */
+	/* deferred collapse (tier 3), see hg_page.want_collapse */
 	unsigned int          collapse_pending;
 	unsigned long         collapse_wanting;       /* pages still flagged */
 	unsigned long         collapse_scan;          /* next page to look at */
@@ -430,40 +396,36 @@ struct hg_block {
 	 * grown arena, as a THP delta may land on 4K next to 2M from init */
 	unsigned long         tier_bytes[HG_MEM_4K + 1];
 
-	/* buddy grid: page 0 is pbase (hbase may be only page-aligned); hps is
-	 * PROBED (2M, 32M or 512M on arm64), so never hardcode ">> 21" */
-	unsigned long hps;         /* huge page size, probed at reserve time */
-	unsigned int  hps_shift;   /* log2(hps), so page-of is a shift */
+	/* buddy grid: hps is the probed huge page (2M, 32M, 512M on arm64) or
+	 * 256 KB in small mode, so never hardcode ">> 21" */
+	unsigned long hps;
+	unsigned int  hps_shift;
 	char         *pbase;       /* page 0 - hbase rounded up to hps */
 	unsigned long npages;      /* whole pages from pbase to the span end
 	                            * (hbase+span_end); grows with the arena */
 	unsigned long npages_cap;  /* whole pages to hbase+hcap; descriptors
 	                            * for all exist from init, never moved */
 
-	/* buddy state (hg_buddy.c): written only under hb->lock; the buddy is
-	 * slow path only (carve_chunk(), the large tier) */
-	struct hg_page     *pages;                    /* npages descriptors */
-	struct hg_free_blk *bfree[HG_MAX_ORDERS + 1]; /* free list per order */
-	unsigned long       nfree[HG_MAX_ORDERS + 1]; /* its length, per order */
+	struct hg_page     *pages;
+	struct hg_free_blk *bfree[HG_MAX_ORDERS + 1];
+	unsigned long       nfree[HG_MAX_ORDERS + 1];
 	/* whole-free pages as a bitmap: a list walks cold page heads and loses
 	 * nodes to punches; bfree[top] is NULL and nfree[top] the popcount */
 	unsigned long      *wfree;
 	unsigned long       wfree_words;
-	unsigned long       buddy_free_leaves;        /* free leaves, whole arena */
+	unsigned long       buddy_free_leaves;
 	unsigned int        buddy_top;                /* whole-page order, cached */
 	unsigned int        buddy_ready;              /* 0 until hg_buddy_init() */
 
 	/* GC work queue, per class: blocks whose every cell is in the global
 	 * pool, accumulated so one free-list walk reclaims them all */
 	struct hg_chunk    *drained[HG_NCLASSES];
-	/* the OLDEST drained block: gc_class_run() returns from the tail (the
-	 * head, most recently drained, is the one kept if gc_keep[c] != 0) */
+	/* the oldest drained: the GC returns from the tail, keeps the head */
 	struct hg_chunk    *drained_tail[HG_NCLASSES];
 	unsigned int        ndrained[HG_NCLASSES];
-	unsigned long       gc_blocks_returned;       /* lifetime, for stats */
+	unsigned long       gc_blocks_returned;
 	unsigned long       gc_passes;
-	/* drained blocks of class c KEPT for gpool_pop(), not returned; fed by
-	 * carves per cycle and capped by a byte budget and HG_GC_KEEP_MAX */
+	/* drained blocks of class c kept for gpool_pop() (hg_gc_cycle()) */
 	unsigned int        gc_keep[HG_NCLASSES];
 	unsigned int        carves_cycle[HG_NCLASSES];
 	unsigned int        gc_next_class;       /* tick's round-robin start */
@@ -479,16 +441,16 @@ struct hg_block {
 	/* corruption DETECTIONS per kind (the site refused or leaked the cell),
 	 * alongside LM_CRIT; non-zero is never routine */
 	unsigned long       corrupt[HG_CORRUPT_KINDS];
-	unsigned long       buddy_splits;             /* blocks split down an order */
+	unsigned long       buddy_splits;
 	/* RUNTIME merges only: hg_buddy_init()'s coalesces go to
 	 * buddy_merges_init, so splits and merges share a zero point */
-	unsigned long       buddy_merges;             /* blocks merged with a buddy */
-	unsigned long       buddy_merges_init;        /* coalesces done building the tree */
+	unsigned long       buddy_merges;
+	unsigned long       buddy_merges_init;
 	unsigned long       blocks_carved;            /* class blocks cut, lifetime */
 	/* set while a flush walks a cache chain: pushing a cell can reclaim its
 	 * block, and the next cell on the chain may live in that same block */
 	unsigned int        gc_deferred;
-	/* free leaves below which the arena is under pressure (set at init):
+	/* free leaves below which the arena is under pressure:
 	 * crossing it sweeps BEFORE an allocation fails, and warns */
 	unsigned long       reserve_floor;
 	unsigned int        below_floor;      /* hysteresis: already reported */

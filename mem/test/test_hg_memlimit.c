@@ -93,10 +93,7 @@ static unsigned long long hml_room(const char *self, struct hg_cg_info *ci)
 	return hg_cgroup_room(ci);
 }
 
-/* host check on a fake 8 GB /proc/meminfo: 4 GB + 100 MB free counts
- * whole on 32-bit and passes; then refusals by the floor and a cgroup */
-/* a grow's two halves, as hg_buddy_grow_unlocks() runs them: nonzero =
- * refused, with the cause recorded */
+/* a grow's two halves, as hg_buddy_grow_unlocks() runs them */
 static int hml_grow_refused(struct hg_block *hb, unsigned long delta)
 {
 	struct hg_room_short rs;
@@ -232,7 +229,6 @@ void test_hg_memlimit(void)
 		"cgroup v1 on a hybrid host: %llu MB of room (50 expected), v%d",
 		r / MB, ci.version);
 
-	/* no limit anywhere, and no membership file at all: no cgroup limit */
 	bad |= hml_put("selfu", "0::/u\n");
 	bad |= hml_put("cg/u", NULL) | hml_put("cg/u/memory.max", "max\n");
 	bad |= hml_put("cg/u/memory.current", "1048576\n");
@@ -241,8 +237,6 @@ void test_hg_memlimit(void)
 		hml_room("nosuch", NULL) == HG_ROOM_ANY,
 		"no limited level, or no membership file: no cgroup limit");
 
-	/* what an mlock() refusal is put down to: the lock limit if short,
-	 * else the hugetlb pool if short, else the kernel's own refusal */
 	ok(hg_mlock_refusal_why(64 * 1024, 32, 2 * MB, 1, 400, 0, 2048) ==
 			HG_GR_MEMLOCK &&
 		hg_mlock_refusal_why(0, 0, 4 * MB, 1, 3, 2, 2048) ==

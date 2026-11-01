@@ -17,15 +17,15 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* Module-owned shared arenas: an HG block of the module's own whatever -a
- * selects; shm_arena_create() from mod_init() only, NULL without HG_MALLOC */
+/* Module-owned shared arenas, whatever -a selects: shm_arena_create() from
+ * mod_init() only; NULL without HG_MALLOC */
 #ifndef mem_arena_h
 #define mem_arena_h
 
 #ifdef HG_MALLOC
 
 #include "hg_malloc.h"
-#include "shm_mem.h"      /* mem_allocator_shm, shm_block */
+#include "shm_mem.h"
 
 typedef struct hg_block mem_arena_t;
 
@@ -40,8 +40,7 @@ static inline int shm_arena_set_profile(mem_arena_t *a, const char *profile)
 	return hg_arena_set_profile(a, profile);
 }
 
-/* is the CORE shm allocator HG_MALLOC? (then shm_malloc() cells are HG cells
- * and a module may simply use shm_block as its arena handle) */
+/* if true, shm_malloc() cells are HG cells, shm_arena_core() their arena */
 static inline int shm_allocator_is_hg(void)
 {
 	return mem_allocator_shm == MM_HG_MALLOC ||
@@ -52,8 +51,7 @@ static inline mem_arena_t *shm_arena_core(void)
 	return shm_allocator_is_hg() ? (mem_arena_t *)shm_block : NULL;
 }
 
-/* the reservation's address range: [lo, hi) holds every pointer the arena
- * ever hands out (the whole cap, committed or not) */
+/* [lo, hi) holds every pointer the arena ever hands out: the whole cap */
 static inline void mem_arena_extents(const mem_arena_t *a, unsigned long *lo,
 		unsigned long *hi)
 {
@@ -67,7 +65,6 @@ static inline int mem_arena_tier(const mem_arena_t *a)
 	return (int)a->tier;
 }
 
-/* committed bytes, the cap, and what is live (handed out) right now */
 static inline void mem_arena_usage(mem_arena_t *a, unsigned long *committed,
 		unsigned long *cap, unsigned long *live)
 {

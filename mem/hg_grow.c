@@ -35,10 +35,8 @@
 #include "../globals.h"
 #include "hg_buddy_int.h"
 
-/* --- grow ------------------------------------------------------------- */
-
 /* a RESOURCE refusal (the host, not the admin, said no): count it and run
- * the two-step latch; the event is raised later by the sweep timer */
+ * the two-step latch */
 static int grow_resource_refused(struct hg_block *hb)
 {
 	hb->grow_refused++;
@@ -63,7 +61,6 @@ static int grow_resource_refused(struct hg_block *hb)
 	return -1;
 }
 
-/* end the episode, if any, and re-arm the once-per-episode messages */
 void hg_grow_unblock(struct hg_block *hb, const char *how)
 {
 	if (hb->grow_blocked)
@@ -76,8 +73,6 @@ void hg_grow_unblock(struct hg_block *hb, const char *how)
 	hb->grow_refuse_mlock = 0;
 }
 
-/* the sweep timer's half of the latch (see grow_blocked_refuse0), once per
- * sweep interval with hb->lock held */
 void hg_grow_blocked_tick(struct hg_block *hb)
 {
 	if (hb->grow_blocked || !hb->grow_blocked_mark)
@@ -91,7 +86,6 @@ void hg_grow_blocked_tick(struct hg_block *hb)
 			hb->name, hb->grow_refused,
 			hb->shared ? "hg_shm_grow_blocked" : "hg_pkg_grow_blocked");
 	} else {
-		/* armed but quiet for a whole interval: the spike passed */
 		hb->grow_blocked_mark = 0;
 		hb->grow_blocked_refuse0 = 0;
 	}
@@ -105,8 +99,7 @@ void hg_grow_blocked_tick(struct hg_block *hb)
 static int hg_buddy_regrow_holes_unlocks(struct hg_block *hb, unsigned long need,
                                          unsigned long room);
 
-/* collapse the 4 KB pages a worker's grow left flagged want_collapse, lock
- * released per page, within HG_COLLAPSE_BUDGET_NS and HG_COLLAPSE_TRIES */
+/* called without hb->lock: takes it per page, within HG_COLLAPSE_BUDGET_NS */
 #define HG_COLLAPSE_BUDGET_NS	(100UL * 1000000UL)
 
 void hg_collapse_deferred(struct hg_block *hb)
@@ -128,7 +121,6 @@ void hg_collapse_deferred(struct hg_block *hb)
 				break;
 			}
 		if (!pg) {
-			/* end of this tick's pass; the next tick starts over */
 			hb->collapse_scan = 0;
 			if (!hb->collapse_wanting)
 				hb->collapse_pending = 0;
@@ -174,8 +166,8 @@ void hg_collapse_deferred(struct hg_block *hb)
 	}
 }
 
-/* grow in three phases: RESERVE under hb->lock, POPULATE unlocked, PUBLISH
- * under it; grow_inflight keeps other grows, trims and punches out */
+/* while hb->lock is dropped, grow_inflight keeps other grows, trims and
+ * punches out */
 static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow_why why)
 {
 	unsigned long delta, room, old_pages, i, limit, off, commit_ns;
@@ -187,8 +179,6 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 	if (!hb->buddy_ready)
 		return -1;
 
-	/* advise-only mode: report what growth WOULD have done, act never -
-	 * the arena behaves exactly like a fixed one, with evidence */
 	if (hg_autoscale_dry_run) {
 		hb->grow_refused++;
 		hb->grow_refuse_why = HG_GR_DRY_RUN;
@@ -220,8 +210,6 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 			} while (__atomic_load_n(&hb->grow_inflight, __ATOMIC_ACQUIRE) &&
 			         waited < HG_GROW_WAIT_MAX_NS);
 			hg_lock_enter(hb, (enum hg_lock_reason)reason);
-			/* new pages published: retry the carve; after a trim
-			 * or a punch, try this caller's own grow below */
 			if (hb->grow_gen != gen) {
 				hg_lkstat_add(&hb->lk_grow_wait, waited);
 				return 0;
@@ -229,27 +217,22 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 		} while (hb->grow_inflight && waited < HG_GROW_WAIT_MAX_NS);
 		hg_lkstat_add(&hb->lk_grow_wait, waited);
 		if (hb->grow_inflight) {
-			hb->grow_wait_timeouts++; /* still populating - give up */
+			hb->grow_wait_timeouts++;
 			hb->grow_refused++;
 			hb->grow_refuse_why = HG_GR_WAIT_TIMEOUT;
 			return -1;
 		}
-		/* the in-flight operation went away; fall through and grow */
 	}
 
-	/* the ceiling: the profile's scale-up target (within the -m INIT:CAP
-	 * reservation), else the reservation */
 	limit = (hb->pol.active && hb->pol.up_bytes) ? hb->pol.up_bytes
 	                                             : hb->hcap;
-	/* room is in committed bytes: the ceiling bounds what is backed, not
-	 * the span; holes are refilled first (below) */
+	/* committed bytes: the ceiling bounds what is backed, not the span */
 	room = limit > hb->committed_bytes ? limit - hb->committed_bytes : 0;
 	if (room == 0) {
 		hb->grow_refused++;
 		hb->grow_refuse_why = limit == hb->hcap ? HG_GR_CAP
 		                                        : HG_GR_PROFILE;
-		/* a ceiling doing its job is a notice, once per episode;
-		 * an arena with no cap (grows == 0) stays silent here */
+		/* an arena with no cap (grows == 0) stays silent here */
 		if (hb->grows && !hb->grow_refuse_said) {
 			hb->grow_refuse_said = 1;
 			LM_NOTICE("%s: at the %lu MB growth ceiling (%s), "
@@ -269,9 +252,9 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 		int r = hg_buddy_regrow_holes_unlocks(hb, need, room);
 
 		if (r > 0)
-			return 0;       /* served: the caller retries */
+			return 0;
 		if (r < 0)
-			return -1;           /* the RAM limb refused */
+			return -1;
 	}
 
 	delta = hb->grow_granule;
@@ -281,16 +264,15 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 	if (delta > room)
 		delta = room;
 
-	/* phase 1 - RESERVE the range under the lock, taking grow_inflight */
+	/* phase 1 - RESERVE under the lock */
 	off = hb->span_end;
 	hb->grow_inflight = 1;
-	backed_fast_update(hb);    /* the slow path while unlocked */
+	backed_fast_update(hb);
 	hb->span_pending = off + delta;
 	reason = hb->lk_cur;
 	hg_lock_leave(hb);
 
-	/* phase 2 - the host-RAM limb of the ceiling (reads files: not under
-	 * the lock), then POPULATE with the lock released */
+	/* phase 2 - unlocked: the host-RAM check, then POPULATE */
 	if (hg_grow_room_short(hb, delta, &rs)) {
 		hg_lock_enter(hb, (enum hg_lock_reason)reason);
 		hb->span_pending = hb->span_end;
@@ -314,7 +296,6 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 			hg_lkstat_add(&hb->lk_cphase[i], cp_ns[i]);
 	__atomic_store_n(&hb->grow_inflight, 0, __ATOMIC_RELEASE);
 	if (tier < 0) {
-		/* the commit rolled itself back; give the reservation back */
 		hb->span_pending = hb->span_end;
 		return grow_resource_refused(hb);
 	}
@@ -345,7 +326,6 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 	hb->span_pending = hb->span_end;
 	span_check(hb, "a grow");
 
-	/* keep the floor at 1/16 of the grid it now guards */
 	floor_recompute(hb);
 
 	hb->grows++;
@@ -355,7 +335,7 @@ static int buddy_grow_body(struct hg_block *hb, unsigned long need, enum hg_grow
 		hb->grows_proactive++;
 	else
 		hb->grows_exhaustion++;
-	hb->shrink_quiet = 0;    /* fresh demand voids any quiet window */
+	hb->shrink_quiet = 0;
 	hb->draining = 0;
 	hb->pol_cooldown = hb->pol.active ? hb->pol.cooldown : 0;
 	hb->pol_dry_said = 0;
@@ -381,8 +361,7 @@ int hg_buddy_grow_unlocks(struct hg_block *hb, unsigned long need, enum hg_grow_
 	return r;
 }
 
-/* re-commit holes before the span grows: each is re-pinned in THIS process
- * (mlock() does not survive fork). 1 served, 0 no hole fits, -1 refused */
+/* re-commit punched holes: 1 served, 0 no hole fits, -1 refused */
 static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
                                    unsigned long room)
 {
@@ -397,8 +376,8 @@ static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
 	if (!hb->punched_pages)
 		return 0;
 
-	/* at least a granule, like a span grow, and at least what the
-	 * request needs - one round trip, not one per page */
+	/* a granule or the request, whichever is more: one round trip, not one
+	 * per page */
 	want = (need + hb->hps - 1) >> hb->hps_shift;
 	if (want < hb->grow_granule >> hb->hps_shift)
 		want = hb->grow_granule >> hb->hps_shift;
@@ -418,12 +397,11 @@ static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
 		if (hb->pages[i].punched && !hb->pages[i].releasing)
 			sel[got++] = i;
 	hb->grow_inflight = 1;
-	backed_fast_update(hb);    /* the slow path while unlocked */
+	backed_fast_update(hb);
 	reason = hb->lk_cur;
 	hg_lock_leave(hb);
 
-	/* the host-RAM limb first, unlocked as in a span grow; nothing was
-	 * taken off a list yet, so a refusal only gives the token back */
+	/* nothing is off a list yet: a refusal only gives the token back */
 	if (hg_grow_room_short(hb, got << hb->hps_shift, &rs)) {
 		hg_lock_enter(hb, (enum hg_lock_reason)reason);
 		__atomic_store_n(&hb->grow_inflight, 0, __ATOMIC_RELEASE);
@@ -431,8 +409,8 @@ static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
 		return grow_resource_refused(hb);
 	}
 
-	/* phase 2 - pin, in this process, lock released; on hugetlb a hole's
-	 * pages went back to the pool, so this can fail and leave holes */
+	/* phase 2 - pin, lock released; on hugetlb a hole's pages went back to
+	 * the pool, so this can fail and leave holes */
 	t0 = hg_now_ns();
 	for (i = 0, ok = 0; i < got; i++) {
 		struct hg_page *pg = &hb->pages[sel[i]];
@@ -463,8 +441,7 @@ static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
 		if (hb->punched_pages)
 			hb->punched_pages--;
 	}
-	/* the count moves last, with release semantics: a waiter polling it
-	 * lock-free must not see it before the pages are back on the list */
+	/* last, with release semantics, as in a span grow */
 	__atomic_store_n(&hb->committed_bytes,
 	                 hb->committed_bytes + (got << hb->hps_shift),
 	                 __ATOMIC_RELEASE);
@@ -474,7 +451,7 @@ static int buddy_regrow_holes_body(struct hg_block *hb, unsigned long need,
 	hb->hole_regrows++;
 	hb->grow_gen++;
 	floor_recompute(hb);
-	hb->shrink_quiet = 0;    /* fresh demand voids any quiet window */
+	hb->shrink_quiet = 0;
 	hb->draining = 0;
 	hb->pol_cooldown = hb->pol.active ? hb->pol.cooldown : 0;
 	span_check(hb, "a re-commit");
@@ -500,8 +477,7 @@ static int hg_buddy_regrow_holes_unlocks(struct hg_block *hb, unsigned long need
 	return r;
 }
 
-/* always-on headroom rule: keep the free grid above twice the floor while
- * the reservation allows, so caches are not flushed every sweep; 1 if grew */
+/* under twice the floor free, every sweep would flush the caches */
 static int grow_headroom_tick_body(struct hg_block *hb)
 {
 	if (!hb->buddy_ready || !hg_grow_ahead)
@@ -524,8 +500,6 @@ int hg_grow_headroom_tick(struct hg_block *hb)
 	return r;
 }
 
-/* the profile's proactive grow, before exhaustion once usage crossed the
- * up-threshold often enough; same call sites and locking as hg_shrink_tick() */
 static void grow_tick_body(struct hg_block *hb)
 {
 	int hit;
@@ -537,7 +511,7 @@ static void grow_tick_body(struct hg_block *hb)
 	if (!hb->pol.active)
 		return;
 	if (hb->committed_bytes >= hb->pol.up_bytes)
-		return;                          /* at the profile ceiling */
+		return;
 
 	hb->pol_up_ticks++;
 	if (hg_get_real_used(hb) * 100 >=

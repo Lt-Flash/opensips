@@ -30,7 +30,7 @@
 #include <sys/time.h>
 #include <errno.h>
 #include <sys/mman.h>
-#include <sys/resource.h>    /* getrlimit(RLIMIT_MEMLOCK) */
+#include <sys/resource.h>
 
 #include "hg_version.h"
 #include "hg_malloc.h"
@@ -41,8 +41,8 @@
 #include "../dprint.h"
 #include "../globals.h"
 #include "../statistics.h"
-#include "../pt_scaling.h"    /* profiles + counted_max_processes via pt.h */
-#include "shm_mem.h"           /* shm_block, for the post-cfg attach */
+#include "../pt_scaling.h"
+#include "shm_mem.h"
 
 #ifdef DBG_MALLOC
 #include "mem_dbg_hash.h"
@@ -51,8 +51,7 @@
 #include "../lib/dbg/struct_hist.h"
 #include "hg_backing.h"
 
-/* the host floor in MB: hg_ram_floor_mb, else MemTotal/20 but at least
- * min(256 MB, MemTotal/8); not cached, as MemTotal and the config change */
+/* the host floor in MB; not cached, as MemTotal and the config change */
 static long hg_ram_floor_of(long total_kb)
 {
 	if (hg_ram_floor_mb > 0)
@@ -146,8 +145,6 @@ int hg_init_fits(const char *what, unsigned long init,
 	return 0;
 }
 
-/* pkg refusals are per process, invisible to stats read elsewhere: each
- * process publishes its own into its slot here, and hgmem: sums them */
 struct hg_pkg_pub {
 	unsigned long grow_refused;
 	unsigned int grow_blocked;
@@ -209,8 +206,6 @@ unsigned long hg_pkg_pub_stat(void *ctx)
 	return sum;
 }
 
-/* before forking another process: can its private arena commit INIT? 0
- * fails the fork cleanly instead of an OOM kill; logged once per episode */
 int hg_fork_fits(void)
 {
 #ifdef PKG_MALLOC
@@ -219,7 +214,6 @@ int hg_fork_fits(void)
 	if (mem_allocator_pkg != MM_HG_MALLOC &&
 	    mem_allocator_pkg != MM_HG_MALLOC_DBG)
 		return 1;
-	/* from RAM: a private arena never takes hugetlb pages */
 	if (hg_ram_room() >= hg_page_round(pkg_mem_size,
 	        hg_arena_page(pkg_mem_size, hg_pkg_cap_bytes) == HG_HPS ?
 	        HG_HPS : HG_SMALL_PAGE)) {
@@ -234,16 +228,14 @@ int hg_fork_fits(void)
 	}
 	return 0;
 #else
-	return 1;      /* pkg memory is the system malloc */
+	return 1;
 #endif
 }
 
-/* at startup, before any fork: does every child's private arena INIT fit
- * above the floor? -1 if the startup processes do not; else only warnings */
 int hg_capacity_check(unsigned int start_procs, unsigned int max_procs)
 {
 #ifndef PKG_MALLOC
-	return 0;      /* pkg memory is the system malloc */
+	return 0;
 #else
 	unsigned long init = pkg_mem_size, cap, initr_ram;
 	/* sums over every process: 64-bit, as the room they are held to */
@@ -306,8 +298,6 @@ int hg_capacity_check(unsigned int start_procs, unsigned int max_procs)
 #endif
 }
 
-/* host-RAM limb of the growth ceiling (see the prototype). It reads files,
- * so it runs without hb->lock, which is every worker's on the shm arena */
 unsigned int hg_grow_room_short(const struct hg_block *hb,
 		unsigned long delta, struct hg_room_short *rs)
 {
@@ -327,11 +317,8 @@ unsigned int hg_grow_room_short(const struct hg_block *hb,
 
 	rs->delta = delta;
 	rs->nproc = 1;
-	/* a pkg grow counts once per process: 64-bit, as the room */
 	rs->effective = delta;
 	if (!hb->shared) {
-		/* pkg: every worker grows its own arena under the same load,
-		 * so the cost is the delta times the process count */
 		rs->nproc = counted_max_processes ? counted_max_processes : 1;
 		rs->effective = (unsigned long long)delta * rs->nproc;
 	}
@@ -352,7 +339,6 @@ unsigned int hg_grow_room_short(const struct hg_block *hb,
 void hg_grow_room_refused(struct hg_block *hb, const struct hg_room_short *rs)
 {
 	hb->grow_refuse_why = rs->why;
-	/* once per episode - see grow_refuse_said's comment */
 	if (hb->grow_refuse_said)
 		return;
 	hb->grow_refuse_said = 1;

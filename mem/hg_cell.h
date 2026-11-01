@@ -20,8 +20,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-/* HG_MALLOC cell header: rounding, size classes, the per-cell header and its
- * state; included by hg_malloc.h, not on its own */
+/* included by hg_malloc.h, not on its own */
 
 #ifndef HG_CELL_H
 #define HG_CELL_H
@@ -80,11 +79,8 @@ const char *hg_mem_tier_str(enum hg_mem_tier tier);
 #endif
 #define HG_REQ_TAIL  (!HG_REQ_SLOT0 && !HG_REQ_PAD)
 
-/* the header as a struct, so sites name a field; the _Static_asserts below
- * pin it to the layout on every ABI and build configuration */
+/* the header as a struct; the _Static_asserts below pin its layout */
 struct hg_cell_hdr {
-	/* the first HG_ROUNDTO bytes: class, state and a checksum over both
-	 * and the cell's address (hg_hdr_set()) */
 	union {
 		struct {
 			unsigned char  cls;           /* class id, or HG_LARGE_MARKER */
@@ -99,15 +95,15 @@ struct hg_cell_hdr {
 		unsigned char  _slot0[HG_ROUNDTO];
 	};
 #ifdef DBG_MALLOC
-	const char    *file;                  /* HG_ROUNDTO */
-	const char    *func;                  /* HG_ROUNDTO * 2 */
-	unsigned long  line;                  /* HG_ROUNDTO * 3 */
+	const char    *file;
+	const char    *func;
+	unsigned long  line;
 #endif
 #ifdef SHM_EXTRA_STATS
-	unsigned long  stat_idx;              /* HG_ROUNDTO + HG_CELL_HDR_DBG */
+	unsigned long  stat_idx;
 #endif
 #if HG_REQ_PAD
-	unsigned int   req;                   /* LIVE_G: keyed size (hg_guard_set()) */
+	unsigned int   req;
 #endif
 };
 
@@ -116,7 +112,7 @@ struct hg_cell_hdr {
 	(((HG_CELL_HDR_RAW + HG_PAYLOAD_ALIGN - 1) / HG_PAYLOAD_ALIGN) \
 	 * HG_PAYLOAD_ALIGN)
 
-/* offset of the statistic_index field, valid only when SHM_EXTRA_STATS */
+/* meaningful only under SHM_EXTRA_STATS */
 #define HG_CELL_STATS_OFF (HG_ROUNDTO + HG_CELL_HDR_DBG)
 
 /* C++ modules include this header too */
@@ -126,7 +122,6 @@ struct hg_cell_hdr {
 #define HG_STATIC_ASSERT _Static_assert
 #endif
 
-/* the pins: the documented offsets, and the raw size the arithmetic gave */
 HG_STATIC_ASSERT(HG_CELL_HDR_RAW == HG_ROUNDTO + HG_CELL_HDR_DBG + HG_CELL_HDR_STATS +
 	(HG_REQ_PAD ? sizeof(unsigned int) : 0),
 	"struct hg_cell_hdr is not the documented header layout");
@@ -205,7 +200,6 @@ union hg_hdr_w {
 HG_STATIC_ASSERT(sizeof(union hg_hdr_w) == 4,
 	"the header word must be exactly class, state and checksum");
 
-/* the header word of a cell of class @cls in state @st, from its @base */
 static inline unsigned int hg_hdr_make(unsigned int cls, unsigned int st,
                                        unsigned short base)
 {
@@ -319,8 +313,7 @@ static inline int hg_guard_ok(void *cs, unsigned short base,
 	return 1;
 }
 
-/* valid only when SHM_EXTRA_STATS; the same for small cells and large frags,
- * since the tag always sits right before the payload */
+/* small cells and large frags alike: the tag sits right before the payload */
 #ifdef SHM_EXTRA_STATS
 #define HG_STATS_IDX(p) (HG_CELL(p)->stat_idx)
 #endif

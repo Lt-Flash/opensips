@@ -32,9 +32,6 @@
 #include "hg_dbg.h"
 #include "../dprint.h"
 
-/* HG_MALLOC_DBG checks on an arena with hb->dbg set: a tail red zone and a
- * poisoned quarantine; other paths only test the flag */
-
 /* the trailer is stored XORed with this, so neither the red zone's own
  * bytes nor a stray small integer reads back as a plausible size */
 static inline unsigned long tail_key(const void *cs)
@@ -45,7 +42,6 @@ static inline unsigned long tail_key(const void *cs)
 	return (unsigned long)(x ^ (x >> 32));
 }
 
-/* the first of @len bytes that is not @byte, or @len */
 static unsigned long first_unlike(const unsigned char *b, unsigned long len,
                                   unsigned char byte)
 {
@@ -83,7 +79,6 @@ int hg_dbg_tail_check(struct hg_block *hb, void *cs, unsigned long cap)
 		snprintf(what, sizeof what, "the %lu bytes asked for (byte %lu)",
 			size, i);
 	} else {
-		/* the trailer itself was overwritten: the size is lost */
 		snprintf(what, sizeof what, "its size (trailer lost)");
 	}
 #ifdef DBG_MALLOC
@@ -100,14 +95,13 @@ int hg_dbg_tail_check(struct hg_block *hb, void *cs, unsigned long cap)
 	return -1;
 }
 
-/* per-thread, per-arena quarantine (no lock): freed cells held poisoned,
- * oldest out first, bounded by HG_QUAR_CELLS and hb->quar_bytes */
+/* a FIFO ring, no lock, bounded by HG_QUAR_CELLS and hb->quar_bytes */
 struct hg_quar {
 	unsigned int  head;                  /* oldest entry */
-	unsigned int  n;                     /* entries held */
-	unsigned long bytes;                 /* cell bytes held */
+	unsigned int  n;
+	unsigned long bytes;
 	char         *cell[HG_QUAR_CELLS];   /* cell starts */
-	unsigned char cls[HG_QUAR_CELLS];    /* their classes */
+	unsigned char cls[HG_QUAR_CELLS];
 };
 
 /* a cell leaving quarantine must be all poison under an intact FREE
@@ -174,8 +168,6 @@ void hg_quar_put(struct hg_block *hb, struct hg_palloc *pl, unsigned int c,
 		if (m == MAP_FAILED) {
 			static int said;
 
-			/* no quarantine: the cell goes back at once, unchecked -
-			 * said once per process, as it weakens the debug checks */
 			if (!said) {
 				said = 1;
 				LM_WARN("%s: no memory for this thread's HG_MALLOC_DBG "

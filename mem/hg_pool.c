@@ -25,7 +25,7 @@
 #include <string.h>
 #include <limits.h>
 #include <stdlib.h>
-#include <unistd.h>   /* sysconf, for the IO-pool consumer count */
+#include <unistd.h>
 
 #include "hg_malloc.h"
 #include "hg_arena.h"
@@ -36,13 +36,8 @@
 #include "../globals.h"
 #include "hg_arena_int.h"
 
-/* ownership is hg_owns(), against bounds fixed at init: another arena's cell
- * looks valid, but pooled here its real owner would overwrite the link */
-/* global pool ops - hb->lock must be held. Both take/return cell_start. */
-/* --- shared free cells, held per block and graded by fullness ---------- */
+/* everything here runs under hb->lock */
 
-/* a block's fullness list, from its free-cell count; grade 0 is the fullest
- * partial, so a refill drains it and leaves emptier blocks to reach zero */
 static inline unsigned int grade_of(const struct hg_chunk *ch)
 {
 	unsigned int g;
@@ -105,8 +100,6 @@ static inline void list_link(struct hg_block *hb, int c, struct hg_chunk *ch,
 	}
 }
 
-/* move @ch to the list its current fullness calls for; usually a no-op, as
- * the grade changes far less often than the cell count */
 static inline void block_regrade(struct hg_block *hb, int c,
                                  struct hg_chunk *ch)
 {
@@ -118,8 +111,7 @@ static inline void block_regrade(struct hg_block *hb, int c,
 	list_link(hb, c, ch, g);
 }
 
-/* the cell's index within its block, or -1 if @cell_start is not a cell
- * boundary of @ch (a link overwritten after the free) */
+/* -1 if @cell_start is not a cell boundary of @ch */
 static inline long cell_index(const struct hg_chunk *ch, const void *cell_start)
 {
 	unsigned long off = (unsigned long)((const char *)cell_start -
@@ -163,12 +155,11 @@ static inline int pool_link_ok(struct hg_block *hb, struct hg_chunk *ch,
 	return 1;
 }
 
-/* hand drained blocks of class @c back to the buddy, down to @keep and at
- * most @limit per call; O(1) per block. hb->lock must be held */
+/* drained blocks of class @c back to the buddy, down to @keep and at most
+ * @limit per call */
 static unsigned int gc_class_run(struct hg_block *hb, int c, unsigned int keep,
                                  unsigned int limit);
 
-/* every block-return pass is timed into hb->lk_gc (lock held) */
 unsigned int hg_gc_class(struct hg_block *hb, int c, unsigned int keep,
                              unsigned int limit)
 {
@@ -190,13 +181,9 @@ static unsigned int gc_class_run(struct hg_block *hb, int c, unsigned int keep,
 		unsigned int ord;
 		unsigned long sz;
 
-		/* the oldest drained block, via the tail: the head, the most
-		 * recently drained, is the one worth keeping */
 		ch = hb->drained_tail[c];
 #ifdef HG_PARANOIA
 		{
-			/* test builds (-DHG_PARANOIA): check the tail against a
-			 * full walk */
 			struct hg_chunk *w = hb->drained[c];
 
 			while (w && w->fnext)
@@ -211,7 +198,6 @@ static unsigned int gc_class_run(struct hg_block *hb, int c, unsigned int keep,
 		}
 #endif
 		if (!ch) {
-			/* ndrained says there is one, the list has none */
 			LM_CRIT("%s: class %d claims %u drained blocks but the list "
 				"is empty - resetting the count\n", hb->name, c,
 				hb->ndrained[c]);
@@ -225,8 +211,6 @@ static unsigned int gc_class_run(struct hg_block *hb, int c, unsigned int keep,
 		ch->in_gpool = 0;
 		ch->free_head = NULL;
 
-		/* out of the registry, or hg_slab_recycled() and the DBG walker
-		 * see a block the buddy has since handed elsewhere */
 		if (ch->prev)
 			ch->prev->next = ch->next;
 		else
@@ -241,7 +225,7 @@ static unsigned int gc_class_run(struct hg_block *hb, int c, unsigned int keep,
 		hb->real_used -= sz;
 
 		/* every read of ch must precede this: the buddy at once reuses
-		 * the block's first bytes for its own free-list linkage */
+		 * the block's first bytes for its own links */
 		hg_san_release(hb, ch, sz);
 		hg_buddy_free(hb, ch, ord);
 		freed++;
@@ -256,14 +240,13 @@ static unsigned int gc_class_run(struct hg_block *hb, int c, unsigned int keep,
 	return freed;
 }
 
-/* a cell becomes shared: onto its own block's free list */
 int hg_gpool_push(struct hg_block *hb, int c, void *cell_start)
 {
 	struct hg_chunk *ch = cell_block(hb, c, cell_start);
 	long i;
 
 	if (!ch)
-		return -1;                  /* refused above, with a CRIT */
+		return -1;
 	i = cell_index(ch, cell_start);
 	if (i < 0) {
 		LM_CRIT("%s: %p is inside block %p (class %u) but not on a cell "
@@ -273,8 +256,7 @@ int hg_gpool_push(struct hg_block *hb, int c, void *cell_start)
 		return -1;
 	}
 	if (map_test(ch, i)) {
-		/* exact: the cell is already in the pool (the block-level test
-		 * below fires only after the damage) */
+		/* the block-level test below fires only after the damage */
 		LM_CRIT("%s: cell %p (block %p, class %u, index %ld) is already in "
 			"the global pool - double free, refusing the second copy\n",
 			hb->name, cell_start, (void *)ch, ch->cls, i);
@@ -295,16 +277,12 @@ int hg_gpool_push(struct hg_block *hb, int c, void *cell_start)
 	hb->gpool_n[c]++;
 	block_regrade(hb, c, ch);
 
-	/* a batch only past HG_GC_EMERGENCY beyond keep, never in a flush
-	 * (gc_deferred): the buddy reuses a block the walk may still reach */
 	if (!hb->gc_deferred &&
 	    hb->ndrained[c] > hb->gc_keep[c] + HG_GC_EMERGENCY)
 		hb->gc_inline_blocks += hg_gc_class(hb, c, hb->gc_keep[c], HG_GC_EMERGENCY);
 	return 0;
 }
 
-/* a shared cell from the fullest partial block, the concentration reclaim
- * depends on: at most HG_GRADES pointer tests */
 void *hg_gpool_pop(struct hg_block *hb, int c)
 {
 	struct hg_chunk *ch = NULL;
@@ -317,7 +295,6 @@ void *hg_gpool_pop(struct hg_block *hb, int c)
 			ch = hb->bucket[c][g];
 			break;
 		}
-	/* nothing partial: reuse a drained block rather than carve a new one */
 	if (!ch)
 		ch = hb->drained[c];
 	if (!ch)
@@ -335,8 +312,8 @@ void *hg_gpool_pop(struct hg_block *hb, int c)
 		block_regrade(hb, c, ch);
 		return NULL;
 	}
-	/* the head must be a map-free cell of this block (a first push was
-	 * never checked as a link), and its link sound before it is followed */
+	/* the head is vetted as well as its link: a first push was never
+	 * checked as a link */
 	i = cell_index(ch, cell_start);
 	if (i < 0 || !map_test(ch, i) ||
 	    !pool_link_ok(hb, ch, cell_next(cell_start), ch->in_gpool - 1)) {
@@ -370,8 +347,6 @@ void *hg_gpool_pop(struct hg_block *hb, int c)
 	return cell_start;
 }
 
-/* recompute each class's keep: the larger of the cycle's carves and half the
- * old keep, capped by a byte budget and HG_GC_KEEP_MAX. hb->lock held */
 void hg_gc_cycle(struct hg_block *hb)
 {
 	unsigned long budget = hb->size >> HG_GC_KEEP_BUDGET_SHIFT;
@@ -391,8 +366,7 @@ void hg_gc_cycle(struct hg_block *hb)
 	}
 }
 
-/* deferred GC: return up to @budget drained blocks beyond keep, round-robin
- * so one class cannot starve the rest. hb->lock held */
+/* round-robin, so one class cannot starve the rest of the budget */
 unsigned int hg_gc_tick(struct hg_block *hb, unsigned int budget)
 {
 	unsigned int done = 0, n;

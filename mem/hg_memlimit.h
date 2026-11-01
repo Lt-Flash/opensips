@@ -23,9 +23,6 @@
 #ifndef hg_memlimit_h
 #define hg_memlimit_h
 
-/* memory still committable: the tighter of the host's room (/proc/meminfo)
- * and the memory cgroup's, whose limit binds first and scopes the OOM kill */
-
 /* the floor a commit must leave free, in MB, on @total_mb of memory: a
  * twentieth, but at least the smaller of 256 MB and an eighth */
 long hg_floor_mb_for(long total_mb);
@@ -36,7 +33,7 @@ struct hg_cg_info {
 	int version;            /* 1 or 2; 0 = no limited level found */
 	unsigned long limit_mb;
 	unsigned long used_mb;  /* charged, less the reclaimable file cache */
-	unsigned long floor_mb; /* what the floor keeps free */
+	unsigned long floor_mb;
 };
 
 /* room above a floor, in 64-bit bytes even on 32-bit builds: the host is
@@ -48,7 +45,7 @@ struct hg_cg_info {
 unsigned long long hg_cgroup_room(struct hg_cg_info *ci);
 
 /* would committing @delta more bytes break the host or cgroup floor? _short()
- * decides without hb->lock; _refused() records and warns, under the lock */
+ * reads files, so runs without hb->lock; _refused() records, under the lock */
 struct hg_block;
 
 struct hg_room_short {
@@ -66,8 +63,7 @@ void hg_grow_room_refused(struct hg_block *hb, const struct hg_room_short *rs);
  * instead of /sys/fs/cgroup and /proc/self/cgroup; NULL restores them */
 void hg_cgroup_test_paths(const char *root, const char *self_cgroup);
 
-/* the file host memory is read from, /proc/meminfo; test hook: read it
- * from @meminfo instead, NULL restores the default */
+/* test hook: read @meminfo instead of /proc/meminfo; NULL restores it */
 extern const char *hg_meminfo_file;
 void hg_meminfo_test_path(const char *meminfo);
 

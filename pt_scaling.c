@@ -154,8 +154,7 @@ struct scaling_profile *get_scaling_profile(char *name)
 }
 
 
-/* rejects a profile unfit to count processes (sized in k/m/g, or >= 1000);
- * call it where a process group takes its profile, to stop the startup */
+/* call it where a process group takes its profile, to stop the startup */
 int check_scaling_profile_procs(struct scaling_profile *p, char *group)
 {
 	if (p->mem_kb_units) {

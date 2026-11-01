@@ -282,7 +282,6 @@ static int main_loop(void)
 		goto error;
 	}
 
-	/* fork the HG_MALLOC maintenance process (elastic shm arenas only) */
 	if (hg_maint_start()!=0) {
 		LM_CRIT("cannot start the HG maintenance process\n");
 		goto error;
@@ -459,8 +458,6 @@ int main(int argc, char** argv)
 						goto error00;
 					}
 					pkg_mem_size = memv;
-					/* :CAP reserves growth room before cfg
-					 * parsing; profiles only set policy */
 					if (tmp && *tmp == ':') {
 						long capv = parse_mem_size(tmp + 1, &tmp);
 
@@ -487,7 +484,6 @@ int main(int argc, char** argv)
 						goto error00;
 					}
 					shm_mem_size = memv;
-					/* INIT[:CAP], as for -M above */
 					if (tmp && *tmp == ':') {
 						long capv = parse_mem_size(tmp + 1, &tmp);
 
@@ -952,8 +948,7 @@ try_again:
 	/* print OpenSIPS version to log for history tracking */
 	LM_NOTICE("version: %s\n", version);
 
-	/* print some data about the configuration (sub-MB arenas exist now,
-	 * so print KB when MB would round to a lie) */
+	/* print some data about the configuration */
 	if (shm_mem_size < 1024 * 1024)
 		LM_NOTICE("using %ld KB of shared memory, allocator: %s\n",
 		          shm_mem_size/1024, mm_str(mem_allocator_shm));

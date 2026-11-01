@@ -210,7 +210,7 @@ enum hg_grow_refusal {
 };
 
 /* parked whole private chains of one class, see hg_xfer.c */
-#define HG_XFER_SLOTS 8
+#define HG_XFER_SLOTS 64
 struct hg_xfer {
 	void *head[HG_XFER_SLOTS];
 	unsigned int len[HG_XFER_SLOTS];

@@ -29,9 +29,10 @@
 #include "hg_arena_int.h"
 #include "hg_xfer.h"
 
-/* a class may park 1/512 of the arena, at most 2 MB */
-#define HG_XFER_SHARE_SHIFT 9
-#define HG_XFER_CLASS_MAX   (2UL << 20)
+/* a class may park 1/128 of the arena, at most 32 MB: tm frees a timer tick's
+ * transactions in one burst, so a few chains overflow at once */
+#define HG_XFER_SHARE_SHIFT 7
+#define HG_XFER_CLASS_MAX   (32UL << 20)
 
 void hg_xfer_caps(struct hg_block *hb)
 {

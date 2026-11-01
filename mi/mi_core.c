@@ -1382,6 +1382,10 @@ static int hg_stats_one(mi_item_t *parent, char *name, struct hg_block *hb,
 		return -1;
 	if (add_mi_number(o, MI_SSTR("floor_crossings"), hb->floor_crossings) < 0)
 		return -1;
+	/* allocations refused for lack of memory, and whether that is ongoing */
+	if (add_mi_number(o, MI_SSTR("alloc_failed"), hb->oom_fails) < 0 ||
+	    add_mi_number(o, MI_SSTR("out_of_memory"), hb->oom_episode) < 0)
+		return -1;
 	if (hg_stats_lock(o, hb) < 0)
 		return -1;
 

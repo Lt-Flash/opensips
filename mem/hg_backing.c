@@ -31,6 +31,9 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#ifdef __OS_linux
+#include <sys/vfs.h>
+#endif
 
 #include "hg_version.h"
 #include "hg_malloc.h"
@@ -66,6 +69,7 @@
 #ifndef MADV_POPULATE_WRITE
 #define MADV_POPULATE_WRITE 23
 #endif
+#define HG_PROC_SUPER_MAGIC 0x9fa0
 #endif /* __OS_linux */
 
 /* probed, as it is not always 2M: a wrong size breaks munmap() and THP */
@@ -291,14 +295,39 @@ const char *hg_4k_reason(int shared)
 		" - host transparent_hugepage/enabled is never";
 }
 
-/* shared anon memory shows up in ShmemHugePages, private in AnonHugePages */
+/* LXCFS serves a container's /proc/meminfo with ShmemHugePages stuck at 0
+ * (AnonHugePages too on cgroup v2): count this process's own pages there */
+static int hg_meminfo_virtual(void)
+{
+	static int virt = -1;
+#ifdef __OS_linux
+	struct statfs sf;
+
+	if (virt < 0) {
+		virt = statfs("/proc/meminfo", &sf) == 0 &&
+		       sf.f_type != HG_PROC_SUPER_MAGIC;
+		if (virt)
+			LM_INFO("/proc/meminfo is not procfs (LXCFS?): huge pages "
+				"are counted from /proc/self/smaps_rollup\n");
+	}
+#else
+	virt = 0;
+#endif
+	return virt;
+}
+
+/* shared anon memory shows up in ShmemHugePages, private in AnonHugePages;
+ * smaps_rollup counts the shared kind mapped here as ShmemPmdMapped */
 static long hg_read_huge_kb(int shared)
 {
+	if (hg_meminfo_virtual())
+		return hg_proc_field("/proc/self/smaps_rollup",
+			shared ? "ShmemPmdMapped" : "AnonHugePages", 10);
 	return hg_meminfo_kb(shared ? "ShmemHugePages" : "AnonHugePages");
 }
 
-/* the system-wide counter delta (O(1), unlike smaps); 90% must show, so a
- * partial populate fails */
+/* the counter's delta (O(1) from meminfo, unlike smaps); 90% must show, so
+ * a partial populate fails */
 static int hg_delta_is_huge(long before_kb, long after_kb, unsigned long len)
 {
 	return before_kb >= 0 && after_kb >= 0 &&

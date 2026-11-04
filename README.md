@@ -31,7 +31,7 @@ Everything lives in the [Lt-Flash/opensips](https://github.com/Lt-Flash/opensips
 
 | branch | what |
 |---|---|
-| [`feature/hg-malloc-v3-final`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-final) | OpenSIPS master (as of 2026-10-09) plus one commit: the allocator, its review fixes, the header state and checksum, debug checks, sanitizer hooks, memory-cgroup limits, unit tests with a fuzzer, and a section for reviewers; proposed upstream as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327) |
+| [`feature/hg-malloc-v3-final`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-final) | OpenSIPS master (as of 2026-11-03) plus one commit: the allocator, its review fixes, the header state and checksum, debug checks, sanitizer hooks, memory-cgroup limits, unit tests with a fuzzer, and a section for reviewers; proposed upstream as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327) |
 | [`feature/hg-malloc-v3-4.0`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-4.0) | the same allocator on the 4.0 branch, as a series of commits; also applies to the 4.0.1, 4.0.2 and 4.0.3 releases |
 | [`hg_malloc`](https://github.com/Lt-Flash/opensips/tree/hg_malloc) | this documentation |
 

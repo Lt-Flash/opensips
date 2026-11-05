@@ -98,6 +98,21 @@ Straight after it, the same point with 32 MB socket buffers: `maxbuffer` and `rm
 
 Four times the buffer does not stop F_MALLOC's and HP_MALLOC's drops - the difference is within their run-to-run spread - so their workers stall for longer than 32 MB of queue covers. F_PARALLEL_MALLOC, which dropped only 2,998 with 8 MB, dropped none; one of its probe INVITEs still took 554 ms. HG_MALLOC dropped none on the server either way; with 32 MB, one client host retransmitted 3,342 times and two probe INVITEs timed out while the server's receive and send error counters stayed at zero.
 
+## HG_MALLOC's ceiling: INVITEs answered by tm
+
+F_MALLOC, F_PARALLEL_MALLOC and HP_MALLOC already drop datagrams at 45,000 INVITEs/s in setup A, so only HG_MALLOC was taken further. Measured on 2026-10-27 on the setup B host (16-vCPU KVM guest, Xeon E5-2699 v4, Linux 6.12; no hugetlb pool and THP `shmem_enabled` = `never`, so the shared arena on 4 KB pages): an HG_MALLOC build of that day (`ada6390`), `-a HG_MALLOC -m 4096 -M 32`, 8 UDP workers, 32 MB socket buffers, tm answering every INVITE with 486 and absorbing the ACK; sipp from three hosts, 85 s per rate, one run per rate.
+
+| INVITEs/s | cores | UDP drops, count | failed INVITEs, count |
+|---|---|---|---|
+| 70,000 | 5.51 | 0 | 0 |
+| 80,000 | 6.06 | 0 | 0 |
+| 90,000 | 6.62 | 0 | 0 |
+| 92,500 | 6.91 | 0 | 0 |
+| 100,000 | 7.85 | 2,789,123 | 38,719 (0.46%) |
+| 110,000 | 8.08 | 8,349,680 | 1,428,919 (15%) |
+
+At 100,000 every one of the 8 workers was busy 0.98 of a core: the limit is the workers' CPU.
+
 ## Backing tiers
 
 Setup A. HG_MALLOC alone at 60,000 INVITEs/s on each of the four tiers, the host set up for one tier at a time (hugetlb pool; no pool and THP `advise`; the same with the advice skipped, so pages fault as 4 KB and are collapsed afterwards; no pool and THP `never`), the tier confirmed from the startup log and `core:hg_stats`. `-m 128:4096 -M 16:32`, 8 MB buffers; the other allocators ran on plain 4 KB pages in every setup A table. These runs used later commits of the PR from the same night - `6bd3352a09`, and for the tier-3 row and the budget table the commits that added the deferred collapse (`6642c73b70`, then `0c21c59eab` with retries) - built with a test-only switch that skips `MADV_HUGEPAGE` so that the host could be held on tier 3; the switch is not in the PR.

@@ -9,7 +9,7 @@
 | `-m INIT[:CAP]` | shared arena: initial size, and the cap it may grow to |
 | `-M INIT[:CAP]` | private (per-process) arena, same form |
 
-Restart-persistent memory (`-r`) is not served by HG_MALLOC: it lives in a file mapped at a fixed address, and HG_MALLOC reserves its own arenas. With `-a HG_MALLOC` it uses F_MALLOC (F_MALLOC_DBG with `-a HG_MALLOC_DBG`); `-r HG_MALLOC` is refused at startup.
+Restart-persistent memory is not served by HG_MALLOC: it lives in a file mapped at a fixed address, and HG_MALLOC reserves its own arenas. With `-a HG_MALLOC` it uses F_MALLOC (F_MALLOC_DBG with `-a HG_MALLOC_DBG`; Q_MALLOC in a build without F_MALLOC); `-e HG_MALLOC` is refused at startup.
 
 Sizes are MB, or take a `k`/`m`/`g` suffix (either case): `-m 128:1g`, `-M 512k:16m`. Without a cap the arena is fixed.
 
@@ -158,7 +158,7 @@ The `hgmem:` statistics group holds the shared arena's figures, plus two that su
 | `hg_shm_lock_stalls` | rising steadily |
 | `hg_shm_committed` against `hg_shm_cap` | committed close to the cap |
 
-Others for graphs: `hg_shm_grows`, `hg_shm_grows_proactive`, `hg_shm_grows_exhaustion`, `hg_shm_grow_refused`, `hg_shm_shrinks`, `hg_shm_shrink_bytes`, `hg_shm_live`, `hg_shm_live_peak`, `hg_shm_carved`, `hg_shm_free_to_carve`, `hg_shm_lock_hold_max_us`, `hg_shm_tier`.
+Others for graphs: `hg_shm_grows`, `hg_shm_grows_proactive`, `hg_shm_grows_exhaustion`, `hg_shm_grow_refused`, `hg_shm_shrinks`, `hg_shm_shrink_bytes`, `hg_shm_live`, `hg_shm_live_peak`, `hg_shm_carved`, `hg_shm_free_to_carve`, `hg_shm_lock_hold_max_us`, `hg_shm_tier`. The rest of the group (`hg_shm_gc_*`, `hg_shm_buddy_*`, `hg_shm_large_*`, the flush, floor and release counters) carries the shared arena's `core:hg_stats` figures, nearly all under the same name, plus its size and pinned bytes (`hg_shm_total_size`, `hg_shm_pinned_bytes`), for graphs over time.
 
 Note that `shmem:free_size` counts only memory not yet carved into size-class blocks; free cells already carved are reusable for their class but not counted, so it reads lower than what is reusable. Alert on the figures above, not on `free_size`.
 

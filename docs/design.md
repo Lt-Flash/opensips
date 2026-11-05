@@ -8,6 +8,8 @@ How HG_MALLOC works, what it guarantees, and how to run and monitor it. For the 
 
 **The common path takes no lock.** Each process (and each thread of a threaded process) keeps a private free list per class. An allocation pops from it and a free pushes to it - no lock, no shared cache line. When a private list runs dry it refills a batch from a shared per-class pool; when it grows past its threshold it donates a batch back. Only those batch transfers take the arena lock.
 
+**Transfer cache.** In a shared arena a donated batch is parked whole, as a chain, in a small per-class cache, and a refill takes a parked chain whole: one pointer swap under the lock instead of a walk of 32 to 128 cells. A class parks up to 64 chains, 1/128 of the arena and at most 32 MB; when its cache is full or empty, the batch moves cell by cell as before. A class idle for a GC cycle hands a chain back to its blocks, and a carve at exhaustion hands them all back. Private (pkg) arenas have no transfer cache.
+
 **Blocks and the buddy allocator.** The arena is a grid of pages the size of the host's huge page - 2 MB on x86-64, larger on arm64 kernels with 16 KB or 64 KB base pages - whichever of the four tiers backs them. A buddy allocator inside each page hands out blocks, and a block is carved into cells of one class. The shared pool keeps each block's free cells on that block and refills from the fullest partially-used block, so emptier blocks drain completely. A block whose cells are all free goes back to the buddy and can be re-cut for any class - memory used by a burst of one size is not stranded there.
 
 **Small arenas.** An arena with an INIT under one huge page settles its page size by the backing it gets. On plain 4 KB memory it runs in small mode, on 256 KB pages: at least 256 KB with a cap, 512 KB without. On huge pages its INIT is raised to one huge page, and an arena whose cap leaves no room above that page is refused at startup.
@@ -30,6 +32,8 @@ The arena is acquired through four tiers, best first, each verified from the ker
 | 4 | plain 4 KB pages | always available |
 
 Tiers 2-4 pin the committed arena with `mlock()`. The startup log names the tier achieved, and says why when THP is turned off by a host setting. Huge pages make the allocator's own work cheaper but are not required; an arena on 4 KB pages behaves the same.
+
+In a container whose `/proc/meminfo` is served by LXCFS (Proxmox and LXD, for example), the huge page counts there read 0 (`ShmemHugePages` always, `AnonHugePages` on cgroup v2), so HG counts the process's own from `/proc/self/smaps_rollup` instead.
 
 **Each growth step negotiates its own backing.** A step may land on a different tier than the memory before it, so `core:hg_stats` reports `tier_bytes` - the split by tier - whenever more than one tier holds bytes. On tier 3 a step taken by a worker that ran out of memory is published on 4 KB pages at once and collapsed by the maintenance process afterwards - one page at a time, with the arena lock released, for up to 100 ms a second, retrying a page the kernel cannot collapse yet up to 16 times - so the worker never waits for `MADV_COLLAPSE` (about 36 ms per 16 MB step); a step taken ahead of demand collapses straight away. `core:hg_stats` counts these pages as `collapse_deferred`, `collapsed_late`, `collapse_retries` and `collapse_late_failed`.
 
@@ -121,7 +125,16 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 | `guard` | 1 when new allocations get the `hg_mem_check` guard |
 | `grows`, `grows_proactive`, `grows_exhaustion`, `grow_refused`, `last_grow_refusal`, `grow_blocked` | growth history, what refused the latest grow (section 3.3) and the latched gauge |
 | `shrinks`, `punches`, `draining`, `whole_free_pages` | release history and what could be released now |
-| `live_committed`, per-class carve and reuse | what is in use and where |
+| `punched_pages`, `repins`, `repin_failed`, `hole_regrows` | pages released and not yet taken back, pages taken back and how many of them could not be pinned again, grows served from released pages |
+| `grow_inflight`, `grow_waits`, `grow_wait_timeouts`, `maintenance_process` | a grow in progress, workers that waited for one and those that gave up; the `HG maintenance` process number, -1 for a fixed arena |
+| `live_committed`, `live_peak`, `live_cells`, `live_payload`, `carved_peak`, `free_to_carve`, per-class carve and reuse | what is in use, its peak, and where |
+| `blocks_carved`, `blocks_returned`, `gc_passes`, `gc_tick_blocks`, `gc_inline_blocks`, `gc_kept_blocks`; per class `gc_keep` | the GC: class blocks cut and given back to the buddy, blocks given back by the maintenance tick and inline (memory pressure, a sweep's flush), empty blocks kept for reuse |
+| `cache_flushes`, `cells_flushed`, `sweeps_skipped`, `pressure_flushes`, `pressure_cells` | the 30 s sweep: flushes run, cells they brought back, sweeps with nothing to flush; flushes a process made when carving ran out, and their cells |
+| `reserve_floor`, `below_floor`, `floor_crossings` | the reserve floor (free memory at 1/16 of the committed pages; dropping below it makes every process flush its cache), 1 from the drop until free memory is back above twice the floor, and how often it dropped below |
+| `large_backing`, `large_live`, `large_recycled`, `large_chunks_carved`, `large_chunks_returned` | requests above 64 KB: bytes of the chunks that hold them, bytes in use, free bytes inside those chunks; chunks taken from and given back to the buddy (taken far ahead of given back means alloc/free churn) |
+| `buddy_splits`, `buddy_merges`, `buddy_free_leaves`, `buddy_free_orders` | the buddy allocator: splits and merges since startup, free leaves, and free runs per order, which tells whether a large chunk can still be served |
+| `xfer_puts`, `xfer_gets`, `xfer_full`, `xfer_drained`; per class `xfer_chains`, `xfer_cap` | the transfer cache: chains parked and taken whole, donations it had no room for, cells handed back from parked chains; chains parked now and the class's cap |
+| `alloc_failed`, `out_of_memory` | allocations refused for lack of memory, and 1 while such an episode is ongoing |
 | `lock` | hold and wait histograms per reason (refill, return, flush, large, policy, stats, other), stalls, the worst hold and its reason, commit and release times |
 | `corruption` | double frees, foreign pointers, bad classes, damaged headers, writes past the request (HG_MALLOC_DBG or `hg_mem_check`) and - under HG_MALLOC_DBG - after free, counted per kind |
 
@@ -147,6 +160,8 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 |---|---|---|
 | startup: `RLIMIT_MEMLOCK is N KB, but growing on hugetlb pages needs M KB locked` | memory lock limit too low for growth on hugetlb pages | `LimitMEMLOCK=infinity` in the unit |
 | `cannot grow ...: RLIMIT_MEMLOCK is N KB` | the same, at grow time | the same |
+| warning: `MAP_HUGETLB refused a ... MB shared arena ... although the pool has N free ... pages` | a NUMA binding (numactl, a cpuset) that leaves out the nodes holding the pool, or a hugetlb cgroup limit | bind to a node that holds pages, or reserve the pool on the bound node (`/sys/devices/system/node/nodeN/hugepages/`) |
+| notice: `hugetlb pool has N free ... pages ... a ... MB shared arena needs M: it falls back` | the pool is smaller than the arena | raise `vm.nr_hugepages` |
 | `hugetlb pool cannot back a ... cap` at startup | `vm.nr_hugepages` smaller than the caps | grow the pool (section 7), restart |
 | startup: `below the 512 KB minimum viable arena` | a fixed arena (no cap) under 512 KB | give a cap (`-M 256k:2m`) or INIT of at least 512 KB |
 | startup: `on huge pages INIT is at least one huge page ... no room to grow` | INIT under 2 MB on huge pages with a cap of 2 MB or less | raise the cap, or give INIT as 2 MB for a fixed arena |
@@ -181,6 +196,7 @@ The unit tests run under HG_MALLOC with `make test UT_ALLOC=HG_MALLOC UT_MEM="-m
 | `mem/hg_arena.c` | the fast path: per-thread caches, cell alloc and free, carving blocks into cells; arena init and per-child reset; flushing this thread's caches; the live-cell walk |
 | `mem/hg_pool.c` | the shared per-class pool and its integrity checks, block fullness lists, drained-block reclaim |
 | `mem/hg_cache.c` | flushing cached cells back to the pool, the sweep's due check, the reserve floor |
+| `mem/hg_xfer.c`, `mem/hg_xfer.h` | the transfer cache: parking and taking whole chains, the per-class caps, hand-back of idle classes and the drain at exhaustion |
 | `mem/hg_stats.c` | statistics, per-thread stats slots, the core statistics; the lock contract check and stall notes |
 | `mem/hg_arena_int.h` | helpers shared by the four files above |
 | `mem/hg_buddy.c` | the page grid and the buddy allocator |
@@ -195,7 +211,8 @@ The unit tests run under HG_MALLOC with `make test UT_ALLOC=HG_MALLOC UT_MEM="-m
 | `mem/hg_maint.c` | the maintenance process |
 | `mem/hg_memlimit.c`, `mem/hg_dbg.c`, `mem/hg_san.h` | cgroup limits, the debug checks, sanitizer hooks |
 | integration | `mem/mem.c`, `mem/shm_mem.c`, `mem/common.c`, `mem/rpm_mem.c`, `pt.c`, `pt_scaling.c`, `main.c`, `cfg.y`, `core_stats.c`, `mi/mi_core.c`, `evi/evi_core.c` |
-| tests | `mem/test/test_hg_malloc.c`, `modules/hgstress` |
+| tests | `mem/test/test_hg_malloc.c`, `mem/test/test_hg_fuzz.c`, `mem/test/test_hg_memlimit.c`, `modules/hgstress` |
+| tm and dialog | `modules/tm/h_table.c` (timer set) and `modules/dialog/dlg_profile.c` (bucket of a profile without a value), in commits of their own: both were picked from the low bits of the object's address, which are the same for every cell of a size class, so every transaction went to one timer set and every dialog of such a profile to one bucket |
 
 ### Invariants
 
@@ -224,6 +241,7 @@ The unit tests run under HG_MALLOC with `make test UT_ALLOC=HG_MALLOC UT_MEM="-m
 |---|---|---|---|
 | a cell is never handed to two processes at once | `hgstress`: every worker stamps each word of its blocks and re-verifies them; a foreign stamp is a double hand-out | by hand | not in CI |
 | alloc / free / realloc under load, many processes, mixed sizes | the allocator stress suite under HG_MALLOC and HG_MALLOC_DBG | CI | checks alignment and the used-size statistic, not content |
+| frees past a class's threshold park whole chains, a refill takes them, no cell is handed out twice, and a drain returns every parked cell | `test_hg_malloc.c`, a module arena | CI | |
 | a cell freed by another process comes back intact | `test_hg_malloc.c` | CI | |
 | pkg memory from before `fork()` can be realloc'ed and freed in a child | `test_hg_malloc.c`, normal and debug builds | CI | |
 | a child's copy of the parent's pkg arena is marked as inherited and its sweep never grows it; a pkg arena that grew one step shrinks again | `test_hg_malloc.c`, normal and debug builds | CI | |

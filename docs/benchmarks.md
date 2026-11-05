@@ -113,6 +113,75 @@ F_MALLOC, F_PARALLEL_MALLOC and HP_MALLOC already drop datagrams at 45,000 INVIT
 
 At 100,000 every one of the 8 workers was busy 0.98 of a core: the limit is the workers' CPU.
 
+## Bare metal: all four allocators, every run's server log checked
+
+Measured on 2026-11-05 and 06 on this PR's head (`6293c4afa6`, optimised, every allocator in one binary). Server: bare metal, 2 x Xeon E5-2690 v2 (40 threads, 2 NUMA nodes), Debian 13, Linux 6.12; 8 UDP workers pinned to NUMA node 0, the other processes and the NIC interrupts on four other CPUs; default socket buffer; receive mode `auto` (`reuseport` here); a fixed 64 GB shared arena and 64 MB private arenas for every allocator, all on 4 KB pages (F_PARALLEL_MALLOC as `-a F_MALLOC -s F_PARALLEL_MALLOC`; HG_MALLOC kept off the hugetlb pool by a cgroup with a zero hugetlb limit, its tier read from `core:hg_stats` in every run). The one extra arm, HG_MALLOC on huge pages, used a fixed 12 GB arena on the host's 16 GB hugetlb pool. Load: sipp on four 16-vCPU VMs, one UAC per 200 calls/s, each with its own ports; the load generators stayed at or below 68% CPU. Two 30 s runs per allocator and rate, the allocators' order reversed for the second; an allocator leaves the ladder at the first rate where neither run holds.
+
+A run holds when every UAC reported, at least 98% of the offered calls completed, at most 0.1% failed, and the OpenSIPS log has no memory error. The last column of each table counts the OpenSIPS log's ERROR and CRITICAL lines and, after the comma, the memory errors among them, per run. CPU is the user and system time of every OpenSIPS process over a 15 s window inside each run, mean of the two runs; UDP drops are the kernel's receive-buffer errors over the whole run, mean of the two; p99 is the worst of the two runs, from sipp's response-time buckets (1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 30, 50, 100, 200, 500 and 1,000 ms).
+
+An earlier pass of the relayed-call test with a 4 GB arena (results withdrawn) failed F_PARALLEL_MALLOC and HG_MALLOC at 28,000 calls/s on memory errors in the OpenSIPS log - the arena, not the allocator; this one gives every allocator 64 GB.
+
+### INVITEs answered by tm
+
+sipp sends an INVITE, tm answers 486 Busy Here and absorbs the ACK: one transaction and three datagrams per call.
+
+| calls/s | allocator | cores | UDP drops | failed calls, per run | p99 | log ERROR, memory errors, per run | runs held |
+|---|---|---|---|---|---|---|---|
+| 30,000 | F_MALLOC | 1.82 | 1,166 | 0.000% / 0.000% | under 2 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 30,000 | F_PARALLEL_MALLOC | 1.75 | 2,404 | 0.000% / 0.000% | under 2 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 30,000 | HP_MALLOC | 1.81 | 1,574 | 0.000% / 0.000% | under 2 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 30,000 | HG_MALLOC | 1.54 | 850 | 0.000% / 0.000% | under 2 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 30,000 | HG_MALLOC, huge pages | 1.48 | 114 | 0.000% / 0.000% | under 2 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 45,000 | F_MALLOC | 2.77 | 11,776 | 0.000% / 0.000% | under 10 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 45,000 | F_PARALLEL_MALLOC | 2.59 | 13,625 | 0.000% / 0.000% | under 5 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 45,000 | HP_MALLOC | 2.73 | 19,604 | 0.000% / 0.000% | under 50 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 45,000 | HG_MALLOC | 2.24 | 7,357 | 0.000% / 0.000% | under 2 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 45,000 | HG_MALLOC, huge pages | 2.14 | 4,846 | 0.000% / 0.000% | under 2 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 60,000 | F_MALLOC | 3.89 | 56,830 | 0.000% / 0.000% | under 1000 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 60,000 | F_PARALLEL_MALLOC | 3.60 | 33,041 | 0.000% / 0.000% | under 1000 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 60,000 | HP_MALLOC | 5.59 | 883,550 | 0.064% / 0.094% | over 1 s | 0, 0 / 0, 0 | 2 of 2 |
+| 60,000 | HG_MALLOC | 3.17 | 19,581 | 0.000% / 0.000% | under 10 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 60,000 | HG_MALLOC, huge pages | 2.95 | 11,796 | 0.000% / 0.000% | under 2 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 75,000 | F_MALLOC | 6.59 | 1,138,884 | 0.054% / 0.069% | over 1 s | 0, 0 / 0, 0 | 2 of 2 |
+| 75,000 | F_PARALLEL_MALLOC | 4.37 | 59,752 | 0.000% / 0.000% | under 1000 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 75,000 | HP_MALLOC | 8.42 | 5,403,430 | 7.431% / 7.407% | over 1 s | 0, 0 / 0, 0 | 0 of 2 |
+| 75,000 | HG_MALLOC | 3.87 | 40,758 | 0.000% / 0.000% | under 1000 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 75,000 | HG_MALLOC, huge pages | 3.55 | 20,944 | 0.000% / 0.000% | under 5 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 90,000 | F_MALLOC | 8.52 | 6,740,348 | 6.906% / 8.363% | over 1 s | 0, 0 / 0, 0 | 0 of 2 |
+| 90,000 | F_PARALLEL_MALLOC | 5.56 | 122,226 | 0.000% / 0.000% | under 1000 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 90,000 | HG_MALLOC | 4.66 | 65,134 | 0.000% / 0.000% | under 1000 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 90,000 | HG_MALLOC, huge pages | 4.28 | 33,744 | 0.000% / 0.000% | under 8 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 105,000 | F_PARALLEL_MALLOC | 6.36 | 227,522 | 0.000% / 0.000% | under 1000 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 105,000 | HG_MALLOC | 5.56 | 129,381 | 0.000% / 0.000% | under 1000 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 105,000 | HG_MALLOC, huge pages | 4.90 | 56,620 | 0.000% / 0.000% | under 100 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 120,000 | F_PARALLEL_MALLOC | 8.05 | 3,282,258 | 0.045% / 0.579% | over 1 s | 0, 0 / 0, 0 | 1 of 2 |
+| 120,000 | HG_MALLOC | 6.44 | 234,791 | 0.000% / 0.000% | under 1000 ms | 0, 0 / 0, 0 | 2 of 2 |
+| 120,000 | HG_MALLOC, huge pages | 5.67 | 92,587 | 0.000% / 0.000% | under 1000 ms | 0, 0 / 0, 0 | 2 of 2 |
+
+### Calls relayed by a record-routing proxy
+
+sipp -> OpenSIPS -> sipp: INVITE, 180, 200, ACK and a BYE 100 ms later; `record_route()` and `t_relay()`. F_PARALLEL_MALLOC and HG_MALLOC ran together, F_MALLOC and HP_MALLOC straight after on the same rig.
+
+| calls/s | allocator | cores | UDP drops | failed calls, per run | log ERROR, memory errors, per run | runs held |
+|---|---|---|---|---|---|---|
+| 24,000 | F_PARALLEL_MALLOC | 5.56 | 55,439 | 0.000% / 0.000% | 0, 0 / 0, 0 | 2 of 2 |
+| 24,000 | HG_MALLOC | 4.28 | 39,072 | 0.000% / 0.000% | 0, 0 / 0, 0 | 2 of 2 |
+| 28,000 | F_PARALLEL_MALLOC | 6.55 | 115,472 | 0.001% / 0.000% | 0, 0 / 0, 0 | 2 of 2 |
+| 28,000 | HG_MALLOC | 5.03 | 58,758 | 0.000% / 0.000% | 0, 0 / 0, 0 | 2 of 2 |
+| 32,000 | F_PARALLEL_MALLOC | 7.74 | 861,730 | 1.176% / 1.565% | 0, 0 / 0, 0 | 0 of 2 |
+| 32,000 | HG_MALLOC | 5.68 | 76,425 | 0.000% / 0.000% | 0, 0 / 0, 0 | 2 of 2 |
+| 36,000 | HG_MALLOC | 6.35 | 138,987 | 0.000% / 0.000% | 0, 0 / 0, 0 | 2 of 2 |
+| 40,000 | HG_MALLOC | 6.88 | 191,334 | 0.000% / 0.000% | 0, 0 / 0, 0 | 2 of 2 |
+| 44,000 | HG_MALLOC | 7.65 | 496,042 | 0.156% / 0.102% | 0, 0 / 0, 0 | 0 of 2 |
+| 8,000 | F_MALLOC | 1.99 | 0 | 0.000% / 0.000% | 0, 0 / 0, 0 | 2 of 2 |
+| 8,000 | HP_MALLOC | 2.20 | 32 | 0.000% / 0.000% | 0, 0 / 0, 0 | 2 of 2 |
+| 12,000 | F_MALLOC | 2.98 | 3,059 | 0.000% / 0.000% | 0, 0 / 0, 0 | 2 of 2 |
+| 12,000 | HP_MALLOC | 3.17 | 194,553 | 0.555% / 0.807% | 0, 0 / 0, 0 | 0 of 2 |
+| 16,000 | F_MALLOC | 3.97 | 29,789 | 0.000% / 0.000% | 0, 0 / 0, 0 | 2 of 2 |
+| 20,000 | F_MALLOC | 4.89 | 360,965 | 0.949% / 0.823% | 0, 0 / 0, 0 | 0 of 2 |
+
+Highest rate held in both runs - relayed calls: HP_MALLOC 8,000, F_MALLOC 16,000, F_PARALLEL_MALLOC 28,000, HG_MALLOC 40,000; INVITEs answered by tm: HP_MALLOC 60,000, F_MALLOC 75,000, F_PARALLEL_MALLOC 105,000, HG_MALLOC 120,000 or more on either page size (the highest rate tried).
+
 ## Backing tiers
 
 Setup A. HG_MALLOC alone at 60,000 INVITEs/s on each of the four tiers, the host set up for one tier at a time (hugetlb pool; no pool and THP `advise`; the same with the advice skipped, so pages fault as 4 KB and are collapsed afterwards; no pool and THP `never`), the tier confirmed from the startup log and `core:hg_stats`. `-m 128:4096 -M 16:32`, 8 MB buffers; the other allocators ran on plain 4 KB pages in every setup A table. These runs used later commits of the PR from the same night - `6bd3352a09`, and for the tier-3 row and the budget table the commits that added the deferred collapse (`6642c73b70`, then `0c21c59eab` with retries) - built with a test-only switch that skips `MADV_HUGEPAGE` so that the host could be held on tier 3; the switch is not in the PR.

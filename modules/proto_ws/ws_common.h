@@ -227,15 +227,16 @@ static inline int ws_send(struct tcp_connection *con, int fd, int op,
 	} else if (len < WS_EXT_LEN) {
 		hdr_buf[1] = len;
 		v[0].iov_len = WS_MIN_HDR_LEN;
-	} else if (len < WS_MAX_ELEN) {
+	} else if (len <= WS_MAX_ELEN) {
 		v[0].iov_len = WS_MIN_HDR_LEN + WS_ELEN_SIZE;
 		hdr_buf[1] = WS_EXT_LEN;
 		*(uint16_t *)(hdr_buf + WS_MIN_HDR_LEN) = htons(len);
 	} else {
 		v[0].iov_len = WS_MIN_HDR_LEN + WS_ELENC_SIZE;
 		hdr_buf[1] = WS_EXTC_LEN;
-		/* len can't be larger than 32 bits long */
-		*(uint64_t *)(hdr_buf + WS_MIN_HDR_LEN) = htonl(len);
+		/* 64 bits in network order; len can't be larger than 32 bits long */
+		*(uint32_t *)(hdr_buf + WS_MIN_HDR_LEN) = 0;
+		*(uint32_t *)(hdr_buf + WS_MIN_HDR_LEN + sizeof(uint32_t)) = htonl(len);
 	}
 
 	if (WS_TYPE(con) == WS_CLIENT) {

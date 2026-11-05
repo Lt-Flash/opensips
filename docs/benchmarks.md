@@ -113,23 +113,6 @@ F_MALLOC, F_PARALLEL_MALLOC and HP_MALLOC already drop datagrams at 45,000 INVIT
 
 At 100,000 every one of the 8 workers was busy 0.98 of a core: the limit is the workers' CPU.
 
-## Relayed calls on bare metal: all four allocators
-
-Measured on 2026-11-05 on this PR's head (`6293c4afa6`, optimised, every allocator in one binary). Server: bare metal, 2 x Xeon E5-2690 v2 (40 threads, 2 NUMA nodes), Debian 13, Linux 6.12; setup B's stateful proxy (record-route, `t_relay()`), 8 UDP workers pinned one per CPU on NUMA node 0, the other processes and the NIC interrupts on four other CPUs; default socket buffer; receive mode `auto`, master's default (`reuseport` here); `-m 4096 -M 32` (F_PARALLEL_MALLOC as `-a F_MALLOC -s F_PARALLEL_MALLOC`), HG_MALLOC `-m 512:4096 -M 64:512` on the host's hugetlb pool. Load: sipp from four 16-vCPU VMs, one UAC per 200 calls/s, each with its own ports, and 40 sipp UAS; a call is INVITE, 180, 200, ACK and a BYE 100 ms later. 30 s per cell, two cells per allocator and rate, the order of the allocators reversed for the second; an allocator leaves the ladder at the first rate where neither cell holds. A cell holds when every UAC reported, at least 98% of the offered calls completed and at most 0.1% failed. The load generators stayed at or below 34% CPU.
-
-OpenSIPS CPU (user and system time of every process over a 15 s window inside each cell, mean of the two cells), or why the rate failed:
-
-| calls/s | F_MALLOC, cores | F_PARALLEL_MALLOC, cores | HP_MALLOC, cores | HG_MALLOC, cores |
-|---|---|---|---|---|
-| 12,000 | 2.96 | 2.84 | fails: 0.65% and 0.79% failed | **2.16** |
-| 16,000 | 3.95 | 3.77 | - | **2.83** |
-| 20,000 | fails: 1.03% and 0.85% failed | 4.61 | - | **3.42** |
-| 24,000 | - | 5.42 | - | **3.95** |
-| 28,000 | - | fails: 3.06% and 0.94% failed | - | **4.56** |
-| 32,000 | - | - | - | fails: 2.16% and 2.30% failed |
-
-Highest rate held: F_MALLOC 16,000, F_PARALLEL_MALLOC 24,000, HP_MALLOC under 12,000 (8,000 held in a single trial cell), HG_MALLOC 28,000. At 16,000 HG_MALLOC used 28% fewer cores than F_MALLOC and 25% fewer than F_PARALLEL_MALLOC.
-
 ## Backing tiers
 
 Setup A. HG_MALLOC alone at 60,000 INVITEs/s on each of the four tiers, the host set up for one tier at a time (hugetlb pool; no pool and THP `advise`; the same with the advice skipped, so pages fault as 4 KB and are collapsed afterwards; no pool and THP `never`), the tier confirmed from the startup log and `core:hg_stats`. `-m 128:4096 -M 16:32`, 8 MB buffers; the other allocators ran on plain 4 KB pages in every setup A table. These runs used later commits of the PR from the same night - `6bd3352a09`, and for the tier-3 row and the budget table the commits that added the deferred collapse (`6642c73b70`, then `0c21c59eab` with retries) - built with a test-only switch that skips `MADV_HUGEPAGE` so that the host could be held on tier 3; the switch is not in the PR.

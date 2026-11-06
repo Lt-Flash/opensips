@@ -98,21 +98,6 @@ Straight after it, the same point with 32 MB socket buffers: `maxbuffer` and `rm
 
 Four times the buffer does not stop F_MALLOC's and HP_MALLOC's drops - the difference is within their run-to-run spread - so their workers stall for longer than 32 MB of queue covers. F_PARALLEL_MALLOC, which dropped only 2,998 with 8 MB, dropped none; one of its probe INVITEs still took 554 ms. HG_MALLOC dropped none on the server either way; with 32 MB, one client host retransmitted 3,342 times and two probe INVITEs timed out while the server's receive and send error counters stayed at zero.
 
-## HG_MALLOC's ceiling: INVITEs answered by tm
-
-F_MALLOC, F_PARALLEL_MALLOC and HP_MALLOC already drop datagrams at 45,000 INVITEs/s in setup A, so only HG_MALLOC was taken further. Measured on 2026-10-27 on the setup B host (16-vCPU KVM guest, Xeon E5-2699 v4, Linux 6.12; no hugetlb pool and THP `shmem_enabled` = `never`, so the shared arena on 4 KB pages): an HG_MALLOC build of that day (`ada6390`), `-a HG_MALLOC -m 4096 -M 32`, 8 UDP workers, 32 MB socket buffers, tm answering every INVITE with 486 and absorbing the ACK; sipp from three hosts, 85 s per rate, one run per rate.
-
-| INVITEs/s | cores | UDP drops, count | failed INVITEs, count |
-|---|---|---|---|
-| 70,000 | 5.51 | 0 | 0 |
-| 80,000 | 6.06 | 0 | 0 |
-| 90,000 | 6.62 | 0 | 0 |
-| 92,500 | 6.91 | 0 | 0 |
-| 100,000 | 7.85 | 2,789,123 | 38,719 (0.46%) |
-| 110,000 | 8.08 | 8,349,680 | 1,428,919 (15%) |
-
-At 100,000 every one of the 8 workers was busy 0.98 of a core: the limit is the workers' CPU.
-
 ## Bare metal: all four allocators, every run's server log checked
 
 Measured on 2026-11-05 and 06 on this PR's head (`6293c4afa6`, optimised, every allocator in one binary). Server: bare metal, 2 x Xeon E5-2690 v2 (40 threads, 2 NUMA nodes), Debian 13, Linux 6.12; 8 UDP workers pinned to NUMA node 0, the other processes and the NIC interrupts on four other CPUs; default socket buffer; receive mode `auto` (`reuseport` here); a fixed 64 GB shared arena and 64 MB private arenas for every allocator, all on 4 KB pages (F_PARALLEL_MALLOC as `-a F_MALLOC -s F_PARALLEL_MALLOC`; HG_MALLOC kept off the hugetlb pool by a cgroup with a zero hugetlb limit, its tier read from `core:hg_stats` in every run). The one extra arm, HG_MALLOC on huge pages, used a fixed 12 GB arena on the host's 16 GB hugetlb pool. Load: sipp on four 16-vCPU VMs, one UAC per 200 calls/s, each with its own ports; the load generators stayed at or below 68% CPU. Two 30 s runs per allocator and rate, the allocators' order reversed for the second; an allocator leaves the ladder at the first rate where neither run holds.

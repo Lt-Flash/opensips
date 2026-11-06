@@ -4,16 +4,14 @@ A memory allocator for [OpenSIPS](https://github.com/OpenSIPS/opensips), for bot
 
 ## Why
 
-- **Less CPU:** 9-27% less than F_MALLOC, F_PARALLEL_MALLOC and HP_MALLOC for the whole server at 20k-60k INVITEs per second answered by tm, and about half on a registrar taking 60k registrations per second.
-- **Over TLS and WSS too:** at the same rate of calls relayed by a stateful proxy, 7-11% less CPU per call (16-23% less in the TCP workers) and 54-69% fewer `sched_yield` calls than F_MALLOC, with HG_MALLOC's shared arena on plain 4 KB pages like F_MALLOC's; over UDP with the default 512 KB socket buffer the highest sustained rate rises from 10k to up to 22k relayed calls per second.
-- **No drops under load:** with 8 MB socket buffers, 0 UDP drops and 0 failed INVITEs at 60k INVITEs/s, where the other allocators drop thousands to millions of datagrams and, with a 2 GB arena, F_MALLOC and F_PARALLEL_MALLOC run out of memory; and 0 drops up to 16k relayed calls/s, where F_MALLOC already drops at 12k. The workers keep the socket drained.
-- **Less memory under overload:** with no drops, transactions are released on time instead of waiting in memory for retransmissions - at 60k INVITEs/s HG_MALLOC peaked at 1.5 GB against 2.0-2.5 GB for HP_MALLOC and F_MALLOC, and stayed within a 2 GB arena that F_MALLOC and F_PARALLEL_MALLOC ran out of.
-- **Tight latency:** 1.2 million registrations at 60k per second with a p99 of 4 ms, against 15-28 s for the others.
-- **No more guessing `-m`:** `-m 128:1024` starts at 128 MB, grows as traffic arrives, and gives memory back when it goes quiet.
+- **Less CPU:** at 60,000 INVITEs/s answered by tm, 18% fewer cores than F_MALLOC with every allocator on 4 KB pages, 24% fewer with huge pages; 23% fewer than F_PARALLEL_MALLOC at the same rate of relayed calls.
+- **More calls per server:** 40,000 relayed calls/s, against 28,000 for F_PARALLEL_MALLOC, 16,000 for F_MALLOC and 8,000 for HP_MALLOC, all on 4 KB pages. INVITEs answered by tm: HG_MALLOC still held at 120,000/s, the highest rate tried, on either page size; HP_MALLOC fails from 75,000, F_MALLOC from 90,000 and F_PARALLEL_MALLOC in one of two runs at 120,000.
+- **Low latency:** p99 under 10 ms at 60,000 INVITEs/s on 4 KB pages, under 2 ms with huge pages, against 0.5-1 s for F_MALLOC and F_PARALLEL_MALLOC and over 1 s for HP_MALLOC.
+- **No more guessing `-m` and `-M` (optional):** `-m 128:1024 -M 16:64` - the shared arena and every process's private arena start small, grow as traffic arrives, and give memory back when it goes quiet. Fixed sizes work as before.
 - **Safe and observable:** every cell header carries the cell's state and a checksum, so a double free is refused whatever came between the two frees, two processes freeing one cell at the same moment free it once, a cell is never handed out twice, and a damaged header, a pointer into a cell or a corrupted free-list link is caught and counted instead of followed. `-a HG_MALLOC_DBG` also finds writes past the request and after free; an ASan or Valgrind build sees inside the private arenas. Every grow, shrink and lock hold is visible through MI, statistics and events.
-- **Runs anywhere:** huge pages when the host has them, plain 4 KB pages when it does not; builds on x86 and ARM, 32-bit and 64-bit, glibc and musl.
+- **Runs anywhere:** memory from the best of four tiers the host offers - a hugetlb pool, transparent huge pages by advice or by collapse, or plain 4 KB pages; builds on x86 and ARM, 32-bit and 64-bit, glibc and musl.
 
-Two benchmark setups, each running every allocator from one binary: INVITEs answered by tm on master plus HG_MALLOC (setup A, rates in INVITEs/s), and calls relayed by a stateful proxy over UDP, TLS and WSS on a 4.1 build with other pending patches (setup B, rates in relayed calls/s, 13 datagrams each). Their rates do not compare with each other - see [what was measured where](docs/benchmarks.md#what-was-measured-where). In production since August 2026, now on 19 SIP nodes: billing gateways and load balancers since August, SBCs and registrars since October.
+The figures above come from one bare-metal server running every allocator from one binary, on the same 4 KB pages and a fixed 64 GB arena (HG_MALLOC on huge pages: a fixed 12 GB arena on a hugetlb pool), with every run's OpenSIPS log checked for errors: [bare metal, all four allocators](docs/benchmarks.md#bare-metal-all-four-allocators-every-runs-server-log-checked). Earlier measurements on KVM guests - TLS and WSS, a registrar, the backing tiers, memory under load - follow on the same page. In production since August 2026; since 2026-11-05 all 49 OpenSIPS nodes of three sites (Australia, UK, US) run this code - 37 production nodes (SBCs, registrars, load balancers and gateways) and 12 test and staging nodes.
 
 ## How it works
 
@@ -35,7 +33,7 @@ Everything lives in the [Lt-Flash/opensips](https://github.com/Lt-Flash/opensips
 | [`feature/hg-malloc-v3-4.0`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-4.0) | the same allocator on the 4.0 branch, as a series of commits; also applies to the 4.0.1, 4.0.2 and 4.0.3 releases. It has the allocator only, without the tm and dialog commits, so under HG_MALLOC `timer_partitions` has no effect there |
 | [`hg_malloc`](https://github.com/Lt-Flash/opensips/tree/hg_malloc) | this documentation |
 
-The branch adds the allocator (`mem/hg_*`), elastic-arena and autoscaling configuration, MI commands, statistics and events, and `modules/hgstress`, a soak and fault-injection test module excluded from the default build; it also fixes an out-of-bounds write in core `add_stats_group()` that HG_MALLOC_DBG found. The master branch also carries the tm and dialog commits described above. Clone a branch and build it as any OpenSIPS tree, or add its commits to an existing tree:
+The branch adds the allocator (`mem/hg_*`), elastic-arena and autoscaling configuration, MI commands, statistics and events, and `modules/hgstress`, a soak and fault-injection test module excluded from the default build; it also carries three small fixes to existing code: an out-of-bounds write in core `add_stats_group()` that HG_MALLOC_DBG found, an `F_PARALEL_MALLOC` typo in `shm_mem.c`, and a build without `DBG_MALLOC` that would not start unless `-a` was given. The master branch also carries the tm and dialog commits described above. Clone a branch and build it as any OpenSIPS tree, or add its commits to an existing tree:
 
 ```bash
 git remote add lt-flash https://github.com/Lt-Flash/opensips.git
@@ -113,12 +111,12 @@ Events: `E_CORE_SHM_GROW_BLOCKED` (growth refused for a sustained period), `E_CO
 
 ## Costs
 
-- Memory per object: a little more than the other allocators, from size-class rounding - +2% live memory on 400k registrations (usrloc insert-only, measured in September 2026 on an earlier HG_MALLOC build), 5-13% on tm's 1-4 KB objects at rates with no drops (setup A). Under overload the total is lower: see [memory under load](docs/benchmarks.md#memory-under-load).
-- The integrity checks (header state and checksum, in every build): 0.1-2.6% more CPU for the whole server at 20k-60k INVITEs/s answered by tm (setup A, 3 runs per rate), and 0.8-2.3% per call at 12k-22k relayed calls/s over UDP (setup B, 4 runs per rate) - within the run-to-run spread at every rate but 60k INVITEs/s; drops and failed calls do not tell the two builds apart. The CPU figures above were measured before they were added: [cost of the integrity checks](docs/benchmarks.md#cost-of-the-integrity-checks).
+- Memory per object: a little more than the other allocators, from size-class rounding - +2% live memory on 400k registrations (usrloc insert-only, measured in September 2026 on an earlier HG_MALLOC build), 5-13% on tm's 1-4 KB objects at rates with no drops (setup A).
+- The integrity checks (header state and checksum, in every build): 0.1-2.6% more CPU for the whole server at 20k-60k INVITEs/s answered by tm (setup A, 3 runs per rate), and 0.8-2.3% per call at 12k-22k relayed calls/s over UDP (setup B, 4 runs per rate) - within the run-to-run spread at every rate but 60k INVITEs/s; drops and failed calls do not tell the two builds apart. Measurements: [cost of the integrity checks](docs/benchmarks.md#cost-of-the-integrity-checks).
 - The optional tail guard (`hg_mem_check = 1`, off by default; `0` costs nothing measurable): 4.5 ns per allocation or free, within the run-to-run spread for INVITEs answered by tm, 2.0-3.4% more CPU per call for a load balancer with topology hiding ([measurements](docs/benchmarks-hg-mem-check.md)).
 - The committed arena is pinned, so it shows as resident from the start.
 - The huge-page tiers and giving memory back to the OS are Linux-only; elsewhere the arena is plain pinned memory that grows but does not shrink.
 
 ## Status
 
-Not yet in upstream OpenSIPS. Proposed as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327); available as branches for master and 4.0 (see [Code](#code)). Licensed under the GNU GPL v2 or later, like OpenSIPS.
+Not yet in upstream OpenSIPS. Proposed as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327), ready for review since 2026-11-06; available as branches for master and 4.0 (see [Code](#code)). Licensed under the GNU GPL v2 or later, like OpenSIPS.

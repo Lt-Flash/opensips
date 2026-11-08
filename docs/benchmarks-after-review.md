@@ -2,7 +2,7 @@
 
 Measured on 2026-10-23 against the head of [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327), `63046ceca0`, which carries both rounds of review fixes: process exit and double frees in the first; in the second a state and a checksum in every cell header with an atomic free, the HG_MALLOC_DBG checks, sanitizer hooks, the host free-memory floor and the memory cgroup's limit, and 32-bit counting. Same hosts, same drivers and the same method as [benchmarks.md](benchmarks.md); the allocators compared are the same too: F_MALLOC, F_PARALLEL_MALLOC, HP_MALLOC and HG_MALLOC on setup A, F_MALLOC and HG_MALLOC on setup B.
 
-HG_MALLOC is still ahead in every test: the least CPU, no UDP drops and no failed requests where the other allocators drop or fail, and the highest sustained call rates (equal to F_MALLOC's in two of the three TLS modes). Run alongside on setup A, the binary behind the original tables - HG_MALLOC before the review fixes - is within 3.2% of the current head in CPU, in both directions.
+HG_MALLOC is still ahead in every test: the least CPU, no UDP drops and no failed requests where the other allocators drop or fail, and the highest sustained call rates. Run alongside on setup A, the binary behind the original tables - HG_MALLOC before the review fixes - is within 3.2% of the current head in CPU, in both directions.
 
 **Reading the setup A tables:** `a → b (c, d)` is the run behind the original tables (one run) → the mean of today's two runs (the two runs). The second run took the allocators in reverse order. Setup B cells say *original → now* where both exist.
 
@@ -79,11 +79,11 @@ HG_MALLOC is still ahead in every test: the least CPU, no UDP drops and no faile
 
 ## Setup B: calls relayed by a stateful proxy
 
+TLS and WSS were measured again on bare metal with all four allocators on 2026-11-07 and 08: [calls relayed over TLS and WSS](benchmarks-tls-wss.md).
+
 - **Server:** the setup B host of [benchmarks.md](benchmarks.md#what-was-measured-where) (16-vCPU KVM guest, Xeon E5-2699 v4, Debian 13, Linux 6.12, no hugetlb pool, THP `shmem_enabled` = `never`), 8 workers per transport; HG_MALLOC `-m 512:4096 -M 64:512`, F_MALLOC `-m 2048 -M 32`.
 - **Build:** as before, an OpenSIPS 4.1 tree: master plus HG_MALLOC - now with the review fixes - and other pending patches, among them the receive modes of [OpenSIPS PR #4365](https://github.com/OpenSIPS/opensips/pull/4365) (`shared` is the current code).
-- **Method:** as in [setup B](benchmarks.md#setup-b-relayed-calls-over-udp): sipp on three other hosts, 30 s cells, two repetitions per rate and mode, the server restarted for every cell. A rate holds when both repetitions complete at least 98% of the offered calls with at most 0.1% failed and every load generator reported. The load generators split a rate over 12 instances (24 for TLS and WSS), so the offered total is rounded: 16,000/s offers 479,880 calls in 30 s.
-- **TLS and WSS:** TLS with default settings, WSS with the staging settings (WSS does not connect with the default `wss_max_msg_chunks`), as before. The original default-settings TLS templates were not kept; they were rebuilt by removing the staging settings (`tls_max_msg_chunks` / `wss_max_msg_chunks` 32, handshake and send timeouts 1,500 ms, TLS 1.2-1.3, and on the gateways `tls_async_max_postponed_chunks` 1024).
-- **Two passes for TLS and WSS:** the ceilings come from the first pass. In it the per-process sampler could not tell TCP main from the TCP workers (its CLI configuration was missing on the server), so the same-rate cells were measured again, with the sampler fixed, in a second pass that held in every cell.
+- **Method:** as in [setup B](benchmarks.md#setup-b-relayed-calls-over-udp): sipp on three other hosts, 30 s cells, two repetitions per rate and mode, the server restarted for every cell. A rate holds when both repetitions complete at least 98% of the offered calls with at most 0.1% failed and every load generator reported. The load generators split a rate over 12 instances, so the offered total is rounded: 16,000/s offers 479,880 calls in 30 s.
 
 ### Highest sustained calls/s (shared / auto / exclusive), original → now
 
@@ -91,10 +91,8 @@ HG_MALLOC is still ahead in every test: the least CPU, no UDP drops and no faile
 |---|---|---|
 | UDP, default 512 KB | 10,000 / 10,000 / 10,000 → 10,000 / 10,000 / 10,000 | 20,000 / 22,000 / 18,000 → **20,000 / 22,000 / 20,000** |
 | UDP, 8 MB | 10,000 / 13,000 / 12,000 → 13,000 / 14,000 / 12,000 | not reported → **22,000 / 22,000 / 22,000** |
-| TLS, defaults | 6,000 / 6,000 / 6,000 → 6,000 / 6,000 / 6,000 | 6,000 / 8,000 / 6,000 → **6,000 / 8,000 / 6,000** |
-| WSS, staging settings | 6,000 / 5,000 / 6,000 → 5,000 / 5,000 / 6,000 | 5,000 / 5,000 / 5,000 → **6,000 / 6,000 / 6,000** |
 
-UDP rates tried: F_MALLOC 8,000, 10,000, 12,000 (512 KB) and 10,000, 12,000, 13,000, 14,000, 16,000 (8 MB); HG_MALLOC 12,000, 16,000, 18,000, 20,000, 22,000, 24,000 (both buffers). At 16,000 with 8 MB, no F_MALLOC load generator wrote its summary before its timeout while the server dropped about a million datagrams per sampling window; those cells count as not holding. At 24,000 HG_MALLOC fails in every mode with either buffer. TLS and WSS search down from 10,000 (10,000, 8,000, 6,000, 5,000) per mode.
+UDP rates tried: F_MALLOC 8,000, 10,000, 12,000 (512 KB) and 10,000, 12,000, 13,000, 14,000, 16,000 (8 MB); HG_MALLOC 12,000, 16,000, 18,000, 20,000, 22,000, 24,000 (both buffers). At 16,000 with 8 MB, no F_MALLOC load generator wrote its summary before its timeout while the server dropped about a million datagrams per sampling window; those cells count as not holding. At 24,000 HG_MALLOC fails in every mode with either buffer.
 
 ### Same rate, UDP 12,000/s, default 512 KB buffer: F_MALLOC → HG_MALLOC
 
@@ -110,31 +108,6 @@ UDP rates tried: F_MALLOC 8,000, 10,000, 12,000 (512 KB) and 10,000, 12,000, 13,
 | syscalls per call, now | 81.5 → 27.0 (-67%) | 70.9 → 23.0 (-68%) | 84.3 → 25.0 (-70%) |
 
 HG_MALLOC's own figures are close to the original ones; the smaller CPU difference comes from F_MALLOC, which at 12,000/s is past its limit (it fails calls and retransmits heavily) and costs less per completed call in some runs than in others.
-
-### Same rate, TLS and WSS
-#### TLS 6,000/s, default settings: F_MALLOC → HG_MALLOC, mean of two cells
-
-| | shared | auto | exclusive |
-|---|---|---|---|
-| CPU % per 1,000 calls/s | 132.9 → 122.4 (-8%) | 121.1 → 112.6 (-7%) | 120.1 → 106.5 (-11%) |
-| TCP workers' CPU % | 280 → 235 (-16%) | 241 → 195 (-19%) | 227 → 171 (-24%) |
-| TCP main CPU % | 381 → 377 (-1%) | 350 → 354 (+1%) | 357 → 345 (-3%) |
-| syscalls per call | 115.8 → 102.4 (-12%) | 114.8 → 99.2 (-14%) | 119.0 → 102.3 (-14%) |
-| `sched_yield` per call | 26.4 → 12.5 (-53%) | 27.4 → 11.5 (-58%) | 31.3 → 14.1 (-55%) |
-| failed calls (2 cells) | 0 → 0 | 0 → 0 | 0 → 0 |
-
-#### WSS 5,000/s, staging settings: F_MALLOC → HG_MALLOC, mean of two cells
-
-| | shared | auto | exclusive |
-|---|---|---|---|
-| CPU % per 1,000 calls/s | 156.1 → 146.8 (-6%) | 145.3 → 132.8 (-9%) | 140.4 → 129.8 (-8%) |
-| TCP workers' CPU % | 238 → 203 (-15%) | 202 → 160 (-21%) | 186 → 147 (-21%) |
-| TCP main CPU % | 426 → 424 (-0%) | 405 → 396 (-2%) | 398 → 395 (-1%) |
-| syscalls per call | 144.5 → 135.0 (-7%) | 145.2 → 133.8 (-8%) | 146.2 → 136.2 (-7%) |
-| `sched_yield` per call | 18.2 → 7.9 (-57%) | 21.4 → 9.3 (-56%) | 22.0 → 11.4 (-48%) |
-| failed calls (2 cells) | 0 → 0 | 0 → 0 | 0 → 0 |
-
-The description's ranges: TLS -9 to -11% CPU per call, -18 to -23% TCP workers' CPU, -14 to -20% syscalls, -54 to -69% `sched_yield`; WSS -7 to -8%, -16 to -21%, -10 to -12%, -59 to -64%.
 
 ### UDP with an 8 MB socket buffer: HG_MALLOC's drops
 

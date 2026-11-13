@@ -73,6 +73,8 @@ enum osips_mm {
 #define DEFAULT_MALLOC_MM MM_HP_MALLOC
 #elif defined PREFERRED_MALLOC_F_PARALLEL_MALLOC
 #define DEFAULT_MALLOC_MM MM_F_PARALLEL_MALLOC
+#elif defined PREFERRED_MALLOC_HG_MALLOC
+#define DEFAULT_MALLOC_MM MM_HG_MALLOC
 #else
 #error "no default memory allocator selected"
 #endif

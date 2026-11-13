@@ -125,7 +125,14 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 | `guard` | 1 when new allocations get the `hg_mem_check` guard |
 | `grows`, `grows_proactive`, `grows_exhaustion`, `grow_refused`, `last_grow_refusal`, `grow_blocked` | growth history, what refused the latest grow (section 3.3) and the latched gauge |
 | `shrinks`, `punches`, `draining`, `whole_free_pages` | release history and what could be released now |
-| `live_committed`, per-class carve and reuse | what is in use and where |
+| `punched_pages`, `repins`, `repin_failed`, `hole_regrows` | pages released and not yet taken back, pages taken back and how many of them could not be pinned again, grows served from released pages |
+| `grow_inflight`, `grow_waits`, `grow_wait_timeouts`, `maintenance_process` | a grow in progress, workers that waited for one and those that gave up; the `HG maintenance` process number, -1 for a fixed arena |
+| `live_committed`, `live_peak`, `live_cells`, `live_payload`, `carved_peak`, `free_to_carve`, per-class carve and reuse | what is in use, its peak, and where |
+| `blocks_carved`, `blocks_returned`, `gc_passes`, `gc_tick_blocks`, `gc_inline_blocks`, `gc_kept_blocks`; per class `gc_keep` | the GC: class blocks cut and given back to the buddy, blocks given back by the maintenance tick and inline (memory pressure, a sweep's flush), empty blocks kept for reuse |
+| `cache_flushes`, `cells_flushed`, `sweeps_skipped`, `pressure_flushes`, `pressure_cells` | the 30 s sweep: flushes run, cells they brought back, sweeps with nothing to flush; flushes a process made when carving ran out, and their cells |
+| `reserve_floor`, `below_floor`, `floor_crossings` | the reserve floor (free memory at 1/16 of the committed pages; dropping below it makes every process flush its cache), 1 from the drop until free memory is back above twice the floor, and how often it dropped below |
+| `large_backing`, `large_live`, `large_recycled`, `large_chunks_carved`, `large_chunks_returned` | requests above 64 KB: bytes of the chunks that hold them, bytes in use, free bytes inside those chunks; chunks taken from and given back to the buddy (taken far ahead of given back means alloc/free churn) |
+| `buddy_splits`, `buddy_merges`, `buddy_free_leaves`, `buddy_free_orders` | the buddy allocator: splits and merges since startup, free leaves, and free runs per order, which tells whether a large chunk can still be served |
 | `xfer_puts`, `xfer_gets`, `xfer_full`, `xfer_drained`; per class `xfer_chains`, `xfer_cap` | the transfer cache: chains parked and taken whole, donations it had no room for, cells handed back from parked chains; chains parked now and the class's cap |
 | `alloc_failed`, `out_of_memory` | allocations refused for lack of memory, and 1 while such an episode is ongoing |
 | `lock` | hold and wait histograms per reason (refill, return, flush, large, policy, stats, other), stalls, the worst hold and its reason, commit and release times |
@@ -183,8 +190,11 @@ The unit tests run under HG_MALLOC with `make test UT_ALLOC=HG_MALLOC UT_MEM="-m
 | option | meaning |
 |---|---|
 | `-a HG_MALLOC` | use HG_MALLOC for shared and private memory (`-s` / `-k` select them separately) |
+| `-a HG_MALLOC_DBG` | the same, recording file, function and line for every allocation, which `mem:pkg_dump` and `mem:shm_dump` print per site; it also puts a red zone after every request, checked at free and realloc, and holds freed cells poisoned in a per-thread quarantine, checked when they leave it - see Integrity checks (section 1) |
 | `-m INIT[:CAP]` | shared arena: initial size, and the cap it may grow to |
 | `-M INIT[:CAP]` | private (per-process) arena, same form |
+
+Restart-persistent memory is not served by HG_MALLOC: it lives in a file mapped at a fixed address, and HG_MALLOC reserves its own arenas. With `-a HG_MALLOC` it uses F_MALLOC (F_MALLOC_DBG with `-a HG_MALLOC_DBG`; Q_MALLOC in a build without F_MALLOC); `-e HG_MALLOC` is refused at startup.
 
 Sizes are MB, or take a `k`/`m`/`g` suffix (either case): `-m 128:1g`, `-M 512k:16m`. Without a cap the arena is fixed.
 
@@ -333,7 +343,7 @@ The `hgmem:` statistics group holds the shared arena's figures, plus two that su
 | `hg_shm_lock_stalls` | rising steadily |
 | `hg_shm_committed` against `hg_shm_cap` | committed close to the cap |
 
-Others for graphs: `hg_shm_grows`, `hg_shm_grows_proactive`, `hg_shm_grows_exhaustion`, `hg_shm_grow_refused`, `hg_shm_shrinks`, `hg_shm_shrink_bytes`, `hg_shm_live`, `hg_shm_live_peak`, `hg_shm_carved`, `hg_shm_free_to_carve`, `hg_shm_lock_hold_max_us`, `hg_shm_tier`.
+Others for graphs: `hg_shm_grows`, `hg_shm_grows_proactive`, `hg_shm_grows_exhaustion`, `hg_shm_grow_refused`, `hg_shm_shrinks`, `hg_shm_shrink_bytes`, `hg_shm_live`, `hg_shm_live_peak`, `hg_shm_carved`, `hg_shm_free_to_carve`, `hg_shm_lock_hold_max_us`, `hg_shm_tier`. The rest of the group (`hg_shm_gc_*`, `hg_shm_buddy_*`, `hg_shm_large_*`, the flush, floor and release counters) carries the shared arena's `core:hg_stats` figures, nearly all under the same name, plus its size and pinned bytes (`hg_shm_total_size`, `hg_shm_pinned_bytes`), for graphs over time.
 
 Note that `shmem:free_size` counts only memory not yet carved into size-class blocks; free cells already carved are reusable for their class but not counted, so it reads lower than what is reusable. Alert on the figures above, not on `free_size`.
 
@@ -388,7 +398,8 @@ ERROR: new process's pkg arena: committing 32 MB now does not fit - ... not fork
 | `mem/hg_maint.c` | the maintenance process |
 | `mem/hg_memlimit.c`, `mem/hg_dbg.c`, `mem/hg_san.h` | cgroup limits, the debug checks, sanitizer hooks |
 | integration | `mem/mem.c`, `mem/shm_mem.c`, `mem/common.c`, `mem/rpm_mem.c`, `pt.c`, `pt_scaling.c`, `main.c`, `cfg.y`, `core_stats.c`, `mi/mi_core.c`, `evi/evi_core.c` |
-| tests | `mem/test/test_hg_malloc.c`, `modules/hgstress` |
+| tests | `mem/test/test_hg_malloc.c`, `mem/test/test_hg_fuzz.c`, `mem/test/test_hg_memlimit.c`, `modules/hgstress` |
+| tm and dialog | `modules/tm/h_table.c` (timer set) and `modules/dialog/dlg_profile.c` (bucket of a profile without a value), in commits of their own: both were picked from the low bits of the object's address, which are the same for every cell of a size class, so every transaction went to one timer set and every dialog of such a profile to one bucket |
 
 ### Invariants
 

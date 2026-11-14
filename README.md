@@ -29,25 +29,30 @@ Everything lives in the [Lt-Flash/opensips](https://github.com/Lt-Flash/opensips
 
 | branch | what |
 |---|---|
-| [`feature/hg-malloc-v3-final`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-final) | OpenSIPS master (as of 2026-11-03) plus three commits: the allocator (its review fixes, the header state and checksum, debug checks, sanitizer hooks, memory-cgroup limits, unit tests with a fuzzer, and a section for reviewers), and one each for tm and dialog, which picked a transaction's timer set and the bucket of a profile without a value from address bits that are the same for every cell of an HG_MALLOC size class - so `timer_partitions` had no effect; proposed upstream as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327) |
-| [`feature/hg-malloc-v3-4.0`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-4.0) | the same allocator on the 4.0 branch, as a series of commits; also applies to the 4.0.1, 4.0.2 and 4.0.3 releases. It has the allocator only, without the tm and dialog commits, so under HG_MALLOC `timer_partitions` has no effect there |
+| [`feature/hg-malloc-v3-final`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-final) | OpenSIPS master (as of 2026-11-13) plus four commits: a fix to the unit-test runner, which made the global context before the modules registered their slots in it; the allocator (its review fixes, the header state and checksum, debug checks, sanitizer hooks, memory-cgroup limits, unit tests with a fuzzer, and a section for reviewers), and one each for tm and dialog, which picked a transaction's timer set and the bucket of a profile without a value from address bits that are the same for every cell of an HG_MALLOC size class - so `timer_partitions` had no effect; proposed upstream as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327) |
+| [`feature/hg-malloc-v3-4.0`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-4.0) | the same allocator, with the tm and dialog commits, on the 4.0 branch (as of 2026-11-13), as a series of commits. It needs a 4.0 tree newer than the 4.0.3 release |
+| [`feature/hg-malloc-v3-4.0.x`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-4.0.x) | the earlier 4.0 series, for the 4.0.1, 4.0.2 and 4.0.3 releases. It has the allocator only, without the tm and dialog commits, so under HG_MALLOC `timer_partitions` has no effect there |
 | [`hg_malloc`](https://github.com/Lt-Flash/opensips/tree/hg_malloc) | this documentation |
 
-The branch adds the allocator (`mem/hg_*`), elastic-arena and autoscaling configuration, MI commands, statistics and events, and `modules/hgstress`, a soak and fault-injection test module excluded from the default build; it also carries three small fixes to existing code: an out-of-bounds write in core `add_stats_group()` that HG_MALLOC_DBG found, an `F_PARALEL_MALLOC` typo in `shm_mem.c`, and a build without `DBG_MALLOC` that would not start unless `-a` was given. The master branch also carries the tm and dialog commits described above. Clone a branch and build it as any OpenSIPS tree, or add its commits to an existing tree:
+The branch adds the allocator (`mem/hg_*`), elastic-arena and autoscaling configuration, MI commands, statistics and events, and `modules/hgstress`, a soak and fault-injection test module excluded from the default build; it also carries a small fix to existing code: an out-of-bounds write in core `add_stats_group()` that HG_MALLOC_DBG found. Two earlier fixes, an `F_PARALEL_MALLOC` typo in `shm_mem.c` and a build without `DBG_MALLOC` that would not start unless `-a` was given, are now in OpenSIPS master and 4.0 on their own. Clone a branch and build it as any OpenSIPS tree, or add its commits to an existing tree:
 
 ```bash
 git remote add lt-flash https://github.com/Lt-Flash/opensips.git
 
 # a master tree
 git fetch lt-flash feature/hg-malloc-v3-final
-git cherry-pick FETCH_HEAD~3..FETCH_HEAD
+git cherry-pick FETCH_HEAD~4..FETCH_HEAD
 
-# a 4.0 tree
+# a 4.0 tree newer than 4.0.3
 git fetch lt-flash feature/hg-malloc-v3-4.0
+git cherry-pick d8dc0d1b71^..FETCH_HEAD
+
+# a 4.0.1, 4.0.2 or 4.0.3 tree
+git fetch lt-flash feature/hg-malloc-v3-4.0.x
 git cherry-pick be2e5d9018^..FETCH_HEAD
 ```
 
-In an unpacked 4.0.x release tarball (checked on 4.0.1, 4.0.2 and 4.0.3), all 4.0 changes as one diff:
+In an unpacked 4.0.1, 4.0.2 or 4.0.3 release tarball (checked on all three), the earlier 4.0 series as one diff:
 
 ```bash
 curl -L 'https://github.com/Lt-Flash/opensips/compare/be2e5d9018a982fc8439b7c6419256ab119f6d7f%5E...3aac56f63a6c12b812944439c63e5be3693806a8.diff' | patch -p1

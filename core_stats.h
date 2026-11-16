@@ -78,9 +78,9 @@ extern stat_var* slow_msgs;
 int init_pkg_stats(int no_procs);
 
 
-/* max/sum pkg high-water across all processes (IPC-refreshed pkg_status),
- * for sizing -M by the worst one; 0 ok, -1 if none has reported yet */
-int hg_pkg_peak_all(unsigned long *peak, unsigned long *sum, int *nproc);
+/* max pkg high-water and summed arena size across all processes (IPC-
+ * refreshed pkg_status), for sizing -M; 0 ok, -1 if none has reported yet */
+int hg_pkg_peak_all(unsigned long *peak, unsigned long *size, int *nproc);
 #endif
 
 #endif /*STATISTICS*/

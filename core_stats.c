@@ -186,7 +186,7 @@ static unsigned long get_pkg_fragments( void*proc_id)
 	return pkg_status[(unsigned long)proc_id][PKG_FRAGMENTS_SIZE_IDX];
 }
 
-int hg_pkg_peak_all(unsigned long *peak, unsigned long *sum, int *nproc)
+int hg_pkg_peak_all(unsigned long *peak, unsigned long *size, int *nproc)
 {
 	unsigned long mx = 0, tot = 0;
 	int i, n = 0;
@@ -209,13 +209,13 @@ int hg_pkg_peak_all(unsigned long *peak, unsigned long *sum, int *nproc)
 		if (!pkg_status[i][PKG_TOTAL_SIZE_IDX])
 			continue;
 		n++;
-		tot += v;
+		tot += pkg_status[i][PKG_TOTAL_SIZE_IDX];
 		if (v > mx)
 			mx = v;
 	}
 
 	if (peak)  *peak  = mx;
-	if (sum)   *sum   = tot;
+	if (size)  *size  = tot;
 	if (nproc) *nproc = n;
 	return n ? 0 : -1;
 }

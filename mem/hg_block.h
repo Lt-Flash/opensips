@@ -302,6 +302,7 @@ struct hg_block {
 
 	unsigned long         committed_min; /* shrink's floor: the -m/-M size,
 	                                     * or profile's scale-down size */
+	unsigned long         init_bytes;    /* committed at init, for advice */
 	unsigned long         grow_granule; /* bytes per grow step, hps multiple */
 	unsigned long         shrink_step;  /* max bytes released per drain
 	                                     * tick, hps multiple */

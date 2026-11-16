@@ -45,6 +45,7 @@
 #include "../../mem/hg_buddy.h"
 #include "../../mem/mem_arena.h"
 #include "../../mem/hg_xfer.h"
+#include "../../mem/hg_advise.h"
 
 /* a fuzz seed has taken from 10 to over 30 s under an emulator (the qemu
  * cross-builds in CI); a child that dies is noticed as it exits, not here */
@@ -697,6 +698,77 @@ static int hgt_child_exit(void *arg)
 	return 0;
 }
 
+#define MB(x) ((unsigned long)(x) << 20)
+
+static void hgt_advise(struct hg_advice *a, int pkg, unsigned long init,
+		unsigned long committed, unsigned long cap, unsigned long peak)
+{
+	memset(a, 0, sizeof *a);
+	a->pkg = pkg;
+	a->init = init;
+	a->size = a->committed = committed;
+	a->cap = cap;
+	a->peak = peak;
+	a->hps = MB(2);
+}
+
+static void test_hg_advise(void)
+{
+	struct hg_advice a;
+	struct hg_block *hb = shm_block;
+
+	/* an RGS on -m 128:512 that grew to 236 MB holding a 211 MB peak */
+	hgt_advise(&a, 0, MB(128), MB(236), MB(512), 221618176UL);
+	hg_advise_compute(&a);
+	ok(a.elastic && a.peak_pct == 41 && !strcmp(a.verdict, "reasonable") &&
+		a.rec_init_mb == 242 && a.rec_mb == 424,
+		"hg_advise: an elastic arena is judged against its cap, not the "
+		"committed size its growth follows (%u%%, %s, INIT %lu, cap %lu)",
+		a.peak_pct, a.verdict, a.rec_init_mb, a.rec_mb);
+
+	hgt_advise(&a, 0, MB(256), MB(256), MB(256), MB(200));
+	hg_advise_compute(&a);
+	ok(!a.elastic && a.peak_pct == 78 && a.rec_mb == 400 && !a.rec_init_mb &&
+		!strcmp(a.verdict, "TIGHT - raise it before the next busy period"),
+		"hg_advise: a fixed arena is judged against its size (%u%%, %s)",
+		a.peak_pct, a.verdict);
+
+	/* a profile shrank it below INIT; INIT is what stays pinned */
+	hgt_advise(&a, 0, MB(192), MB(128), MB(384), MB(37));
+	hg_advise_compute(&a);
+	ok(a.elastic && a.peak_pct == 9 && a.rec_init_mb == 44 &&
+		!strcmp(a.verdict, "INIT oversized - pinned from startup and never used"),
+		"hg_advise: an elastic arena's INIT far above its peak is oversized, "
+		"its unused cap is not (%s, INIT %lu)", a.verdict, a.rec_init_mb);
+
+	/* a profile growing at 80% needs INIT = peak / 0.8 to stay put */
+	hgt_advise(&a, 0, MB(64), MB(128), MB(512), MB(100));
+	a.grow_pct = 80;
+	hg_advise_compute(&a);
+	ok(a.rec_init_mb == 126, "hg_advise: INIT clears the profile's grow "
+		"line (%lu)", a.rec_init_mb);
+
+	hgt_advise(&a, 1, MB(16), MB(24), MB(64), MB(20));
+	a.nproc = 10;
+	a.committed_all = MB(10 * 24);
+	hg_advise_compute(&a);
+	ok(a.margin == 3 && a.pinned_total_mb == 240 && a.rec_init_mb == 24 &&
+		a.rec_total_mb == 240,
+		"hg_advise: elastic pkg pins the sum of every process's arena "
+		"(%lu MB) and recommends INIT per process (%lu MB)",
+		a.pinned_total_mb, a.rec_init_mb);
+
+	if (!hb)
+		return;
+	hg_advise_arena(hb, hb->max_real_used, 0, 0, 0, &a);
+	ok(a.init == hb->init_bytes && a.committed == hb->committed_bytes &&
+		a.cap == ((hb->pol.active && hb->pol.up_bytes) ? hb->pol.up_bytes :
+		hb->hcap) && a.elastic == (a.cap > a.init),
+		"hg_advise: the shm arena's INIT, committed size and cap reach the "
+		"advice (%lu/%lu/%lu MB)", a.init >> 20, a.committed >> 20,
+		a.cap >> 20);
+}
+
 static void test_hg_exit_returns_cells(void)
 {
 	struct hg_block *hb = shm_block;
@@ -1130,6 +1202,7 @@ void test_hg_malloc(void)
 	test_hg_pkg_shrink();
 	test_hg_inherited();
 	test_hg_grow_refusal_cause();
+	test_hg_advise();
 	test_hg_exit_returns_cells();
 	test_hg_san();
 	test_hg_memlimit();

@@ -539,6 +539,7 @@ struct hg_block *hg_malloc_init_cap(unsigned long size, unsigned long cap_req,
 	hb->size = hb->span_end;
 	hb->committed_bytes = hb->span_end;
 	hb->committed_min = hb->committed_bytes;
+	hb->init_bytes = hb->committed_bytes;
 	hb->span_pending = hb->span_end;
 	hb->hcap = cap;
 	/* a step bounds a commit's pre-fault; a small-mode arena steps one page,

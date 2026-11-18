@@ -15,8 +15,8 @@ The figures above come from one bare-metal server running every allocator from o
 
 ## How it works
 
-- **Lock-free common path.** 21 size classes from 64 B to 64 KB, served from a private free list per process: an allocation and the free that returns it take no lock and touch no shared cache line. Cells move between processes through a shared per-class pool, in batches.
-- **Memory is reused, not stranded.** Blocks are carved from a buddy allocator over a grid of pages the size of the host's huge page (2 MB on x86-64), whichever tier backs them; a block whose cells are all free returns to the buddy and can be re-cut for any size class.
+- **Lock-free common path.** 21 size classes from 64 B to 65,472 B, served from a private free list per process: an allocation and the free that returns it take no lock and touch no shared cache line. Cells move between processes through a shared per-class pool, in batches.
+- **Memory is reused, not stranded.** Blocks are carved from a buddy allocator over a grid of pages the size of the host's transparent huge page (2 MB on x86-64), whichever tier backs them; a block whose cells are all free returns to the buddy and can be re-cut for any size class.
 - **Four tiers of backing memory.** The arena is acquired through a four-tier ladder - `MAP_HUGETLB`, transparent huge pages by advice, by collapse, then plain 4 KB pages - each tier verified from the kernel's own counters. Huge pages are optional.
 - **Elastic arenas.** `-m INIT:CAP` reserves the cap and commits pages only as needed; a maintenance process grows ahead of demand and releases quiet pages with the arena lock dropped. Growth stops at the cap, at what the backing tier can give, and at a floor of free memory - the host's, and the memory cgroup's in a container or a unit with `MemoryMax` - and when the backing or host memory keeps refusing, an alertable event is raised.
 - **No OOM surprises.** Every arena's INIT - the shared `-m` and each process's `-M` - is checked against host memory before it is committed: OpenSIPS refuses a combination the host cannot hold at startup, and shared-arena growth and the auto-scaler both stop at a free-memory floor instead of running into the OOM killer - the host's (5% of RAM, at least 256 MB, or an eighth of RAM on a host under 2 GB), and in a container or a unit with `MemoryMax` the memory cgroup's, whose limit `/proc/meminfo` does not show.
@@ -112,7 +112,7 @@ opensips-cli -x mi core:hg_advise        # what -m and -M should be, from the pe
 opensips-cli -x mi statistics:get hgmem:
 ```
 
-Events: `E_CORE_SHM_GROW_BLOCKED` (growth refused for a sustained period), `E_CORE_HG_LOCK_STALL` (an arena-lock hold above `hg_lock_stall_us`). Parameters, examples and what to alert on: [configuration](docs/configuration.md#events).
+Events: `E_CORE_SHM_GROW_BLOCKED` (growth refused for a sustained period), `E_CORE_HG_LOCK_STALL` (a core shm arena lock hold above `hg_lock_stall_us`). Parameters, examples and what to alert on: [configuration](docs/configuration.md#events).
 
 ## Costs
 

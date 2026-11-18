@@ -9,7 +9,7 @@
 | `-m INIT[:CAP]` | shared arena: initial size, and the cap it may grow to |
 | `-M INIT[:CAP]` | private (per-process) arena, same form |
 
-Restart-persistent memory is not served by HG_MALLOC: it lives in a file mapped at a fixed address, and HG_MALLOC reserves its own arenas. With `-a HG_MALLOC` it uses F_MALLOC (F_MALLOC_DBG with `-a HG_MALLOC_DBG`; Q_MALLOC in a build without F_MALLOC); `-e HG_MALLOC` is refused at startup.
+Restart-persistent memory is not served by HG_MALLOC: it lives in a file mapped at a fixed address, and HG_MALLOC reserves its own arenas. With `-a HG_MALLOC` it uses the build's default allocator, as a run without `-a HG_MALLOC` would (its debug variant with `-a HG_MALLOC_DBG`; Q_MALLOC, else F_MALLOC, when HG_MALLOC is the build's default); `-e HG_MALLOC` is refused at startup. The pool file records its allocator, and a pool made by another one is recreated rather than reused.
 
 Sizes are MB, or take a `k`/`m`/`g` suffix (either case): `-m 128:1g`, `-M 512k:16m`. Without a cap the arena is fixed.
 
@@ -64,7 +64,7 @@ All optional.
 | `hg_scaling_cycle` | 30 | seconds per policy cycle of shared arenas (the profile's "cycles"); private arenas use the fixed 30 s sweep |
 | `hg_shrink_step` | 64m | most a shared arena releases from its top per maintenance tick (plus up to as much again from inside with `hg_interior_release`); a private arena releases one step per quiet window |
 | `hg_interior_release` | 0 | 1 = give back whole free pages from anywhere in the arena, not only the top |
-| `hg_lock_stall_us` | 1000 | an arena-lock hold at or above this is a stall: counted per arena, and raises `E_CORE_HG_LOCK_STALL` for the shared arena; 0 disables |
+| `hg_lock_stall_us` | 1000 | an arena-lock hold at or above this is a stall: counted per arena, and raises `E_CORE_HG_LOCK_STALL` for the core shm arena; 0 disables |
 | `hg_mem_check` | 0 | 1 = a guard after every new allocation, checked at free and realloc (see [Integrity checks](design.md#1-allocation)); 2 = the same, and abort on the first corruption any check finds. Ignored by HG_MALLOC_DBG arenas, whose red zone covers more |
 
 Example:
@@ -78,7 +78,7 @@ hg_lock_stall_us = 2000
 
 ## Events
 
-Both events describe the shared arena and are raised from the 30 s cache-sweep timer, never while the arena lock is held. Catch them in the script with `event_route` or send them out with any event transport (`event_datagram`, `event_stream`, `event_rabbitmq`, ...).
+Both events describe the core shm arena (module arenas raise neither) and are raised from the 30 s cache-sweep timer, never while the arena lock is held. Catch them in the script with `event_route` or send them out with any event transport (`event_datagram`, `event_stream`, `event_rabbitmq`, ...).
 
 ### E_CORE_SHM_GROW_BLOCKED
 
@@ -95,12 +95,12 @@ What to do: free or add host memory, or on hugetlb pages raise the memory-lock l
 
 ### E_CORE_HG_LOCK_STALL
 
-A process held the shared arena's lock for `hg_lock_stall_us` (default 1000 us) or longer. Raised at most once per 30 s, carrying the most recent stall; `hg_lock_stall_us = 0` turns it off.
+A process held the core shm arena's lock for `hg_lock_stall_us` (default 1000 us) or longer. Raised at most once per 30 s, carrying the most recent stall; `hg_lock_stall_us = 0` turns it off.
 
 | parameter | meaning |
 |---|---|
 | `arena` | `shm` |
-| `reason` | what the lock was held for: `refill` (taking cells or a new block), `return` (giving cells or a block back), `flush` (a process emptying its private cache), `large` (an allocation too big for the 64 KB class), `policy` (a grow or shrink decision), `stats` (a statistics walk), `other` |
+| `reason` | what the lock was held for: `refill` (taking cells or a new block), `return` (giving cells or a block back), `flush` (a process emptying its private cache), `large` (an allocation too big for the top class), `policy` (a grow or shrink decision), `stats` (a statistics walk), `other` |
 | `hold_us` | how long it was held |
 | `process` | OpenSIPS process number that held it, as listed by `opensips-cli -x mi ps` |
 | `stalls` | stalls since startup |
@@ -144,7 +144,7 @@ opensips-cli -x mi core:hg_advise     # what -m and -M should be, from the peak 
 opensips-cli -x mi statistics:get hgmem:
 ```
 
-`core:hg_stats` answers for the process that receives the MI command, so its `pkg` section is that process's private arena; `core:hg_advise` covers the worst process, from the figures each process publishes at its 30 s sweep: its carve peak, committed size and live split.
+`core:hg_stats` answers for the process that receives the MI command, so its `pkg` section is that process's private arena; `core:hg_advise` covers the worst process, from the figures each process publishes at its 30 s sweep: its carve peak, committed size and live split. The worst peak ever published is kept after its process exits (an auto-scaled worker), and the pre-fork arena, which holds the parsed config and is sized by the same `-M`, counts too.
 
 For a fixed arena `core:hg_advise` reports `configured_mb`, the peak as a share of it, and `recommended_mb`, the size to give `-m` or `-M`. An elastic arena commits just past its peak, so it is judged against its cap instead: it reports `init_mb`, `committed_mb`, `cap_mb` and `peak_pct_of_cap`, and two recommendations, `recommended_init_mb` (an INIT that holds the peak without growing) and `recommended_cap_mb`. It calls INIT oversized when the peak stays under a fifth of it. The unused part of the cap is not committed, though on hugetlb pages (tier 1) it is reserved from the pool.
 
@@ -179,7 +179,7 @@ The shared arena commits its `-m` INIT at startup, and every process then create
 - **Private arenas at startup, before anything forks:** every process's private arena is checked against RAM above the floor. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
 - **Each new process, auto-scaler forks included:** not forked if its INIT does not fit. The auto-scaler keeps the processes it has and tries again on its next cycle, so a profile that allows more processes than the host holds stops short instead of running into the OOM killer.
 - **Every arena:** an INIT the host cannot hold is refused when the arena is created.
-- **Every grow:** refused if it would cross the floor; a private-arena step is counted once per process. Private-arena refusals show in `hg_pkg_grow_refused` and `hg_pkg_grow_blocked`.
+- **Every grow:** refused if it would cross the floor; a step counts at its real size, a private arena's too. Private-arena refusals show in `hg_pkg_grow_refused` and `hg_pkg_grow_blocked`.
 
 ```
 INFO:  pkg: 14 processes at startup, up to 16 with auto-scaling, -M INIT 32 MB: 416 MB (480 MB at the maximum) from RAM; 0 MB of RAM available above the 11778 MB floor

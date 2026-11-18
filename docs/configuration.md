@@ -144,7 +144,7 @@ opensips-cli -x mi core:hg_advise     # what -m and -M should be, from the peak 
 opensips-cli -x mi statistics:get hgmem:
 ```
 
-`core:hg_stats` answers for the process that receives the MI command, so its `pkg` section is that process's private arena; `core:hg_advise` covers the worst process.
+`core:hg_stats` answers for the process that receives the MI command, so its `pkg` section is that process's private arena; `core:hg_advise` covers the worst process, from the figures each process publishes at its 30 s sweep: its carve peak, committed size and live split.
 
 For a fixed arena `core:hg_advise` reports `configured_mb`, the peak as a share of it, and `recommended_mb`, the size to give `-m` or `-M`. An elastic arena commits just past its peak, so it is judged against its cap instead: it reports `init_mb`, `committed_mb`, `cap_mb` and `peak_pct_of_cap`, and two recommendations, `recommended_init_mb` (an INIT that holds the peak without growing) and `recommended_cap_mb`. It calls INIT oversized when the peak stays under a fifth of it. The unused part of the cap is not committed, though on hugetlb pages (tier 1) it is reserved from the pool.
 
